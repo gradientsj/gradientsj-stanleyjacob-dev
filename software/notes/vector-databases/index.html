@@ -47,6 +47,70 @@ CREATE INDEX ON docs USING hnsw (embedding vector_cosine_ops);
 -- the five nearest documents to a query embedding ($1) by cosine distance
 SELECT id FROM docs ORDER BY embedding &lt;=&gt; $1 LIMIT 5;
 </code></pre>
+          <h2>FAISS in depth</h2>
+          <p>
+            FAISS (Facebook AI Similarity Search) is a C++ library with Python bindings, not a server, for building
+            approximate-nearest-neighbor indexes over dense vectors on CPU or GPU. You choose an index type that trades
+            exactness, speed, and memory, optionally train it, add your vectors, and search. The workflow is always the
+            same three calls: <code>train</code> (for index types that learn structure), <code>add</code>, and
+            <code>search(queries, k)</code>, which returns the distances and ids of the k nearest neighbors.
+          </p>
+          <h2>The index types that matter</h2>
+          <ul>
+            <li><strong>IndexFlatL2 / IndexFlatIP</strong>: exact brute force under Euclidean or inner-product distance. It is the recall baseline and needs no training, but it is O(nd) per query, so it is for small sets or for measuring the recall the approximate indexes lose.</li>
+            <li><strong>IndexIVFFlat</strong>: k-means partitions the vectors into <code>nlist</code> Voronoi cells, and a query searches only the <code>nprobe</code> nearest cells. It must be <code>train</code>-ed to learn the cells; <code>nprobe</code> is the recall/speed dial (more cells, higher recall, slower).</li>
+            <li><strong>IndexIVFPQ</strong>: adds <strong>product quantization</strong> on top of IVF to shrink memory. Each vector is split into <code>m</code> subvectors, and each subvector is quantized to one of 256 centroids (<code>nbits=8</code>), so a vector is stored as just <code>m</code> bytes instead of 4d, and distances are computed from small precomputed lookup tables. This is what makes billion-scale search fit in RAM, at some accuracy cost.</li>
+            <li><strong>IndexHNSWFlat</strong>: the graph index from the section above, very fast and high recall, no training, but the most memory.</li>
+          </ul>
+          <p>
+            Composite indexes are built with the <strong>index factory</strong>, a string that names the pipeline, for
+            example <code>index_factory(d, "IVF4096,PQ16")</code> or <code>"OPQ16,IVF65536,PQ16"</code> where OPQ adds a
+            learned rotation that makes product quantization more accurate. For cosine similarity, L2-normalize the
+            vectors and use the inner-product index. GPU support (<code>index_cpu_to_gpu</code>) gives a large speedup,
+            and indexes persist with <code>write_index</code> / <code>read_index</code>.
+          </p>
+          <p>
+            Choosing, per the FAISS guidelines: <code>Flat</code> for exact or tiny data; <code>IVFFlat</code> for
+            millions of vectors when memory is fine; <code>IVFPQ</code> or an OPQ variant for hundreds of millions to
+            billions where memory dominates; and <code>HNSW</code> when you have ample RAM and want the best
+            speed-recall trade. The single most important runtime knob on IVF indexes is <code>nprobe</code>.
+          </p>
+          <pre><code class="language-python">import faiss
+import numpy as np
+
+d = 768                                          # embedding dimension
+xb = np.random.rand(100_000, d).astype('float32')  # database vectors
+xq = np.random.rand(5, d).astype('float32')        # query vectors
+
+# 1) exact baseline (brute force, L2) -- the recall ground truth
+index = faiss.IndexFlatL2(d)
+index.add(xb)
+D, I = index.search(xq, k=10)                    # distances and ids of the 10 nearest
+
+# 2) IVF: cluster into nlist cells, then search nprobe of them
+quantizer = faiss.IndexFlatL2(d)
+ivf = faiss.IndexIVFFlat(quantizer, d, 4096)     # nlist = 4096 Voronoi cells
+ivf.train(xb)                                    # k-means on the data to learn the cells
+ivf.add(xb)
+ivf.nprobe = 16                                  # search 16 cells: more = higher recall, slower
+D, I = ivf.search(xq, 10)
+
+# 3) IVF + product quantization: compress each vector to m bytes
+ivfpq = faiss.IndexIVFPQ(quantizer, d, 4096, 16, 8)  # m=16 subvectors, 8 bits (256 centroids) each
+ivfpq.train(xb); ivfpq.add(xb)
+ivfpq.nprobe = 16
+
+# composite index via the factory string; OPQ improves PQ accuracy
+index2 = faiss.index_factory(d, "OPQ16,IVF4096,PQ16")
+
+# cosine similarity: L2-normalize and use inner product
+faiss.normalize_L2(xb)
+cos = faiss.IndexFlatIP(d); cos.add(xb)
+
+# move to GPU, and persist to disk
+# gpu = faiss.index_cpu_to_gpu(faiss.StandardGpuResources(), 0, ivfpq)
+faiss.write_index(ivfpq, "vectors.faiss")
+loaded = faiss.read_index("vectors.faiss")</code></pre>
           <h2>Worked example</h2>
           <p>The index only approximates this exact cosine ranking, which a brute-force search makes concrete; a query near "cat" retrieves the animal embeddings before the vehicle ones:</p>
           <pre><code class="language-python">import numpy as np
@@ -64,6 +128,14 @@ print(sorted(docs, key=lambda k: cosine(q, docs[k]), reverse=True))
 </code></pre>
           <h2>Complexity (time and space)</h2>
           <p>Exact search is $O(nd)$ time per query for $n$ vectors of dimension $d$. HNSW answers in about $O(\log n)$ with $O(nd + nM)$ memory ($M$ graph edges per node), and IVF in roughly $O(\text{probes} \times \text{cell size})$ with less memory. The dimension $d$ also matters: embeddings are often reduced or quantized (product quantization) to cut both memory and distance-computation cost.</p>
+          <h2>In production</h2>
+          <p>
+            Vector search is the retrieval half of retrieval-augmented generation, so it sits inside most LLM
+            applications: embed a corpus once, then at query time embed the question and fetch the nearest chunks to
+            ground the model's answer. In-house systems frequently build on FAISS directly, while managed and
+            standalone databases (pgvector, Qdrant, Pinecone, Milvus, Weaviate) wrap the same approximate-nearest-
+            neighbor cores with persistence, metadata filtering, and operations.
+          </p>
           <h2>Follow-up questions</h2>
           <ul>
             <li><strong>HNSW vs IVF, when each?</strong> HNSW for most workloads with active writes (graph, ~log n, high recall, more memory); IVF for huge, mostly-static data where memory or build time dominates.</li>
@@ -78,6 +150,8 @@ print(sorted(docs, key=lambda k: cosine(q, docs[k]), reverse=True))
             <li>Johnson, Douze &amp; J&eacute;gou, <a href="https://arxiv.org/abs/1702.08734" target="_blank" rel="noreferrer">Billion-scale Similarity Search with GPUs</a> (FAISS, 2017).</li>
             <li><a href="https://github.com/pgvector/pgvector" target="_blank" rel="noreferrer">pgvector</a> (open-source Postgres extension).</li>
             <li>Kleppmann, <a href="https://dataintensive.net/" target="_blank" rel="noreferrer">Designing Data-Intensive Applications</a> (2017).</li>
+            <li>Pinecone, <a href="https://www.pinecone.io/learn/series/faiss/faiss-tutorial/" target="_blank" rel="noreferrer">Introduction to Faiss</a> (tutorial series).</li>
+            <li>facebookresearch, <a href="https://github.com/facebookresearch/faiss/wiki/Guidelines-to-choose-an-index" target="_blank" rel="noreferrer">FAISS Wiki: Guidelines to Choose an Index</a>.</li>
           </ol>
         </article>
       </div>
