@@ -69,13 +69,25 @@
             weighted average of what every other token offers, with the weights set by content similarity.
           </p>
           <p>
+            One easily-forgotten detail is why this uses a <em>dot product</em> rather than the additive, MLP-based
+            attention of earlier models. The two are close in quality; scaled dot-product attention won because the
+            whole score matrix is a single matrix multiply, the one operation GPUs execute most efficiently, so it is
+            dramatically faster at scale for the same result.
+          </p>
+          <p>
             The $1/\sqrt{d_k}$ factor is not cosmetic. If the entries of $q$ and $k$ are independent with mean zero
             and unit variance, then $q \cdot k = \sum_{i=1}^{d_k} q_i k_i$ has mean zero and variance $d_k$. Without
             rescaling, the logits grow like $\sqrt{d_k}$, the softmax saturates toward a one-hot vector, and its
             Jacobian $\operatorname{diag}(p) - p p^\top$ collapses toward zero, so gradients vanish. Dividing by
             $\sqrt{d_k}$ restores unit-variance logits and keeps the map trainable. The softmax itself is always
             evaluated in shift-invariant form, $\operatorname{softmax}(z)_i = e^{\,z_i - m}/\sum_k e^{\,z_k - m}$
-            with $m = \max_j z_j$, so it never exponentiates a large positive number.
+            with $m = \max_j z_j$. The reason is concrete floating-point behavior: a 32-bit float tops out near
+            $3.4 \times 10^{38}$, which $e^{x}$ exceeds once $x$ passes about $88.7$ (around $709$ for 64-bit), so an
+            unshifted large logit overflows to $+\infty$, and the subsequent $\infty/\infty$ in the normalization
+            evaluates to $\mathrm{NaN}$ that then propagates through every downstream operation and ruins the run.
+            Subtracting the row max makes the largest exponent $e^{0} = 1$ and every other term at most $1$, so
+            overflow becomes impossible; the only rounding error left is the harmless underflow of very negative
+            terms to $0$, which is exactly the weight they should have.
           </p>
 
           <h2>Multi-head attention</h2>
@@ -132,10 +144,15 @@
 
           <h2>Normalization and the residual stream</h2>
           <p>
-            Each sublayer is wrapped as $x \leftarrow x + \operatorname{Sublayer}(\operatorname{Norm}(x))$. The
-            residual gives gradients a direct path to every layer and lets each layer learn a small edit to the
-            stream rather than a full rewrite. Putting the norm <em>inside</em> the residual (pre-norm) is what keeps
-            very deep stacks stable; post-norm needs careful warmup to train at depth.
+            Each sublayer is wrapped as $x \leftarrow x + \operatorname{Sublayer}(\operatorname{Norm}(x))$. The point
+            of the residual is gradient flow: differentiating a sum gives an identity term plus the sublayer's
+            Jacobian, so the gradient always has a path back that is never multiplied toward zero, which is what lets
+            very deep stacks train at all (the same fix as in ResNets, where otherwise accuracy <em>degrades</em> as
+            layers are added). It also reframes each layer's job as a small additive edit to the stream rather than a
+            full rewrite, an easier function to learn. Pre-norm, normalizing <em>inside</em> the residual branch,
+            matters because in post-norm the repeated residual additions make the activation norm grow with depth, so
+            gradients drift toward exploding or vanishing and need a warmup schedule to control; pre-norm keeps the
+            stream's scale bounded and preserves a clean identity path from output back to input.
           </p>
           <p>
             LayerNorm standardizes each token vector and rescales it,
@@ -143,23 +160,37 @@
             models instead use <strong>RMSNorm</strong>
             (<a href="https://arxiv.org/abs/1910.07467" target="_blank" rel="noreferrer">Zhang &amp; Sennrich 2019</a>),
             which drops mean-centering and bias, $\operatorname{RMSNorm}(x) = \dfrac{x}{\sqrt{\tfrac{1}{d}\sum_i x_i^2 + \epsilon}} \odot \gamma$.
-            It is cheaper and as effective, which matters when normalization runs twice per layer across hundreds of layers.
+            It is cheaper and just as effective, and why it can drop the mean is itself instructive: the stabilizing
+            benefit of normalization comes mostly from rescaling activations to a controlled magnitude, not from
+            re-centering them, so removing the mean subtraction (and the learned bias) costs nothing while saving
+            compute that runs twice per layer across hundreds of layers.
           </p>
 
           <h2>The feed-forward network</h2>
           <p>
             The position-wise FFN holds most of the parameters and raw capacity. Classically it is two linear layers
             with a nonlinearity, $\operatorname{FFN}(x) = W_2\,\phi(W_1 x + b_1) + b_2$, with inner width about $4d$,
-            roughly $8d^2$ parameters per layer. Modern models use the gated <strong>SwiGLU</strong> variant
-            (<a href="https://arxiv.org/abs/2002.05202" target="_blank" rel="noreferrer">Shazeer 2020</a>),
-            $\operatorname{FFN}(x) = W_2\big(\phi(W_1 x) \odot W_3 x\big)$, which adds a matrix but improves quality
-            per parameter. A block is therefore about $12d^2$ parameters, roughly one third attention and two thirds FFN.
+            roughly $8d^2$ parameters per layer.
+          </p>
+          <p>
+            Modern models use the gated <strong>SwiGLU</strong> variant
+            (<a href="https://arxiv.org/abs/2002.05202" target="_blank" rel="noreferrer">Shazeer 2020</a>), which is
+            worth stating exactly because it is easy to half-remember. Begin with a gated linear unit (GLU): take two
+            independent linear projections of the input and multiply them elementwise, so one branch acts as a learned
+            gate on the other. SwiGLU is the GLU whose active branch uses the <strong>Swish</strong> activation (also
+            called SiLU), $\operatorname{Swish}(z) = z\,\sigma(z)$, a smooth, non-monotonic relative of ReLU. Written
+            out, $\operatorname{FFN}(x) = \big(\operatorname{Swish}(xW_1) \odot xW_3\big)W_2$, with three weight
+            matrices instead of two. Because of that third matrix, the inner width is usually scaled to about
+            $\tfrac{2}{3}\cdot 4d = \tfrac{8}{3}d$ so the parameter count stays comparable to a classic $4d$ FFN. A
+            block is then about $12d^2$ parameters, roughly one third attention and two thirds FFN.
           </p>
 
           <h2>Causal masking and the objective</h2>
           <p>
             For autoregressive language modeling, position $i$ must not see positions $&gt; i$. A causal mask sets those
-            logits to $-\infty$ before the softmax, zeroing their weights. Training minimizes the average next-token
+            logits to $-\infty$ before the softmax, which works precisely because $e^{-\infty} = 0$, so the forbidden
+            positions receive exactly zero weight and drop out of the convex combination with no renormalization or
+            special-casing. Training minimizes the average next-token
             cross-entropy, and because the mask makes every position a valid prediction, one forward pass over a
             length-$n$ sequence yields $n$ supervised signals at once, which is what makes pretraining so
             sample-efficient in wall-clock terms (<a href="https://arxiv.org/abs/2005.14165" target="_blank" rel="noreferrer">Brown et al. 2020</a>).
@@ -197,11 +228,33 @@
             of this recipe combined with the components above (pre-norm RMSNorm, RoPE, GQA, SwiGLU).
           </p>
 
+          <h2>Training memory and numerical precision</h2>
+          <p>
+            Two practical points come up constantly and are worth knowing precisely. First, large models train in
+            <strong>bf16</strong> rather than fp16 because bf16 keeps the full 8-bit exponent of fp32, so it has the
+            same dynamic range and rarely overflows or underflows; fp16's 5-bit exponent has a narrow range that
+            forces a loss-scaling trick to stop small gradients from flushing to zero. Its mantissa is shorter, so
+            bf16 is less precise per number, but for training that range matters more than precision. Second, it is
+            <em>activations</em>, not parameters, that usually dominate training memory, because every intermediate
+            must be retained for the backward pass. <strong>Gradient (activation) checkpointing</strong> keeps only a
+            few activations and recomputes the rest during the backward pass, trading roughly one extra forward pass
+            of compute for a large memory saving, which is often what makes a long sequence or a large batch fit on
+            the device at all.
+          </p>
+
           <h2>Beyond dense attention: long context, MoE, and state-space models</h2>
           <p>
             The quadratic cost has produced three durable directions. <strong>Sparse and windowed attention</strong>,
             such as <a href="https://arxiv.org/abs/2004.05150" target="_blank" rel="noreferrer">Longformer (2020)</a>,
-            restrict each token to a local or strided neighborhood for near-linear cost on long inputs.
+            restricts which key positions each query may see. The basic pattern is a <em>sliding window</em>: position
+            $i$ attends only to the $w$ neighbors in $[\,i - w/2,\; i + w/2\,]$, which drops the cost from $O(n^2)$ to
+            $O(n\,w)$, linear in length for a fixed $w$; stacking such layers grows the effective receptive field the
+            way convolutions do, since a token reaches a little further each layer. To widen reach without enlarging
+            $w$, <em>dilated</em> (strided) windows skip positions, attending to every $k$-th neighbor so a width-$w$
+            window spans $k\,w$ tokens. A few <em>global</em> tokens, say a classification token or sentence
+            boundaries, are then allowed to attend to, and be attended by, everything, restoring the long-range links
+            a purely local window drops. Longformer combines exactly these, local windows for most tokens plus a
+            handful of global ones, for linear time and memory on long documents.
             <strong>Mixture of experts</strong> decouples parameters from per-token compute by routing each token to a
             few expert FFNs (<a href="https://arxiv.org/abs/2101.03961" target="_blank" rel="noreferrer">Fedus et al. 2021</a>;
             <a href="https://arxiv.org/abs/2401.04088" target="_blank" rel="noreferrer">Mixtral 2024</a>;
@@ -283,7 +336,7 @@ print(weights.sum(axis=-1))                 # [1. 1. 1.]  -- each row is a distr
           </ul>
 
           <h2>References</h2>
-          <ul>
+          <ol class="refs">
             <li>Vaswani et al., <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noreferrer">Attention Is All You Need</a> (2017).</li>
             <li>Shazeer, <a href="https://arxiv.org/abs/1911.02150" target="_blank" rel="noreferrer">Fast Transformer Decoding</a> (Multi-Query Attention, 2019).</li>
             <li>Zhang &amp; Sennrich, <a href="https://arxiv.org/abs/1910.07467" target="_blank" rel="noreferrer">Root Mean Square Layer Normalization</a> (RMSNorm, 2019).</li>
@@ -304,7 +357,7 @@ print(weights.sum(axis=-1))                 # [1. 1. 1.]  -- each row is a distr
             <li>Jiang et al., <a href="https://arxiv.org/abs/2401.04088" target="_blank" rel="noreferrer">Mixtral of Experts</a> (2024).</li>
             <li>Shah et al., <a href="https://arxiv.org/abs/2407.08608" target="_blank" rel="noreferrer">FlashAttention-3</a> (2024).</li>
             <li>DeepSeek-AI, <a href="https://arxiv.org/abs/2412.19437" target="_blank" rel="noreferrer">DeepSeek-V3 Technical Report</a> (Multi-head Latent Attention, 2024).</li>
-          </ul>
+          </ol>
         </article>
       </div>
     </section>
