@@ -4,10 +4,11 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Rate limiting · Stanley Jacob</title>
-    <meta name="description" content="Protect a service from overload and abuse with the token bucket and related algorithms." />
+    <meta name="description" content="Token bucket math (burst b, rate r), the algorithm family (leaky, fixed/sliding window), distributed limiting with Redis, and complexity." />
     <link rel="stylesheet" href="/style.css" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css" />
   </head>
   <body>
     <nav class="top">
@@ -21,7 +22,6 @@
         </div>
       </div>
     </nav>
-
     <header class="hero">
       <div class="wrap">
         <div class="eyebrow"><a href="/software">← Software</a></div>
@@ -29,26 +29,22 @@
         <p class="meta">Software &amp; architecture · architecture · Dec 2023</p>
       </div>
     </header>
-
     <section style="padding-top: 0">
       <div class="wrap">
         <article class="prose article">
-          <p>Rate limiting caps how many requests a client can make in a window, protecting a service from overload, runaway clients, and abuse. The token bucket is the most common algorithm because it allows short bursts while bounding the average rate.</p>
-          <p>A bucket refills with tokens at a fixed rate up to a capacity; each request spends a token, and requests are rejected when the bucket is empty.</p>
-          <h2>When it matters</h2>
-          <ul>
-            <li>Public APIs that need per-client quotas.</li>
-            <li>Protecting a downstream dependency from being overwhelmed.</li>
-            <li>Smoothing bursty traffic and preventing abuse.</li>
-          </ul>
-          <h2>Common algorithms</h2>
+          <p>Rate limiting caps how many requests a client may make in a window, protecting a service from overload, runaway clients, and abuse. The <strong>token bucket</strong> is the most common algorithm because it bounds the long-run average while still permitting short bursts, which matches how real traffic behaves.</p>
+          <p>Picture a bucket that refills with tokens at rate $r$ per second up to capacity $b$; each request spends one token, and requests are rejected when the bucket is empty. The two parameters give exactly the two guarantees you want: the bucket allows an instantaneous <strong>burst of up to $b$</strong> requests, and over any long interval the admitted rate cannot exceed the refill rate $r$. The current token count is recomputed lazily on each request as $\min(b,\ \text{tokens} + (t - t_{\text{last}})\,r)$, so no background timer is needed.</p>
+          <h2>The algorithm family</h2>
+          <p><strong>Leaky bucket</strong> is the dual: it drains at a constant rate and queues or drops overflow, enforcing a strictly smooth output with no bursts. <strong>Fixed window</strong> counts requests per calendar window and is trivial, but it allows a $2\times$ burst at a boundary, since a client can send a full window at the end of one and another full window at the start of the next. <strong>Sliding window log</strong> stores each request timestamp for an exact limit at $O(\text{window})$ memory, while the <strong>sliding window counter</strong> approximates it cheaply by weighting the previous window.</p>
+          <h2>Distributed rate limiting</h2>
+          <p>Per-instance limiting is easy but lets a client exceed the global limit by spreading requests across servers. A global limit needs shared state, typically Redis with an atomic <code>INCR</code> plus <code>EXPIRE</code> (or a small Lua script for token-bucket math), so the count is correct under concurrency. The why is atomicity: without it, two servers can both read the same count and both admit a request that should have been the last.</p>
+          <h2>Step by step</h2>
           <ol>
-            <li>Token bucket: refill over time, allow a request if a token is available; permits bursts up to capacity.</li>
-            <li>Leaky bucket: drain at a constant rate, queueing or dropping overflow; strictly smooths output.</li>
-            <li>Fixed window: count per calendar window; simple but allows a 2x burst at the boundary.</li>
-            <li>Sliding window: smoother and fairer, at the cost of more memory.</li>
+            <li>Refill the bucket lazily based on elapsed time, capped at capacity b.</li>
+            <li>If at least one token is available, spend it and admit the request.</li>
+            <li>Otherwise reject (return HTTP 429) and let it refill over time.</li>
+            <li>For a global limit, keep the counter in a shared store with atomic updates.</li>
           </ol>
-          <h2>Implementation</h2>
           <pre><code class="language-python">import time
 
 class TokenBucket:
@@ -68,8 +64,9 @@ class TokenBucket:
         return False
 </code></pre>
           <h2>Complexity (time and space)</h2>
-          <p>Each check is O(1) time and O(1) space per client (a token count and a timestamp). Distributed limiting keeps that state in Redis keyed by client.</p>
+          <p>Each check is $O(1)$ time and $O(1)$ space per client, just a token count and a timestamp. A sliding-window log is $O(1)$ amortized but $O(\text{requests-in-window})$ space, which is why high-volume limiters prefer the token bucket or the counter approximation.</p>
           <h2>Worked example</h2>
+          <p>A bucket of capacity 2 admits two requests immediately, then rejects until it refills:</p>
           <pre><code class="language-python">tb = TokenBucket(rate=1, capacity=2)   # 1 token/sec, holds at most 2
 print(tb.allow())   # True   (2 -&gt; 1 token)
 print(tb.allow())   # True   (1 -&gt; 0 tokens)
@@ -77,20 +74,20 @@ print(tb.allow())   # False  (empty; refills over time)
 </code></pre>
           <h2>Follow-up questions</h2>
           <ul>
-            <li><strong>Token bucket vs leaky bucket?</strong> Token bucket allows bursts up to capacity; leaky bucket enforces a strictly smooth output rate.</li>
-            <li><strong>How do you rate limit across many servers?</strong> Keep counters in a shared store like Redis (atomic increment with expiry) so the limit is global, not per instance.</li>
-            <li><strong>What should a limited request return?</strong> HTTP 429 Too Many Requests, ideally with a Retry-After header.</li>
-            <li><strong>Why does a fixed window allow a 2x burst?</strong> A client can send a full window at the end of one and another full window at the start of the next; sliding windows fix this.</li>
+            <li><strong>What two guarantees does a token bucket give?</strong> A burst of up to capacity b, and a long-run average admitted rate no greater than the refill rate r.</li>
+            <li><strong>Token bucket vs leaky bucket?</strong> Token bucket permits bursts up to capacity; leaky bucket enforces a strictly smooth, constant output rate.</li>
+            <li><strong>Why does a fixed window allow a 2x burst?</strong> A client can send a full window at the end of one period and another at the start of the next, doubling the rate across the boundary.</li>
+            <li><strong>How do you rate limit across many servers?</strong> Keep the counter in a shared store like Redis with atomic INCR and EXPIRE (or a Lua script) so the global limit holds under concurrency.</li>
+            <li><strong>What status code should a limited request get?</strong> HTTP 429 Too Many Requests, ideally with a Retry-After header.</li>
           </ul>
           <h2>References</h2>
-          <ul>
+          <ol class="refs">
             <li>Alex Xu, <a href="https://bytebytego.com/" target="_blank" rel="noreferrer">ByteByteGo System Design</a> (vol. 1 and 2).</li>
             <li>Kleppmann, <a href="https://dataintensive.net/" target="_blank" rel="noreferrer">Designing Data-Intensive Applications</a> (2017).</li>
-          </ul>
+          </ol>
         </article>
       </div>
     </section>
-
     <footer class="site">
       <div class="inner">
         <span>© <span id="yr">2026</span> Stanley Jacob</span>
@@ -104,6 +101,21 @@ print(tb.allow())   # False  (empty; refills over time)
       document.getElementById("yr").textContent = new Date().getFullYear();
     </script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-    <script>hljs.highlightAll();</script>
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (window.hljs) hljs.highlightAll();
+        if (window.renderMathInElement) {
+          renderMathInElement(document.body, {
+            delimiters: [
+              { left: "$$", right: "$$", display: true },
+              { left: "$", right: "$", display: false }
+            ],
+            ignoredTags: ["script", "noscript", "style", "textarea", "pre", "code"]
+          });
+        }
+      });
+    </script>
   </body>
 </html>
