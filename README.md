@@ -2,14 +2,20 @@
 
 A tiny static site (no build step):
 
-- `index.html` → **stanleyjacob.dev** (landing page about me)
-- `projects/index.html` → **stanleyjacob.dev/projects** (live browser-window
-  preview of [status.stanleyjacob.dev](https://status.stanleyjacob.dev))
-- `style.css` → shared dark theme
+- `index.html` → **stanleyjacob.dev** (about me, areas, skills)
+- `ai/index.html` → **stanleyjacob.dev/ai** (machine learning projects + notes)
+- `robotics/index.html` → **stanleyjacob.dev/robotics** (robotics projects + notes)
+- `software/index.html` → **stanleyjacob.dev/software** (software projects + notes,
+  incl. a live preview of [status.stanleyjacob.dev](https://status.stanleyjacob.dev))
+- `style.css` → shared light theme
 
-## Edit the content
-Search the HTML for `EDIT:` comments, that's the headline, intro, skill cards,
-and links. No build tools needed; just edit and redeploy.
+## Add a project or note
+- **Project:** copy a `.proj` card block on the relevant area page. Use the
+  `badge wip` ("In progress") badge until it ships, then swap to the green
+  `badge` ("Live now") badge and add a real link.
+- **Note / blog post:** add an `<li>` to the `.notes` list on the area page
+  (replacing the "First notes coming soon" empty state), linking to a new HTML
+  page for the post. No build tools needed; just edit and redeploy.
 
 ## Run locally
 Any static server works, e.g.:
