@@ -4,10 +4,11 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>What it takes to train an LLM · Stanley Jacob</title>
-    <meta name="description" content="A thorough look at the LLM training pipeline: data, tokenization, the next-token objective, optimization, scaling laws, parallelism, and post-training." />
+    <meta name="description" content="A detailed treatment of LLM training: data curation, tokenization, the cross-entropy objective and perplexity, AdamW, precision and memory (bf16, ZeRO, checkpointing), parallelism, scaling laws, and SFT/RLHF/DPO, cited 2016-2024." />
     <link rel="stylesheet" href="/style.css" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css" />
   </head>
   <body>
     <nav class="top">
@@ -33,29 +34,141 @@
     <section style="padding-top: 0">
       <div class="wrap">
         <article class="prose article">
-          <p>Training a large language model is, at its core, teaching a network to predict the next token in a sequence. That single objective, repeated over an enormous amount of text, is enough to produce models that write code, answer questions, and translate, because predicting the next token well turns out to require absorbing grammar, facts, and patterns of reasoning. The conceptual recipe is short, but almost all of the actual difficulty is engineering: assembling and cleaning the data, fitting the model across many machines, and keeping a run that lasts days or weeks numerically stable.</p>
-          <p>It helps to separate the pipeline into stages, because each has its own failure modes and the cost of a mistake grows with scale. First the data is gathered and filtered, then it is turned into tokens, then a loss is defined and optimized, and finally the pretrained model is adapted to follow instructions. A flaw early in that chain can quietly waste a great deal of compute before the loss curve reveals anything is wrong, which is why careful, incremental validation matters so much.</p>
-          <h2>Data is the real lever</h2>
-          <p>The single biggest influence on a model's quality is its data, not its architecture. Pretraining corpora are assembled from web crawls, books, code, and curated sources, then aggressively cleaned: deduplicated so the model does not simply memorize repeated passages, stripped of boilerplate and low-quality text, and filtered for harmful content. The mixture matters as much as the volume, since adding code tends to improve reasoning and adding many languages improves multilingual ability. Because a model can only ever learn what is present in its data, this curation is where a large share of the real work, and the competitive advantage, actually lives.</p>
+          <p>
+            Training a large language model is, at its core, fitting one objective, predict the next token, over an
+            enormous corpus. That single self-supervised target is enough to induce grammar, world knowledge, and
+            patterns of reasoning, because compressing text well demands all of them
+            (<a href="https://arxiv.org/abs/2005.14165" target="_blank" rel="noreferrer">Brown et al. 2020</a>). The
+            conceptual recipe is short; almost all of the difficulty is engineering: curating the data, fitting the
+            model across many machines, and keeping a run that lasts days or weeks numerically stable.
+          </p>
+          <p>
+            It pays to separate the pipeline into stages, because each has distinct failure modes and the cost of a
+            mistake grows with scale. Data is gathered and filtered, turned into tokens, fed to a loss that is
+            optimized, and finally the pretrained model is adapted to follow instructions. The most transparent
+            account of the whole pipeline end to end is the OLMo report
+            (<a href="https://arxiv.org/abs/2402.00838" target="_blank" rel="noreferrer">Groeneveld et al. 2024</a>),
+            which releases data, code, and logs alongside the weights.
+          </p>
+
+          <h2>Data: the dominant lever</h2>
+          <p>
+            Quality is set more by data than by architecture, so curation is where much of the real work lives. Web
+            crawl, books, and code are filtered for quality, then <strong>deduplicated</strong>, and the reason
+            matters: near-duplicate documents make the model waste capacity memorizing repeats and, worse, leak test
+            sets into training so evaluations overstate ability. The mixture is tuned deliberately, since adding code
+            improves reasoning and adding many languages improves multilingual transfer
+            (<a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noreferrer">Llama 3, 2024</a>). Because a
+            model can only learn what is present, the corpus is effectively part of the architecture.
+          </p>
+
           <h2>Tokenization</h2>
-          <p>Models do not read characters or whole words; they read tokens, which are subword units produced by a tokenizer. Byte-pair encoding is the usual choice: it starts from individual bytes and repeatedly merges the most frequent adjacent pair into a new symbol, building a fixed vocabulary of common fragments. This strikes a useful balance, since frequent words collapse to a single token while rare words split into a handful of pieces, and because it can always fall back to raw bytes, nothing is ever truly out of vocabulary. Vocabulary size is itself a trade-off: a larger vocabulary shortens sequences and makes attention cheaper, but it enlarges the embedding and output projection layers.</p>
+          <p>
+            Models read <strong>tokens</strong>, subword units from a tokenizer, not characters or words.
+            Byte-pair encoding (<a href="https://arxiv.org/abs/1508.07909" target="_blank" rel="noreferrer">Sennrich et al. 2016</a>)
+            starts from bytes and repeatedly merges the most frequent adjacent pair into a new symbol, building a
+            fixed vocabulary of common fragments; SentencePiece
+            (<a href="https://arxiv.org/abs/1808.06226" target="_blank" rel="noreferrer">Kudo &amp; Richardson 2018</a>)
+            packages this to run directly on raw text. The why behind subwords is a balance: frequent words become one
+            token while rare words split into a few pieces, and a byte-level fallback guarantees nothing is ever out of
+            vocabulary. Vocabulary size is itself a trade-off, since a larger vocabulary shortens sequences and makes
+            attention cheaper but enlarges the embedding and output-projection matrices.
+          </p>
+
           <h2>The objective</h2>
-          <p>At every position the model outputs a probability distribution over the entire vocabulary, and training minimizes the <strong>cross-entropy</strong> between that distribution and the token that actually came next. Cross-entropy rewards placing high probability on the correct token and penalizes confident mistakes heavily, which is exactly the pressure you want. Because of causal masking, every position is a separate prediction, so one forward and backward pass over a length-n sequence yields n training signals at once. The loss is often reported as <strong>perplexity</strong>, the exponentiated cross-entropy, which can be read intuitively as the effective number of tokens the model is choosing between at each step.</p>
+          <p>
+            At every position the model emits a distribution over the vocabulary, and training minimizes the average
+            cross-entropy of the true next token,
+          </p>
+          <p>
+            $$\mathcal{L}(\theta) = -\frac{1}{T}\sum_{t=1}^{T} \log p_\theta\!\left(x_t \mid x_{&lt;t}\right).$$
+          </p>
+          <p>
+            Cross-entropy is the right loss because minimizing it is exactly maximum-likelihood estimation, and it
+            penalizes confident mistakes sharply (the $-\log p$ term blows up as the assigned probability goes to
+            zero). Causal masking makes every position a valid prediction, so one forward and backward pass over a
+            length-$T$ sequence yields $T$ supervised signals, which is what makes pretraining sample-efficient in
+            wall-clock terms. The loss is usually reported as <strong>perplexity</strong>, $\mathrm{ppl} = e^{\mathcal{L}}$,
+            which reads as the effective number of tokens the model is choosing between at each step, so halving
+            uncertainty is a multiplicative, not additive, improvement.
+          </p>
+
           <h2>Optimization</h2>
-          <p>The optimizer of choice is <strong>AdamW</strong>, which adapts the step size for each parameter using running averages of the gradient and its squared magnitude, and applies weight decay separately from that adaptive update. The learning rate is never constant: a short warmup ramps it up to avoid early instability, after which a cosine schedule decays it smoothly toward a small final value. Two further safeguards are standard at scale, namely gradient clipping, which caps the global gradient norm so a single bad batch cannot blow up the weights, and mixed precision in bf16, which halves memory and speeds up matrix multiplies while keeping a numerically safe range. Tuning these together is the difference between a loss curve that descends cleanly and one that diverges hours into the run.</p>
+          <p>
+            The optimizer is <strong>AdamW</strong>
+            (<a href="https://arxiv.org/abs/1711.05101" target="_blank" rel="noreferrer">Loshchilov &amp; Hutter 2019</a>).
+            Adam keeps running estimates of the gradient mean $m_t$ and uncentered variance $v_t$ and steps
+            $\theta \leftarrow \theta - \eta\, \hat m_t / (\sqrt{\hat v_t} + \epsilon)$, which rescales each
+            coordinate by its own recent gradient magnitude; the why is that language-model loss surfaces are badly
+            conditioned, with parameters that need very different effective learning rates, and a single global rate
+            would be too large for some directions and too small for others. AdamW's contribution is to apply weight
+            decay <em>separately</em> from that adaptive rescaling, so regularization is not distorted by the
+            per-coordinate scaling. The learning rate uses a short linear <strong>warmup</strong>, because the early
+            $\hat v_t$ estimates are noisy and a large step then can destabilize the run, followed by a cosine decay to
+            a small final value. Gradient clipping by global norm caps the occasional large batch so one bad step
+            cannot blow up the weights.
+          </p>
+
+          <h2>Memory and numerical precision</h2>
+          <p>
+            Large models train in <strong>bf16</strong>, not fp16, because bf16 keeps the full 8-bit exponent of fp32
+            and therefore the same dynamic range, so gradients rarely overflow or underflow; fp16's 5-bit exponent has
+            a narrow range that forces loss-scaling to stop small gradients from flushing to zero
+            (<a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noreferrer">Micikevicius et al. 2018</a>).
+            Memory is dominated by two things people often forget. Adam's optimizer state is <em>two</em> extra values
+            per parameter, so it can exceed the parameters themselves; <strong>ZeRO</strong>
+            (<a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noreferrer">Rajbhandari et al. 2020</a>)
+            shards optimizer state, gradients, and parameters across devices to remove that redundancy. And
+            <em>activations</em>, retained for the backward pass, dominate the rest; <strong>activation
+            checkpointing</strong> stores only a few and recomputes the others, trading roughly one extra forward pass
+            for a large memory saving.
+          </p>
+
+          <h2>Parallelism</h2>
+          <p>
+            No single accelerator holds a frontier model, so training combines several kinds of parallelism.
+            <strong>Data parallelism</strong> replicates the model and splits the batch, averaging gradients across
+            replicas; <strong>tensor parallelism</strong> splits individual weight matrices across devices; and
+            <strong>pipeline parallelism</strong> assigns different layers to different devices and streams
+            micro-batches through them (<a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noreferrer">Shoeybi et al. 2019</a>).
+            Gradient accumulation reaches a very large effective batch without holding it all at once. Keeping
+            thousands of devices busy and recovering from inevitable failures is itself a major systems effort, which
+            the Llama 3 report documents in unusual detail.
+          </p>
+
           <h2>Scaling laws</h2>
-          <p>How big a model, how much data, and how much compute should be combined is governed by <strong>scaling laws</strong>, empirical power-law relationships between loss and scale. The influential Chinchilla result showed that many large models had been undertrained, and that for a fixed compute budget it is better to train a somewhat smaller model on far more data, with parameters and tokens scaled together at roughly twenty tokens per parameter. The practical takeaway is that model size and dataset size should grow in tandem, and that a giant model fed too little data simply wastes its own capacity.</p>
-          <h2>Parallelism and the systems problem</h2>
-          <p>No single accelerator can hold a frontier model, so training is spread across many of them in complementary ways. <strong>Data parallelism</strong> replicates the model and splits the batch, averaging gradients across replicas; <strong>tensor parallelism</strong> splits individual weight matrices across devices; and <strong>pipeline parallelism</strong> places different layers on different devices and streams micro-batches through them. Gradient accumulation lets the cluster reach a very large effective batch size without holding it all in memory at once. Orchestrating these so the hardware stays busy, and recovering gracefully from the inevitable node failures, is a substantial distributed-systems problem in its own right.</p>
-          <h2>After pretraining</h2>
-          <p>A freshly pretrained model is good at continuing text but does not yet follow instructions or behave the way a user expects. <strong>Supervised fine-tuning</strong> on curated instruction-and-response pairs teaches the desired format and tone. After that, preference optimization aligns the model with human judgments: classic <strong>RLHF</strong> trains a reward model from human comparisons and then optimizes the policy against it with reinforcement learning, while the simpler <strong>Direct Preference Optimization</strong> skips the separate reward model and optimizes the preference objective directly. These post-training stages use comparatively little compute but disproportionately shape how the finished model feels to use.</p>
+          <p>
+            How to spend compute is governed by empirical power laws. Early work
+            (<a href="https://arxiv.org/abs/2001.08361" target="_blank" rel="noreferrer">Kaplan et al. 2020</a>) found
+            loss falls smoothly with parameters, data, and compute. The Chinchilla analysis
+            (<a href="https://arxiv.org/abs/2203.15556" target="_blank" rel="noreferrer">Hoffmann et al. 2022</a>) then
+            showed many models were undertrained and that, for a fixed compute budget $C \approx 6ND$ (parameters $N$,
+            tokens $D$), loss is minimized when $N$ and $D$ grow together, roughly twenty tokens per parameter. The why
+            is a constrained optimization: with $C$ fixed, pouring it all into parameters starves the model of data and
+            vice versa, and the optimum balances the two.
+          </p>
+
+          <h2>After pretraining: SFT, RLHF, and DPO</h2>
+          <p>
+            A pretrained model continues text but does not follow instructions. <strong>Supervised fine-tuning</strong>
+            on instruction-response pairs teaches the format. Alignment to human preference then follows one of two
+            routes. Classic <strong>RLHF</strong>
+            (<a href="https://arxiv.org/abs/2203.02155" target="_blank" rel="noreferrer">Ouyang et al. 2022</a>) trains
+            a reward model from human comparisons and optimizes the policy against it with reinforcement learning, with
+            a KL penalty to the reference model so it does not drift into degenerate text.
+            <strong>DPO</strong> (<a href="https://arxiv.org/abs/2305.18290" target="_blank" rel="noreferrer">Rafailov et al. 2023</a>)
+            shows that the same preference objective has a closed-form optimum, so you can skip the separate reward
+            model and the RL loop and instead minimize a simple classification loss on preferred-versus-rejected
+            pairs, which is far simpler and more stable.
+          </p>
+
           <h2>Step by step: byte-pair encoding</h2>
           <ol>
-            <li>Start with the text as a list of individual characters.</li>
+            <li>Start with the text as a list of characters.</li>
             <li>Count every adjacent pair of symbols.</li>
-            <li>Merge the single most frequent pair everywhere into one new symbol.</li>
-            <li>Record the merge and repeat until you reach the target vocabulary size.</li>
-            <li>To tokenize new text later, apply the learned merges in order.</li>
+            <li>Merge the most frequent pair everywhere into one new symbol.</li>
+            <li>Record the merge and repeat to the target vocabulary size.</li>
+            <li>To tokenize new text, apply the learned merges in order.</li>
           </ol>
           <pre><code class="language-python">from collections import Counter
 
@@ -66,7 +179,7 @@ def merge(tokens, pair):
     out, i = [], 0
     while i &lt; len(tokens):
         if i &lt; len(tokens) - 1 and (tokens[i], tokens[i + 1]) == pair:
-            out.append(tokens[i] + tokens[i + 1])   # join the merged pair
+            out.append(tokens[i] + tokens[i + 1])
             i += 2
         else:
             out.append(tokens[i])
@@ -79,36 +192,57 @@ def train_bpe(text, num_merges):
         pairs = get_pairs(tokens)
         if not pairs:
             break
-        best = max(pairs, key=pairs.get)          # most frequent pair
+        best = max(pairs, key=pairs.get)
         tokens = merge(tokens, best)
         merges.append(best)
-    return tokens, merges
-</code></pre>
+    return tokens, merges</code></pre>
+
           <h2>Complexity (time and space)</h2>
-          <p>A useful rule of thumb is that training costs about 6ND floating-point operations, where N is the number of parameters and D the number of training tokens, splitting into roughly two for the forward pass and four for the backward pass per parameter per token. Memory on each device must hold the parameters, their gradients, and the optimizer state, and since Adam keeps two extra values per parameter, that optimizer state often dominates and is commonly sharded across devices. The naive tokenizer trainer shown here is about O(merges times corpus length); production tokenizers use smarter counting to scale to very large corpora.</p>
+          <p>
+            Training compute is about $C \approx 6ND$ floating-point operations, roughly two for the forward pass and
+            four for the backward pass per parameter per token. Device memory must hold parameters, gradients, and
+            optimizer state (Adam adds two values per parameter, so optimizer state alone is about twice the model),
+            plus activations, which is why ZeRO sharding and activation checkpointing are standard. The naive BPE
+            trainer shown is about $O(\text{merges} \times \text{corpus length})$; production tokenizers use smarter
+            counting to scale.
+          </p>
+
           <h2>Worked example</h2>
-          <p>Byte-pair encoding builds up frequent fragments from characters. Trained on a tiny repetitive corpus, the first merges assemble the common piece "low" before moving on to "est" inside the repeated "newest":</p>
+          <p>
+            Byte-pair encoding builds frequent fragments from characters. On a tiny repetitive corpus, the first
+            merges assemble the common piece "low" before starting on "est" inside the repeated "newest":
+          </p>
           <pre><code class="language-python">toks, merges = train_bpe("low low low lower lower newest newest newest widest", 6)
 print(merges)
-# [('l', 'o'), ('lo', 'w'), (' ', 'low'), ('e', 's'), ('es', 't'), (' ', 'n')]
-# it first builds the frequent fragment 'low' from characters,
-# then starts assembling 'est' from the repeated 'newest'.
-</code></pre>
+# [('l', 'o'), ('lo', 'w'), (' ', 'low'), ('e', 's'), ('es', 't'), (' ', 'n')]</code></pre>
+
           <h2>Follow-up questions</h2>
           <ul>
-            <li><strong>Why next-token prediction rather than something more elaborate?</strong> It is a self-supervised objective that needs no labels and, applied at scale, forces the model to learn grammar, facts, and reasoning as a side effect.</li>
-            <li><strong>What does the Chinchilla result say?</strong> For a fixed compute budget, scale tokens and parameters together (about 20 tokens per parameter); many earlier models were too large for their data.</li>
-            <li><strong>Why AdamW instead of plain SGD?</strong> Per-parameter adaptive steps converge faster on the noisy, ill-conditioned loss surfaces of large models, and decoupled weight decay regularizes without distorting that adaptive step.</li>
-            <li><strong>What is perplexity?</strong> The exponential of the cross-entropy loss, read as the effective number of tokens the model is choosing among at each position.</li>
-            <li><strong>How do RLHF and DPO differ?</strong> Both align to human preferences; RLHF trains a separate reward model and optimizes with reinforcement learning, while DPO optimizes the preference objective directly, which is simpler and more stable.</li>
+            <li><strong>Why minimize cross-entropy specifically?</strong> It is the negative log-likelihood, so minimizing it is maximum-likelihood estimation of the data distribution, and it punishes confident errors via the $-\log p$ blow-up.</li>
+            <li><strong>Why warmup the learning rate?</strong> Adam's variance estimate $\hat v_t$ is unreliable in the first steps, so a large rate then can destabilize training; warmup ramps in once the estimates settle.</li>
+            <li><strong>Why does optimizer state dominate memory?</strong> Adam stores two extra fp32 values (first and second moment) per parameter, often exceeding the parameters themselves, which is what ZeRO shards.</li>
+            <li><strong>What exactly does Chinchilla prescribe?</strong> For a fixed compute budget $C \approx 6ND$, scale parameters and tokens together (about 20 tokens per parameter); many earlier models were too large for their data.</li>
+            <li><strong>Why is DPO simpler than RLHF?</strong> The RLHF objective has a closed-form optimal policy, so DPO replaces the reward model and RL loop with a single classification loss on preference pairs.</li>
+            <li><strong>Why deduplicate the corpus?</strong> Duplicates waste capacity on memorization and can leak evaluation data into training, inflating benchmark scores.</li>
           </ul>
+
           <h2>References</h2>
-          <ul>
-            <li>Brown et al., <a href="https://arxiv.org/abs/2005.14165" target="_blank" rel="noreferrer">Language Models are Few-Shot Learners</a> (GPT-3, 2020).</li>
-            <li>Hoffmann et al., <a href="https://arxiv.org/abs/2203.15556" target="_blank" rel="noreferrer">Training Compute-Optimal Large Language Models</a> (Chinchilla, 2022).</li>
+          <ol class="refs">
+            <li>Sennrich et al., <a href="https://arxiv.org/abs/1508.07909" target="_blank" rel="noreferrer">Neural Machine Translation of Rare Words with Subword Units</a> (BPE, 2016).</li>
+            <li>Micikevicius et al., <a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noreferrer">Mixed Precision Training</a> (2018).</li>
+            <li>Kudo &amp; Richardson, <a href="https://arxiv.org/abs/1808.06226" target="_blank" rel="noreferrer">SentencePiece</a> (2018).</li>
             <li>Loshchilov &amp; Hutter, <a href="https://arxiv.org/abs/1711.05101" target="_blank" rel="noreferrer">Decoupled Weight Decay Regularization</a> (AdamW, 2019).</li>
-            <li>Ouyang et al., <a href="https://arxiv.org/abs/2203.02155" target="_blank" rel="noreferrer">Training Language Models to Follow Instructions with Human Feedback</a> (2022).</li>
-          </ul>
+            <li>Shoeybi et al., <a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noreferrer">Megatron-LM</a> (2019).</li>
+            <li>Rajbhandari et al., <a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noreferrer">ZeRO</a> (2020).</li>
+            <li>Kaplan et al., <a href="https://arxiv.org/abs/2001.08361" target="_blank" rel="noreferrer">Scaling Laws for Neural Language Models</a> (2020).</li>
+            <li>Brown et al., <a href="https://arxiv.org/abs/2005.14165" target="_blank" rel="noreferrer">Language Models are Few-Shot Learners</a> (GPT-3, 2020).</li>
+            <li>Hoffmann et al., <a href="https://arxiv.org/abs/2203.15556" target="_blank" rel="noreferrer">Training Compute-Optimal LLMs</a> (Chinchilla, 2022).</li>
+            <li>Ouyang et al., <a href="https://arxiv.org/abs/2203.02155" target="_blank" rel="noreferrer">Training LMs to Follow Instructions with Human Feedback</a> (InstructGPT, 2022).</li>
+            <li>Rafailov et al., <a href="https://arxiv.org/abs/2305.18290" target="_blank" rel="noreferrer">Direct Preference Optimization</a> (DPO, 2023).</li>
+            <li>Groeneveld et al., <a href="https://arxiv.org/abs/2402.00838" target="_blank" rel="noreferrer">OLMo: Accelerating the Science of Language Models</a> (2024).</li>
+            <li>Llama Team, <a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noreferrer">The Llama 3 Herd of Models</a> (2024).</li>
+            <li>DeepSeek-AI, <a href="https://arxiv.org/abs/2412.19437" target="_blank" rel="noreferrer">DeepSeek-V3 Technical Report</a> (2024).</li>
+          </ol>
         </article>
       </div>
     </section>
@@ -126,6 +260,21 @@ print(merges)
       document.getElementById("yr").textContent = new Date().getFullYear();
     </script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-    <script>hljs.highlightAll();</script>
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (window.hljs) hljs.highlightAll();
+        if (window.renderMathInElement) {
+          renderMathInElement(document.body, {
+            delimiters: [
+              { left: "$$", right: "$$", display: true },
+              { left: "$", right: "$", display: false }
+            ],
+            ignoredTags: ["script", "noscript", "style", "textarea", "pre", "code"]
+          });
+        }
+      });
+    </script>
   </body>
 </html>
