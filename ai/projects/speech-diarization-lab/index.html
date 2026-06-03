@@ -36,17 +36,32 @@
       <div class="wrap">
         <article class="prose article">
           <p>
-            A transcript that does not say who is speaking is close to
-            unusable for meetings, interviews, and calls, because the thing
-            people actually want is who said what, with timestamps. This
-            project builds that end to end: Whisper, run through CTranslate2,
-            produces the words; a diarization pipeline assembled from open
-            parts decides the speakers; and a small, fully tested alignment
-            joins the two. As with my other projects, the part I cared most
-            about is knowing whether the thing actually works, so the scoring
-            metrics are implemented from scratch against hand-computed
-            values, and every number on this page comes from a reproducible
-            benchmark with its exact configuration stated. The code is at
+            People record meetings, interviews, lectures, and support calls,
+            and then the recordings mostly sit unused, because an hour of
+            audio is opaque, and even a plain transcript of it cannot answer
+            "who agreed to do what" or "what did the customer object to".
+            The purpose of this project is to turn a raw audio file into the
+            form in which a conversation becomes useful: a transcript that
+            says who said what and when, searchable and quotable, built
+            entirely from open components and cheap enough to run on
+            hardware I already have.
+          </p>
+          <p>
+            A second purpose shaped the design more than the first: to
+            measure the system well enough that the numbers can carry real
+            decisions. The benchmark on this page answers the questions a
+            team shipping this would actually face. Which Whisper size
+            should be served, where the answer turned out not to be the
+            biggest one. Whether int8 quantization is safe, where the answer
+            is mostly, with one failure mode worth knowing about before
+            deploying it. And where the diarization errors come from, where
+            the answer is speaker counting rather than voice confusion.
+            Whisper, run through CTranslate2, produces the words; a
+            diarization pipeline assembled from open parts decides the
+            speakers; a small, fully tested alignment joins the two; and the
+            scoring metrics are implemented from scratch and checked against
+            examples worked out by hand, which step 4 explains concretely.
+            The code is at
             <a href="https://github.com/gradientsj/speech-diarization-lab" target="_blank" rel="noreferrer">github.com/gradientsj/speech-diarization-lab</a>.
           </p>
 
@@ -61,67 +76,170 @@
 
           <h2>Step 1: transcription, and why CTranslate2</h2>
           <p>
-            The words come from Whisper running on
-            <a href="https://github.com/SYSTRAN/faster-whisper" target="_blank" rel="noreferrer">faster-whisper</a>,
-            which executes the same weights on the CTranslate2 inference
-            engine instead of the reference PyTorch code. The practical
-            difference is serving: quantized int8 inference makes CPU
-            transcription usable and GPU transcription very fast, and the
-            benchmark below measures that as a <strong>real-time
-            factor</strong>, processing seconds per second of audio, where
-            0.1 means ten times faster than real time. Word-level timestamps
-            are switched on because the alignment step downstream consumes
-            words, not whole segments.
+            The words come from Whisper, OpenAI's open speech recognition
+            model. It is an encoder-decoder transformer: the audio is first
+            converted into a spectrogram, which is a picture of how much
+            energy each frequency carries at each moment in time, the
+            encoder reads that picture, and the decoder writes out text
+            tokens one at a time, the same way a translation model writes a
+            sentence.
+          </p>
+          <p>
+            The reference implementation runs in PyTorch, and for serving
+            that is the slow way.
+            <a href="https://github.com/SYSTRAN/faster-whisper" target="_blank" rel="noreferrer">faster-whisper</a>
+            runs the same trained weights on
+            <a href="https://github.com/OpenNMT/CTranslate2" target="_blank" rel="noreferrer">CTranslate2</a>,
+            an inference engine written in C++ specifically for transformer
+            decoding. Its speedups are unglamorous and they add up:
+            operations that PyTorch dispatches one by one are fused into
+            single kernels, weights are laid out in memory for sequential
+            access, and the beam search that picks the best transcription
+            shares computation across its candidates. The option that
+            matters most here is <strong>int8 quantization</strong>: the
+            weights are stored as 8-bit integers instead of 16-bit floating
+            point numbers, which halves the memory the processor has to
+            stream and lets matrix multiplies run in cheap integer
+            arithmetic. Quantization rounds every weight to its nearest
+            representable value, and rounding can cost accuracy, so whether
+            int8 is safe is not something to assume; it is one of the things
+            the benchmark below measures, and the answer turned out to have
+            an interesting exception.
+          </p>
+          <p>
+            Speed is reported as a <strong>real-time factor</strong>, RTF,
+            which is processing time divided by audio duration: an RTF of
+            0.1 means one minute of audio transcribes in six seconds.
+            Whisper is also asked for timestamps per word rather than per
+            sentence, because the speaker assignment in step 3 happens word
+            by word.
           </p>
 
           <h2>Step 2: diarization built from parts</h2>
           <p>
-            Most products call a pretrained end-to-end diarization pipeline
-            and treat it as a black box. I built mine from parts instead:
-            silero VAD finds the speech, 1.5 second windows of it are
-            embedded by a pretrained ECAPA-TDNN speaker model, the windows
-            are clustered by cosine distance with average linkage, and
-            consecutive same-speaker windows merge into turns, with
-            overlapping disagreements cut at the midpoint. Building it this
-            way keeps every join visible, and the joins are where these
-            systems quietly fail, so each stage boundary is a pure function
-            with unit tests rather than a line buried inside a framework.
+            Diarization answers "who spoke when" without knowing who anyone
+            is. The system has to discover how many voices a recording
+            contains and which spans of time belong to which voice, with no
+            enrollment and no names. Most products call a pretrained
+            end-to-end pipeline for this and treat it as a black box; this
+            one is assembled from four visible stages instead, because the
+            joins between stages are where such systems quietly fail, and a
+            join you can see is a join you can test.
+          </p>
+          <p>
+            <strong>First, find the speech.</strong> Silero VAD is a small
+            open voice-activity-detection network. It slides along the
+            waveform in chunks a few tens of milliseconds long and outputs,
+            for each chunk, the probability that someone is speaking in it.
+            Keeping the chunks above a threshold and joining adjacent ones
+            produces speech regions: spans like 0.4 s to 7.2 s with talking
+            inside and silence or noise outside. Everything downstream looks
+            only inside these regions, because a voice fingerprint computed
+            over silence describes the room, not a person.
+          </p>
+          <p>
+            <strong>Second, turn the speech into voice fingerprints.</strong>
+            A speaker embedding model maps a short clip of speech to a list
+            of 192 numbers. ECAPA-TDNN is such a model, trained on a large
+            corpus of labeled speakers for the task of speaker verification,
+            deciding whether two clips come from the same person. That
+            training pushes clips of the same voice toward nearby vectors
+            and clips of different voices far apart, so the distance between
+            two fingerprints measures how unlikely they are to be the same
+            speaker. The speech regions are cut into windows 1.5 seconds
+            long, one starting every 0.75 seconds, and each window gets its
+            fingerprint. Windows are short so that each one mostly contains
+            a single voice, and they never cross a silence boundary, which
+            is where the speaker is most likely to have changed.
+          </p>
+          <p>
+            <strong>Third, group the fingerprints.</strong> At this point
+            there are a few dozen vectors and no labels, which is a
+            clustering problem. Agglomerative clustering starts with every
+            window as its own cluster and repeatedly merges the two closest
+            clusters, stopping when the closest remaining pair is further
+            apart than a threshold. Closeness here is cosine distance, the
+            angle between two vectors with their lengths ignored, and the
+            distance between two clusters is the average over all pairs of
+            their members, called average linkage, which keeps one stray
+            window from bridging two otherwise clean groups. However many
+            clusters remain when the merging stops is the number of speakers
+            the system believes it heard. That stopping threshold is the one
+            real hyperparameter in the pipeline: too loose and two people
+            merge into one speaker, too strict and one person splits into
+            two. The results below show that this is exactly where the
+            remaining error lives.
+          </p>
+          <p>
+            <strong>Fourth, draw the turns.</strong> Consecutive windows
+            that landed in the same cluster merge into one span of speech
+            per speaker. Where two overlapping windows disagree about the
+            speaker, the boundary goes at the midpoint of the overlap, since
+            neither window has better evidence inside the contested region.
           </p>
           <p>
             The pretrained
             <a href="https://huggingface.co/pyannote/speaker-diarization-3.1" target="_blank" rel="noreferrer">pyannote 3.1</a>
             pipeline is wired in as a second backend behind the same
-            interface, because a thing built from parts only means something
-            when it is judged next to a strong reference under identical
-            metrics. That is the same shape as my eval-harness and robot
-            imitation projects, and it is deliberate.
+            interface, so the from-parts pipeline gets judged against a
+            strong reference under identical metrics rather than only
+            against itself.
           </p>
 
           <h2>Step 3: joining words to speakers</h2>
           <p>
-            The ASR and the diarizer run independently and disagree at the
-            edges, so the join is where output quality is decided. The rules
-            are simple and fully tested: a word goes to the turn it overlaps
-            most, ties break to the earlier turn so the output is
-            deterministic, and a word that overlaps no turn is given to the
-            nearest one only if it is within a second, otherwise it stays
-            unattributed, because in a transcript a visible gap is more
-            useful than a confident mistake.
+            The transcriber and the diarizer run independently and disagree
+            at the edges, so the rules of the join decide the quality of the
+            final transcript. The main rule is maximum overlap, and it is
+            easiest to see with numbers. Suppose the diarizer decided
+            speaker A holds 12.0 to 15.4 seconds and speaker B holds 15.4 to
+            19.0, and Whisper timed the word "really" at 15.3 to 15.6
+            seconds. The word overlaps A's turn by 0.1 seconds and B's by
+            0.2, so it goes to B. Exact ties go to the earlier turn, so
+            running the pipeline twice gives the same transcript. A word
+            that touches no turn at all, which happens when the diarizer's
+            speech detection trimmed more audio than Whisper did, is given
+            to the nearest turn only if the gap is under a second; past
+            that it stays unattributed, because in a transcript a visible
+            gap is more useful than a confident guess. Finally, consecutive
+            words by the same speaker group into display segments, breaking
+            whenever the speaker changes or a pause runs longer than a
+            second, which is what keeps subtitles readable.
           </p>
 
           <h2>Step 4: scoring you can audit</h2>
           <p>
-            Two metrics decide everything, so both are implemented from
-            scratch in plain Python and tested against hand-computed values.
-            <strong>WER</strong>, word error rate, counts substitutions,
-            deletions, and insertions against the reference transcript.
-            <strong>DER</strong>, diarization error rate, integrates missed
-            speech, false alarm speech, and speaker confusion over the
-            reference timeline, with a no-score collar around turn boundaries
-            and the speaker mapping chosen by the Hungarian algorithm, the
-            same semantics as the standard NIST scorer. Where a metric is
-            undefined it returns NaN, and NaN is treated as failure, never as
-            a pass.
+            Two numbers decide whether any of the above actually works, so
+            both are implemented in plain Python in the repository rather
+            than imported from a library, and "checked against examples
+            worked out by hand" means exactly that: each test case was
+            computed on paper first, and the code is required to reproduce
+            it. <strong>WER</strong>, word error rate, lines the system's
+            transcript up against the reference and counts the cheapest set
+            of edits that turns one into the other. If the reference is "the
+            cat sat" and the system wrote "the cat sat down", that is one
+            inserted word against three reference words, a WER of 1/3. The
+            test suite holds dozens of such cases, substitutions, deletions,
+            insertions, and combinations, each with its precomputed answer.
+          </p>
+          <p>
+            <strong>DER</strong>, diarization error rate, scores who spoke
+            when as time rather than words, and it splits the error three
+            ways: <strong>miss</strong> is reference speech the system
+            attributed to nobody, <strong>false alarm</strong> is claimed
+            speech where nobody was talking, and <strong>confusion</strong>
+            is speech handed to the wrong person. Two subtleties make it
+            easy to get wrong. The system's labels are arbitrary, its
+            SPEAKER_00 might be the reference's bob, so before scoring, the
+            labels are paired up by whichever assignment explains the most
+            time. And a quarter-second collar around every true boundary is
+            excluded from scoring, because even human annotators cannot
+            place a turn boundary more precisely than that. The hand-worked
+            test cases include the awkward situations: two people talking at
+            once, every span given to the wrong speaker, boundaries jittered
+            just inside the collar. Where a metric is undefined it returns
+            NaN, and NaN is treated as failure, never as a pass, because
+            "this could not be measured" must never read as a perfect score.
           </p>
           <p>
             The benchmark is built rather than downloaded: single-speaker
@@ -169,7 +287,10 @@
             small at int8 on CPU matches float16 on 11 of the 12 mixtures
             and then silently drops whole utterances on the twelfth, deleting
             59 of its 157 reference words and inflating that mixture's WER to
-            40.1% against 3.8% at float16. A pooled average would have read
+            40.1% against 3.8% at float16. The deletions come in consecutive
+            runs, which points at the quantized model misjudging stretches of
+            real speech as silence and skipping past them, rather than
+            mistranscribing them. A pooled average would have read
             as "int8 is a bit worse"; the per-mixture rows are what turned it
             into "int8 can silently skip speech", which is the kind of tail
             failure a serving system needs to know exists.
