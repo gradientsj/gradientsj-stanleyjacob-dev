@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Specializing an 8B model for idiomatic Rust · Stanley Jacob</title>
-    <meta name="description" content="Project write-up: a full BF16 fine-tune stack for specializing Qwen3-8B on Rust, with a license-gated crates.io corpus, dedup, a forgetting guardrail, FSDP2 on 4x H100, and compile-pass-rate as the primary metric." />
+    <meta name="description" content="Project write-up: a full BF16 fine-tune of Qwen3-8B for Rust on 4x H100, with a license-gated corpus, measured domain gains, a forgetting guardrail that caught a real regression, FP8 serving verified by the compiler, and a GRPO pass rewarded by cargo." />
     <link rel="stylesheet" href="/style.css" />
     <link
       rel="icon"
@@ -43,13 +43,15 @@
             actually serve themselves: an 8B-parameter coder specialized on
             permissively licensed Rust through a full fine-tune, on rented
             hardware, with the data pipeline, the legal hygiene, and the
-            evaluation gates all built rather than assumed. The repository
-            currently contains the complete corpus pipeline and the training
-            stack, verified end to end on a pilot data slice; the full
-            corpus harvest and the 4x H100 training run are the next step,
-            and nothing below claims a result that has not been measured.
-            What this page walks through is the part that determines whether
-            the run will mean anything: the decisions. The code is at
+            evaluation gates all built rather than assumed. The full path
+            has now run end to end: the corpus harvest, the fine-tune, the
+            evaluation gates, a quantized serving deployment verified by the
+            compiler, and a reinforcement learning pass that uses the
+            compiler as its reward. The forgetting guardrail caught a real
+            regression along the way, which is precisely the job it was
+            built for. This page walks through the decisions first and the
+            measured results after, because the decisions are what make the
+            numbers mean something. The code is at
             <a href="https://github.com/gradientsj/rust-coder-ft" target="_blank" rel="noreferrer">github.com/gradientsj/rust-coder-ft</a>.
           </p>
 
@@ -175,26 +177,139 @@
             training, the FSDP shards consolidate back to a standard
             checkpoint, an FP8-quantized export follows for cheap serving
             (FP8 is an 8-bit floating-point format H100s execute natively),
-            and a vLLM endpoint serves the result; the FP8 throughput
-            experiment during training itself is deliberately deferred
-            until the BF16 baseline run is proven, so the loss curves stay
-            comparable.
+            and a vLLM endpoint serves the result. Using FP8 during training
+            itself was measured rather than assumed: on a one-batch overfit
+            harness the FP8 loss curve matched BF16 step for step, but
+            throughput dropped 37% because the torchao float8 path needs
+            torch.compile to pay off, so the real run trained in BF16 and
+            FP8 stayed a serving-side story.
           </p>
 
-          <h2>Status and limitations</h2>
+          <h2>The fine-tune, measured</h2>
           <p>
-            What exists and is committed: the harvest, filter, dedup, pair
-            extraction, mixing, and formatting pipeline; the training
-            configs with the memory budget worked out; and the FSDP launch
-            stack, all exercised on a pilot slice of a few hundred pairs to
-            prove the path end to end. What does not exist yet: the
-            full-scale corpus, the training run, and therefore any quality
-            numbers, and the evaluation, export, and serving stages are
-            specified but not yet landed in the repo. The before-and-after
-            table, compile-pass rate against the base model plus the
-            HumanEval/MBPP retention check, is the entire point of the
-            exercise, and it will be reported with its configuration when
-            the run completes, whichever way it comes out.
+            The full-scale harvest attempted 201 crates and kept 180, with
+            21 rejected by the strict license gate doing exactly its job
+            (rustls, for example, carries "Apache-2.0 OR ISC OR MIT" and is
+            refused despite being electable). 4,916 files became 4,248
+            after quality filtering and dedup, yielding 14,080 domain pairs
+            blended with 28,160 anchor records at exactly the 1:2 target,
+            with a 668-pair domain holdout split at the file level so near
+            duplicates of training files cannot leak into evaluation.
+            Training ran 3 epochs, 225 optimizer steps, 54 minutes on the
+            four H100s, with evaluation loss falling from 1.22 to 0.625 and
+            essentially flat after the first epoch.
+          </p>
+          <table>
+            <thead>
+              <tr><th>held-out domain (100 pairs)</th><th class="num">base Qwen3-8B</th><th class="num">fine-tuned</th><th class="num">delta</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>mean edit similarity</td><td class="num">0.260</td><td class="num"><strong>0.566</strong></td><td class="num">+0.306</td></tr>
+              <tr><td>exact-match rate</td><td class="num">0.0%</td><td class="num"><strong>23%</strong></td><td class="num">+23 pts</td></tr>
+            </tbody>
+          </table>
+          <p>
+            One measurement plan had to bend to reality: compile-pass rate
+            on this holdout is void, because only 1 of the 100 held-out
+            references compiles standalone, the rest referencing private
+            crate internals. The harness was designed for this
+            (reference-compile filtering admits a pair to the compile
+            metric only when its reference solution itself compiles), and
+            the compile signal instead comes from the served model's output
+            passing build, clippy, and tests downstream.
+          </p>
+          <table>
+            <thead>
+              <tr><th>retention</th><th class="num">before</th><th class="num">after</th><th class="num">delta</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>HumanEval pass@1</td><td class="num">0.628</td><td class="num">0.555</td><td class="num">-7.3 pts</td></tr>
+              <tr><td>MBPP pass@1</td><td class="num">0.658</td><td class="num">0.656</td><td class="num">-0.2 pts</td></tr>
+            </tbody>
+          </table>
+          <p>
+            This is the guardrail earning its place. The domain gain is
+            large and MBPP is fully retained, but HumanEval regressed 7.3
+            points, a real forgetting cost that an unmeasured fine-tune
+            would have shipped silently. The diagnosis is plausible and
+            testable: HumanEval is raw-completion Python, the protocol most
+            distant from chat-format Rust training, and the queued levers
+            are two epochs instead of three (the loss was flat after one),
+            a larger general-instruct anchor share, and a raw-Python anchor
+            pool alongside the raw-Rust one.
+          </p>
+
+          <h2>Serving the result</h2>
+          <p>
+            The trained checkpoint consolidates to a standard 8.19B-parameter
+            model, quantizes data-free to FP8 (16.4 GB down to 9.44 GB, with
+            the output head kept in bf16), and serves through vLLM. The
+            smoke test closes the loop in the most satisfying way available:
+            the served model is asked for a Rust function over the
+            OpenAI-compatible endpoint, and the response is piped through
+            this repo's own cargo judge, where it compiles, passes clippy
+            clean, and passes its tests in the sandbox. The serving stack
+            and the evaluation stack compose, which is what makes the next
+            section possible.
+          </p>
+
+          <h2>Teaching with the compiler: a GRPO pass</h2>
+          <p>
+            Supervised fine-tuning imitates reference code; it cannot reward
+            an answer for being correct, only for being similar.
+            <strong>GRPO</strong> (group relative policy optimization)
+            closes that gap with reinforcement learning: for each problem
+            the model samples a group of candidate solutions, each is
+            scored by a reward, and the policy shifts toward candidates
+            that scored above their group's average, no learned reward
+            model required when the reward is verifiable. Here the reward
+            is the cargo judge with graded tiers (penalty for malformed
+            output, credit for compiling, full credit for passing tests, a
+            bonus for clippy-clean), and the problem banks are kept apart
+            deliberately: 354 Rust-translated MBPP problems for training,
+            verified compilable by the harness, and 158 HumanEvalPack-Rust
+            problems never trained on for evaluation, with the
+            contamination consequences for the Python retention metrics
+            documented rather than discovered.
+          </p>
+          <table>
+            <thead>
+              <tr><th>158 unseen Rust problems</th><th class="num">fine-tuned</th><th class="num">+ GRPO</th><th class="num">delta</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>pass rate</td><td class="num">36.1%</td><td class="num"><strong>38.6%</strong></td><td class="num">+2.5</td></tr>
+              <tr><td>compile rate</td><td class="num">58.2%</td><td class="num"><strong>62.7%</strong></td><td class="num">+4.4</td></tr>
+              <tr><td>format rate</td><td class="num">94.9%</td><td class="num">97.5%</td><td class="num">+2.5</td></tr>
+            </tbody>
+          </table>
+          <p>
+            The proof-of-concept run was deliberately conservative, 120
+            steps of 128 completions in about 52 minutes, and the training
+            reward stayed flat while every held-out axis moved in the
+            reward's gradient direction, which is the pattern of a policy
+            improving on what the reward actually measures rather than
+            overfitting its training prompts. The obvious levers for a full
+            run are written down next to the result: more steps, a
+            curriculum filter that drops zero-variance groups, and a heavier
+            clippy weight, since zero percent of passing solutions from
+            either model are clippy-clean, a wide-open headroom for exactly
+            the idiomatic-Rust objective this project exists for.
+          </p>
+
+          <h2>Limitations</h2>
+          <p>
+            This is one supervised run and one conservative RL
+            proof-of-concept, not a sweep. The HumanEval regression is
+            diagnosed but not yet fixed, and the fix list is speculation
+            until V2 runs. Compile-pass on the crate-internal holdout is
+            structurally unavailable, so the domain gain rests on edit
+            similarity and exact match, which are weaker evidence than the
+            compiler. Absolute HumanEval and MBPP numbers are
+            protocol-dependent, which is why only the before-and-after
+            deltas under an identical protocol are treated as the metric of
+            record. And the GRPO evaluation bank is 158 problems, big
+            enough to see consistent movement, small enough that a couple
+            of points ride on a handful of solutions.
           </p>
 
           <h2>Links</h2>
@@ -202,6 +317,7 @@
             <li><a href="https://github.com/gradientsj/rust-coder-ft" target="_blank" rel="noreferrer">Source on GitHub</a></li>
             <li><a href="https://github.com/gradientsj/rust-coder-ft/blob/main/data/scrape/sources.yaml" target="_blank" rel="noreferrer">The curated crate allowlist and license policy</a></li>
             <li><a href="https://github.com/gradientsj/rust-coder-ft/blob/main/configs/qwen3coder-8b-fft.yaml" target="_blank" rel="noreferrer">The primary training config</a> (memory budget and decisions annotated inline)</li>
+            <li><a href="https://github.com/gradientsj/rust-coder-ft/blob/main/REPORT.md" target="_blank" rel="noreferrer">The build report</a> (every phase, every failure, every fix, in order)</li>
           </ul>
         </article>
       </div>
