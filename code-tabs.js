@@ -2,7 +2,7 @@
    block on the page to that language and remembers the choice for future
    visits. Blocks missing the chosen language fall back to their first tab. */
 (function () {
-  var LANGS = ["python", "cpp", "rust", "typescript"];
+  var LANGS = ["python", "cpp", "rust", "typescript", "go", "swift"];
 
   function setLang(lang) {
     document.querySelectorAll(".code-tabs").forEach(function (block) {

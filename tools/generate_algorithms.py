@@ -6,10 +6,12 @@ Reads from the local interview-prep repo (C:/Users/stanl/algorithms):
   - cpp/tests/graph_traversal_tests.cpp      -> C++ snippets
   - rust/src/graph_traversal.rs              -> Rust snippets
   - typescript/src/graphTraversal.ts         -> TypeScript snippets
+  - golang/neetcode/<topic>/<topic>.go       -> Go snippets
+  - swift/neetcode/<topic>.swift             -> Swift snippets
 
 Writes:
   - algorithms/index.html                    (18 NeetCode topics, all 250 problems)
-  - algorithms/graph-traversal/index.html    (12 BFS/DFS variants, 4-language tabs)
+  - algorithms/graph-traversal/index.html    (12 BFS/DFS variants, 6-language tabs)
 
 Re-run after changing the checklist or any implementation:
   python tools/generate_algorithms.py
@@ -167,8 +169,8 @@ TOPIC_META = {
         "graphs",
         "BFS for distances, DFS for structure, indegrees for ordering, and "
         "union-find for connectivity. The twelve canonical traversal variants "
-        "are written out in four languages on the graph traversal page.",
-        [("Graph traversal in four languages", "/algorithms/graph-traversal"),
+        "are written out in six languages on the graph traversal page.",
+        [("Graph traversal in six languages", "/algorithms/graph-traversal"),
          ("Breadth-first search (BFS)", "/software/algorithms/bfs"),
          ("Depth-first search (DFS)", "/software/algorithms/dfs"),
          ("Graph theory: topological sort and cycles", "/software/algorithms/graph-theory"),
@@ -261,9 +263,8 @@ def render_index(topics, descriptions):
     sections = []
     for i, (topic, problems) in enumerate(topics):
         tid, desc, links = TOPIC_META[topic]
-        n_solved = sum(1 for p in problems if p[0] in SOLUTIONS)
         toc.append(
-            f'          <a class="tag" href="#{tid}">{html.escape(topic)} · {len(problems)}</a>'
+            f'          <a class="tag" href="#{tid}">{html.escape(topic)}</a>'
         )
         rows = []
         for name, lc, diff, hook in problems:
@@ -278,9 +279,7 @@ def render_index(topics, descriptions):
         if links:
             parts = " · ".join(f'<a href="{href}">{html.escape(label)}</a>' for label, href in links)
             link_line = f'\n          <p class="deep-links">Deep dives: {parts}</p>'
-        kicker = f"{i + 1:02d} · {len(problems)} problems"
-        if n_solved:
-            kicker += f" · {n_solved} solved in four languages"
+        kicker = f"{i + 1:02d}"
         soft = ' class="soft"' if i % 2 == 0 else ""
         sections.append(f"""    <section id="{tid}"{soft}>
       <div class="wrap">
@@ -303,7 +302,7 @@ def render_index(topics, descriptions):
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Algorithms · Stanley Jacob</title>
-    <meta name="description" content="The NeetCode 250 organized into eighteen topics, from arrays and hashing to bit manipulation, with canonical implementations in Python, C++, Rust, and TypeScript." />
+    <meta name="description" content="The NeetCode 250 organized into eighteen topics, from arrays and hashing to bit manipulation, with canonical implementations in Python, C++, Rust, TypeScript, Go, and Swift." />
     <link rel="stylesheet" href="/style.css" />
     <link rel="icon" href="{FAVICON}" />
   </head>
@@ -319,11 +318,12 @@ def render_index(topics, descriptions):
           in roadmap order, where each one builds on the techniques of the ones before it. Every
           problem carries a refresher underneath covering what it asks, how the solution works, and
           the trick behind it, and links to its topic page, where solutions appear side by side in
-          Python, C++, Rust, and TypeScript with a language switcher. A solution is published only
-          after its implementation passes unit tests against the official LeetCode examples.
+          Python, C++, Rust, TypeScript, Go, and Swift with a language switcher. A solution is
+          published only after its implementation passes unit tests against the official LeetCode
+          examples.
         </p>
         <div class="cta-row">
-          <a class="btn primary" href="/algorithms/graph-traversal">Graph traversal in four languages</a>
+          <a class="btn primary" href="/algorithms/graph-traversal">Graph traversal in six languages</a>
         </div>
         <div class="tags" style="margin-top: 20px">
 {toc_html}
@@ -344,15 +344,15 @@ def render_topic_page(i, topic, problems, descriptions):
     n_solved = sum(1 for p in problems if p[0] in SOLUTIONS)
     if n_solved:
         solved_note = (
-            f" {n_solved} of the {len(problems)} problems here have full solutions in Python, "
-            "C++, Rust, and TypeScript; the tabs switch every snippet on the page at once. The "
-            "rest gain solutions as their implementations pass tests."
+            " Every problem here has a full solution in Python, C++, Rust, TypeScript, Go, "
+            "and Swift; the tabs switch every snippet on the page at once, and each solution "
+            "is published only after passing unit tests against the official LeetCode examples."
         )
     else:
         solved_note = (
-            " Solutions in Python, C++, Rust, and TypeScript are being added topic by topic, "
-            "and each appears only after its implementation passes unit tests against the "
-            "official LeetCode examples."
+            " Solutions in Python, C++, Rust, TypeScript, Go, and Swift are being added topic "
+            "by topic, and each appears only after its implementation passes unit tests against "
+            "the official LeetCode examples."
         )
     link_line = ""
     if links:
@@ -379,7 +379,7 @@ def render_topic_page(i, topic, problems, descriptions):
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>{html.escape(topic)} · Algorithms · Stanley Jacob</title>
-    <meta name="description" content="{html.escape(topic)} from the NeetCode 250: every problem with a description of what it asks, how the solution works, and the trick behind it, plus solutions in Python, C++, Rust, and TypeScript." />
+    <meta name="description" content="{html.escape(topic)} from the NeetCode 250: every problem with a description of what it asks, how the solution works, and the trick behind it, plus solutions in Python, C++, Rust, TypeScript, Go, and Swift." />
     <link rel="stylesheet" href="/style.css" />
     <link rel="icon" href="{FAVICON}" />
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" />
@@ -390,7 +390,7 @@ def render_topic_page(i, topic, problems, descriptions):
       <div class="wrap">
         <div class="eyebrow"><a href="/algorithms">← Algorithms</a></div>
         <h1>{html.escape(topic)}</h1>
-        <p class="meta">Topic {i + 1:02d} of 18 · {len(problems)} problems</p>
+        <p class="meta">Topic {i + 1:02d} of 18</p>
         <p class="lead">{desc}{solved_note}</p>{link_line}
       </div>
     </header>
@@ -478,16 +478,27 @@ def extract_range(lines, start_prefix, end_prefix):
     return "\n".join(lines[start:end + 1])
 
 
+def extract_between(lines, start_prefix, end_prefix):
+    """The lines strictly between two col-0 markers (Go class sections)."""
+    start = _find(lines, start_prefix)
+    end = _find(lines, end_prefix)
+    return "\n".join(lines[start + 1:end]).strip("\n")
+
+
 SOURCES = {
     "py_bfs": PY_BFS,
     "py_dfs": PY_DFS,
     "cpp": CPP,
     "rs": RS,
     "ts": TS,
+    "go_gt": ALGO / "golang" / "neetcode" / "graph_traversal" / "graph_traversal.go",
+    "sw_gt": ALGO / "swift" / "neetcode" / "graph_traversal.swift",
     "py_ah": ALGO / "python" / "neetcode" / "arrays_hashing.py",
     "cpp_ah": ALGO / "cpp" / "tests" / "arrays_hashing_tests.cpp",
     "rs_ah": ALGO / "rust" / "src" / "arrays_hashing.rs",
     "ts_ah": ALGO / "typescript" / "src" / "arraysHashing.ts",
+    "go_ah": ALGO / "golang" / "neetcode" / "arrays_hashing" / "arrays_hashing.go",
+    "sw_ah": ALGO / "swift" / "neetcode" / "arrays_hashing.swift",
 }
 _SRC_CACHE = {}
 
@@ -515,6 +526,8 @@ def snippet(parts):
             out.append(extract_line(src, part[2]))
         elif kind == "range":
             out.append(extract_range(src, part[2], part[3]))
+        elif kind == "between":
+            out.append(extract_between(src, part[2], part[3]))
     return "\n\n".join(out)
 
 
@@ -802,7 +815,25 @@ VARIANTS = [
     },
 ]
 
-LANG_LABELS = [("python", "Python"), ("cpp", "C++"), ("rust", "Rust"), ("typescript", "TypeScript")]
+# the Go and Swift graph-traversal modules hold one self-contained function
+# per variant, so their specs are uniform and injected here
+GT_FUNCS = {
+    "level-order": "levelOrder", "grid-bfs": "shortestPathBinaryMatrix",
+    "multi-source": "orangesRotting", "bidirectional": "ladderLength",
+    "kahn": "findOrderKahn", "zero-one-bfs": "minObstacleRemoval",
+    "flood-fill": "numIslands", "iterative-dfs": "numIslandsIterative",
+    "cycle-detection": "canFinishDFS", "topo-dfs": "findOrderDFS",
+    "diameter": "diameterOfBinaryTree", "word-search": "exist",
+}
+for _v in VARIANTS:
+    _fn = GT_FUNCS[_v["id"]]
+    _v["code"]["go"] = [("block", "go_gt", f"func {_fn}(")]
+    _v["code"]["swift"] = [("block", "sw_gt", f"func {_fn}(")]
+
+LANG_LABELS = [
+    ("python", "Python"), ("cpp", "C++"), ("rust", "Rust"),
+    ("typescript", "TypeScript"), ("go", "Go"), ("swift", "Swift"),
+]
 
 # ------------------------------------------------------------ descriptions
 
@@ -826,6 +857,8 @@ def _ah_fn(snake, camel):
         "cpp": [("blockre", "cpp_ah", rf"^\S.*\b{camel}\(")],
         "rust": [("block", "rs_ah", f"pub fn {snake}(")],
         "typescript": [("block", "ts_ah", f"export function {camel}(")],
+        "go": [("block", "go_ah", f"func {camel}(")],
+        "swift": [("block", "sw_ah", f"func {camel}(")],
     }
 
 
@@ -835,12 +868,14 @@ def _ah_class(cls):
         "cpp": [("blockre", "cpp_ah", rf"^class {cls}\b")],
         "rust": [("block", "rs_ah", f"pub struct {cls}"), ("block", "rs_ah", f"impl {cls}")],
         "typescript": [("block", "ts_ah", f"export class {cls}")],
+        "go": [("between", "go_ah", f"// section: {cls}", f"// endsection: {cls}")],
+        "swift": [("block", "sw_ah", f"class {cls}")],
     }
 
 
 _VARIANT_CODE = {v["id"]: v["code"] for v in VARIANTS}
 
-# problem name (verbatim from the checklist) -> 4-language extraction specs.
+# problem name (verbatim from the checklist) -> per-language extraction specs.
 # Only problems listed here get code tabs; everything else shows its
 # description until tested implementations land.
 SOLUTIONS = {
@@ -872,6 +907,8 @@ SOLUTIONS = {
         "cpp": [("blockre", "cpp_ah", r"^\S.*\bencode\("), ("blockre", "cpp_ah", r"^\S.*\bdecode\(")],
         "rust": [("block", "rs_ah", "pub fn encode("), ("block", "rs_ah", "pub fn decode(")],
         "typescript": [("block", "ts_ah", "export function encode("), ("block", "ts_ah", "export function decode(")],
+        "go": [("block", "go_ah", "func encode("), ("block", "go_ah", "func decode(")],
+        "swift": [("block", "sw_ah", "func encode("), ("block", "sw_ah", "func decode(")],
     },
     "Range Sum Query 2D Immutable": _ah_class("NumMatrix"),
     "Product of Array Except Self": _ah_fn("product_except_self", "productExceptSelf"),
@@ -1057,7 +1094,7 @@ TOPIC_SYMBOLS = {
     },
 }
 
-# topics whose four-language implementations have passed tests
+# topics whose per-language implementations have passed tests
 ENABLED_TOPICS = set(TOPIC_SYMBOLS)
 
 TS_MODULE_NAMES = {"stack": "stackProblems", "dp_1d": "dp1d", "dp_2d": "dp2d"}
@@ -1077,13 +1114,15 @@ def snake_name(camel):
 
 
 def _symbol_specs(symbol, keys):
-    pyk, cppk, rsk, tsk = keys
+    pyk, cppk, rsk, tsk, gok, swk = keys
     if symbol[0].isupper():  # a design-problem class
         return {
             "python": [("pyclass", pyk, symbol)],
             "cpp": [("blockre", cppk, rf"^class {symbol}\b")],
             "rust": [("block", rsk, f"pub struct {symbol}"), ("block", rsk, f"impl {symbol}")],
             "typescript": [("block", tsk, f"export class {symbol}")],
+            "go": [("between", gok, f"// section: {symbol}", f"// endsection: {symbol}")],
+            "swift": [("block", swk, f"class {symbol}")],
         }
     sn = snake_name(symbol)
     return {
@@ -1091,6 +1130,8 @@ def _symbol_specs(symbol, keys):
         "cpp": [("blockre", cppk, rf"^\S.*\b{symbol}\(")],
         "rust": [("block", rsk, f"pub fn {sn}(")],
         "typescript": [("block", tsk, f"export function {symbol}(")],
+        "go": [("block", gok, f"func {symbol}(")],
+        "swift": [("block", swk, f"func {symbol}(")],
     }
 
 
@@ -1101,16 +1142,18 @@ def _register_topic_sources():
         SOURCES[f"cpp_{m}"] = ALGO / "cpp" / "tests" / f"{m}_tests.cpp"
         SOURCES[f"rs_{m}"] = ALGO / "rust" / "src" / f"{m}.rs"
         SOURCES[f"ts_{m}"] = ALGO / "typescript" / "src" / f"{_camel_module(m)}.ts"
+        SOURCES[f"go_{m}"] = ALGO / "golang" / "neetcode" / m / f"{m}.go"
+        SOURCES[f"sw_{m}"] = ALGO / "swift" / "neetcode" / f"{m}.swift"
 
 
 def _build_topic_solutions():
     for tid in ENABLED_TOPICS:
         m = tid.replace("-", "_")
-        keys = (f"py_{m}", f"cpp_{m}", f"rs_{m}", f"ts_{m}")
+        keys = (f"py_{m}", f"cpp_{m}", f"rs_{m}", f"ts_{m}", f"go_{m}", f"sw_{m}")
         for name, symbols in TOPIC_SYMBOLS[tid].items():
             if isinstance(symbols, str):
                 symbols = [symbols]
-            merged = {"python": [], "cpp": [], "rust": [], "typescript": []}
+            merged = {lang: [] for lang, _ in LANG_LABELS}
             for sym in symbols:
                 for lang, parts in _symbol_specs(sym, keys).items():
                     merged[lang].extend(parts)
@@ -1160,8 +1203,8 @@ def render_traversal():
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Graph traversal in four languages · Stanley Jacob</title>
-    <meta name="description" content="The twelve canonical BFS and DFS variants, each implemented in Python, C++, Rust, and TypeScript and verified by unit tests: level order, grid BFS, multi-source, bidirectional, Kahn's, 0-1 BFS, flood fill, cycle detection, topological sort, postorder trees, and grid backtracking." />
+    <title>Graph traversal in six languages · Stanley Jacob</title>
+    <meta name="description" content="The twelve canonical BFS and DFS variants, each implemented in Python, C++, Rust, TypeScript, Go, and Swift and verified by unit tests: level order, grid BFS, multi-source, bidirectional, Kahn's, 0-1 BFS, flood fill, cycle detection, topological sort, postorder trees, and grid backtracking." />
     <link rel="stylesheet" href="/style.css" />
     <link rel="icon" href="{FAVICON}" />
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" />
@@ -1171,7 +1214,7 @@ def render_traversal():
     <header class="hero">
       <div class="wrap">
         <div class="eyebrow"><a href="/algorithms">← Algorithms</a></div>
-        <h1>Graph traversal in four languages</h1>
+        <h1>Graph traversal in six languages</h1>
         <p class="meta">Algorithms · graphs · Jun 2026</p>
       </div>
     </header>
@@ -1181,8 +1224,8 @@ def render_traversal():
           <p>Breadth-first and depth-first search are two skeletons that between them solve most of
           the graph problems in an interview loop. Each section below takes one canonical variant,
           explains what single knob it turns on the base skeleton, and shows the same implementation
-          in Python, C++, Rust, and TypeScript. The tabs remember your language across snippets and
-          visits. Every function is lifted verbatim from a repository where it runs against the
+          in Python, C++, Rust, TypeScript, Go, and Swift. The tabs remember your language across
+          snippets and visits. Every function is lifted verbatim from a repository where it runs against the
           official LeetCode examples plus the edge cases that actually get submissions rejected, so
           the code on this page is the code that passed.</p>
           <p>The BFS skeleton never changes: seed a queue, mark nodes visited as they are enqueued,
@@ -1198,9 +1241,10 @@ def render_traversal():
           <h2 id="references">Where the code lives</h2>
           <p>The implementations and their test suites live in a local interview-prep repository,
           with the Python versions under <code>python/graph_traversal/</code>, C++ as a
-          self-contained assert suite, Rust as a library module with inline tests, and TypeScript
-          checked by both ts-node assertions and the compiler. The longer written treatment of each
-          variant, including the naive baselines and follow-up questions, is in the
+          self-contained assert suite, Rust as a library module with inline tests, TypeScript
+          checked by both ts-node assertions and the compiler, Go as a package with go test
+          suites, and Swift compiled and asserted against the same cases. The longer written
+          treatment of each variant, including the naive baselines and follow-up questions, is in the
           <a href="/software/algorithms/bfs">BFS</a> and
           <a href="/software/algorithms/dfs">DFS</a> notes.</p>
         </article>
@@ -1245,11 +1289,11 @@ def main():
         out = SITE / "algorithms" / tid / "index.html"
         write(out, render_topic_page(i, topic, problems, descriptions))
     n_solved = sum(1 for n in all_names if n in SOLUTIONS)
-    print(f"wrote {len(topics)} topic pages ({n_solved} problems with 4-language solutions)")
+    print(f"wrote {len(topics)} topic pages ({n_solved} problems with {len(LANG_LABELS)}-language solutions)")
 
     out_trav = SITE / "algorithms" / "graph-traversal" / "index.html"
     write(out_trav, render_traversal())
-    print(f"wrote {out_trav} ({len(VARIANTS)} variants x 4 languages)")
+    print(f"wrote {out_trav} ({len(VARIANTS)} variants x {len(LANG_LABELS)} languages)")
 
 
 if __name__ == "__main__":
