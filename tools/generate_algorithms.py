@@ -1058,7 +1058,7 @@ TOPIC_SYMBOLS = {
 }
 
 # topics whose four-language implementations have passed tests
-ENABLED_TOPICS = {"two-pointers", "sliding-window", "stack", "binary-search", "linked-list", "trees"}
+ENABLED_TOPICS = set(TOPIC_SYMBOLS)
 
 TS_MODULE_NAMES = {"stack": "stackProblems", "dp_1d": "dp1d", "dp_2d": "dp2d"}
 
