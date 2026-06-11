@@ -223,6 +223,31 @@ TOPIC_META = {
 }
 
 
+# internal "Variant" references in the checklist hooks become links into the
+# graph-traversal walkthrough on the site
+VARIANT_ANCHORS = {
+    ("BFS", "1"): "level-order", ("BFS", "2"): "grid-bfs", ("BFS", "3"): "multi-source",
+    ("BFS", "4"): "bidirectional", ("BFS", "5"): "kahn", ("BFS", "6"): "zero-one-bfs",
+    ("DFS", "1"): "flood-fill", ("DFS", "2"): "iterative-dfs", ("DFS", "3"): "cycle-detection",
+    ("DFS", "4"): "topo-dfs", ("DFS", "5"): "diameter", ("DFS", "6"): "word-search",
+}
+
+
+def render_trick(hook):
+    text = html.escape(hook, quote=False)
+
+    def variant_link(m):
+        anchor = VARIANT_ANCHORS[(m.group(1), m.group(2))]
+        return f'(<a href="/algorithms/graph-traversal#{anchor}">walkthrough</a>)'
+
+    text = re.sub(r"\((?:study_guide )?(BFS|DFS) Variant (\d)\)", variant_link, text)
+    text = text.replace(
+        "(Variants 4 + 5)",
+        '(<a href="/algorithms/graph-traversal#kahn">walkthrough</a>)',
+    )
+    return text
+
+
 def render_index(topics):
     toc = []
     sections = []
@@ -235,8 +260,9 @@ def render_index(topics):
         for name, lc, diff, hook in problems:
             url = f"https://leetcode.com/problems/{lc_slug(name)}/"
             rows.append(
-                f'            <li title="{html.escape(hook, quote=True)}">'
+                "            <li><div class=\"prob\">"
                 f'<a href="{url}" target="_blank" rel="noreferrer">{html.escape(name)}</a>'
+                f'<p class="trick">{render_trick(hook)}</p></div>'
                 f'<span class="date diff-{diff.lower()}">{diff} · LC {lc}</span></li>'
             )
         link_line = ""
@@ -251,7 +277,7 @@ def render_index(topics):
           <h2>{html.escape(topic)}</h2>
           <p>{desc}</p>{link_line}
         </div>
-        <ul class="notes">
+        <ul class="notes tricks">
 {chr(10).join(rows)}
         </ul>
       </div>
@@ -279,9 +305,11 @@ def render_index(topics):
         <p class="lead">
           The NeetCode 250 problem set, organized the way NeetCode subdivides it: eighteen topics
           in roadmap order, where each one builds on the techniques of the ones before it. Every
-          problem links to LeetCode, and the pattern pages show the same canonical implementation
-          side by side in Python, C++, Rust, and TypeScript, each verified by unit tests against
-          the official examples before it appears here.
+          problem links to LeetCode and carries its key idea underneath, the one line about how the
+          solution works and what the trick is that you would want to recall before writing any
+          code. The pattern pages show the same canonical implementation side by side in Python,
+          C++, Rust, and TypeScript, each verified by unit tests against the official examples
+          before it appears here.
         </p>
         <div class="cta-row">
           <a class="btn primary" href="/algorithms/graph-traversal">Graph traversal in four languages</a>
