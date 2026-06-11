@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Design an ad click event aggregation system · Stanley Jacob</title>
+    <meta name="description" content="An interview walkthrough of designing an ad click aggregation pipeline: the durable raw log, event-time windows and watermarks, deduplication and exactly-once effects, fraud filtering, and the batch reconciliation path that billing trusts." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems" class="active">Systems</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/systems">← Systems</a></div>
+        <h1>Design an ad click event aggregation system</h1>
+        <p class="meta">Systems design · Data pipelines and observability · Oct 2025</p>
+      </div>
+    </header>
+    <section style="padding-top: 0">
+      <div class="wrap">
+        <article class="prose article">
+          <p>When someone clicks an ad, three things hang on that event being counted correctly: the advertiser is billed for it, their campaign budget is paced against it, and the bidding system learns from it. This system ingests every click from a large ad network, aggregates counts per ad per minute, and serves those numbers to dashboards, budget pacers, and the billing pipeline. It is worth saying plainly why interviewers love it: this is a money pipeline. A metrics system that undercounts CPU usage wastes a capacity planner's afternoon, but an ad system that overcounts clicks bills customers for traffic that never happened, and the failure modes are measured in refunds, audits, and occasionally lawsuits. Correctness outranks freshness here, which inverts the priorities of most streaming designs and shapes every decision below.</p>
+          <p>The hard parts are time and duplication. Clicks arrive late and out of order from flaky mobile networks, the same click arrives twice because a phone retried, and the aggregation must nonetheless converge on one defensible number per ad per minute. The design that follows is the standard shape for this problem: a durable raw log as the source of truth, a streaming layer for fast approximate answers, and a batch layer that recomputes the truth at leisure.</p>
+
+          <h2>Scope and requirements</h2>
+          <p>Functionally, the system must return the number of clicks for a given ad in any one-minute window, return the top N ads by clicks over a recent window such as the last hour, and support queries over both recent data for pacing and historical data for invoices and disputes. Filtering out fraudulent clicks before they reach billable aggregates is in scope, because no real ad network bills raw clicks.</p>
+          <p>Non-functionally, correctness is the headline: billable numbers must be exact, deduplicated, and reproducible, in the sense that recomputing any window from raw events yields the same answer an auditor was shown. Freshness matters at the level of a minute or two for dashboards and pacing, not seconds. The system must absorb large traffic spikes, a viral moment or a holiday auction surge, without losing events, and every raw event must be retained long enough to recompute history when, not if, a defect in the aggregation logic ships.</p>
+
+          <h2>Sizing the problem</h2>
+          <p>Assume 1 billion clicks per day. A day has 86,400 seconds, so the average rate is about 11,600 clicks per second, and ad traffic is spiky enough that the system should be sized for peaks around 50,000 per second. A raw click event carries an event ID, ad ID, user identifier, timestamp, and a little context, roughly 0.1 KB, so a day of raw events is about 100 GB, a comfortably small volume by log standards. Keeping 90 days of raw events in Kafka with threefold replication costs about 100 GB times 90 times 3, or 27 TB, which is cheap insurance for a billing system. The aggregate side is smaller still: with around 2 million ads active in a day, even if every ad received clicks in every minute the day would produce 2.9 billion aggregate rows, and in practice click activity is concentrated, so daily aggregate output lands well under that and a year of it fits in a few TB of columnar storage.</p>
+
+          <h2>The query API</h2>
+          <p>Two consumers dominate: dashboards and pacing read recent windows, and billing reads reconciled history. The write side is an internal ingestion endpoint that ad servers call; end-user clicks never hit this API directly.</p>
+          <pre><code class="language-http">POST /v1/clicks                       ← from ad servers, batched
+{ "events": [ { "event_id": "9f1c-...", "ad_id": 88231,
+                "user_id": "u-2231", "ts": "2025-10-07T12:00:40Z" }, ... ] }
+
+GET /v1/ads/88231/clicks?from=2025-10-07T12:00Z&amp;to=2025-10-07T13:00Z
+    &amp;granularity=minute
+→ 200 { "windows": [ { "minute": "12:00", "clicks": 1042,
+                       "source": "reconciled" }, ... ] }
+
+GET /v1/ads/top?window=1h&amp;n=100       → 200 { "ads": [ ... ] }
+</code></pre>
+          <p>The <code>source</code> field in the response is a deliberate piece of API design: every aggregate is labeled as streaming or reconciled, so downstream systems can choose, and billing simply refuses to read anything not yet reconciled.</p>
+
+          <h2>The data model</h2>
+          <p>The aggregate store is keyed by ad and minute, which is the access pattern for every query above, and each row carries the identity of the computation run that produced it so that recomputation can supersede old results without ever updating in place ambiguously.</p>
+          <pre><code class="language-sql">CREATE TABLE clicks_per_minute (
+  ad_id        BIGINT      NOT NULL,
+  minute       TIMESTAMPTZ NOT NULL,   -- window start, UTC
+  clicks       BIGINT      NOT NULL,
+  filtered     BIGINT      NOT NULL,   -- clicks held out as suspect
+  run_id       BIGINT      NOT NULL,   -- which computation produced this
+  reconciled   BOOLEAN     NOT NULL DEFAULT FALSE,
+  PRIMARY KEY (ad_id, minute, run_id)
+);
+-- readers take the highest run_id per (ad_id, minute),
+-- billing additionally requires reconciled = TRUE
+</code></pre>
+
+          <h2>The high-level architecture</h2>
+          <p>Ad servers log every click to Kafka, a durable, partitioned, append-only log, and that log is the source of truth for the entire system: raw, immutable, retained for 90 days, and never filtered or rewritten, because any cleverness applied before the log cannot be undone later. A stream processor consumes the log, deduplicates, applies fraud filtering, aggregates into one-minute windows, and writes rows to the aggregate store within a minute or two of real time. Independently, a nightly batch job replays the same raw log and recomputes every window with hours of hindsight, writing corrected rows that supersede the streaming ones. Dashboards read whatever is freshest; billing reads only reconciled rows. This is the two-path arrangement often called a lambda architecture, and its cost, maintaining two computations of the same logic, is the explicit price paid for putting a fast number on a dashboard without ever billing from it.</p>
+          <div class="diagram"><svg width="100%" style="max-width: 760px" viewBox="0 0 760 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Click aggregation pipeline with raw log, stream processor, batch reconciliation, and aggregate store"><defs><marker id="arr-ac1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#86868b"/></marker></defs><g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"><rect x="20" y="44" width="140" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="90" y="68" text-anchor="middle" font-size="14" fill="#1d1d1f">Click sources</text><text x="90" y="84" text-anchor="middle" font-size="11" fill="#5f5f66">apps and ad servers</text><rect x="210" y="44" width="150" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="285" y="68" text-anchor="middle" font-size="14" fill="#1d1d1f">Ingest gateway</text><text x="285" y="84" text-anchor="middle" font-size="11" fill="#5f5f66">validate, batch</text><rect x="410" y="44" width="150" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="485" y="68" text-anchor="middle" font-size="14" fill="#1d1d1f">Kafka raw log</text><text x="485" y="84" text-anchor="middle" font-size="11" fill="#5f5f66">source of truth</text><rect x="610" y="44" width="140" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="680" y="68" text-anchor="middle" font-size="14" fill="#1d1d1f">Stream job</text><text x="680" y="84" text-anchor="middle" font-size="11" fill="#5f5f66">window, dedup</text><rect x="360" y="166" width="180" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="450" y="190" text-anchor="middle" font-size="14" fill="#1d1d1f">Batch recompute</text><text x="450" y="206" text-anchor="middle" font-size="11" fill="#5f5f66">nightly, from raw log</text><rect x="610" y="166" width="140" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="680" y="190" text-anchor="middle" font-size="14" fill="#1d1d1f">Aggregate store</text><text x="680" y="206" text-anchor="middle" font-size="11" fill="#5f5f66">(ad, minute) rows</text><rect x="360" y="288" width="180" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="450" y="312" text-anchor="middle" font-size="14" fill="#1d1d1f">Quarantine store</text><text x="450" y="328" text-anchor="middle" font-size="11" fill="#5f5f66">suspect clicks</text><rect x="610" y="288" width="140" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="680" y="312" text-anchor="middle" font-size="14" fill="#1d1d1f">Query API</text><text x="680" y="328" text-anchor="middle" font-size="11" fill="#5f5f66">dashboards, billing</text><path d="M160,70 H210" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-ac1)"/><path d="M360,70 H410" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-ac1)"/><path d="M560,70 H610" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-ac1)"/><path d="M680,96 V166" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-ac1)"/><text x="688" y="135" text-anchor="start" font-size="12" fill="#5f5f66">1-min rows</text><path d="M450,96 V166" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-ac1)"/><text x="458" y="135" text-anchor="start" font-size="12" fill="#5f5f66">nightly replay</text><path d="M540,192 H610" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-ac1)"/><text x="575" y="158" text-anchor="middle" font-size="12" fill="#5f5f66">corrections</text><path d="M610,86 H580 V250 H450 V288" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-ac1)"/><text x="515" y="242" text-anchor="middle" font-size="12" fill="#5f5f66">suspect clicks</text><path d="M680,218 V288" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-ac1)"/></g></svg></div>
+          <p class="quiet">Every click lands in the raw log before anything else happens to it. The stream job publishes fast per-minute rows, the nightly batch replays the same log and writes corrections, and suspect clicks are routed aside rather than deleted.</p>
+
+          <h2>Event time, windows, and watermarks</h2>
+          <p>Aggregation here means windowed counting: the day is divided into tumbling windows, fixed, non-overlapping one-minute intervals, and each click increments the count of exactly one window. The subtlety is which window, because every event has two times. Event time is when the click actually happened on the device; processing time is when the event reached the pipeline. A click at 12:00:40 from a phone in a subway tunnel may not arrive until 12:02:30, and if the pipeline assigned it by arrival it would land in the 12:02 window, overcounting one minute and undercounting another, and replaying the log later would assign it differently again, which is fatal for reproducibility. Billing-grade aggregation must therefore window by event time, and that immediately raises the question a watermark answers: when is the 12:00 window finished?</p>
+          <p>A watermark is the pipeline's moving claim that all events with event time earlier than T have, it believes, arrived, and it is typically computed as the maximum event time seen so far minus an allowed lateness, say two minutes. When the watermark passes 12:01, the 12:00 to 12:01 window closes and its count is emitted. The setting is a trade with no free option: a tight watermark of a few seconds emits windows fast but calls more events late, while a generous one of ten minutes catches almost every straggler but delays every dashboard and pacing decision by that long. The practical middle ground emits at a two-minute watermark, accepts that a small tail will still arrive later, and lets the closed window be corrected, in the streaming layer through late-update rows, and definitively by the nightly batch, which by then has seen everything.</p>
+          <div class="diagram"><svg width="100%" style="max-width: 760px" viewBox="0 0 760 230" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Event time windows on a processing time axis with a late click corrected into its window"><defs><marker id="arr-ac2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#86868b"/></marker></defs><g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"><rect x="80" y="64" width="200" height="40" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="180" y="88" text-anchor="middle" font-size="12" fill="#1d1d1f">window 12:00 to 12:01</text><rect x="280" y="64" width="200" height="40" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="380" y="88" text-anchor="middle" font-size="12" fill="#1d1d1f">12:01 to 12:02</text><rect x="480" y="64" width="200" height="40" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="580" y="88" text-anchor="middle" font-size="12" fill="#1d1d1f">12:02 to 12:03</text><path d="M40,120 H720" fill="none" stroke="#86868b" stroke-width="1.4"/><path d="M80,116 V124" fill="none" stroke="#86868b" stroke-width="1.4"/><path d="M280,116 V124" fill="none" stroke="#86868b" stroke-width="1.4"/><path d="M480,116 V124" fill="none" stroke="#86868b" stroke-width="1.4"/><path d="M680,116 V124" fill="none" stroke="#86868b" stroke-width="1.4"/><text x="80" y="142" text-anchor="middle" font-size="11" fill="#5f5f66">12:00</text><text x="280" y="142" text-anchor="middle" font-size="11" fill="#5f5f66">12:01</text><text x="480" y="142" text-anchor="middle" font-size="11" fill="#5f5f66">12:02</text><text x="680" y="142" text-anchor="middle" font-size="11" fill="#5f5f66">12:03</text><text x="720" y="160" text-anchor="end" font-size="11" fill="#5f5f66">processing time</text><circle cx="120" cy="120" r="4" fill="#86868b"/><circle cx="170" cy="120" r="4" fill="#86868b"/><circle cx="230" cy="120" r="4" fill="#86868b"/><circle cx="320" cy="120" r="4" fill="#86868b"/><circle cx="400" cy="120" r="4" fill="#86868b"/><circle cx="520" cy="120" r="4" fill="#86868b"/><circle cx="560" cy="120" r="5" fill="#0066cc"/><path d="M460,106 V160" fill="none" stroke="#0066cc" stroke-width="1.4" stroke-dasharray="5 4"/><text x="450" y="140" text-anchor="end" font-size="12" fill="#5f5f66">watermark passes 12:01</text><path d="M560,128 V195 H180 V104" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-ac2)"/><text x="340" y="187" text-anchor="middle" font-size="12" fill="#5f5f66">late click, event time 12:00:40</text><circle cx="140" cy="160" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="140" y="164" text-anchor="middle" font-size="11" fill="#1d1d1f">1</text><circle cx="460" cy="174" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="460" y="178" text-anchor="middle" font-size="11" fill="#1d1d1f">2</text><circle cx="588" cy="132" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="588" y="136" text-anchor="middle" font-size="11" fill="#1d1d1f">3</text></g></svg></div>
+          <p class="quiet">Step 1: clicks arriving on time count into the window holding their event time. Step 2: the watermark passes 12:01 and the first window closes and emits. Step 3: a click stamped 12:00:40 arrives during 12:02 and is routed back as a correction to the already-closed window.</p>
+
+          <h2>Counting each click exactly once</h2>
+          <p>Mobile clients retry over bad networks, so the same click arrives more than once as a matter of routine, and the defense starts at the source: the client mints a unique event ID when the click happens, not when the request is sent, so every retry carries the same ID. The stream job keeps a set of recently seen IDs in its keyed state and drops repeats; the set is bounded by the watermark, since an event older than the allowed lateness will be handled by reconciliation anyway, so a few minutes of IDs at 50,000 events per second is on the order of tens of millions of small entries, which fits in operator state without strain.</p>
+          <p>Deduplication handles duplicate inputs, but the pipeline can also duplicate its own work when it crashes mid-stream, and the guard there is the checkpoint: the stream processor periodically snapshots all operator state, the partial window counts and the dedup set, together with the exact Kafka offsets it had consumed, the positions in the log marking how far it had read. After a crash it restores the snapshot and resumes from those offsets, so no event is skipped and none is counted twice inside the processor. The last gap is the boundary with the store, because a job that crashes after writing a row but before recording the checkpoint will rewrite that row on recovery; the fix is an idempotent sink, meaning a write that can be applied many times with the same result, which the schema above provides by making the row key include the window and the run, so a rewrite of the 12:00 row for ad 88231 replaces an identical value rather than adding to it. Transactional sinks, where the write and the checkpoint commit or abort together, are the heavier alternative when the target store supports them. None of this machinery makes events arrive exactly once, which is impossible over real networks; it makes their effect on stored aggregates happen exactly once, and that is the property billing needs.</p>
+
+          <h2>Fraud filtering and the reconciliation path</h2>
+          <p>Raw clicks are not billable clicks. Some fraction comes from automated traffic, click farms, and accidental double taps, and a filtering stage sits in the stream job ahead of billable aggregation, applying cheap rules first, impossible click rates from one device, datacenter IP ranges, clicks with no matching ad impression, and then a model score for subtler patterns. Suspicious events are not deleted; they are routed to a quarantine store with the reason attached, counted in a separate <code>filtered</code> column, and kept for dispute resolution, because an advertiser challenging an invoice will ask exactly what was excluded and why, and because the filters themselves need auditing when their thresholds drift.</p>
+          <p>The batch path is what makes the whole system defensible. Every night, a job replays the raw log for the previous day and recomputes every window with complete information: every late event has arrived, fraud filters run with final rule versions and the day's full context, and the output is written as a new run with the <code>reconciled</code> flag set. The correction policy is explicit and asymmetric: dashboards and pacing read streaming rows because they need speed and tolerate small drift, while billing reads only reconciled rows, so an invoice is never built on a number that a late click could still move. Streaming and batch totals are compared every night, and a drift beyond a small threshold pages someone, since persistent disagreement means one of the two computations has a defect. The same machinery doubles as the recovery procedure after a faulty deploy: rewind the consumer offsets to before the damage, rerun the corrected job over the affected range, and publish the output under a new run ID, which supersedes the wrong rows without destroying the audit trail of what was previously reported.</p>
+
+          <h2>Scaling, failures, and operations</h2>
+          <p>Kafka partitions the click topic by ad ID, which gives each stream-processor task a disjoint slice of ads and makes window state local; 50,000 events per second at 0.1 KB is 5 MB/s, trivial for the log itself, so the partition count is set by the parallelism the stream job wants rather than by throughput. The aggregate store partitions the same way and scales reads with replicas. The stream job scales by adding tasks, and its failure story is the checkpoint replay described above, with the queue absorbing backlog while the job catches up. One ad going viral creates a hot key, a single partition receiving a disproportionate share of traffic, and the standard relief is local pre-aggregation: split the hot ad's counts across sub-keys, count each independently, and sum them at emission, trading a little merge work for an even load.</p>
+          <p>The failures worth rehearsing are the quiet ones. If the stream job lags, dashboards go stale but nothing is lost, and an alert on consumer lag catches it within minutes. If the aggregate store is briefly unavailable, the job pauses against its checkpoint rather than dropping output. If a fraud rule misfires and quarantines a legitimate campaign's clicks, the quarantine store plus reconciliation rerun makes the repair a recomputation, not an apology. The one disaster with no good recovery is losing raw events before they reach the log, which is why the ingest gateway acknowledges an ad server only after Kafka has replicated the write, and why the log's replication and retention settings are treated as billing-critical configuration rather than tunables.</p>
+
+          <h2>Follow-up questions</h2>
+          <ul>
+            <li><strong>Why window by event time instead of arrival time?</strong> Arrival-time windows change with network weather and replays, so the same log would yield different invoices on different days. Event-time windows make every recomputation land identically, which is the definition of auditable.</li>
+            <li><strong>How do you choose the watermark delay?</strong> Measure the real lateness distribution: if 99.9 percent of clicks arrive within two minutes, a two-minute watermark leaves a 0.1 percent tail for reconciliation to fix. Tighter delays trade correction volume for freshness.</li>
+            <li><strong>What does exactly-once actually mean here?</strong> Not that events traverse the network once, which is impossible, but that each event's effect on stored aggregates is applied once: dedup by client-minted event ID, checkpointed state with Kafka offsets, and idempotent keyed writes together give that.</li>
+            <li><strong>Why keep both a streaming and a batch path?</strong> They serve different masters: pacing needs an answer in a minute, billing needs an answer that cannot move. One path could serve both only by being as slow as batch or as approximate as streaming.</li>
+            <li><strong>How does top-100 ads over the last hour work?</strong> The OLAP store sums sixty per-minute rows per ad and takes the top of the ranking; at a few million active ads that is an inexpensive scan. A streaming top-K with a count-min sketch can serve the dashboard version if sub-second latency is wanted.</li>
+            <li><strong>A deploy miscounted six hours of clicks. Now what?</strong> Rewind offsets to before the deploy, replay the raw log through the fixed job, publish under a new run ID, and let reconciled rows supersede the wrong ones. The raw log's immutability is what makes this a procedure instead of an incident report.</li>
+          </ul>
+
+          <h2>References</h2>
+          <ol class="refs">
+            <li>Akidau et al., <a href="http://www.vldb.org/pvldb/vol8/p1792-Akidau.pdf" target="_blank" rel="noreferrer">The Dataflow Model</a> (VLDB 2015), on event time, windows, and watermarks.</li>
+            <li>Apache Kafka, <a href="https://kafka.apache.org/documentation/" target="_blank" rel="noreferrer">Documentation</a>, on partitioning, replication, and retention.</li>
+            <li>Apache Flink, <a href="https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/time/" target="_blank" rel="noreferrer">Timely stream processing concepts</a>, on event time and watermarks in practice.</li>
+            <li>Kleppmann, <a href="https://dataintensive.net/" target="_blank" rel="noreferrer">Designing Data-Intensive Applications</a> (2017), on stream processing and exactly-once semantics.</li>
+            <li>Xu, <a href="https://www.amazon.com/System-Design-Interview-Insiders-Guide/dp/1736049119" target="_blank" rel="noreferrer">System Design Interview, Volume 2</a> (2022), chapter on ad click event aggregation.</li>
+          </ol>
+        </article>
+      </div>
+    </section>
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (window.hljs) hljs.highlightAll();
+      });
+    </script>
+  </body>
+</html>

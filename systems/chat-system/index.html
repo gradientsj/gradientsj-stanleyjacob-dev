@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Design a chat system · Stanley Jacob</title>
+    <meta name="description" content="An interview walkthrough of designing a chat system: WebSocket connections, the session registry, message ordering, wide-column storage, multi-device sync, delivery receipts, group fanout, and presence." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems" class="active">Systems</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/systems">← Systems</a></div>
+        <h1>Design a chat system</h1>
+        <p class="meta">Systems design · Social and messaging · Jul 2025</p>
+      </div>
+    </header>
+    <section style="padding-top: 0">
+      <div class="wrap">
+        <article class="prose article">
+          <p>A chat system moves short messages between people in close to real time: WhatsApp, Messenger, and Slack are the familiar shapes of it. The product sounds simple, type a message and the other person sees it, but the machinery underneath is unlike most web systems, because the server has to push data to clients the moment it arrives rather than wait to be asked. Interviewers reach for this question because it forces a candidate out of the comfortable stateless request-response world and into stateful connections, message ordering, fanout to many recipients, and the surprisingly tricky problem of knowing who is online. The hard parts live in the connection tier that holds millions of open sockets, in the IDs that keep a conversation in order, and in the arithmetic that decides whether a group message is written to every member or read from a shared log.</p>
+
+          <h2>Scope and requirements</h2>
+          <p>The feature list I would confirm up front: one-to-one chat, group chat up to a few hundred members with very large groups treated as a special case, text messages with small media handled by reference, message history that survives reinstalls, sync across a user's phone and laptop, online presence indicators, and the delivery states users expect to see (sent, delivered, read). When the recipient is offline, the system must hand the message to a push notification service, which is the operating-system channel (APNs on iOS, FCM on Android) that can wake an app that is not running.</p>
+          <p>The non-functional requirements are what shape the design. Delivery should feel instant, ideally a few hundred milliseconds end to end when both people are online. Messages must never be lost once the sender sees the sent state, which means persistence happens before acknowledgment. Within a single conversation, everyone should see messages in the same order, though no ordering promise is needed across different conversations. And the system must tolerate the constant churn of mobile networks, where connections drop every few minutes and clients reconnect from new IP addresses.</p>
+
+          <h2>Sizing the problem</h2>
+          <p>Assume 50 million daily active users sending 40 messages each per day. That is 2 billion messages per day, and a day is 86,400 seconds, so the average send rate is about 23,000 messages per second. Traffic peaks in the evening, and a five times multiplier is a safe planning number, which gives roughly 115,000 messages per second at peak. Every message is also delivered at least once, so the connection tier handles double that in total socket traffic before counting receipts and presence updates.</p>
+          <p>Storage is gentler than the request rate suggests. At 100 bytes for a typical text message plus metadata, 2 billion messages a day is 200 GB per day, which over a year comes to about 73 TB. Even with indexes and replication tripling it, a couple hundred terabytes a year is well within what a modest storage cluster handles, so the pressure point is write throughput and fanout, not capacity.</p>
+          <p>The connection count is the number that makes this system different. If a quarter of daily actives are connected at the evening peak, that is 12.5 million concurrent sockets. A well-tuned server holding mostly idle connections can manage on the order of a million sockets, so the floor is around 13 chat servers, and running 25 to 30 gives headroom for failure and deploys. Holding a socket is cheap in CPU but real in memory, roughly tens of kilobytes per connection, so a million sockets costs tens of gigabytes of RAM per box.</p>
+
+          <h2>Connections and the interface</h2>
+          <p>The first design decision is how the server pushes a message to a recipient who did not ask for it. Plain HTTP polling, where the client asks "anything new?" every few seconds, collapses at this scale: 50 million clients polling every five seconds is 10 million requests per second, almost all of which return nothing. Long polling improves on that by having the server hold each request open until a message arrives or a timeout passes, which removes the empty responses but still pays connection setup costs and keeps one outstanding request per client. The right tool is a WebSocket, which is a persistent two-way TCP connection created by upgrading an ordinary HTTP request; once established, either side can send frames at any time with a few bytes of overhead, so the server can push a message the instant it arrives. Long polling stays in the design as the fallback for the small fraction of corporate networks and old proxies that mishandle WebSocket upgrades.</p>
+          <pre><code class="language-http">GET /ws HTTP/1.1
+Host: chat.example.com
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+
+HTTP/1.1 101 Switching Protocols
+
+// after the upgrade, JSON frames flow both ways
+→ { "type": "send", "channel_id": "c917", "client_msg_id": "a1b2", "text": "hey" }
+← { "type": "ack", "client_msg_id": "a1b2", "msg_id": 4821, "state": "sent" }
+← { "type": "message", "channel_id": "c917", "msg_id": 4822, "from": "u042", "text": "hi" }
+← { "type": "receipt", "channel_id": "c917", "msg_id": 4821, "state": "read" }
+</code></pre>
+          <p>The <code>client_msg_id</code> matters more than it looks. Mobile networks drop acknowledgments as readily as they drop messages, and a client that resends after a timeout must not create a duplicate, so the server treats sends as idempotent, meaning a retried request with the same client ID has no additional effect and simply returns the original result.</p>
+
+          <h2>The data model</h2>
+          <p>Messages are written once, never updated, read as recent ranges within one conversation, and arrive at 23,000 per second sustained. That access pattern fits a wide-column store such as Cassandra or HBase, which is a database organized as a sorted key-value structure where all rows sharing a partition key live together in write-optimized log-structured storage. A relational database fits poorly here, not because SQL cannot express the schema but because sustaining this insert volume on B-tree indexes forces heavy sharding anyway, and none of the relational machinery (joins, multi-row transactions) is needed on the hot path.</p>
+          <pre><code class="language-sql">CREATE TABLE messages (
+  channel_id  BIGINT,        -- one-to-one pair or group
+  msg_id      BIGINT,        -- ordered within the channel
+  sender_id   BIGINT,
+  body        TEXT,
+  created_at  TIMESTAMP,
+  PRIMARY KEY ((channel_id), msg_id)
+) WITH CLUSTERING ORDER BY (msg_id DESC);
+
+CREATE TABLE inbox (
+  user_id     BIGINT,        -- per-user delivery feed
+  seq         BIGINT,        -- per-user sequence number
+  channel_id  BIGINT,
+  msg_id      BIGINT,
+  PRIMARY KEY ((user_id), seq)
+);
+</code></pre>
+          <p>Partitioning by <code>channel_id</code> keeps each conversation's history together so the common query, the latest fifty messages in this channel, is one sequential read. The <code>inbox</code> table is the per-user feed that multi-device sync will lean on later: every message addressed to a user lands there with a per-user sequence number, so a device can ask "everything after sequence 90,210" and get one ordered answer covering all of its conversations.</p>
+
+          <h2>The high-level architecture</h2>
+          <p>Clients hold a WebSocket to a chat server, and because a socket lives on exactly one machine, the tier is stateful: the system must always be able to answer "which server holds this user's connection right now?" That answer lives in a session registry, a small key-value store mapping user ID to server, written when a connection is established and cleared when it drops. Between acceptance and delivery sits a message queue, which decouples the sender's server from the recipient's so that persistence and delivery proceed even when the recipient's server is slow, and the message store and push notification service hang off that path.</p>
+          <div class="diagram"><svg width="100%" style="max-width: 760px" viewBox="0 0 760 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="High-level chat architecture with the WebSocket tier, session registry, message store, queue, and push path"><defs><marker id="arr-ch1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#86868b"/></marker></defs><g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"><rect x="20" y="64" width="130" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="85" y="95" text-anchor="middle" font-size="14" fill="#1d1d1f">Sender device</text><rect x="250" y="64" width="150" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="325" y="95" text-anchor="middle" font-size="14" fill="#1d1d1f">Chat server A</text><rect x="250" y="154" width="150" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="325" y="178" text-anchor="middle" font-size="14" fill="#1d1d1f">Message queue</text><text x="325" y="194" text-anchor="middle" font-size="11" fill="#5f5f66">per-recipient delivery</text><rect x="250" y="244" width="150" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="325" y="275" text-anchor="middle" font-size="14" fill="#1d1d1f">Chat server B</text><rect x="20" y="244" width="130" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="85" y="275" text-anchor="middle" font-size="14" fill="#1d1d1f">Recipient device</text><rect x="560" y="20" width="180" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="650" y="44" text-anchor="middle" font-size="14" fill="#1d1d1f">Session registry</text><text x="650" y="60" text-anchor="middle" font-size="11" fill="#5f5f66">user → server map</text><rect x="560" y="110" width="180" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="650" y="134" text-anchor="middle" font-size="14" fill="#1d1d1f">Message store</text><text x="650" y="150" text-anchor="middle" font-size="11" fill="#5f5f66">wide-column, by channel</text><rect x="560" y="200" width="180" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="650" y="224" text-anchor="middle" font-size="14" fill="#1d1d1f">Push service</text><text x="650" y="240" text-anchor="middle" font-size="11" fill="#5f5f66">APNs / FCM</text><path d="M150,90 H250" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-ch1)"/><text x="200" y="82" text-anchor="middle" font-size="12" fill="#5f5f66">WebSocket</text><path d="M400,80 H480 V46 H560" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-ch1)"/><text x="470" y="32" text-anchor="middle" font-size="12" fill="#5f5f66">route lookup</text><path d="M325,116 V154" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-ch1)"/><text x="335" y="138" text-anchor="start" font-size="12" fill="#5f5f66">enqueue</text><path d="M400,168 H500 V136 H560" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-ch1)"/><text x="530" y="128" text-anchor="middle" font-size="12" fill="#5f5f66">persist</text><path d="M400,192 H480 V226 H560" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-ch1)"/><text x="520" y="216" text-anchor="middle" font-size="12" fill="#5f5f66">offline</text><path d="M325,206 V244" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-ch1)"/><text x="335" y="228" text-anchor="start" font-size="12" fill="#5f5f66">deliver</text><path d="M250,270 H150" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-ch1)"/><text x="200" y="262" text-anchor="middle" font-size="12" fill="#5f5f66">push frame</text></g></svg></div>
+          <p class="quiet">Chat servers hold the sockets, the session registry says which server holds whom, and the queue decouples persistence and delivery; when no socket exists the dashed branch hands the message to the push service.</p>
+
+          <h2>The life of a one-to-one message</h2>
+          <p>The sequence below is where the architecture earns its keep, and the ordering of the steps is deliberate: the message is persisted before the sender sees "sent," so a crash after that point can delay delivery but never lose data.</p>
+          <div class="diagram"><svg width="100%" style="max-width: 760px" viewBox="0 0 760 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="One-to-one message delivery sequence with acknowledgment states and the offline push branch"><defs><marker id="arr-ch2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#86868b"/></marker></defs><g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"><rect x="20" y="50" width="110" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="75" y="81" text-anchor="middle" font-size="14" fill="#1d1d1f">Sender</text><rect x="200" y="50" width="140" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="270" y="81" text-anchor="middle" font-size="14" fill="#1d1d1f">Chat server A</text><rect x="420" y="50" width="140" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="490" y="81" text-anchor="middle" font-size="14" fill="#1d1d1f">Chat server B</text><rect x="630" y="50" width="110" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="685" y="81" text-anchor="middle" font-size="14" fill="#1d1d1f">Recipient</text><rect x="200" y="170" width="140" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="270" y="201" text-anchor="middle" font-size="14" fill="#1d1d1f">Message store</text><rect x="420" y="170" width="140" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="490" y="194" text-anchor="middle" font-size="14" fill="#1d1d1f">Push service</text><text x="490" y="210" text-anchor="middle" font-size="11" fill="#5f5f66">offline branch</text><path d="M130,66 H200" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-ch2)"/><circle cx="165" cy="48" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="165" y="52" text-anchor="middle" font-size="11" fill="#1d1d1f">1</text><path d="M250,102 V170" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-ch2)"/><circle cx="271" cy="136" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="271" y="140" text-anchor="middle" font-size="11" fill="#1d1d1f">2</text><path d="M200,90 H130" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-ch2)"/><circle cx="165" cy="108" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="165" y="112" text-anchor="middle" font-size="11" fill="#1d1d1f">3</text><path d="M340,66 H420" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-ch2)"/><circle cx="380" cy="48" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="380" y="52" text-anchor="middle" font-size="11" fill="#1d1d1f">4</text><path d="M560,66 H630" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-ch2)"/><circle cx="595" cy="48" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="595" y="52" text-anchor="middle" font-size="11" fill="#1d1d1f">5</text><path d="M630,90 H560" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-ch2)"/><circle cx="595" cy="108" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="595" y="112" text-anchor="middle" font-size="11" fill="#1d1d1f">6</text><path d="M490,102 V170" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-ch2)"/><circle cx="511" cy="136" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="511" y="140" text-anchor="middle" font-size="11" fill="#1d1d1f">7</text></g></svg></div>
+          <p class="quiet">Step 1: the sender writes over its socket. Step 2: server A persists the message and assigns its channel sequence number. Step 3: server A acknowledges "sent." Step 4: server A forwards to server B, found via the session registry. Step 5: server B pushes the frame down the recipient's socket. Step 6: the recipient acknowledges, and a "delivered" receipt flows back along the reverse path. Step 7: if the registry shows no socket, the dashed branch hands the message to the push service instead.</p>
+          <p>The message ID assigned in step 2 carries the ordering of the whole conversation, so it deserves a moment. The clean option is a per-channel sequence: a counter scoped to the channel, so messages get IDs 1, 2, 3 within that conversation and sorting by ID is exactly the order everyone should see. Maintaining a counter per channel costs an atomic increment on the channel's partition, which the wide-column store can do cheaply because the partition lives on one node at a time. The looser option is a time-ordered global ID in the style of Twitter's Snowflake, a 64-bit number packing a millisecond timestamp, a machine ID, and a small counter, which needs no coordination at all but only orders messages as well as the clocks agree, so two messages in the same millisecond from different servers can sort either way. For chat, per-channel sequences are worth the small coordination cost because users notice misordered replies, and the channel partition is already the unit of storage.</p>
+
+          <h2>Multi-device sync and delivery states</h2>
+          <p>One user is several devices, and a message must reach the phone in a pocket and the laptop at a desk, whichever connects next. The per-user inbox from the data model is the mechanism: every inbound message lands in the recipient's inbox with an increasing per-user sequence number, and each device keeps a cursor, which is simply the highest sequence number it has applied. A device that reconnects after a subway ride sends its cursor, the server returns everything after it in order, and the device is current again without any per-conversation bookkeeping. The same inbox covers the sender's other devices too: when a user sends from the phone, the message is also placed in the user's own inbox so the laptop renders the outgoing message in the right place.</p>
+          <p>Delivery states ride the same rails as messages because they are messages, just tiny ones. "Sent" is the acknowledgment in step 3 of the sequence, issued the moment the store accepts the write. "Delivered" is a receipt frame the recipient's device emits when the message arrives, and it travels back through the recipient's chat server into the sender's inbox, updating the tick mark on every sender device. "Read" is the same receipt with a different state, emitted when the conversation is actually on screen. The volume is real, since every message can generate two receipts, roughly doubling write traffic again, which is one more reason the storage tier was chosen for cheap appends. In groups the read state is kept per member and most products surface only an aggregate, "read by 12," because rendering 200 individual receipt streams helps nobody.</p>
+
+          <h2>Group chat, fanout, and presence</h2>
+          <p>A group message must reach every member, and there are two ways to arrange that. Fanout on write copies the message into every member's inbox at send time, so each device syncs exactly one stream, its own inbox, and reads are as cheap as one-to-one chat. Fanout on read writes the message once to the group's channel and makes each device pull from every channel it belongs to. The arithmetic picks the policy: for a 50-member group, fanout on write costs 50 inbox appends of roughly 100 bytes each, about 5 KB per message, which is trivial against the simplicity it buys. For a 100,000-member announcement channel, the same message would cost 100,000 writes, and a hundred messages a day in such a channel is 10 million writes for content most members will never scroll to, so large channels flip to fanout on read: the message is written once, members' devices query the channel on open, and only a lightweight "channel has news" hint is pushed. A threshold of a few thousand members, tuned by measurement, separates the regimes.</p>
+          <p>Presence, the green dot, is a soft-state system layered alongside messaging. Each connected client sends a heartbeat, a tiny keepalive frame every 30 seconds or so, and the chat server records last-seen timestamps in a memory store; a user is shown online if a heartbeat arrived within the last minute, which means the indicator can lag a real disconnect by that window, and that imprecision is accepted everywhere because the alternative is a storm of flapping transitions on every cellular hiccup. When status changes, the change is fanned out to friends who are themselves online, and here the arithmetic bites again: 12.5 million connected users each notifying a few hundred friends on every transition is billions of tiny updates an hour, so high-fanout cases are not pushed at all. Instead, the client pulls presence lazily for exactly the users on screen, and pushed updates are reserved for small friend lists or open conversations.</p>
+          <p>End-to-end encryption deserves an acknowledgment even when the interviewer leaves it out of scope. In an end-to-end design the devices hold the keys and encrypt for each other, so the server still routes, stores, and fans out ciphertext exactly as drawn, but it can no longer index message bodies, scan for abuse server-side, or render previews; search moves on-device and the message store becomes a blind mailbox. The architecture survives intact, which is worth saying out loud, but every feature that read message content has to be redesigned or dropped.</p>
+
+          <h2>Scaling, failures, and operations</h2>
+          <p>Each tier scales by its own rule. Chat servers scale by adding boxes, but unlike stateless services they cannot hide behind a plain load balancer for delivery, because a specific user lives on a specific server; the session registry absorbs that, and it must itself be a small replicated store (Redis with replicas, or etcd) since losing it strands every in-flight delivery. The message store scales by partitions, and because partition keys are channel and user IDs, load spreads evenly except for the occasional enormous channel, which the fanout-on-read policy already keeps from becoming a hot partition. The queue scales by topic partitions keyed on recipient, which preserves per-user ordering while spreading throughput.</p>
+          <p>The interesting failure is a chat server dying with a million sockets on it. Every affected client notices the dead TCP connection within seconds and reconnects through the load balancer to a surviving server, which updates the session registry; messages sent to them in the gap simply wait in their inboxes and arrive on the cursor sync that follows every reconnect, so nothing is lost. The operational hazard is the reconnect itself: a million clients retrying at once is a thundering herd that can knock over the next server too, so clients back off with jitter, meaning each one waits a randomized, growing delay before retrying, and servers shed load by accepting connections before processing backlogs. Deploys get the same care, draining sockets gradually rather than restarting a full box at once. Push notifications are the tier the system does not control, so they are treated as best effort with delivery confirmed only when the device actually syncs, and the queue retains undelivered messages until then. Monitoring leans on a few numbers that capture health better than CPU graphs: socket count per server, end-to-end delivery latency sampled by echo messages, inbox backlog age, and registry staleness.</p>
+
+          <h2>Follow-up questions</h2>
+          <ul>
+            <li><strong>Why WebSockets instead of long polling everywhere?</strong> Long polling re-establishes a request per message and wastes a connection slot per idle client, while a WebSocket amortizes one TCP connection across the whole session with tiny per-frame overhead. Long polling survives as the fallback for networks that break upgrades.</li>
+            <li><strong>Where does message order come from?</strong> From a per-channel sequence number assigned at persistence time on the channel's partition. Client timestamps are untrustworthy and server clocks differ, so ordering by an assigned sequence is the only answer that holds up.</li>
+            <li><strong>What happens when a chat server dies?</strong> Clients detect the dead socket and reconnect with jittered backoff, the registry is updated, and the cursor-based inbox sync replays anything missed. Persistence happened before acknowledgment, so the failure delays delivery rather than losing messages.</li>
+            <li><strong>Why not MySQL for messages?</strong> The access pattern is append-only writes at tens of thousands per second and range reads within a partition, which log-structured wide-column stores serve natively. Relational engines can be sharded into doing it, but none of their strengths are used on this path.</li>
+            <li><strong>How do you avoid duplicate messages on retry?</strong> The client attaches a client-generated message ID and the server treats sends as idempotent, returning the original result for a retried ID instead of writing a second row.</li>
+            <li><strong>How would end-to-end encryption change the design?</strong> Routing, storage, and fanout are unchanged but carry ciphertext, while every server-side feature that reads content, search indexing, previews, and content moderation, must move on-device or disappear.</li>
+          </ul>
+
+          <h2>References</h2>
+          <ol class="refs">
+            <li>Xu, <a href="https://www.amazon.com/System-Design-Interview-insiders-Second/dp/B08CMF2CQF" target="_blank" rel="noreferrer">System Design Interview, Volume 1</a> (2020), chapter on chat systems.</li>
+            <li>Fette and Melnikov, <a href="https://datatracker.ietf.org/doc/html/rfc6455" target="_blank" rel="noreferrer">RFC 6455: The WebSocket Protocol</a> (2011).</li>
+            <li>Discord Engineering, <a href="https://discord.com/blog/how-discord-stores-billions-of-messages" target="_blank" rel="noreferrer">How Discord Stores Billions of Messages</a> (2017).</li>
+            <li>High Scalability, <a href="http://highscalability.com/blog/2014/2/26/the-whatsapp-architecture-facebook-bought-for-19-billion.html" target="_blank" rel="noreferrer">The WhatsApp Architecture Facebook Bought for $19 Billion</a> (2014).</li>
+            <li>Kleppmann, <a href="https://dataintensive.net/" target="_blank" rel="noreferrer">Designing Data-Intensive Applications</a> (2017), on partitioning and ordering.</li>
+          </ol>
+        </article>
+      </div>
+    </section>
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (window.hljs) hljs.highlightAll();
+      });
+    </script>
+  </body>
+</html>

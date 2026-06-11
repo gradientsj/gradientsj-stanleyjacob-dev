@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Design a web crawler · Stanley Jacob</title>
+    <meta name="description" content="An interview walkthrough of designing a web crawler: sizing the fetch loop, the URL frontier with front and back queues for politeness, dedup with Bloom filters and simhash, spider traps, and recrawl scheduling." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems" class="active">Systems</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/systems">← Systems</a></div>
+        <h1>Design a web crawler</h1>
+        <p class="meta">Systems design · Search and discovery · Apr 2025</p>
+      </div>
+    </header>
+    <section style="padding-top: 0">
+      <div class="wrap">
+        <article class="prose article">
+          <p>A web crawler starts from a set of seed URLs, downloads those pages, extracts the links they contain, and follows them, repeating until it has visited some meaningful slice of the web. Search engines run crawlers to build their indexes, archives run them to preserve pages before they disappear, and research and monitoring systems run them to mine content at scale. The loop sounds like a weekend project, and a single-machine crawler genuinely is one, which is exactly why interviewers ask the question: the distance between the toy and the real system is made of problems that only appear at scale, and most of them are about restraint rather than speed.</p>
+          <p>That restraint is the social contract of crawling. A crawler is a guest on every server it visits, and an aggressive one is indistinguishable from a denial-of-service attack, so politeness, honoring each site's stated rules and limiting request rate per host, is a first-class design constraint rather than a feature to add later. The hard parts of this design live in three places: the URL frontier, which is the data structure that decides what to fetch next while enforcing politeness; deduplication of both URLs and content at billions of items; and the traps a hostile or merely strange web lays for any program that follows links blindly.</p>
+
+          <h2>Scope and requirements</h2>
+          <p>Functionally, the crawler should fetch HTML pages starting from seeds, extract and follow links, store raw page content for downstream consumers such as an indexer, and revisit pages to pick up changes. Scope excludes rendering JavaScript-heavy pages (a real consideration, but a separate fleet of headless browsers), and excludes non-HTML media beyond noting their links. Non-functionally, the target is one billion pages per month with the politeness rules above, resilience to individual machine failures without losing the frontier, and extensibility, since every crawl operator eventually adds new content processors.</p>
+          <p>It is worth saying that coverage and freshness fight each other for the same fetch budget. Every request spent revisiting a known page is a request not spent discovering a new one, so the requirement is not "crawl everything, always fresh" but "spend a fixed budget where it earns the most," which reframes the scheduler as the interesting component rather than the downloader.</p>
+
+          <h2>Sizing the problem</h2>
+          <p>One billion pages per month over roughly 2.6 million seconds is about 385 pages per second, call it 400. At an average page size of 500 KB, that is 400 times 500 KB, or 200 MB/s of download bandwidth, about 1.6 Gbps sustained, which a small fleet handles without exotic networking. Storage is the bigger number: one billion pages times 500 KB is 500 TB per month of raw HTML before compression, and HTML compresses well, so 100 to 150 TB per month lands in the blob store, with retention policy deciding how many months accumulate.</p>
+          <p>The politeness constraint converts throughput into concurrency. If the crawler limits itself to one request per host every two seconds, sustaining 400 pages per second requires fetches in flight against at least 800 distinct hosts at any moment, and since a fetch including DNS, connect, and transfer takes about a second on average, the fleet needs on the order of a thousand concurrent connections spread across hosts. That single calculation explains the frontier design below: the scheduler's real job is keeping hundreds of hosts in rotation, not keeping a queue full.</p>
+
+          <h2>The crawler's interface to the web</h2>
+          <p>The crawler speaks plain HTTP, and two exchanges define its manners. Before fetching anything from a host, it fetches and caches that host's <code>robots.txt</code>, the file where sites declare what crawlers may touch, and on revisits it uses conditional requests so unchanged pages cost almost nothing.</p>
+          <pre><code class="language-http">GET /robots.txt HTTP/1.1
+Host: example.com
+User-Agent: research-crawler/1.0 (+https://crawler.example.org/about)
+
+→ 200
+User-agent: *
+Disallow: /private/
+Crawl-delay: 2
+
+GET /products/blue-shoes HTTP/1.1
+Host: example.com
+If-Modified-Since: Tue, 01 Apr 2025 08:00:00 GMT
+
+→ 304 Not Modified              (unchanged: no body transferred)
+</code></pre>
+          <p>The descriptive User-Agent with a contact URL is part of the contract: site operators seeing the crawler in their logs can find out who is fetching and ask for changes, and crawlers that hide behind browser agent strings get blocked as abusers because that is what they resemble.</p>
+
+          <h2>The data model</h2>
+          <p>Raw page bodies go to a blob store keyed by content hash, and a metadata database carries the crawl state per URL. The per-URL row is what the scheduler reads and writes, so it stays narrow.</p>
+          <pre><code class="language-sql">CREATE TABLE urls (
+  url_hash      BYTEA PRIMARY KEY,     -- 16-byte hash of normalized URL
+  url           TEXT NOT NULL,
+  host          TEXT NOT NULL,
+  last_fetched  TIMESTAMPTZ,
+  content_hash  BYTEA,                 -- last seen body checksum
+  change_score  REAL DEFAULT 0.5,      -- estimated change frequency
+  depth         SMALLINT DEFAULT 0,
+  failures      SMALLINT DEFAULT 0
+);
+</code></pre>
+          <p>One billion URLs at roughly 200 bytes per row is about 200 GB, which shards comfortably by url_hash; the table's job is bookkeeping, while the heavy read-write traffic of "have I seen this URL" goes through an in-memory structure described below.</p>
+
+          <h2>The high-level architecture</h2>
+          <p>The system is a loop drawn as a pipeline. The URL frontier holds URLs waiting to be fetched and releases them according to priority and politeness. Fetcher workers take URLs from the frontier, resolve DNS through a local cache, download the page, and hand the body to a content-dedup check that discards pages whose content was already stored under a different URL. New content goes to the blob store, and a parser extracts outgoing links, which pass through URL normalization, filtering, and the seen-set test before the survivors re-enter the frontier, closing the loop. Traversal is breadth-first in flavor, since links are discovered level by level from the seeds, but the frontier's priorities mean it is never strictly BFS: important or fast-changing pages jump the line, which is the behavior you actually want.</p>
+          <div class="diagram"><svg width="100%" style="max-width: 760px" viewBox="0 0 760 310" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Crawler pipeline: frontier, fetchers with DNS cache, content dedup, blob store, link extractor, URL normalizer, and seen set feeding back to the frontier"><defs><marker id="arr-wc1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#86868b"/></marker></defs><g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"><rect x="20" y="100" width="140" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="90" y="124" text-anchor="middle" font-size="14" fill="#1d1d1f">URL frontier</text><text x="90" y="140" text-anchor="middle" font-size="11" fill="#5f5f66">politeness + priority</text><rect x="230" y="10" width="140" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="300" y="41" text-anchor="middle" font-size="14" fill="#1d1d1f">DNS cache</text><rect x="230" y="100" width="140" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="300" y="124" text-anchor="middle" font-size="14" fill="#1d1d1f">Fetcher pool</text><text x="300" y="140" text-anchor="middle" font-size="11" fill="#5f5f66">obeys robots.txt</text><rect x="430" y="100" width="140" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="500" y="124" text-anchor="middle" font-size="14" fill="#1d1d1f">Content dedup</text><text x="500" y="140" text-anchor="middle" font-size="11" fill="#5f5f66">checksum, simhash</text><rect x="640" y="10" width="100" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="690" y="34" text-anchor="middle" font-size="14" fill="#1d1d1f">Blob store</text><text x="690" y="50" text-anchor="middle" font-size="11" fill="#5f5f66">raw HTML</text><rect x="620" y="100" width="120" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="680" y="131" text-anchor="middle" font-size="14" fill="#1d1d1f">Link extractor</text><rect x="430" y="220" width="160" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="510" y="244" text-anchor="middle" font-size="14" fill="#1d1d1f">URL normalizer</text><text x="510" y="260" text-anchor="middle" font-size="11" fill="#5f5f66">canonical form, filters</text><rect x="180" y="220" width="140" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="250" y="244" text-anchor="middle" font-size="14" fill="#1d1d1f">URL seen set</text><text x="250" y="260" text-anchor="middle" font-size="11" fill="#5f5f66">Bloom filter</text><path d="M160,126 H230" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-wc1)"/><text x="195" y="114" text-anchor="middle" font-size="12" fill="#5f5f66">next URL</text><path d="M300,100 V62" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-wc1)"/><text x="312" y="85" text-anchor="start" font-size="12" fill="#5f5f66">resolve</text><path d="M370,126 H430" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-wc1)"/><text x="400" y="114" text-anchor="middle" font-size="12" fill="#5f5f66">page</text><path d="M520,100 V36 H640" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-wc1)"/><text x="580" y="26" text-anchor="middle" font-size="12" fill="#5f5f66">raw HTML</text><path d="M570,126 H620" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-wc1)"/><text x="595" y="114" text-anchor="middle" font-size="12" fill="#5f5f66">if new</text><path d="M680,152 V246 H590" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-wc1)"/><text x="692" y="200" text-anchor="start" font-size="12" fill="#5f5f66">links</text><path d="M430,246 H320" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-wc1)"/><text x="375" y="234" text-anchor="middle" font-size="12" fill="#5f5f66">candidates</text><path d="M180,246 H90 V152" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-wc1)"/><text x="102" y="200" text-anchor="start" font-size="12" fill="#5f5f66">new URLs only</text></g></svg></div>
+          <p class="quiet">The crawl loop: the frontier dispenses URLs under politeness rules, fetchers download through a DNS cache, new content is stored and parsed for links, and normalized unseen URLs flow back into the frontier.</p>
+          <p>DNS deserves its box in that picture because resolution quietly becomes a bottleneck: 400 fetches per second against fresh hostnames is 400 resolver queries per second, each costing tens of milliseconds through a typical resolver chain. Running a local caching resolver per crawler node, with the crawler's own cache keyed by host on top, turns the common case into a memory lookup and also gives one place to implement per-host connection reuse.</p>
+
+          <h2>The frontier: front queues for priority, back queues for politeness</h2>
+          <p>A naive frontier is one big FIFO queue, and it fails politeness immediately: a burst of links discovered on one site, say ten thousand URLs from example.com, would be fetched back to back, hammering that host. The classic fix, from the Mercator crawler, splits the frontier in two. A set of front queues implements priority: a prioritizer scores each incoming URL by signals like site importance, depth from seeds, and expected change rate, and places it in the queue for its priority band. A larger set of back queues implements politeness: each back queue holds URLs for exactly one host, a table maps hosts to their queues, and a delay heap orders hosts by the earliest time each may be contacted again, based on its crawl delay.</p>
+          <div class="diagram"><svg width="100%" style="max-width: 760px" viewBox="0 0 760 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Frontier internals: prioritizer feeding front queues by priority, a router filling one back queue per host, and a delay heap timing host access for fetchers"><defs><marker id="arr-wc2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#86868b"/></marker></defs><g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"><rect x="20" y="130" width="130" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="85" y="154" text-anchor="middle" font-size="14" fill="#1d1d1f">Prioritizer</text><text x="85" y="170" text-anchor="middle" font-size="11" fill="#5f5f66">priority score</text><rect x="200" y="90" width="150" height="44" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="275" y="109" text-anchor="middle" font-size="14" fill="#1d1d1f">Front queue 1</text><text x="275" y="125" text-anchor="middle" font-size="11" fill="#5f5f66">high priority</text><rect x="200" y="180" width="150" height="44" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="275" y="199" text-anchor="middle" font-size="14" fill="#1d1d1f">Front queue 2</text><text x="275" y="215" text-anchor="middle" font-size="11" fill="#5f5f66">low priority</text><rect x="400" y="130" width="140" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="470" y="154" text-anchor="middle" font-size="14" fill="#1d1d1f">Back-queue router</text><text x="470" y="170" text-anchor="middle" font-size="11" fill="#5f5f66">host table</text><rect x="600" y="30" width="140" height="44" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="670" y="49" text-anchor="middle" font-size="14" fill="#1d1d1f">Back queue 1</text><text x="670" y="65" text-anchor="middle" font-size="11" fill="#5f5f66">host a.example</text><rect x="600" y="130" width="140" height="44" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="670" y="149" text-anchor="middle" font-size="14" fill="#1d1d1f">Back queue 2</text><text x="670" y="165" text-anchor="middle" font-size="11" fill="#5f5f66">host b.example</text><rect x="600" y="230" width="140" height="44" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="670" y="249" text-anchor="middle" font-size="14" fill="#1d1d1f">Back queue 3</text><text x="670" y="265" text-anchor="middle" font-size="11" fill="#5f5f66">host c.example</text><rect x="150" y="310" width="160" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="230" y="334" text-anchor="middle" font-size="14" fill="#1d1d1f">Delay heap</text><text x="230" y="350" text-anchor="middle" font-size="11" fill="#5f5f66">host → ready time</text><rect x="400" y="310" width="150" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="475" y="341" text-anchor="middle" font-size="14" fill="#1d1d1f">Fetcher threads</text><path d="M150,146 H175 V112 H200" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-wc2)"/><path d="M150,166 H175 V202 H200" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-wc2)"/><path d="M350,112 H375 V146 H400" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-wc2)"/><path d="M350,202 H375 V166 H400" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-wc2)"/><path d="M540,140 H570 V52 H600" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-wc2)"/><path d="M540,156 H600" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-wc2)"/><path d="M540,172 H570 V252 H600" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-wc2)"/><path d="M310,330 H400" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-wc2)"/><text x="355" y="320" text-anchor="middle" font-size="12" fill="#5f5f66">pop ready host</text><path d="M400,352 H310" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-wc2)"/><text x="355" y="378" text-anchor="middle" font-size="12" fill="#5f5f66">push host, now + delay</text><path d="M600,266 H580 V336 H550" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-wc2)"/><text x="592" y="300" text-anchor="end" font-size="12" fill="#5f5f66">dequeue</text></g></svg></div>
+          <p class="quiet">Incoming URLs are scored into front queues; the router moves them into per-host back queues, never mixing hosts. A fetcher pops the next ready host from the delay heap, dequeues one URL from that host's back queue (dashed), fetches it, and pushes the host back with ready time now plus its crawl delay.</p>
+          <p>The flow step by step: a fetcher wanting work pops the delay heap, which yields the host whose ready time has passed, takes one URL from that host's back queue, and fetches it. When the fetch completes, the host goes back on the heap with a ready time of now plus its delay, two seconds by default or whatever <code>Crawl-delay</code> requested. If a back queue empties, the router refills it by pulling from the front queues, biased toward the high-priority queues, and assigns any URL from a brand-new host to a free back queue, updating the host table. Priority and politeness stay cleanly separated: the front queues decide what deserves fetching, the back queues and heap decide when each host can be touched, and no burst of discoveries can ever concentrate requests on one server. Keeping roughly three times as many back queues as fetcher threads ensures a fetcher almost always finds some host ready.</p>
+
+          <h2>Deduplication, traps, and recrawl</h2>
+          <p>The seen-set answers "has this URL ever entered the frontier?" billions of times, so it cannot be a database round trip per link. URLs are first normalized, lowercasing scheme and host, resolving relative paths, sorting or stripping known-irrelevant query parameters, and removing fragments, so that trivially different spellings of the same page collapse. Then a Bloom filter, a compact bit array that answers definitely-no or probably-yes using a few hash probes per key, screens candidates in memory: 10 billion URLs at 10 bits each is about 12.5 GB for a false-positive rate near 1 percent. The trade is that a false positive silently skips a never-seen URL, which costs about 1 percent of discovered links; a crawl that cannot accept that pairs the filter with a sharded key-value confirmation for filter hits, paying the lookup only on the rare probably-yes path.</p>
+          <p>Content dedup is the same idea one level up, because the web is full of identical bodies under different URLs, mirrors, session-ID variants, and www versus bare domains, and storing each copy wastes the blob store and skews the index. An exact checksum over the body catches identical copies cheaply, and near-duplicate detection catches the boilerplate-plus-same-article case: simhash condenses a document into a 64-bit fingerprint with the property that similar documents differ in only a few bits, so checking new fingerprints against the corpus within a small Hamming distance flags near-copies at scale.</p>
+          <p>Spider traps are link structures that generate unbounded URLs, sometimes by accident: an infinite calendar whose "next month" link never ends, session IDs minting a fresh URL per visit, faceted listings multiplying parameters forever. Defenses stack: a depth limit per crawl path, URL pattern heuristics such as rejecting URLs beyond a length cap or with many repeated path segments, and most robustly a per-domain page budget so even an undetected trap costs only that domain's allotment before the crawler moves on. Budgets also bound damage from genuinely enormous sites that would otherwise absorb the whole crawl.</p>
+          <p>Recrawl scheduling closes the loop on freshness. Each fetch that returns 304 or an unchanged checksum nudges that page's change-rate estimate down, and each observed change nudges it up, with the scheduler converting estimates into next-visit times: a news front page every few minutes, a stable reference page every few weeks. The change_score column in the metadata table is exactly this estimate, and the frontier's prioritizer reads it, which is how freshness competes with discovery inside one fetch budget rather than in two separate systems.</p>
+
+          <h2>Scaling, failures, and operations</h2>
+          <p>The crawl distributes by partitioning the URL space by host across crawler nodes, so every URL for example.com lives on the same node. That one decision keeps all politeness state, the back queue, the delay timing, the robots.txt cache for the host, local to one machine with no cross-node coordination on the hot path, and it also localizes DNS cache hits and connection reuse. Links a node extracts for hosts it does not own are forwarded to the owning node, conveniently through a queue partitioned the same way. Adding nodes means re-partitioning hosts, which consistent hashing keeps proportional, and a node's frontier is recoverable because back-queue contents are checkpointed to durable storage; losing a node at worst re-fetches the few pages in flight.</p>
+          <p>The failure stories are mostly graceful. A dead fetcher's URLs time out and retry elsewhere. A slow or unreachable host accumulates failures in the metadata table and gets backed off exponentially, then parked. The blob store and metadata database scale independently, by capacity and by url_hash shards respectively. The system's two real operational hazards are external: hammering someone's site through a politeness defect, which is why per-host rate limiting deserves tests and the User-Agent carries contact information, and being blocked or rate limited by content delivery networks, which is managed by spreading requests in time rather than by evasion. A daily report of top hosts by request count is the cheapest early warning for both.</p>
+
+          <h2>Follow-up questions</h2>
+          <ul>
+            <li><strong>Why partition the crawl by host rather than by URL hash?</strong> Politeness is per host, so host-partitioning keeps the delay state, robots cache, and connection pools on one node. URL-hash partitioning would scatter one host's URLs everywhere and force the nodes to coordinate every fetch against the shared rate limit.</li>
+            <li><strong>What happens when robots.txt itself is unavailable?</strong> A 404 means no restrictions, but a timeout or 5xx is treated conservatively: retry later, and skip the host's pages meanwhile. Caching robots.txt for about a day with revalidation balances respect for changes against fetch overhead.</li>
+            <li><strong>How does the design avoid recrawling the same page forever via different URLs?</strong> Three layers: URL normalization collapses spelling variants, the seen-set drops known URLs, and content dedup catches the remainder where genuinely different URLs return the same body, recording an alias rather than storing a copy.</li>
+            <li><strong>Is this BFS or DFS, and does it matter?</strong> BFS-flavored: discovery spreads outward from seeds, which finds important, well-linked pages early. But strict ordering is abandoned in favor of priorities, since politeness already reorders everything and pages differ enormously in value. DFS is avoided because it dives into one site, which is both rude and low-yield.</li>
+            <li><strong>What breaks first at 10x scale?</strong> The seen-set and frontier memory: 100 GB of Bloom filter wants sharding across nodes, which host-partitioning already provides. Bandwidth grows to 16 Gbps, pushing the fetcher fleet across regions, and the metadata table's write rate makes batched, asynchronous updates necessary.</li>
+            <li><strong>How would you crawl JavaScript-rendered pages?</strong> A separate rendering fleet of headless browsers, fed by the same frontier but budgeted independently, because a rendered fetch costs 10 to 100 times a plain one. Most operators render selectively, triggered by signals that static HTML was empty of content.</li>
+          </ul>
+
+          <h2>References</h2>
+          <ol class="refs">
+            <li>Manning, Raghavan, and Schütze, <a href="https://nlp.stanford.edu/IR-book/html/htmledition/web-crawling-and-indexes-1.html" target="_blank" rel="noreferrer">Introduction to Information Retrieval, chapter 20: Web crawling and indexes</a> (2008), including the Mercator-style frontier.</li>
+            <li>RFC 9309, <a href="https://www.rfc-editor.org/rfc/rfc9309" target="_blank" rel="noreferrer">Robots Exclusion Protocol</a> (2022).</li>
+            <li>Google, <a href="https://developers.google.com/search/docs/fundamentals/how-search-works" target="_blank" rel="noreferrer">How Google Search works: crawling and indexing</a>.</li>
+            <li>Xu, <a href="https://www.amazon.com/System-Design-Interview-insiders-Second/dp/B08CMF2CQF" target="_blank" rel="noreferrer">System Design Interview, Volume 1</a> (2020), chapter on web crawlers.</li>
+          </ol>
+        </article>
+      </div>
+    </section>
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (window.hljs) hljs.highlightAll();
+      });
+    </script>
+  </body>
+</html>

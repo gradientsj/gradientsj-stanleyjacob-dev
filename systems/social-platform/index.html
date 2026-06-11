@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Design a social media platform · Stanley Jacob</title>
+    <meta name="description" content="An interview walkthrough of designing a social media platform: posts, follows, likes, and reposts, fanout timelines with a celebrity exception, sharded counters, media through a CDN, and hot partition mitigation." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems" class="active">Systems</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/systems">← Systems</a></div>
+        <h1>Design a social media platform</h1>
+        <p class="meta">Systems design · Social and messaging · Jun 2025</p>
+      </div>
+    </header>
+    <section style="padding-top: 0">
+      <div class="wrap">
+        <article class="prose article">
+          <p>A social media platform lets people publish short posts with text and images, follow other people, and read a timeline of what the people they follow have published, with likes and reposts layered on top as the engagement currency. Hundreds of millions of people open such an app many times a day, which is why interviewers love the question: it packs a read-heavy serving problem, a write amplification problem, a counting problem, and a media delivery problem into one prompt, and the candidate has to decide which parts deserve the deep dives. The walkthrough below scopes the product, sizes it with worked numbers, decomposes it into services, and then spends its depth on the three places the design actually strains: reposts, counters, and timeline delivery.</p>
+
+          <h2>Scope and requirements</h2>
+          <p>I would pin the feature set early. Users create posts containing text up to a small limit and optionally a few images; users follow each other, and following is one-directional; users can like a post and can repost it, meaning share another person's post to their own followers with the original attributed; and there are two read surfaces, a home timeline showing recent posts from everyone the user follows and a profile timeline showing one user's own posts. Direct messages, search, and ranked recommendations are real systems of their own, so I would explicitly leave them out and note that the timeline design leaves a slot where ranking can plug in later.</p>
+          <p>The non-functional requirements drive the architecture more than the features do. The system is overwhelmingly read-heavy, so home timeline loads must feel instant, ideally under 200 milliseconds end to end, while a new post may take a few seconds to reach all followers because humans cannot perceive that lag in a social context. The platform must stay available through node failures, and it can accept eventual consistency, which means a reader may briefly see slightly stale data that converges shortly after writes stop, for almost everything except one case: a user must see their own post immediately after publishing it, because nothing erodes trust faster than an app that appears to eat your words.</p>
+
+          <h2>Sizing the problem</h2>
+          <p>Concrete numbers turn the design from adjectives into engineering. Assume 200 million daily active users and that on average 2 posts arrive per 10 users per day, which is 0.2 posts per user per day and therefore 40 million posts per day. A day holds 86,400 seconds, so writes average about 460 posts per second, and a peak factor of three puts the write path around 1,400 posts per second. Timeline reads run about 100 times the write rate in this kind of product, which gives 4 billion timeline requests per day, an average of roughly 46,000 reads per second, and peaks near 140,000 per second. That two-and-a-half-orders-of-magnitude gap between reads and writes is the single most important number in the design, because it says we should do extra work at write time to make reads cheap.</p>
+          <p>Storage follows. A post row with text, author, timestamps, and counters fits in about 1 KB, so 40 million posts per day is 40 GB per day and roughly 15 TB per year, which is modest. Media dominates instead: if a quarter of posts carry an image averaging 300 KB, that is 10 million images and 3 TB per day, about 1.1 PB per year, which is why images live in an object store behind a CDN rather than in any database. Fanout is the hidden multiplier: with an average of 200 followers per user, delivering 40 million posts into followers' timelines means 8 billion timeline insertions per day, an average near 93,000 small writes per second, and that number is what the fanout tier must be built to absorb.</p>
+
+          <h2>The API</h2>
+          <p>The external surface is a small set of authenticated JSON endpoints plus a separate upload path for media, where the client first asks for a presigned URL, which is a short-lived URL carrying permission to upload one object directly to storage, so image bytes never pass through the application servers.</p>
+          <pre><code class="language-http">POST /api/v1/posts
+{ "text": "shipping day", "media_ids": ["m-81f2"] }
+→ 201 { "post_id": "p-99021", "created_at": "2025-06-03T17:20:11Z" }
+
+POST /api/v1/posts/p-99021/like        → 204
+POST /api/v1/posts/p-99021/repost      → 201 { "post_id": "p-99544" }
+POST /api/v1/users/u-417/follow        → 204
+
+GET  /api/v1/timeline/home?cursor=p-98712&amp;limit=20
+→ 200 { "posts": [ ... ], "next_cursor": "p-97608" }
+
+POST /api/v1/media/uploads             → 201 { "media_id": "m-81f2",
+                                               "upload_url": "https://..." }
+</code></pre>
+
+          <h2>The data model</h2>
+          <p>Three tables carry the social core, and the repost deliberately reuses the posts table: a repost is a lightweight post whose <code>repost_of</code> column points at the original, with no text of its own in the simple variant. Follows and likes are plain relationship rows, partitioned in practice by their first column so one user's relationships live together.</p>
+          <pre><code class="language-sql">CREATE TABLE posts (
+  post_id     BIGINT PRIMARY KEY,        -- time-ordered ID (Snowflake style)
+  author_id   BIGINT NOT NULL,
+  text        VARCHAR(500),
+  media_ids   JSONB,
+  repost_of   BIGINT,                    -- NULL for original posts
+  created_at  TIMESTAMPTZ NOT NULL,
+  deleted_at  TIMESTAMPTZ
+);
+
+CREATE TABLE follows (
+  follower_id BIGINT NOT NULL,
+  followee_id BIGINT NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (follower_id, followee_id)
+);
+
+CREATE TABLE likes (
+  user_id    BIGINT NOT NULL,
+  post_id    BIGINT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (user_id, post_id)
+);
+</code></pre>
+          <p>Two details earn comment. Post IDs should be time-ordered but not from one central counter, and the Snowflake scheme, which packs a timestamp, a machine ID, and a sequence number into one 64-bit integer, gives every application server the ability to mint sortable unique IDs locally. And the like and repost counts that render on every post are conspicuously absent from these tables as live counters, because maintaining them naively is one of the failure modes this design treats at length below.</p>
+
+          <h2>The high-level architecture</h2>
+          <p>The decomposition follows the data: a user service owns profiles and auth, a social graph service owns follows, a post service owns post rows, a media path of object store plus CDN owns image bytes, a fanout tier turns each new post into timeline entries, and a timeline service assembles home timelines at read time. The fanout tier is asynchronous behind a queue so a publish never waits on 200 cache writes, and the timeline cache holds per-user lists of post IDs rather than full posts so each post body is stored once and referenced many times.</p>
+          <div class="diagram"><svg width="100%" style="max-width: 760px" viewBox="0 0 760 410" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="High-level architecture of the social platform"><defs><marker id="arr-so1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#86868b"/></marker></defs><g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"><rect x="20" y="214" width="110" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="75" y="245" text-anchor="middle" font-size="14" fill="#1d1d1f">Client</text><rect x="180" y="214" width="130" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="245" y="245" text-anchor="middle" font-size="14" fill="#1d1d1f">API gateway</text><rect x="360" y="64" width="150" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="435" y="95" text-anchor="middle" font-size="14" fill="#1d1d1f">Post service</text><rect x="360" y="164" width="150" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="435" y="188" text-anchor="middle" font-size="14" fill="#1d1d1f">Graph service</text><text x="435" y="204" text-anchor="middle" font-size="11" fill="#5f5f66">follows</text><rect x="360" y="264" width="150" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="435" y="288" text-anchor="middle" font-size="14" fill="#1d1d1f">Timeline service</text><text x="435" y="304" text-anchor="middle" font-size="11" fill="#5f5f66">assembles home feed</text><rect x="580" y="64" width="160" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="660" y="88" text-anchor="middle" font-size="14" fill="#1d1d1f">Post store</text><text x="660" y="104" text-anchor="middle" font-size="11" fill="#5f5f66">posts, likes, reposts</text><rect x="580" y="154" width="160" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="660" y="178" text-anchor="middle" font-size="14" fill="#1d1d1f">Fanout workers</text><text x="660" y="194" text-anchor="middle" font-size="11" fill="#5f5f66">queue + workers</text><rect x="580" y="244" width="160" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="660" y="268" text-anchor="middle" font-size="14" fill="#1d1d1f">Timeline cache</text><text x="660" y="284" text-anchor="middle" font-size="11" fill="#5f5f66">per-user post IDs</text><rect x="580" y="334" width="160" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="660" y="358" text-anchor="middle" font-size="14" fill="#1d1d1f">Object store + CDN</text><text x="660" y="374" text-anchor="middle" font-size="11" fill="#5f5f66">images</text><path d="M130,240 H180" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-so1)"/><path d="M225,214 V90 H360" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-so1)"/><text x="295" y="80" text-anchor="middle" font-size="12" fill="#5f5f66">write post</text><path d="M265,214 V190 H360" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-so1)"/><text x="315" y="180" text-anchor="middle" font-size="12" fill="#5f5f66">follow</text><path d="M245,266 V290 H360" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-so1)"/><text x="300" y="284" text-anchor="middle" font-size="12" fill="#5f5f66">read feed</text><path d="M75,266 V340 H580" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-so1)"/><text x="330" y="332" text-anchor="middle" font-size="12" fill="#5f5f66">presigned upload</text><path d="M510,90 H580" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-so1)"/><text x="545" y="80" text-anchor="middle" font-size="12" fill="#5f5f66">insert</text><path d="M510,104 H545 V180 H580" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-so1)"/><text x="552" y="140" text-anchor="start" font-size="12" fill="#5f5f66">enqueue</text><path d="M580,196 H510" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-so1)"/><text x="545" y="224" text-anchor="middle" font-size="12" fill="#5f5f66">followers</text><path d="M660,206 V244" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-so1)"/><text x="668" y="228" text-anchor="start" font-size="12" fill="#5f5f66">push IDs</text><path d="M510,280 H580" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-so1)"/><text x="545" y="270" text-anchor="middle" font-size="12" fill="#5f5f66">read IDs</text></g></svg></div>
+          <p class="quiet">Writes flow along the top: the post service persists the post and enqueues fanout, and workers fetch follower lists and push post IDs into per-user timeline caches that the timeline service reads and then hydrates from the post store. Dashed arrows are asynchronous.</p>
+
+          <h2>Reposts as lightweight posts</h2>
+          <p>Modeling the repost as a post row with a <code>repost_of</code> pointer buys three things at once: reposts flow through the exact same fanout pipeline as originals, they paginate and sort in timelines with no special casing, and the original's content lives in one place so an edit or takedown of the original is reflected everywhere. At render time the timeline service hydrates the repost, sees the pointer, fetches the original in the same batched read, and the client displays the original's content under the reposter's attribution line. Hydration here means converting stored IDs into full display objects by looking them up in a cache or store.</p>
+          <div class="diagram"><svg width="100%" style="max-width: 760px" viewBox="0 0 760 270" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The repost flow step by step"><defs><marker id="arr-so2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#86868b"/></marker></defs><g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"><rect x="20" y="40" width="110" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="75" y="71" text-anchor="middle" font-size="14" fill="#1d1d1f">Client</text><rect x="240" y="40" width="170" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="325" y="71" text-anchor="middle" font-size="14" fill="#1d1d1f">Post service</text><rect x="580" y="40" width="160" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="660" y="64" text-anchor="middle" font-size="14" fill="#1d1d1f">Post store</text><text x="660" y="80" text-anchor="middle" font-size="11" fill="#5f5f66">repost row + original</text><rect x="20" y="190" width="150" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="95" y="214" text-anchor="middle" font-size="14" fill="#1d1d1f">Counter service</text><text x="95" y="230" text-anchor="middle" font-size="11" fill="#5f5f66">sharded, batched</text><rect x="240" y="190" width="170" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="325" y="221" text-anchor="middle" font-size="14" fill="#1d1d1f">Fanout workers</text><rect x="580" y="190" width="160" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="660" y="214" text-anchor="middle" font-size="14" fill="#1d1d1f">Timeline caches</text><text x="660" y="230" text-anchor="middle" font-size="11" fill="#5f5f66">follower ID lists</text><path d="M130,66 H240" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-so2)"/><circle cx="185" cy="48" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="185" y="52" text-anchor="middle" font-size="11" fill="#1d1d1f">1</text><path d="M410,58 H580" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-so2)"/><circle cx="495" cy="40" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="495" y="44" text-anchor="middle" font-size="11" fill="#1d1d1f">2</text><path d="M240,82 H190 V216 H170" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-so2)"/><circle cx="211" cy="150" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="211" y="154" text-anchor="middle" font-size="11" fill="#1d1d1f">3</text><path d="M325,92 V190" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-so2)"/><circle cx="304" cy="141" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="304" y="145" text-anchor="middle" font-size="11" fill="#1d1d1f">4</text><path d="M410,216 H580" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-so2)"/><circle cx="495" cy="198" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="495" y="202" text-anchor="middle" font-size="11" fill="#1d1d1f">5</text><path d="M700,190 V92" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-so2)"/><circle cx="721" cy="141" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="721" y="145" text-anchor="middle" font-size="11" fill="#1d1d1f">6</text></g></svg></div>
+          <p class="quiet">Step 1: the user taps repost. Step 2: the post service writes a lightweight post whose repost_of field references the original. Step 3: the original's repost counter increments through the counter service. Step 4: a fanout job is enqueued. Step 5: workers push the new post ID into followers' timeline caches. Step 6: at render time the cached ID is hydrated, fetching the repost row and the original it points to.</p>
+          <p>Deletion is the case that proves the model. When an original is deleted, the row gets a <code>deleted_at</code> tombstone rather than being removed, and every repost pointing at it hydrates to a placeholder ("this post is unavailable") on the next render, with no need to chase down thousands of repost rows or fanned-out timeline entries at delete time. Counters need symmetric care: a repost increments the original's repost count, deleting the repost decrements it, and deleting the original freezes its counters and removes the original from circulation while the repost shells decay naturally. The one rule worth stating is that the platform never edits other users' timelines synchronously on delete, because tombstone checks at hydration achieve the same effect for the cost of one cache field.</p>
+
+          <h2>Counting likes without melting a row</h2>
+          <p>The naive implementation runs <code>UPDATE posts SET like_count = like_count + 1 WHERE post_id = ?</code> on every like, and it fails precisely on the posts that matter. A relational database serializes writes to a single row through that row's lock, and a hot row sustains perhaps 500 to 1,000 such updates per second before queueing dominates, while a viral post can attract 10,000 likes per second. At that rate the lock queue grows without bound, latencies climb past timeouts, and the failure spreads as retries amplify the load, all while the rest of the database sits idle.</p>
+          <p>The standard fix is to spread and batch. Sharded counters split one logical counter into N rows, each increment picks a shard at random, and the displayed value is the sum, so 16 shards turn 10,000 increments per second into about 625 per shard, inside what a row can take. A counting service goes further by absorbing increments in memory and flushing batched deltas every few hundred milliseconds: 10,000 likes per second flushed every 500 milliseconds across 16 shards becomes 32 database writes per second carrying delta values, a 300-fold reduction in write traffic. The displayed count consequently lags by up to the flush interval, which is invisible in a number already past thousands, and the like rows themselves still land in the likes table so the count can be recomputed from truth if a flush is lost. Like state for the viewing user ("did I like this?") reads from the likes table keyed by user, never from the counter.</p>
+
+          <h2>Timeline delivery and the celebrity exception</h2>
+          <p>Fanout on write means computing each user's home timeline at publish time by pushing the new post ID into every follower's cached timeline, and the sizing numbers say the average case is cheap: 200 followers per post is 200 writes of a few dozen bytes each, roughly 93,000 cache appends per second platform-wide, which a sharded cache cluster absorbs without drama. Reads then become a single cache fetch, which is exactly the trade the 100-to-1 read ratio wants. The alternative, fanout on read, would assemble each timeline on demand by querying every followed account's recent posts, and at 46,000 reads per second against an average of 200 followed accounts that is over 9 million author-timeline lookups per second, which is the wrong side of the arithmetic.</p>
+          <p>Celebrities break the write-side plan: one post by an account with 100 million followers is 100 million cache writes, and at even a million appends per second that single post occupies the fanout tier for 100 seconds while ordinary posts queue behind it. The hybrid answer fans out for normal users but skips fanout for accounts above a follower threshold, on the order of one hundred thousand followers or more, and instead merges at read: the timeline service pulls the user's precomputed timeline from cache, separately fetches recent posts from the handful of celebrities the user follows (those author lists are few and intensely cacheable), and merges the two streams by post ID time order before hydrating. Each user follows few celebrities, so the merge adds a couple of cache reads per timeline load, and the system buys itself out of unbounded write amplification.</p>
+          <p>Viral moments create the mirror-image hot spot on the read side. A post everyone is hydrating lives on one post-cache shard, and 100,000 reads per second against one key can saturate that node's network before its CPU. The mitigations are replication and salting: hot keys get detected by a simple counter and replicated to several cache nodes with clients picking one at random, or the key is salted, meaning copies are written under derived keys like <code>p-99021#3</code> so reads spread across shards by construction. The same trick applies to the celebrity author lists during a news spike.</p>
+
+          <h2>Scaling, failures, and operations</h2>
+          <p>Each tier scales on its own axis. The stateless services scale horizontally behind load balancers; the post store shards by post ID and replicates each shard, with reads happily served from replicas because staleness of seconds is acceptable; the graph store shards by user ID so one user's follow list is one partition read; the timeline cache shards by user ID across a cluster sized by the arithmetic above (200 million users with an 800-entry ID list at 8 bytes each is about 1.3 TB, which is 30 to 40 large cache nodes); and the object store and CDN are bought, not built. The fanout queue is the system's shock absorber: a publish spike becomes queue depth rather than write failures, and the visible symptom is that posts take longer to appear in followers' timelines, which the product tolerates by design.</p>
+          <p>Failures map to degraded freshness rather than errors when the design is working. A dead fanout worker's jobs get re-delivered by the queue, and because appending a post ID to a timeline twice is repaired by de-duplication at read, at-least-once delivery is safe. A lost timeline cache node costs its users a rebuild, either lazily on next read by querying followed accounts (expensive but rare) or by replaying recent fanout jobs. A post store shard failover pauses writes to that ID range for seconds while a replica promotes. The metrics that matter operationally are fanout queue lag, cache hit rates, and the p99 of timeline assembly, and the worst real-world day is a global event when posting rate, like rate, and read rate all spike together, which is why every tier needs headroom rather than exact-fit capacity.</p>
+
+          <h2>Follow-up questions</h2>
+          <ul>
+            <li><strong>What happens when the original of a repost is deleted?</strong> The original row gets a tombstone, and every repost hydrates to an unavailable placeholder on next render. Nothing chases repost rows or fanned-out entries synchronously, since hydration-time checks give the same result for one cache field.</li>
+            <li><strong>Why not store like_count directly on the posts row?</strong> A single row sustains maybe a thousand locked updates per second and viral posts attract ten thousand likes per second, so the hot row queues and times out. Sharded counters with batched flushes cut the write rate by orders of magnitude, for example 10,000 per second becoming 32 batched writes per second.</li>
+            <li><strong>How do you pick the celebrity threshold?</strong> By equating costs: fanout costs followers-count writes once, read-merge costs one extra fetch per timeline load of each follower forever. Accounts around one hundred thousand followers are where fanout latency and queue occupancy stop being worth it, and the threshold should be a tunable, not a constant.</li>
+            <li><strong>How do timelines avoid unbounded memory?</strong> Cached timelines are capped, around 800 post IDs, because almost nobody pages past that; deeper history falls back to a slower query path against the post store via the follow list.</li>
+            <li><strong>What if a fanout worker dies mid-job?</strong> The queue re-delivers, and appends are idempotent in effect because duplicate IDs are dropped at read. At-least-once plus idempotent application is the standard recipe, and it is cheaper than trying to build exactly-once delivery.</li>
+            <li><strong>How do you survive a viral post hammering one cache shard?</strong> Detect the hot key by counting, then replicate it across nodes or salt it into several derived keys so reads spread. The post body is immutable, so copies cannot diverge in any way that matters.</li>
+          </ul>
+
+          <h2>References</h2>
+          <ol class="refs">
+            <li>Bronson et al., <a href="https://www.usenix.org/conference/atc13/technical-sessions/presentation/bronson" target="_blank" rel="noreferrer">TAO: Facebook's Distributed Data Store for the Social Graph</a> (USENIX ATC 2013).</li>
+            <li>Krikorian, <a href="https://www.infoq.com/presentations/Twitter-Timeline-Scalability/" target="_blank" rel="noreferrer">Timelines at Scale</a> (QCon talk, InfoQ), on Twitter's hybrid fanout.</li>
+            <li>Kleppmann, <a href="https://dataintensive.net/" target="_blank" rel="noreferrer">Designing Data-Intensive Applications</a> (2017), on the Twitter home timeline example and partitioning.</li>
+            <li>Instagram Engineering, <a href="https://instagram-engineering.com/sharding-ids-at-instagram-1cf5a71e5a5c" target="_blank" rel="noreferrer">Sharding and IDs at Instagram</a>, on time-ordered distributed IDs.</li>
+            <li>Xu, <a href="https://www.amazon.com/System-Design-Interview-insiders-Second/dp/B08CMF2CQF" target="_blank" rel="noreferrer">System Design Interview, Volume 1</a> (2020), chapter on news feed systems.</li>
+          </ol>
+        </article>
+      </div>
+    </section>
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (window.hljs) hljs.highlightAll();
+      });
+    </script>
+  </body>
+</html>

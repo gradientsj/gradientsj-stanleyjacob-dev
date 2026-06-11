@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Design a URL shortener · Stanley Jacob</title>
+    <meta name="description" content="An interview walkthrough of designing a URL shortener: requirements, sizing, base62 code generation, the data model, the redirect path, caching, sharding, and the trade-offs at each step." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems" class="active">Systems</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/systems">← Systems</a></div>
+        <h1>Design a URL shortener</h1>
+        <p class="meta">Systems design · Classic starters · Jan 2025</p>
+      </div>
+    </header>
+    <section style="padding-top: 0">
+      <div class="wrap">
+        <article class="prose article">
+          <p>A URL shortener takes a long web address and returns a short one, so that <code>tiny.url/2TX9a</code> sends a visitor to the same page as a four-hundred-character link full of tracking parameters. Marketing teams need short links that fit in a text message, print cleanly on a poster, and report how many people clicked. The design question looks small, and that is exactly why interviewers like it: in thirty minutes it touches unique ID generation, the read-heavy caching story, database sharding, and an HTTP subtlety about redirects that has real product consequences. The walkthrough below is the way I would actually run it in an interview, starting from scope and working down into the parts where the hard decisions live.</p>
+
+          <h2>Scope and requirements</h2>
+          <p>The first few minutes belong to questions, because the design changes a lot depending on the answers. I would confirm that the core features are creating a short link from a long one, redirecting anyone who visits the short link, and optionally letting users pick a custom alias and an expiry time. Click analytics come up almost immediately, so I would agree to count clicks but keep rich analytics out of the core path. Deleting and updating links matters for abuse handling even if users rarely do it.</p>
+          <p>The non-functional requirements shape everything that follows. Redirects must be fast, ideally a few tens of milliseconds, because the shortener sits in front of every page view it serves. The service must be highly available, since a downed shortener breaks every link it ever issued, and for the same reason links must not be lost once created. Reads will vastly outnumber writes. A shortened link is created once and clicked many times, and a sensible assumption to state out loud is a 100 to 1 read-to-write ratio.</p>
+
+          <h2>Sizing the problem</h2>
+          <p>Back-of-the-envelope estimation is the habit of turning vague scale words into concrete numbers before designing, and it earns its keep here. Suppose the service creates 100 million links per month. A month is about 2.6 million seconds, so that is roughly 40 new links per second on average. With the 100 to 1 read ratio, redirects run at about 4,000 per second on average, and traffic is never flat, so planning for a peak of five times that gives 20,000 redirects per second.</p>
+          <p>Storage stays surprisingly small. A link record holds the short code, the long URL, an owner, and a couple of timestamps, which fits comfortably in 500 bytes. At 100 million links per month kept for five years, that is 6 billion records, or about 3 TB. A single modern server can hold 3 TB; the reason to shard, which means splitting the data across machines, will be read throughput and availability rather than raw size.</p>
+          <p>The cache sizing follows the usual skew argument. Link traffic obeys something like the 80/20 rule, where a small fraction of links receives most of the clicks. At 4,000 redirects per second the service answers about 350 million redirects a day, and caching the 20 percent of each day's distinct links that are hot, say 70 million entries at 500 bytes, costs around 35 GB of memory. That fits in one large cache node, though running a small cluster is wiser for availability.</p>
+
+          <h2>The API</h2>
+          <p>The external interface is small enough to write out completely. Creation is an authenticated JSON endpoint, and the redirect is a bare GET on the short path, because the whole point is that the short link works in any browser with no client logic.</p>
+          <pre><code class="language-http">POST /api/v1/links
+{ "long_url": "https://example.com/some/very/long/path?utm_source=...",
+  "custom_alias": "spring-sale",        // optional
+  "expires_at": "2025-12-31T00:00:00Z"  // optional
+}
+→ 201 { "short_url": "https://tiny.url/2TX9a" }
+
+GET /{code}
+→ 301 Location: https://example.com/some/very/long/path?utm_source=...
+
+DELETE /api/v1/links/{code}            → 204
+GET    /api/v1/links/{code}/stats      → 200 { "clicks": 18234, ... }
+</code></pre>
+
+          <h2>Generating short codes</h2>
+          <p>The heart of the question is how to mint a short, unique code for every link, and there are three families of answers worth comparing out loud.</p>
+          <p>The first idea most people reach for is hashing: run the long URL through a hash function such as MD5, which deterministically maps any input to a long fixed-size value, and keep the first seven characters. The appeal is statelessness, but truncating a hash invites collisions, where two different URLs land on the same code, so every write has to check the database and probe again on conflict. The same URL also always produces the same code, which sounds like a feature until two users shorten the same address and expect separate click counts.</p>
+          <p>The cleaner family is counter plus base62. Give every link a unique integer ID and encode the integer in base62, which is positional notation using the 62 characters 0 to 9, a to z, and A to Z. Seven base62 characters cover 62<sup>7</sup>, about 3.5 trillion values, which at 100 million links a month lasts close to three thousand years. The encoding is worth doing on the whiteboard once: ID 11157 is 2 × 62² + 55 × 62 + 59, and with 55 mapping to T and 59 mapping to X, the code is <code>2TX</code>.</p>
+          <pre><code class="language-python">ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+def encode(n: int) -> str:
+    out = []
+    while n:
+        n, r = divmod(n, 62)
+        out.append(ALPHABET[r])
+    return "".join(reversed(out)) or "0"
+
+encode(11157)   # '2TX'
+</code></pre>
+          <p>The remaining question is where the unique integers come from once there is more than one server. A single auto-incrementing database column works until that database becomes the bottleneck and the single point of failure. The standard fix is range leasing: a small coordination store hands each application server a block of one million IDs at a time, the server burns through its block in memory, and it leases a new one when the block runs out. Losing a server wastes the rest of its block, which is harmless when the keyspace holds trillions. A third option, a key generation service that pre-computes random-looking codes into a pool, buys unguessable codes at the cost of another service to operate; sequential base62 codes are guessable, so if that matters, encrypt or permute the counter before encoding rather than running a whole extra service.</p>
+
+          <h2>The data model</h2>
+          <p>One table carries the service. The short code is the natural primary key, and at scale the store should be a key-value database such as DynamoDB or Cassandra, because the access pattern is a single-key lookup and those systems shard and replicate that pattern automatically. Postgres is the right starting point at small scale, and saying so in the interview shows judgment rather than weakness.</p>
+          <pre><code class="language-sql">CREATE TABLE links (
+  code        VARCHAR(10) PRIMARY KEY,   -- '2TX9a' or custom alias
+  long_url    TEXT        NOT NULL,
+  owner_id    BIGINT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at  TIMESTAMPTZ
+);
+</code></pre>
+          <p>Click counts deliberately live elsewhere. Incrementing a counter inside this table on every redirect would turn the hottest read path in the system into a write path, so clicks flow through an event queue into an analytics store, and the stats endpoint reads from there.</p>
+
+          <h2>The high-level architecture</h2>
+          <p>With those decisions made, the architecture nearly draws itself. A load balancer, which is the component that spreads incoming requests across identical servers, fronts two stateless services: a write service that leases ID blocks and inserts rows, and a redirect service that resolves codes. The redirect service leans on a cache, which is a fast in-memory store holding recently used code-to-URL mappings so most lookups never touch the database, and it emits click events asynchronously.</p>
+          <div class="diagram"><svg width="100%" style="max-width: 760px" viewBox="0 0 760 410" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="High-level architecture of the URL shortener"><defs><marker id="arr-hl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#86868b"/></marker></defs><g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"><rect x="20" y="184" width="110" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="75" y="215" text-anchor="middle" font-size="14" fill="#1d1d1f">Client</text><rect x="180" y="184" width="130" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="245" y="215" text-anchor="middle" font-size="14" fill="#1d1d1f">Load balancer</text><rect x="360" y="64" width="150" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="435" y="95" text-anchor="middle" font-size="14" fill="#1d1d1f">Write service</text><rect x="360" y="244" width="150" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="435" y="275" text-anchor="middle" font-size="14" fill="#1d1d1f">Redirect service</text><rect x="570" y="64" width="170" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="655" y="88" text-anchor="middle" font-size="14" fill="#1d1d1f">ID range store</text><text x="655" y="104" text-anchor="middle" font-size="11" fill="#5f5f66">leases blocks of 1M IDs</text><rect x="570" y="154" width="170" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="655" y="178" text-anchor="middle" font-size="14" fill="#1d1d1f">Links database</text><text x="655" y="194" text-anchor="middle" font-size="11" fill="#5f5f66">sharded by code</text><rect x="570" y="244" width="170" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="655" y="268" text-anchor="middle" font-size="14" fill="#1d1d1f">Cache</text><text x="655" y="284" text-anchor="middle" font-size="11" fill="#5f5f66">code → URL, ~35 GB</text><rect x="570" y="334" width="170" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="655" y="358" text-anchor="middle" font-size="14" fill="#1d1d1f">Click event queue</text><text x="655" y="374" text-anchor="middle" font-size="11" fill="#5f5f66">feeds analytics store</text><path d="M130,210 H180" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-hl)"/><path d="M245,184 V90 H360" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-hl)"/><text x="300" y="80" text-anchor="middle" font-size="12" fill="#5f5f66">POST /api/links</text><path d="M245,236 V270 H360" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-hl)"/><text x="302" y="262" text-anchor="middle" font-size="12" fill="#5f5f66">GET /{code}</text><path d="M510,90 H570" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-hl)"/><text x="540" y="80" text-anchor="middle" font-size="12" fill="#5f5f66">lease</text><path d="M510,100 H540 V170 H570" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-hl)"/><text x="548" y="148" text-anchor="start" font-size="12" fill="#5f5f66">insert</text><path d="M510,270 H570" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-hl)"/><text x="540" y="260" text-anchor="middle" font-size="12" fill="#5f5f66">lookup</text><path d="M510,258 H550 V190 H570" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-hl)"/><text x="556" y="225" text-anchor="start" font-size="12" fill="#5f5f66">on miss</text><path d="M510,283 H545 V360 H570" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-hl)"/><text x="552" y="330" text-anchor="start" font-size="12" fill="#5f5f66">click event</text></g></svg></div>
+          <p class="quiet">The write path leases ID blocks and inserts rows; the redirect path serves from the cache and falls back to the database, emitting click events off the critical path. Dashed arrows are taken only sometimes or asynchronously.</p>
+
+          <h2>The redirect path in detail</h2>
+          <p>Most of the system's work happens in one short sequence, so it deserves its own picture and its own scrutiny.</p>
+          <div class="diagram"><svg width="100%" style="max-width: 760px" viewBox="0 0 760 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The redirect read path step by step"><defs><marker id="arr-rp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#86868b"/></marker></defs><g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"><rect x="20" y="50" width="110" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="75" y="81" text-anchor="middle" font-size="14" fill="#1d1d1f">Browser</text><rect x="240" y="50" width="170" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="325" y="81" text-anchor="middle" font-size="14" fill="#1d1d1f">Redirect service</text><rect x="530" y="50" width="110" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="585" y="81" text-anchor="middle" font-size="14" fill="#1d1d1f">Cache</text><rect x="530" y="170" width="110" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="585" y="201" text-anchor="middle" font-size="14" fill="#1d1d1f">Database</text><rect x="240" y="170" width="170" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="325" y="201" text-anchor="middle" font-size="14" fill="#1d1d1f">Click event queue</text><path d="M130,66 H240" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-rp)"/><circle cx="185" cy="48" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="185" y="52" text-anchor="middle" font-size="11" fill="#1d1d1f">1</text><path d="M410,66 H530" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-rp)"/><circle cx="470" cy="48" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="470" y="52" text-anchor="middle" font-size="11" fill="#1d1d1f">2</text><path d="M585,102 V170" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-rp)"/><circle cx="606" cy="136" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="606" y="140" text-anchor="middle" font-size="11" fill="#1d1d1f">3</text><path d="M240,90 H130" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-rp)"/><circle cx="185" cy="108" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="185" y="112" text-anchor="middle" font-size="11" fill="#1d1d1f">4</text><path d="M325,102 V170" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-rp)"/><circle cx="346" cy="136" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="346" y="140" text-anchor="middle" font-size="11" fill="#1d1d1f">5</text></g></svg></div>
+          <p class="quiet">Step 1: the browser requests GET /2TX9a. Step 2: the service checks the cache. Step 3: on a miss it reads the database and refills the cache. Step 4: it answers with a redirect and the Location header. Step 5: a click event goes to the queue without blocking the response.</p>
+          <p>The response code is a real decision, not trivia. A 301 is a permanent redirect, and browsers cache it, so repeat visitors skip the shortener entirely. That lowers load but makes the service blind to repeat clicks and unable to change the destination later. A 302 is a temporary redirect that browsers re-request every time, which preserves analytics and editability at the cost of serving every click. A link shortener whose product is analytics should answer 302; one optimizing purely for cost can answer 301. I would choose 302 and say why.</p>
+          <p>Lookups for codes that do not exist deserve attention, because random probing and typos produce them constantly and each one would fall through the cache to the database. Caching the absence, storing a short-lived entry that says this code resolves to nothing, blunts most of it, and a Bloom filter, a compact probabilistic structure that can say definitely-not-present for most missing keys, can sit in front of the database if negative traffic is heavy.</p>
+
+          <h2>Scaling, failures, and operations</h2>
+          <p>Every tier in the diagram scales by a different rule, and walking through them in order closes the design. The two services are stateless, so they scale horizontally behind the load balancer, and at 20,000 redirects per second a handful of nodes is plenty. The cache scales by sharding keys across a small cluster, and because the data is tiny per entry, the working set fits with room to spare. The database shards by hashing the short code, which spreads both data and load evenly because codes themselves are effectively random; consistent hashing keeps a reshard from moving more than its fair share of keys. Each shard replicates to followers, and since a redirect read that is a few seconds stale is harmless, reads can come from replicas freely. Geo-distribution falls out naturally too, because links never change destination in the 301 design and rarely in the 302 design, so read replicas or an edge cache in each region cut latency for a worldwide audience.</p>
+          <p>Expiry is best handled lazily. The redirect path checks <code>expires_at</code> and answers 410 Gone for dead links, and a background job sweeps expired rows out in bulk, which avoids paying deletion costs on the hot path. Custom aliases ride the same table as ordinary codes with a uniqueness check at insert and a reserved-word list so nobody claims <code>/api</code>. Abuse is the operational tax of running any shortener: malicious actors hide phishing destinations behind short links, so creation should be rate limited per user, destinations should be checked against a service such as Google Safe Browsing both at creation and periodically afterward, and takedown needs to be a first-class admin operation.</p>
+          <p>The failure stories are reassuringly boring, which is the point of the architecture. A dead redirect node is replaced behind the load balancer, a dead cache node costs a temporary rise in database reads while its shard rewarms, and a dead database primary fails over to a replica. The one component that must not be casually centralized is the ID range store, and it is naturally protected by its own access pattern: servers contact it once per million links, so it can be a small strongly consistent store such as ZooKeeper or a single Postgres row updated transactionally, and brief unavailability only pauses link creation, never redirects.</p>
+
+          <h2>Follow-up questions</h2>
+          <ul>
+            <li><strong>Why not just hash the URL and skip the counter?</strong> Truncated hashes collide and need probing on write, and identical URLs collapse to one code, which breaks per-user analytics. The counter with base62 gives uniqueness by construction.</li>
+            <li><strong>301 or 302?</strong> 301 lets browsers cache the hop and cuts load; 302 keeps every click visible and the destination editable. The analytics product wants 302.</li>
+            <li><strong>How long should codes be?</strong> Seven base62 characters give about 3.5 trillion values, roughly three thousand years at 100 million links a month. Six characters give 57 billion, which a large service exhausts in decades, so seven is the comfortable answer.</li>
+            <li><strong>What breaks first at 10x traffic?</strong> Nothing structural: redirect nodes and cache shards multiply, and the database adds shards. The design point worth saying is that the data model never changes because the access pattern is already a single-key lookup.</li>
+            <li><strong>How do you stop sequential codes from leaking creation volume?</strong> Permute or encrypt the counter with a keyed bijection before base62 encoding, so codes look random while staying collision-free.</li>
+            <li><strong>Where do click counts live?</strong> In an analytics store fed by the event queue, never as a counter update on the links table, because that would put a write on the hottest read path.</li>
+          </ul>
+
+          <h2>References</h2>
+          <ol class="refs">
+            <li>Kleppmann, <a href="https://dataintensive.net/" target="_blank" rel="noreferrer">Designing Data-Intensive Applications</a> (2017), on partitioning and replication.</li>
+            <li>Xu, <a href="https://www.amazon.com/System-Design-Interview-insiders-Second/dp/B08CMF2CQF" target="_blank" rel="noreferrer">System Design Interview, Volume 1</a> (2020), chapter on URL shortening.</li>
+            <li>High Scalability, <a href="http://highscalability.com/blog/2014/7/14/bitly-lessons-learned-building-a-distributed-system-that-ha.html" target="_blank" rel="noreferrer">Bitly: Lessons Learned Building a Distributed System That Handles 6 Billion Clicks a Month</a> (2014).</li>
+            <li>MDN, <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Redirections" target="_blank" rel="noreferrer">HTTP redirections</a>, on 301, 302, and caching behavior.</li>
+          </ol>
+        </article>
+      </div>
+    </section>
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (window.hljs) hljs.highlightAll();
+      });
+    </script>
+  </body>
+</html>

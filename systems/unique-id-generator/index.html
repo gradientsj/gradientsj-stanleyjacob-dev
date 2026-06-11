@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Design a unique ID generator · Stanley Jacob</title>
+    <meta name="description" content="An interview walkthrough of designing a distributed unique ID generator: UUIDs versus auto-increment versus ticket servers, the Snowflake 64-bit layout with its lifetime arithmetic, clock skew handling, and worker ID assignment." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems" class="active">Systems</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/systems">← Systems</a></div>
+        <h1>Design a unique ID generator</h1>
+        <p class="meta">Systems design · Distributed building blocks · Feb 2025</p>
+      </div>
+    </header>
+    <section style="padding-top: 0">
+      <div class="wrap">
+        <article class="prose article">
+          <p>Every record a system creates needs a name: every order, message, photo, and event gets an identifier that nothing else will ever share. On one machine this is a solved problem, an integer that increments. Across a fleet of machines creating millions of records, with no machine allowed to be a single point of failure and with downstream systems wanting IDs that sort roughly by creation time, it becomes a genuinely interesting design, which is why Twitter, Instagram, and Flickr each wrote engineering posts about how they did it and why interviewers keep asking. The question rewards exact arithmetic, since the whole design lives inside 64 bits, and it surfaces a distributed-systems classic: what to do when a machine's clock moves backwards.</p>
+          <p>The hard parts are three. First, choosing among very different families of solutions, from random UUIDs to coordinated counters, each of which fails a different requirement. Second, budgeting bits so the ID fits in a native integer while encoding time, place, and sequence. Third, the operational edges: clock skew, worker identity, and what happens at burst rates beyond what one worker can mint.</p>
+
+          <h2>Scope and requirements</h2>
+          <p>The functional requirement sounds like one line: produce identifiers that are globally unique. The qualifiers carry the design. IDs should be 64 bits, because they will be primary keys and foreign keys in databases and fields in network protocols, and a native integer is half the storage and a fraction of the comparison cost of a 128-bit value. They should be roughly sortable by creation time, so that ordering by ID approximates ordering by time, which lets feeds, pagination cursors, and B-tree indexes (the sorted tree structure databases use to find rows) all benefit without a separate timestamp column. Numeric IDs should not require coordination on the hot path: a generator that must talk to a central service per ID has that service's availability and latency stapled to every write in the company.</p>
+          <p>Non-functionally, the system must mint at least 10,000 IDs per second across the fleet with room for bursts of ten times that, must keep working through the loss of any node, and should degrade predictably rather than ever issuing a duplicate, because a duplicate primary key is silent data corruption while a brief pause in issuance is merely latency.</p>
+
+          <h2>Sizing the problem</h2>
+          <p>Suppose the platform creates 10,000 records per second on average, about 860 million per day, with peaks of 100,000 per second during events. The design below gives every worker process the ability to mint 4,096 IDs per millisecond, which is 4 million per second per worker, so even the peak needs only a single worker in principle and a handful in practice for availability. The fleet-level ceiling with the full bit budget, 1,024 workers each minting 4,096 per millisecond, is about 4 billion IDs per second, so capacity is never the constraint; the constraint is the timestamp's lifetime.</p>
+          <p>That lifetime is worth computing in front of the interviewer. With 41 bits of milliseconds, the counter spans 2^41 milliseconds, which is about 2.2 trillion milliseconds; dividing by 1,000 gives 2.2 billion seconds, and dividing by 31.5 million seconds per year gives roughly 69 years. Counting from the Unix epoch of 1970 would spend 55 of those years before the system ever launched, which is why generators define a custom epoch at deployment time, say January 1, 2025, and count milliseconds from there, buying the full 69 years forward.</p>
+
+          <h2>The interface</h2>
+          <p>The generator is best shipped as a library embedded in each service, so minting an ID is a function call with no network hop, but a thin HTTP form is worth defining for clients that cannot embed it, and the batch endpoint matters because callers who need thousands of IDs should not pay a round trip each.</p>
+          <pre><code class="language-http">GET /v1/id
+→ 200 { "id": 7269841635818741761 }
+
+GET /v1/ids?count=500
+→ 200 { "ids": [7269841635818741762, ..., 7269841635818742261] }
+
+GET /v1/id/decode?id=7269841635818741761
+→ 200 { "timestamp": "2025-02-11T08:14:02.113Z",
+        "datacenter": 3, "worker": 17, "sequence": 1 }
+</code></pre>
+          <p>The decode endpoint is free to build and pays for itself in troubleshooting, since every ID carries its own creation time and birthplace; it is also a reminder that these IDs leak timing information, which the operations section returns to.</p>
+
+          <h2>The design space</h2>
+          <p>Four families of solutions come up, and walking them against the requirements shows why the layered bit layout wins.</p>
+          <p>UUID version 4 is 128 bits of randomness, mintable anywhere with no coordination, and with so much entropy that collisions are not a practical concern. It fails two requirements rather than one: it is twice the agreed width, and it is completely unordered, which hurts more than it sounds. A B-tree index clusters nearby keys on the same disk pages, so time-ordered keys append neatly to the rightmost page while random keys land on a different page every insert, splitting pages and evicting cache constantly; teams that key large tables by UUIDv4 routinely measure several-fold slowdowns in insert throughput compared with sequential keys. Random IDs are the right answer when unguessability is the requirement, and the wrong one here.</p>
+          <p>Database auto-increment delegates the problem to one database's counter. It is perfectly ordered and trivially correct, and it is a single point of failure whose every failover risks either repeated or skipped ranges, while every ID minted in the company queues behind one machine's write throughput. The multi-master refinement gives each of k database servers an offset, so server i issues i, i + k, i + 2k and so on: with two servers, one issues odd numbers and the other even, which is exactly how Flickr's ticket servers worked. This removes the single point of failure but hard-wires k into the arithmetic, and changing it later is painful: growing from 2 servers to 3 means the existing odd/even sequences collide with any new modulus scheme, so the new server must start beyond every ID ever issued and the old servers must be re-stepped, a delicate migration for what should be an operational non-event. Time ordering across servers is also only approximate at best, since the counters advance at independent rates.</p>
+          <p>A ticket server centralizes that pattern: one small service hands out ranges or single values from a counter it persists. It is simple and Flickr ran it for years, but the hot-path coordination requirement returns, and making the ticket server highly available reintroduces the failover-duplication problem it was meant to hide. Handing out large ranges amortizes the round trips, and a range-leasing ticket server is a respectable fallback design, but there is a cleaner shape.</p>
+
+          <h2>The Snowflake layout</h2>
+          <p>Twitter's Snowflake, published in 2010, packs time, place, and a counter into one 64-bit integer, and the recommended design here is that layout essentially unchanged. The top bit stays zero so the number is positive in signed-integer systems. The next 41 bits hold milliseconds since the custom epoch. Five bits name the datacenter and five the worker, allowing 32 datacenters of 32 workers each, 1,024 generator instances total. The final 12 bits are a sequence number that counts IDs minted within the same millisecond on the same worker, wrapping at 2^12 = 4,096.</p>
+          <div class="diagram"><svg width="100%" style="max-width: 760px" viewBox="0 0 760 200" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The 64-bit Snowflake ID layout with bit widths"><defs><marker id="arr-id1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#86868b"/></marker></defs><g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"><text x="20" y="66" text-anchor="start" font-size="12" fill="#5f5f66">1 bit</text><text x="225" y="66" text-anchor="middle" font-size="12" fill="#5f5f66">41 bits</text><text x="445" y="66" text-anchor="middle" font-size="12" fill="#5f5f66">5 bits</text><text x="555" y="66" text-anchor="middle" font-size="12" fill="#5f5f66">5 bits</text><text x="675" y="66" text-anchor="middle" font-size="12" fill="#5f5f66">12 bits</text><rect x="20" y="80" width="40" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="40" y="111" text-anchor="middle" font-size="14" fill="#1d1d1f">0</text><rect x="60" y="80" width="330" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="225" y="111" text-anchor="middle" font-size="14" fill="#1d1d1f">timestamp (ms since custom epoch)</text><rect x="390" y="80" width="110" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="445" y="111" text-anchor="middle" font-size="14" fill="#1d1d1f">datacenter</text><rect x="500" y="80" width="110" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="555" y="111" text-anchor="middle" font-size="14" fill="#1d1d1f">worker</text><rect x="610" y="80" width="130" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="675" y="111" text-anchor="middle" font-size="14" fill="#1d1d1f">sequence</text><path d="M225,158 V133" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-id1)"/><text x="225" y="176" text-anchor="middle" font-size="12" fill="#5f5f66">2^41 ms = about 69 years</text><path d="M675,158 V133" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-id1)"/><text x="675" y="176" text-anchor="middle" font-size="12" fill="#5f5f66">4,096 IDs per ms</text></g></svg></div>
+          <p class="quiet">The 64-bit budget: a zero sign bit, 41 bits of milliseconds from a custom epoch, 10 bits naming one of 1,024 workers, and a 12-bit per-millisecond sequence.</p>
+          <p>Because the timestamp occupies the high bits, numeric order is creation order down to the millisecond, with ties broken arbitrarily by worker and sequence, which satisfies the rough-sortability requirement; and because the worker bits make every generator's output disjoint by construction, no two workers can collide even when minting in the same millisecond, which removes coordination from the hot path entirely. The packing itself is shifts and ORs, and the sequence logic fits in a dozen lines.</p>
+          <pre><code class="language-python">EPOCH = 1735689600000          # 2025-01-01 in ms
+
+def next_id(self):
+    now = clock_ms()
+    if now &lt; self.last_ts:
+        raise ClockMovedBackwards(self.last_ts - now)
+    if now == self.last_ts:
+        self.seq = (self.seq + 1) &amp; 0xFFF      # 12-bit wrap
+        if self.seq == 0:                      # 4,096 used: wait
+            now = spin_until_next_ms(self.last_ts)
+    else:
+        self.seq = 0
+    self.last_ts = now
+    return ((now - EPOCH) &lt;&lt; 22) | (self.dc &lt;&lt; 17) \
+           | (self.worker &lt;&lt; 12) | self.seq
+</code></pre>
+          <p>The sequence-exhaustion branch is the built-in flow control: a worker asked for its 4,097th ID in one millisecond spins until the next millisecond begins, capping each worker at 4.096 million IDs per second, far above any realistic single-process demand. The other branch, the clock check, is the part interviewers most want to hear about.</p>
+
+          <h2>When the clock moves backwards</h2>
+          <p>The layout's correctness rests on the timestamp never repeating with a smaller sequence available, and real clocks violate that assumption. NTP, the network time protocol that keeps machine clocks aligned with reference servers, normally adjusts a fast clock by slewing, slowing it slightly until it is correct, but a badly drifted clock can be stepped backwards in one jump, and virtual machine migrations, leap-second handling, and operator mistakes do the same. A worker whose clock steps back two seconds and keeps minting will re-issue the same timestamp values with fresh sequences and produce duplicates of its own earlier IDs.</p>
+          <p>The defenses stack. The generator remembers the last timestamp it used and compares on every call, which makes backwards motion detectable in one branch. For a small regression, tens of milliseconds, the worker simply waits it out, sleeping until the wall clock passes its remembered high-water mark; for a large one it must refuse to issue and alert, because waiting two hours is not viable and guessing is how duplicates happen. Hosts should run NTP configured to slew rather than step wherever possible, and the generator can additionally lease its worker ID with the lease invalidated on restart, so a worker that crashes and restarts with a confused clock cannot resume its old identity until the coordination layer confirms the timestamp high-water mark. The plain summary to give in an interview is that the design trades a rare, bounded availability loss (a worker pausing during clock repair) for a guarantee of no duplicates, which is the right side of the trade for primary keys.</p>
+
+          <h2>Worker identity and deployment</h2>
+          <p>The ten place bits are an assumption that needs operational backing: two workers configured with the same datacenter and worker number collide freely. Static configuration works for small, stable fleets, with the datacenter baked into the host image and worker numbers assigned by deployment slot; the failure mode is human, a copy-pasted config, so a startup check that pings peers or registers in a shared store is cheap insurance. The more robust pattern uses a coordination service such as ZooKeeper or etcd, a small strongly consistent store designed for configuration and locks: on startup each generator instance acquires an ephemeral lease on an unused worker number, holds it with heartbeats for as long as it runs, and the lease's expiry returns the number to the pool when the instance dies. The coordination store sits entirely off the hot path, touched once at startup and on lease renewal, so its availability gates only the startup of new workers and never the minting of IDs.</p>
+          <div class="diagram"><svg width="100%" style="max-width: 760px" viewBox="0 0 760 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Deployment architecture: services embed the generator, ZooKeeper assigns worker IDs, NTP disciplines clocks"><defs><marker id="arr-id2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#86868b"/></marker></defs><g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"><rect x="40" y="40" width="180" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="130" y="64" text-anchor="middle" font-size="14" fill="#1d1d1f">Order service</text><text x="130" y="80" text-anchor="middle" font-size="11" fill="#5f5f66">embeds generator</text><rect x="40" y="130" width="180" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="130" y="154" text-anchor="middle" font-size="14" fill="#1d1d1f">Payment service</text><text x="130" y="170" text-anchor="middle" font-size="11" fill="#5f5f66">embeds generator</text><rect x="40" y="220" width="180" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="130" y="244" text-anchor="middle" font-size="14" fill="#1d1d1f">Chat service</text><text x="130" y="260" text-anchor="middle" font-size="11" fill="#5f5f66">embeds generator</text><rect x="520" y="130" width="200" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="620" y="154" text-anchor="middle" font-size="14" fill="#1d1d1f">ZooKeeper</text><text x="620" y="170" text-anchor="middle" font-size="11" fill="#5f5f66">leases worker IDs</text><rect x="40" y="310" width="180" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="130" y="334" text-anchor="middle" font-size="14" fill="#1d1d1f">NTP time source</text><text x="130" y="350" text-anchor="middle" font-size="11" fill="#5f5f66">disciplines host clocks</text><path d="M220,66 H460 V146 H520" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-id2)"/><path d="M220,156 H520" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-id2)"/><text x="330" y="146" text-anchor="middle" font-size="12" fill="#5f5f66">lease worker ID</text><path d="M220,246 H480 V166 H520" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-id2)"/><path d="M130,310 V272" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-id2)"/><text x="148" y="296" text-anchor="start" font-size="12" fill="#5f5f66">clock sync, every host</text></g></svg></div>
+          <p class="quiet">Each service embeds the generator library and mints IDs locally; ZooKeeper hands each instance a leased worker number at startup and off the hot path, while NTP keeps every host's clock disciplined.</p>
+
+          <h2>Scaling, failures, and operations</h2>
+          <p>Scaling is the pleasant part of this design because the hot path has no shared state: adding capacity means starting more instances, each minting up to 4,096 IDs per millisecond independently, and the only finite resource is the pool of 1,024 worker numbers, which a fleet would have to grow very large to exhaust. If it ever did, the bit budget can be re-cut at design time, trading sequence bits for worker bits, though never after launch, because the meaning of existing IDs must stay fixed forever.</p>
+          <p>The failure analysis goes tier by tier. A generator instance dying takes nothing with it; its worker number returns to the pool when the lease expires, and callers retry against another instance or, in the embedded-library form, are themselves the instance, so the generator dies only when its service does. ZooKeeper being briefly unavailable stops new instances from starting but does not affect running ones, which is the right dependency direction; the layout's one true global dependency is wall-clock time, which is why clock monitoring (alert when any host's offset exceeds a few milliseconds) belongs in the runbook next to disk-full alerts. The subtle operational items are about meaning rather than uptime: the custom epoch and bit layout are forever-contracts that belong in a constants file with a warning comment, IDs expose creation time and rough volume to anyone who can read them, which may matter for competitive or privacy reasons and can be mitigated by encrypting IDs at the API boundary, and JavaScript numbers cannot represent 64-bit integers exactly, so APIs serving web clients should transmit IDs as strings, a detail that has produced production incidents at companies that learned it late.</p>
+
+          <h2>Follow-up questions</h2>
+          <ul>
+            <li><strong>Why not UUIDv4 and call it done?</strong> It is 128 bits against a 64-bit requirement, and its randomness scatters B-tree inserts across pages, measurably slowing large tables. It is the right tool when IDs must be unguessable or minted by untrusted clients, not when they are primary keys at scale.</li>
+            <li><strong>What if 4,096 IDs per millisecond is not enough for one worker?</strong> That is 4 million per second from one process, so the realistic answer is to run more workers. Within the layout, bits can shift from worker to sequence at design time; afterward the layout is frozen.</li>
+            <li><strong>What exactly happens when the clock jumps back ten minutes?</strong> The generator detects it against its last-used timestamp, refuses to issue, and alerts; small regressions of milliseconds it just waits out. Issuing through a backwards jump is the one path to duplicates, so availability is sacrificed there deliberately.</li>
+            <li><strong>How do two workers avoid getting the same worker ID?</strong> Either static assignment from deployment slots, verified at startup, or ephemeral leases in ZooKeeper or etcd whose expiry recycles dead workers' numbers. The lease path also gives a place to persist timestamp high-water marks across restarts.</li>
+            <li><strong>Are these IDs safe to expose publicly?</strong> They leak creation time and let observers estimate volume from the sequence and density of IDs. If that matters, keep the internal ID and expose an encrypted or randomized public alias at the boundary.</li>
+            <li><strong>How does this compare with Instagram's approach?</strong> Instagram packed a similar layout (41 bits of time, 13 bits of logical shard, 10 bits of per-shard sequence) inside Postgres itself, minting IDs in a stored procedure per shard, which trades the standalone library for leaning on a database they already ran. Same arithmetic, different host.</li>
+          </ul>
+
+          <h2>References</h2>
+          <ol class="refs">
+            <li>Twitter Engineering, <a href="https://blog.twitter.com/engineering/en_us/a/2010/announcing-snowflake" target="_blank" rel="noreferrer">Announcing Snowflake</a> (2010), the original 64-bit layout.</li>
+            <li>Flickr Engineering, <a href="https://code.flickr.net/2010/02/08/ticket-servers-distributed-unique-primary-keys-on-the-cheap/" target="_blank" rel="noreferrer">Ticket Servers: Distributed Unique Primary Keys on the Cheap</a> (2010), the multi-master offset design.</li>
+            <li>Instagram Engineering, <a href="https://instagram-engineering.com/sharding-ids-at-instagram-1cf5a71e5a5c" target="_blank" rel="noreferrer">Sharding &amp; IDs at Instagram</a> (2012), a Snowflake-style layout inside Postgres.</li>
+            <li>IETF, <a href="https://datatracker.ietf.org/doc/html/rfc4122" target="_blank" rel="noreferrer">RFC 4122: A Universally Unique IDentifier (UUID) URN Namespace</a> (2005).</li>
+            <li>Xu, <a href="https://www.amazon.com/System-Design-Interview-insiders-Second/dp/B08CMF2CQF" target="_blank" rel="noreferrer">System Design Interview, Volume 1</a> (2020), chapter on unique ID generators.</li>
+          </ol>
+        </article>
+      </div>
+    </section>
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (window.hljs) hljs.highlightAll();
+      });
+    </script>
+  </body>
+</html>

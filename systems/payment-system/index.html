@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Design a payment system · Stanley Jacob</title>
+    <meta name="description" content="An interview walkthrough of designing a payment system for an e-commerce platform: PSP integration, idempotency keys, the double-entry ledger, the payment state machine, webhooks, reconciliation against settlement files, and failover." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems" class="active">Systems</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/systems">← Systems</a></div>
+        <h1>Design a payment system</h1>
+        <p class="meta">Systems design · Reservations and money · Nov 2025</p>
+      </div>
+    </header>
+    <section style="padding-top: 0">
+      <div class="wrap">
+        <article class="prose article">
+          <p>A payment system for an e-commerce platform moves money from a buyer through the platform to sellers. The checkout page collects a card, an external processor charges it, the platform keeps its fee, and the seller eventually receives the rest. We are explicitly not building a card network or a bank; we are building the backend that orchestrates one, records what happened, and never loses track of a cent. Interviewers like the question because the data is money and the failure modes show up on real bank statements, so the usual instinct to optimize for latency and availability gets inverted in a way that exposes how a candidate thinks.</p>
+          <p>That inversion is the defining property of the whole design. A checkout that takes three seconds is fine, and a payment service that pauses for a minute during an incident is survivable, but a double charge is a support fire, a chargeback, and a dent in trust that no latency win buys back. Correctness beats latency here, and it even beats availability. Everything that follows, the idempotency keys, the append-only ledger, the strict state machine, and the nightly reconciliation, exists to make the system's view of money provably match reality.</p>
+
+          <h2>Scope and requirements</h2>
+          <p>The functional core is the pay-in flow: checkout creates a payment, the platform charges the buyer through a payment service provider, and the amount splits between the seller's balance and the platform's fee. Around it sit refunds, payouts that move accumulated seller balances to their bank accounts, ingestion of asynchronous notifications from the processor, and reconciliation against the processor's records. Fraud scoring and tax are real systems I would acknowledge and exclude.</p>
+          <p>A payment service provider, or PSP, is a company such as Stripe or Adyen that accepts card payments on your behalf, and using one is itself a scope decision worth defending: raw card numbers never touch the platform, because the PSP returns a token, an opaque reference that stands in for the card, and that shrinks the burden of PCI DSS, the card industry's security standard, from the whole platform down to one integration. The non-functional requirements then read in priority order: money moves effectively once, every movement is auditable years later, and the system tolerates a slow or unreachable PSP without ever guessing what happened to an in-flight charge.</p>
+
+          <h2>Sizing the problem</h2>
+          <p>Suppose the platform processes 1 million orders per day. A day is 86,400 seconds, so that averages about 12 payments per second, and a sale-day peak of thirty times the average is still only around 360 per second. Each payment makes a handful of PSP calls that take 200 milliseconds to 2 seconds, so a few hundred requests may be in flight at once, which a small stateless service tier absorbs easily. The ledger grows faster than the traffic suggests: at roughly five ledger rows per payment, the system writes 5 million rows per day, and at 200 bytes per row that is about 1 GB per day, or 365 GB per year, which calls for monthly partitions and an archive tier but strains nothing. The arithmetic makes the real point for you in the interview: queries per second are never the story in a payment system, and the engineering budget goes to correctness machinery instead.</p>
+
+          <h2>The API</h2>
+          <p>Amounts travel as integers in minor units, cents for dollars, because binary floating point cannot represent most decimal fractions exactly and money must never inherit rounding surprises. Every mutating endpoint accepts an idempotency key, which the deep dive below defines and defends.</p>
+          <pre><code class="language-http">POST /api/v1/payments
+Idempotency-Key: 9c41e8d2-7b13-4f60-b2aa-51f0c3e8d977
+{ "order_id": "ord_312", "amount": 10000, "currency": "usd",
+  "payment_method": "pm_card_visa_tok",
+  "split": [ { "account": "seller_881",   "amount": 8500 },
+             { "account": "platform_fees", "amount": 1500 } ] }
+→ 201 { "payment_id": "pay_91", "status": "pending" }
+
+GET  /api/v1/payments/pay_91
+→ 200 { "payment_id": "pay_91", "status": "succeeded", ... }
+
+POST /api/v1/payments/pay_91/refunds
+Idempotency-Key: 4ab7f1c9-08d2-44ce-9e31-77b4a2d6f188
+{ "amount": 10000 }                       → 201 { "refund_id": "ref_17", "status": "pending" }
+</code></pre>
+
+          <h2>The ledger data model</h2>
+          <p>The record of money is a double-entry ledger, an idea borrowed from five centuries of accounting. Every movement of money is written as at least two entries, a debit in one account and a credit in another, and the entries of any single transfer must sum to zero when debits are positive and credits negative. Money is therefore never created or destroyed in the books, only moved, and an imbalanced write is rejected at the door. The table is append-only: no row is ever updated or deleted, and a correction is a new reversing entry, so the history of every dispute reads straight off the table.</p>
+          <pre><code class="language-sql">CREATE TABLE ledger_entries (
+  entry_id     BIGSERIAL PRIMARY KEY,
+  transfer_id  UUID    NOT NULL,        -- groups the legs of one movement
+  account      TEXT    NOT NULL,
+  debit        BIGINT  NOT NULL DEFAULT 0,   -- minor units
+  credit       BIGINT  NOT NULL DEFAULT 0,
+  currency     CHAR(3) NOT NULL,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- invariant, enforced at write time:
+--   per transfer_id, SUM(debit) = SUM(credit)
+-- append only: the application never issues UPDATE or DELETE here
+</code></pre>
+          <p>A worked example makes the shape concrete. A buyer pays 100 dollars, the platform's quoted fee is 15 dollars, and the PSP takes 3 dollars of that fee. The transfer writes four rows: debit <code>buyer_clearing</code> 10000; credit <code>seller_payable</code> 8500; credit <code>platform_revenue</code> 1200; credit <code>psp_fees</code> 300. Debits total 10000 and credits total 8500 + 1200 + 300 = 10000, so the books balance, and any account's balance at any moment is just the sum of its entries. Balances are derived, never stored as the truth.</p>
+
+          <h2>The high-level architecture</h2>
+          <p>The payment service is a thin orchestrator that owns the payment state machine, calls the PSP, and writes the ledger. Webhooks from the PSP arrive on a separate handler, and a nightly reconciliation job compares the ledger against the PSP's settlement files, routing any disagreement to operations queues.</p>
+          <div class="diagram"><svg width="100%" style="max-width: 760px" viewBox="0 0 760 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="End-to-end payment flow with PSP, webhooks, ledger, and reconciliation"><defs><marker id="arr-pay1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#86868b"/></marker></defs><g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"><rect x="20" y="64" width="130" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="85" y="95" text-anchor="middle" font-size="14" fill="#1d1d1f">Checkout</text><rect x="230" y="64" width="160" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="310" y="88" text-anchor="middle" font-size="14" fill="#1d1d1f">Payment service</text><text x="310" y="104" text-anchor="middle" font-size="11" fill="#5f5f66">the state machine</text><rect x="470" y="64" width="150" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="545" y="88" text-anchor="middle" font-size="14" fill="#1d1d1f">PSP</text><text x="545" y="104" text-anchor="middle" font-size="11" fill="#5f5f66">external processor</text><rect x="230" y="174" width="160" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="310" y="198" text-anchor="middle" font-size="14" fill="#1d1d1f">Ledger</text><text x="310" y="214" text-anchor="middle" font-size="11" fill="#5f5f66">double-entry, append-only</text><rect x="470" y="174" width="150" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="545" y="205" text-anchor="middle" font-size="14" fill="#1d1d1f">Webhook handler</text><rect x="20" y="284" width="130" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="85" y="308" text-anchor="middle" font-size="14" fill="#1d1d1f">Ops queues</text><text x="85" y="324" text-anchor="middle" font-size="11" fill="#5f5f66">by discrepancy class</text><rect x="230" y="284" width="160" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="310" y="308" text-anchor="middle" font-size="14" fill="#1d1d1f">Reconciliation</text><text x="310" y="324" text-anchor="middle" font-size="11" fill="#5f5f66">nightly compare</text><rect x="470" y="284" width="150" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="545" y="308" text-anchor="middle" font-size="14" fill="#1d1d1f">Settlement files</text><text x="545" y="324" text-anchor="middle" font-size="11" fill="#5f5f66">from the PSP</text><path d="M150,90 H230" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-pay1)"/><text x="190" y="80" text-anchor="middle" font-size="12" fill="#5f5f66">intent</text><path d="M390,90 H470" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-pay1)"/><text x="430" y="80" text-anchor="middle" font-size="12" fill="#5f5f66">charge</text><path d="M545,116 V174" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-pay1)"/><text x="553" y="148" text-anchor="start" font-size="12" fill="#5f5f66">webhooks</text><path d="M470,182 H410 V100 H390" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-pay1)"/><text x="418" y="150" text-anchor="start" font-size="12" fill="#5f5f66">state</text><path d="M310,116 V174" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-pay1)"/><text x="318" y="148" text-anchor="start" font-size="12" fill="#5f5f66">entries</text><path d="M470,200 H390" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-pay1)"/><text x="430" y="192" text-anchor="middle" font-size="12" fill="#5f5f66">events</text><path d="M310,226 V284" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-pay1)"/><text x="318" y="258" text-anchor="start" font-size="12" fill="#5f5f66">internal view</text><path d="M470,310 H390" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-pay1)"/><text x="430" y="302" text-anchor="middle" font-size="12" fill="#5f5f66">compare</text><path d="M230,310 H150" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-pay1)"/><text x="190" y="302" text-anchor="middle" font-size="12" fill="#5f5f66">mismatches</text></g></svg></div>
+          <p class="quiet">The payment service drives the PSP and records every movement in the ledger; webhooks update payment state asynchronously, and reconciliation compares the ledger against the PSP's settlement files, routing mismatches to ops queues. Dashed arrows are asynchronous.</p>
+
+          <h2>Idempotency end to end</h2>
+          <p>An operation is idempotent when performing it twice has the same effect as performing it once, and in payments this is the core mechanism rather than a nicety, because retries are how distributed systems cope with uncertainty and a payment retried without protection is a payment that might happen twice. The implementation is a client-supplied key: the caller generates a unique token per logical operation, the server stores the key alongside the outcome in the same transaction as the side effect, and any later request bearing the same key gets the stored response replayed instead of a fresh execution. A hash of the request body is stored too, so the same key arriving with a different payload is rejected as a client error rather than silently honored.</p>
+          <p>The retry storm scenario shows the mechanism earning its keep. The payment service calls the PSP to charge 100 dollars and the connection times out after ten seconds. The truth at that moment is unknown: the charge may have failed to arrive, or it may have succeeded just after the service stopped waiting. A naive retry risks a second charge, and not retrying risks an order the buyer paid for being treated as unpaid. With idempotency key K on both attempts, the PSP looks up K, finds the charge it already created, and returns that original result, so the retry is safe no matter which side of the timeout the first attempt landed on. The platform offers the identical contract to its own clients, which is why the API above takes a key: a mobile checkout retrying over a flaky connection, or a user tapping the button twice, produces exactly one payment.</p>
+          <div class="diagram"><svg width="100%" style="max-width: 760px" viewBox="0 0 760 200" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Idempotent charge sequence with a timeout and retry resolving to one charge"><defs><marker id="arr-pay2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#86868b"/></marker></defs><g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"><rect x="20" y="86" width="110" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="75" y="117" text-anchor="middle" font-size="14" fill="#1d1d1f">Client</text><rect x="230" y="86" width="170" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="315" y="110" text-anchor="middle" font-size="14" fill="#1d1d1f">Payment service</text><text x="315" y="126" text-anchor="middle" font-size="11" fill="#5f5f66">keeps result per key</text><rect x="530" y="86" width="150" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="605" y="110" text-anchor="middle" font-size="14" fill="#1d1d1f">PSP</text><text x="605" y="126" text-anchor="middle" font-size="11" fill="#5f5f66">dedupes by key</text><path d="M130,98 H230" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-pay2)"/><circle cx="180" cy="82" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="180" y="86" text-anchor="middle" font-size="11" fill="#1d1d1f">1</text><path d="M400,98 H530" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-pay2)"/><circle cx="465" cy="82" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="465" y="86" text-anchor="middle" font-size="11" fill="#1d1d1f">2</text><path d="M530,122 H400" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-pay2)"/><circle cx="450" cy="136" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="450" y="140" text-anchor="middle" font-size="11" fill="#1d1d1f">3</text><path d="M315,138 V174 H605 V138" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-pay2)"/><circle cx="490" cy="158" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="490" y="162" text-anchor="middle" font-size="11" fill="#1d1d1f">4</text><path d="M605,86 V54 H315 V86" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-pay2)"/><circle cx="460" cy="40" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="460" y="44" text-anchor="middle" font-size="11" fill="#1d1d1f">5</text><path d="M230,122 H130" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-pay2)"/><circle cx="180" cy="136" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="180" y="140" text-anchor="middle" font-size="11" fill="#1d1d1f">6</text></g></svg></div>
+          <p class="quiet">Steps 1 and 2 carry the charge with idempotency key K. Step 3: the PSP creates the charge but the response is lost to a timeout. Step 4: the service retries with the same key. Step 5: the PSP recognizes K and returns the original charge instead of creating a second one. Step 6: the client gets one definitive result, and exactly one charge exists.</p>
+
+          <h2>The state machine and webhooks</h2>
+          <p>Every payment lives in exactly one state: <code>created</code>, <code>pending</code> once submitted to the PSP, then <code>succeeded</code> or <code>failed</code>, and from succeeded possibly <code>refunded</code>. The discipline that makes the machine trustworthy is that transitions fire only on verified events, never on assumption. A timeout does not mean failed; it means unknown, and unknown is resolved by a webhook or by querying the PSP, never by guessing. The PSP signs each webhook payload with a shared secret, and the handler verifies the signature before believing a word of it, because an unauthenticated endpoint that flips payments to succeeded is an invitation.</p>
+          <p>A webhook is a callback: instead of the platform polling, the PSP sends an HTTP request to the platform when something happens, such as a charge succeeding or a dispute opening. Webhooks arrive with two awkward properties that the handler must absorb: they are delivered at least once, so duplicates are routine, and they are not ordered, so a succeeded event can land before the pending event it logically follows. The handler therefore dedupes on the PSP's event ID and consults the state machine before applying anything, ignoring transitions that are illegal from the current state rather than letting a stale event drag a succeeded payment backward.</p>
+          <pre><code class="language-python">LEGAL = {("created", "pending"), ("created", "failed"),
+         ("pending", "succeeded"), ("pending", "failed"),
+         ("succeeded", "refunded")}
+
+def on_webhook(event):
+    if not verify_signature(event):           return reject()
+    if seen_before(event.id):                 return ack()      # duplicate delivery
+    payment = load(event.payment_id)
+    if (payment.state, event.target) not in LEGAL:
+        return park_for_review(event)         # out of order or impossible
+    apply_transition(payment, event)          # ledger entries + state, one transaction
+</code></pre>
+
+          <h2>Reconciliation</h2>
+          <p>Even with idempotency and a careful state machine, two independent systems recording the same money will drift: a webhook provider outage, a dropped message, a fee model change, a currency rounding rule. Reconciliation is the process that finds the drift, and the system that notices a discrepancy first is the one that resolves it cheaply. Each night the PSP publishes a settlement file, a batch listing of every transaction it processed and every fund movement it made for the account, and a job compares that file line by line against the internal ledger, matching on the PSP's charge identifier.</p>
+          <p>Discrepancies fall into three classes, each with its own queue and runbook. A payment recorded internally but missing from the file usually means the charge is still settling, so it ages a day or two before anyone investigates; if it persists, the service trusted something it should not have. A line in the file with no internal record is the severe direction, money moved that the platform never accounted for, typically a lost webhook plus a gap in polling, and it triggers both a repair entry in the ledger and an investigation of the ingestion path. An amount mismatch is most often fees, partial captures, or foreign exchange, and resolves to a correcting entry once classified. At 1 million payments a day, a discrepancy rate of just 0.01 percent is a hundred cases daily, which is exactly why the classes are queued and mostly auto-healed rather than handled as surprises.</p>
+
+          <h2>Scaling, failures, and operations</h2>
+          <p>The service tier is stateless and scales horizontally to numbers far beyond what payments require, and the ledger partitions by month with old partitions archived to cheap storage, so the operational interest is concentrated in failure handling. Retries use exponential backoff, where the wait doubles after each failure, one second, then two, then four, with random jitter so a thousand retries do not synchronize into a thundering herd, and retries are issued only from safe states: re-submitting a charge that carries its idempotency key is safe, while re-attempting an operation whose previous outcome is unknown and unkeyed is how double charges are born.</p>
+          <p>When a PSP degrades, a circuit breaker, a component that stops calling a failing dependency and fails fast until a probe succeeds, takes it out of rotation, and new payments route to a secondary PSP. The dangerous moment is the handoff: any charge in an unknown state at the degraded PSP must be resolved by query, webhook, or reconciliation before the platform re-attempts that payment anywhere else, because idempotency keys do not span providers and no single PSP's deduplication can see a duplicate created at its competitor. Failing over the new traffic is easy; the in-flight unknowns are the part that needs a written procedure.</p>
+          <p>Payouts to sellers are the mirrored flow. Sales accumulate as credits in <code>seller_payable</code>, and on a schedule, daily or weekly, a payout job moves balances to sellers' bank accounts through the PSP's transfer rails, with the same idempotency keys, the same ledger entries debiting <code>seller_payable</code>, and the same reconciliation against payout reports. Gating payouts on clean reconciliation of the days they cover is cheap insurance, since clawing money back out of a bank account is far harder than delaying it a day. Monitoring watches the success rate per PSP, where a drop signals a processor incident before any status page admits it, and the distribution of decline codes, where a spike in a code such as "do not honor" flags fraud waves or an issuer problem; both are leading indicators that pure error-rate dashboards miss.</p>
+
+          <h2>Follow-up questions</h2>
+          <ul>
+            <li><strong>Why is exactly-once delivery impossible, and what do you do instead?</strong> Networks lose acknowledgments, so a sender can never distinguish a lost request from a lost reply. The achievable contract is at-least-once delivery plus idempotent processing, which yields effectively-once outcomes, and that is what the keys implement.</li>
+            <li><strong>A charge call timed out. What is the payment's state?</strong> Unknown, and the system must say so: it stays pending until a webhook or a PSP query resolves it, and any retry carries the original idempotency key so resolution and retry cannot disagree.</li>
+            <li><strong>Why an append-only ledger instead of updating a balance column?</strong> Balances are derivable, but history is not re-derivable from a mutated balance. Append-only entries give audit, dispute evidence, and corrections as visible reversals, and the zero-sum invariant catches whole classes of defects at write time.</li>
+            <li><strong>Webhooks arrive twice and out of order. What protects you?</strong> Deduplication on the PSP's event ID and a state machine that rejects illegal transitions, so duplicates are no-ops and stale events cannot regress a succeeded payment.</li>
+            <li><strong>How do you switch PSPs during an incident?</strong> Circuit-break the degraded provider, route new payments to the secondary, and resolve every unknown-state charge at the old provider before re-attempting it anywhere, because no idempotency mechanism spans two processors.</li>
+            <li><strong>Where do seller payouts fit?</strong> As the mirrored flow on a schedule: payable balances accumulate in the ledger, payout transfers carry their own keys and entries, and payout reports reconcile exactly like settlement files.</li>
+          </ul>
+
+          <h2>References</h2>
+          <ol class="refs">
+            <li>Stripe, <a href="https://stripe.com/blog/idempotency" target="_blank" rel="noreferrer">Designing robust and predictable APIs with idempotency</a> (2017).</li>
+            <li>Stripe documentation, <a href="https://docs.stripe.com/webhooks" target="_blank" rel="noreferrer">Receive Stripe events in your webhook endpoint</a>, on signatures, retries, and ordering.</li>
+            <li>Xu and Lam, <a href="https://www.amazon.com/System-Design-Interview-Insiders-Guide/dp/1736049119" target="_blank" rel="noreferrer">System Design Interview, Volume 2</a> (2022), chapter on payment systems.</li>
+            <li>Kleppmann, <a href="https://dataintensive.net/" target="_blank" rel="noreferrer">Designing Data-Intensive Applications</a> (2017), on exactly-once semantics, retries, and fault tolerance.</li>
+          </ol>
+        </article>
+      </div>
+    </section>
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (window.hljs) hljs.highlightAll();
+      });
+    </script>
+  </body>
+</html>

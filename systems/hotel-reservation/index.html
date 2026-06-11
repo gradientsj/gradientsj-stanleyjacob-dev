@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Design a hotel reservation system · Stanley Jacob</title>
+    <meta name="description" content="An interview walkthrough of designing a hotel reservation system: room type inventory, the availability table, optimistic concurrency for the last room, payment holds, idempotency keys, overbooking policy, caching, and sharding." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems" class="active">Systems</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/systems">← Systems</a></div>
+        <h1>Design a hotel reservation system</h1>
+        <p class="meta">Systems design · Reservations and money · Oct 2025</p>
+      </div>
+    </header>
+    <section style="padding-top: 0">
+      <div class="wrap">
+        <article class="prose article">
+          <p>A hotel reservation system sells nights in rooms: a traveler searches a city for a three-night stay, compares hotels, books a king room, pays, and later perhaps cancels or shifts the stay by a day. Booking.com, Expedia, and every chain's own website run a version of it, and interviewers reach for the question because it looks like ordinary form-and-database work right up until two guests grab the last room in the same instant. The traffic numbers turn out to be small by internet standards, and that is the real lesson of the problem: the difficulty is not throughput but correctness, because every count in the inventory table corresponds to a physical bed that a real person will expect on arrival.</p>
+          <p>The hard parts live in a few specific places. The inventory model decides whether a booking is a clean transaction or a tangle. Concurrency control decides what happens when two requests race for the final room. Payment sits in the middle of the booking flow and can fail or hang at the worst moment. And overbooking, which sounds like a defect, is actually a deliberate business rule that the system has to enforce precisely. The walkthrough below takes those in order, the way I would run it in an interview.</p>
+
+          <h2>Scope and requirements</h2>
+          <p>I would start by confirming the features: search hotels by location and date range, show availability and price per room type, book with payment, cancel or modify a reservation, and give hotel staff a way to manage their inventory and rates. Loyalty programs, dynamic pricing engines, and the hotel's on-premise property management system are all real, but they sit outside the core and I would say so explicitly. The most valuable agreement to extract early concerns the unit of sale: guests book a room type for a date range, such as one king room for three nights, and never a specific room number. That single product decision shapes the whole data model.</p>
+          <p>The non-functional requirements are dominated by one rule: the system must never sell beyond the configured capacity policy, full stop. Bookings must be durable once confirmed, since losing one strands a traveler in a lobby. Search should be fast and may tolerate slightly stale availability, while the booking path may not. And reads vastly outnumber writes, because people look at far more rooms than they ever book, which means the read path and the write path deserve different machinery.</p>
+
+          <h2>Sizing the problem</h2>
+          <p>A modest but realistic framing is 5,000 hotels and 1 million rooms, which works out to 200 rooms per hotel on average. Assume 70 percent occupancy and an average stay of three nights. Occupied room-nights per day are then 1,000,000 × 0.7, or 700,000, and dividing by the three-night average stay gives roughly 233,000 new bookings per day. A day is 86,400 seconds, so that is about 2.7 bookings per second on average, and planning for a peak of ten times that means 30 bookings per second. The write rate is tiny. Any single healthy relational database can absorb it, and saying that out loud reframes the problem correctly: the design effort goes into making every one of those writes right, not into making them fast.</p>
+          <p>Reads are a different story. With a sensible 100 to 1 ratio of availability searches to bookings, search runs near 300 queries per second on average and spikes into the thousands during promotions, which is what the cache tier is for. Storage stays small everywhere. The availability table holds one row per hotel, room type, and night: 5,000 hotels × 5 room types × 730 nights of forward inventory is about 18 million rows, around 2 GB. Reservations accumulate at 233,000 per day, roughly 85 million per year, and at 500 bytes each that is about 43 GB per year. Nothing here strains a database; the constraint is correctness under concurrency.</p>
+
+          <h2>The API</h2>
+          <p>The external surface is compact. Search is a read, booking is an authenticated write that carries an idempotency key (defined properly in the payment section), and cancellation and modification operate on an existing reservation.</p>
+          <pre><code class="language-http">GET /api/v1/hotels/search?city=lisbon&amp;check_in=2025-10-10&amp;check_out=2025-10-13&amp;guests=2
+→ 200 { "hotels": [ { "hotel_id": 42, "room_types": [
+        { "room_type_id": 7, "name": "King", "nightly_rate": 180, "available": true } ] } ] }
+
+POST /api/v1/reservations
+Idempotency-Key: 7f3c9d2a-91b4-4c0e-a2f1-6d8e0b5c4a17
+{ "hotel_id": 42, "room_type_id": 7, "check_in": "2025-10-10",
+  "check_out": "2025-10-13", "guest_id": 9001, "payment_token": "tok_x91k" }
+→ 201 { "reservation_id": "res_55812", "status": "confirmed" }
+
+DELETE /api/v1/reservations/res_55812        → 200 { "status": "cancelled" }
+PATCH  /api/v1/reservations/res_55812        → 200   (date change: cancel plus rebook, one transaction)
+</code></pre>
+
+          <h2>The inventory data model</h2>
+          <p>The central decision is to track room types, not physical rooms. A room type is a sellable category such as "king, city view," and the hotel holds some count of them. Guests buy a count; the front desk assigns an actual room number at check-in, which lets the hotel shuffle assignments freely for maintenance or upgrades without touching the reservation system at all. Modeling physical rooms would force the booking write to pick and lock a specific room across a date range, and it would buy nothing the product needs.</p>
+          <p>With counts, availability becomes a simple table keyed by hotel, room type, and night, holding the total number of rooms and the number already reserved. A stay spanning three nights touches exactly three rows. Booking the king room from October 10 to October 13 means the nights of October 10, 11, and 12, so the write increments <code>reserved</code> on those three rows inside one database transaction, which is the property that the three updates apply entirely or not at all. If any night is full, the whole booking rolls back and nothing changed.</p>
+          <pre><code class="language-sql">CREATE TABLE room_type_inventory (
+  hotel_id      BIGINT  NOT NULL,
+  room_type_id  BIGINT  NOT NULL,
+  night         DATE    NOT NULL,
+  total_rooms   INT     NOT NULL,
+  reserved      INT     NOT NULL DEFAULT 0,
+  version       INT     NOT NULL DEFAULT 0,
+  PRIMARY KEY (hotel_id, room_type_id, night)
+);
+
+CREATE TABLE reservations (
+  reservation_id   UUID PRIMARY KEY,
+  hotel_id         BIGINT NOT NULL,
+  room_type_id     BIGINT NOT NULL,
+  guest_id         BIGINT NOT NULL,
+  check_in         DATE   NOT NULL,
+  check_out        DATE   NOT NULL,
+  status           TEXT   NOT NULL,        -- pending, confirmed, cancelled
+  idempotency_key  TEXT   NOT NULL UNIQUE,
+  expires_at       TIMESTAMPTZ             -- set while a hold is pending
+);
+</code></pre>
+          <p>One row per night looks wasteful next to storing a date range, but it makes every question the system asks trivial: availability for a range is a read of N rows, a partial overlap between stays needs no interval arithmetic, and the booking write is a handful of integer updates with an obvious correctness condition on each.</p>
+
+          <h2>The high-level architecture</h2>
+          <p>The shape of the system follows from the read/write split. An API gateway fronts two services: a search service that answers availability queries from a cache, and a reservation service that owns the booking transaction against the inventory database, calls the external payment provider, and emits events for everything downstream.</p>
+          <div class="diagram"><svg width="100%" style="max-width: 760px" viewBox="0 0 760 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="High-level architecture of the hotel reservation system"><defs><marker id="arr-hot1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#86868b"/></marker></defs><g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"><rect x="20" y="184" width="110" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="75" y="215" text-anchor="middle" font-size="14" fill="#1d1d1f">Client</text><rect x="180" y="184" width="130" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="245" y="215" text-anchor="middle" font-size="14" fill="#1d1d1f">API gateway</text><rect x="360" y="64" width="160" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="440" y="95" text-anchor="middle" font-size="14" fill="#1d1d1f">Search service</text><rect x="360" y="244" width="160" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="440" y="275" text-anchor="middle" font-size="14" fill="#1d1d1f">Reservation service</text><rect x="570" y="64" width="170" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="655" y="88" text-anchor="middle" font-size="14" fill="#1d1d1f">Availability cache</text><text x="655" y="104" text-anchor="middle" font-size="11" fill="#5f5f66">bounded staleness</text><rect x="570" y="174" width="170" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="655" y="198" text-anchor="middle" font-size="14" fill="#1d1d1f">Inventory database</text><text x="655" y="214" text-anchor="middle" font-size="11" fill="#5f5f66">source of truth</text><rect x="570" y="264" width="170" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="655" y="288" text-anchor="middle" font-size="14" fill="#1d1d1f">Payment provider</text><text x="655" y="304" text-anchor="middle" font-size="11" fill="#5f5f66">external PSP</text><rect x="570" y="354" width="170" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="655" y="378" text-anchor="middle" font-size="14" fill="#1d1d1f">Event stream</text><text x="655" y="394" text-anchor="middle" font-size="11" fill="#5f5f66">analytics and pricing</text><path d="M130,210 H180" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-hot1)"/><path d="M245,184 V90 H360" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-hot1)"/><text x="300" y="80" text-anchor="middle" font-size="12" fill="#5f5f66">search</text><path d="M245,236 V270 H360" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-hot1)"/><text x="300" y="262" text-anchor="middle" font-size="12" fill="#5f5f66">book</text><path d="M520,90 H570" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-hot1)"/><text x="545" y="80" text-anchor="middle" font-size="12" fill="#5f5f66">read</text><path d="M520,104 H540 V196 H570" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-hot1)"/><text x="546" y="150" text-anchor="start" font-size="12" fill="#5f5f66">on miss</text><path d="M520,258 H550 V214 H570" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-hot1)"/><text x="545" y="238" text-anchor="end" font-size="12" fill="#5f5f66">reserve</text><path d="M520,290 H570" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-hot1)"/><text x="545" y="282" text-anchor="middle" font-size="12" fill="#5f5f66">charge</text><path d="M440,296 V380 H570" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-hot1)"/><text x="452" y="340" text-anchor="start" font-size="12" fill="#5f5f66">events</text></g></svg></div>
+          <p class="quiet">Search reads cached availability with bounded staleness, while the booking path goes through the reservation service to the inventory database, which stays the source of truth. Dashed arrows are asynchronous or taken only sometimes.</p>
+
+          <h2>The last room: concurrency control</h2>
+          <p>Suppose one king room remains for the night of October 10 and two booking requests arrive within a millisecond of each other. Both read the availability row, both see 99 of 100 reserved, and without protection both increment the count, and the hotel has sold 101 rooms it does not have. The two standard defenses are worth defining carefully because the interviewer will ask for both.</p>
+          <p>Pessimistic locking takes the locks up front: the transaction issues <code>SELECT ... FOR UPDATE</code> on the three night rows, the database blocks any competing transaction on those rows until the first commits, and the race disappears. It is correct and simple, but every booking now serializes on its rows whether or not a conflict exists, lock wait time grows with anything slow inside the transaction, and two stays locking overlapping night ranges in different orders can deadlock. The discipline it demands, never holding row locks across a network call such as the payment charge, has to be maintained forever.</p>
+          <p>Optimistic concurrency control inverts the bet. Each row carries a <code>version</code> column; the transaction reads the rows remembering their versions, then attempts a conditional update, called compare-and-set, that only applies if the version is still the value it read. If another writer got there first, the update matches zero rows, and the application re-reads and retries. Nothing locks during the read or the user's think time, and the cost of a conflict is paid only when a conflict actually happens.</p>
+          <pre><code class="language-sql">UPDATE room_type_inventory
+   SET reserved = reserved + 1, version = version + 1
+ WHERE hotel_id = 42 AND room_type_id = 7 AND night = '2025-10-10'
+   AND version = 18
+   AND reserved + 1 &lt;= CEIL(total_rooms * 1.05);   -- the overbooking cap
+-- repeated for each night; if any statement touches 0 rows, ROLLBACK and retry
+</code></pre>
+          <p>Optimistic wins here because contention is rare by construction. Thirty bookings per second spread across 25,000 hotel and room type combinations and 730 distinct nights almost never land on the same rows simultaneously, so locking every transaction to protect against a collision that occurs a few times a day is the wrong trade. When a collision does occur, the loser re-reads, sees either a new version with rooms still free (retry succeeds) or a full count (return a clean sold-out answer), and a bound of three attempts keeps the loop from spinning during a genuine rush. The cap predicate inside the UPDATE also means even a retried write can never push <code>reserved</code> past policy, so correctness never depends on the retry logic being clever.</p>
+
+          <h2>Holds, payment, and idempotency</h2>
+          <p>Payment makes the booking a two-act story, because the charge happens at an external provider and takes seconds, sometimes fails, and sometimes times out in an unknown state. The hold pattern resolves the ordering problem: the reservation service first writes a reservation in a <code>pending</code> state and increments the inventory rows, stamping the reservation with a time-to-live of, say, ten minutes. The room is now off the market while the guest's card is charged. On success the status flips to <code>confirmed</code> and the TTL is cleared; on failure, or if the guest abandons checkout, the expiry releases the hold by decrementing the same rows. Without the hold, charging first risks taking money for a room that vanishes mid-payment, and reserving without a TTL parks inventory behind every abandoned cart. The TTL bounds the damage of both.</p>
+          <p>The second mechanism is the idempotency key, a client-generated unique token attached to a logical operation so that performing it twice has the same effect as performing it once. The double-submit scenario shows why it is not optional: the guest taps Book, the request reaches the server and succeeds, but the response is lost on a flaky connection, so the client retries. Without a key the retry creates a second reservation and a second charge. With the key, the server finds it already stored on the first reservation (the unique index enforces this) and simply returns the original result. The reservation service applies the same idea downstream, deriving an idempotency key from the reservation ID for the payment provider call, so a retried charge also lands exactly once.</p>
+          <div class="diagram"><svg width="100%" style="max-width: 760px" viewBox="0 0 760 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Booking sequence under optimistic concurrency with a payment hold"><defs><marker id="arr-hot2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#86868b"/></marker></defs><g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"><rect x="20" y="70" width="110" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="75" y="101" text-anchor="middle" font-size="14" fill="#1d1d1f">Guest</text><rect x="240" y="70" width="170" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="325" y="101" text-anchor="middle" font-size="14" fill="#1d1d1f">Reservation service</text><rect x="530" y="70" width="160" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="610" y="94" text-anchor="middle" font-size="14" fill="#1d1d1f">Inventory database</text><text x="610" y="110" text-anchor="middle" font-size="11" fill="#5f5f66">availability rows</text><rect x="530" y="200" width="160" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="610" y="231" text-anchor="middle" font-size="14" fill="#1d1d1f">Payment provider</text><path d="M130,86 H240" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-hot2)"/><circle cx="185" cy="68" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="185" y="72" text-anchor="middle" font-size="11" fill="#1d1d1f">1</text><path d="M410,84 H530" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-hot2)"/><circle cx="470" cy="66" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="470" y="70" text-anchor="middle" font-size="11" fill="#1d1d1f">2</text><path d="M410,108 H530" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-hot2)"/><circle cx="470" cy="126" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="470" y="130" text-anchor="middle" font-size="11" fill="#1d1d1f">3</text><path d="M290,70 V40 H360 V70" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-hot2)"/><circle cx="325" cy="26" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="325" y="30" text-anchor="middle" font-size="11" fill="#1d1d1f">4</text><path d="M325,122 V226 H530" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-hot2)"/><circle cx="345" cy="168" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="345" y="172" text-anchor="middle" font-size="11" fill="#1d1d1f">5</text><path d="M240,106 H130" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-hot2)"/><circle cx="185" cy="124" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="185" y="128" text-anchor="middle" font-size="11" fill="#1d1d1f">6</text></g></svg></div>
+          <p class="quiet">Step 1: the guest submits a booking with an idempotency key. Step 2: the service reads the three availability rows and their versions. Step 3: the conditional update creates a pending hold with a TTL. Step 4: on a version conflict it re-reads and retries. Step 5: it charges the card through the payment provider. Step 6: the hold flips to confirmed and the guest gets the answer.</p>
+
+          <h2>Overbooking, search, and the cache</h2>
+          <p>Overbooking is the practice of deliberately selling more than physical capacity because some fraction of guests reliably fails to arrive. A hotel with 100 king rooms and a measured 5 percent no-show rate can sell 105 and expect to fill the building rather than leave paid-for rooms empty. The crucial design point is that this is a configurable business rule, not a side effect of weak locking: the cap check sits explicitly inside the conditional update, <code>reserved + 1 &lt;= CEIL(total_rooms * 1.05)</code>, with the factor stored per hotel and room type. If 102 guests actually show up, the hotel relocates two of them at its own expense, an outcome the revenue team priced when it chose 1.05. Selling room 106 would be a defect; selling room 105 is the plan. Keeping that line bright is the difference between a policy and an incident.</p>
+          <p>Search is the other side of the read/write asymmetry. Availability queries outnumber bookings a hundred to one, and they tolerate staleness in a way bookings never can, because the worst consequence of a stale search result is a guest who clicks through and finds the room just sold. So the search service answers from a cache of availability counts keyed by hotel, room type, and night, refreshed with a short TTL of around 60 seconds and additionally invalidated by booking events. That bounded staleness, a known upper limit on how out of date an answer can be, is the contract. The reservation service never trusts the cache; its conditional update against the inventory database is the recheck, so the failure mode is a polite "that room just went" at checkout rather than an oversell.</p>
+
+          <h2>Scaling, failures, and operations</h2>
+          <p>The services are stateless and scale horizontally, and at 30 writes per second the inventory database runs comfortably as a single primary with replicas for years. When one database is no longer enough, whether for write headroom or fault isolation, the natural shard key is the hotel ID. All inventory rows and reservations for a hotel live on one shard, so the multi-row booking transaction stays local and nothing in the correctness story changes; a stay never spans hotels, so no booking ever needs a distributed transaction. Cross-hotel search never touches the shards directly anyway, since it reads the cache and a search index fed by events.</p>
+          <p>Events deserve a precise mechanism. The reservation service writes an event row into an outbox table inside the same transaction as the booking, and a relay process publishes those rows to the stream. This transactional outbox guarantees that analytics, dynamic pricing, and confirmation emails see exactly the bookings that committed, with no phantom events from rolled-back transactions and no committed bookings that vanished from the feed.</p>
+          <p>Cancellation runs the booking in reverse: one transaction sets the reservation status to cancelled and decrements <code>reserved</code> on the same night rows, and the refund flows through the payment provider under its own idempotency key according to the rate's cancellation policy. Modification is cancel-plus-rebook inside a single transaction: release the old nights, attempt the new nights through the same cap-checked conditional updates, and commit both legs or neither. If the new dates are full, the rollback leaves the original booking untouched, which is exactly what the guest would want.</p>
+          <p>The failure stories stay small because the source of truth is one transactional store. A lost cache node means a temporary surge of cheap count reads against the database while the cache rewarms. A failed primary promotes a replica, with synchronous replication if the business cannot tolerate losing the last few seconds of bookings. A stalled hold-expiry sweeper just means pending holds linger until the lazy check on the read path releases them. A payment provider outage degrades bookings while search continues untouched. The metric worth paging on is the invariant itself: any row where <code>reserved</code> exceeds the cap means the concurrency control has been bypassed somewhere, and that is a five-alarm signal, not a statistic.</p>
+
+          <h2>Follow-up questions</h2>
+          <ul>
+            <li><strong>Why track room types instead of physical rooms?</strong> Guests buy a category, the front desk assigns rooms at check-in, and inventory becomes a few integer columns per night. Physical-room modeling forces the booking write to lock a specific room across dates and buys nothing the product needs.</li>
+            <li><strong>Pessimistic or optimistic locking?</strong> At 30 bookings per second across 25,000 sellable combinations, conflicts are rare, so optimistic concurrency pays the retry cost only when collisions actually happen. Pessimistic locks earn their keep only under sustained contention on the same rows, such as a flash-sale event.</li>
+            <li><strong>What stops a retried request from charging twice?</strong> An idempotency key stored uniquely with the reservation: the retry finds the key and gets the original result, and the payment provider receives its own key derived from the reservation ID.</li>
+            <li><strong>How does overbooking not become overselling?</strong> The cap is an explicit predicate in the conditional update with a per-hotel factor, so the limit is enforced at write time. Anything past the cap is impossible by construction rather than discouraged by convention.</li>
+            <li><strong>How would you shard the database?</strong> By hotel ID, so a stay's night rows and its reservation share a shard and the booking transaction stays local. Search scales separately through the cache and index, which are fed by events rather than shard queries.</li>
+            <li><strong>Where is staleness acceptable?</strong> Search can be a minute behind, because the booking path rechecks the source of truth. The inventory database itself is never read through the cache for a write decision.</li>
+          </ul>
+
+          <h2>References</h2>
+          <ol class="refs">
+            <li>Xu and Lam, <a href="https://www.amazon.com/System-Design-Interview-Insiders-Guide/dp/1736049119" target="_blank" rel="noreferrer">System Design Interview, Volume 2</a> (2022), chapter on hotel reservation systems.</li>
+            <li>Kleppmann, <a href="https://dataintensive.net/" target="_blank" rel="noreferrer">Designing Data-Intensive Applications</a> (2017), on transactions, isolation, and weak isolation anomalies.</li>
+            <li>PostgreSQL documentation, <a href="https://www.postgresql.org/docs/current/transaction-iso.html" target="_blank" rel="noreferrer">Transaction Isolation</a>, on what each isolation level actually guarantees.</li>
+            <li>Stripe, <a href="https://stripe.com/blog/idempotency" target="_blank" rel="noreferrer">Designing robust and predictable APIs with idempotency</a> (2017).</li>
+          </ol>
+        </article>
+      </div>
+    </section>
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (window.hljs) hljs.highlightAll();
+      });
+    </script>
+  </body>
+</html>

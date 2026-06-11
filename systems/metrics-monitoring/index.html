@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Design a metrics monitoring and alerting system · Stanley Jacob</title>
+    <meta name="description" content="An interview walkthrough of designing a metrics and alerting system: the label data model and cardinality, pull against push collection, Gorilla-style compression, retention and downsampling tiers, the query layer, and the alert state machine." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems" class="active">Systems</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/systems">← Systems</a></div>
+        <h1>Design a metrics monitoring and alerting system</h1>
+        <p class="meta">Systems design · Data pipelines and observability · Oct 2025</p>
+      </div>
+    </header>
+    <section style="padding-top: 0">
+      <div class="wrap">
+        <article class="prose article">
+          <p>A metrics system watches everything else. Every server, container, and service in a fleet emits numbers, CPU load, request counts, queue depths, error rates, and this system collects them, stores them as time series, draws them on dashboards, and wakes someone up when a number crosses a line. Operations teams live inside it, capacity planning is impossible without it, and during an incident it is the difference between a five-minute diagnosis and an hour of guessing. Interviewers reach for this question because it looks like simple plumbing and then turns out to contain a specialized database, a streaming pipeline, and a small state machine with pager-duty consequences, all of which must keep working precisely when the rest of the infrastructure is on fire.</p>
+          <p>The hard parts are the data model's tendency to explode combinatorially, the storage engine that must absorb a million writes per second on hardware that a general-purpose database would saturate at a fraction of that, and the alerting path, which has to be the most reliable component in the company while depending on everything else. The walkthrough below takes them in that order.</p>
+
+          <h2>Scope and requirements</h2>
+          <p>Functionally, the system collects operational metrics from a large fleet, on the order of 100,000 servers, stores them as time series, serves a query language for dashboards and ad hoc investigation, and evaluates alert rules that notify on-call engineers through pagers, chat, and email. Log and trace collection are explicitly out of scope, since they have different shapes and different systems; this design is for numbers over time.</p>
+          <p>Non-functionally, ingestion must keep up with the fleet at around one million samples per second without dropping data during traffic spikes, queries over recent data should return in well under a second because humans iterate on dashboards interactively, and a year or more of history must be retained at a cost that does not dwarf the fleet it monitors. Alert evaluation has the strictest requirement of all: it must keep functioning through partial failures of the very infrastructure it observes, and a late or lost page is the worst defect this system can have. Slightly stale data is acceptable almost everywhere, which is a freedom worth exploiting, and samples are append-only facts that are never updated in place.</p>
+
+          <h2>Sizing the problem</h2>
+          <p>The unit of storage is a series: one metric name plus one unique combination of labels. If each of 100,000 servers exposes about 100 series, the fleet carries 10 million active series, and scraping each one every 10 seconds produces 1 million samples per second, 86.4 billion samples per day. A sample is a timestamp and a 64-bit float, 16 bytes uncompressed, so a day of raw data is about 1.4 TB before compression and, as covered below, nearer 120 GB after it.</p>
+          <p>The number that actually kills these systems is cardinality, the count of distinct label combinations. Labels are key-value pairs attached to a metric name, such as <code>http_requests_total{service="checkout", region="us-east"}</code>, and every new combination creates a new series with its own index entry and in-memory state. Suppose one engineer adds a <code>user_id</code> label to a request-latency metric in a service with 2 million active users and 10 instrumented endpoints: that single decision mints up to 20 million new series, tripling the fleet-wide total, and at roughly 3 KB of index and head-block memory per active series it demands about 60 GB of additional RAM across the storage tier. Series churn does similar damage, since a label that embeds a container ID creates a fresh series on every redeploy. Guardrails on label values are a requirement, not a refinement.</p>
+
+          <h2>The query API</h2>
+          <p>Dashboards and alert rules speak the same interface: select series by name and label matchers, apply functions over time windows, and aggregate across series. The HTTP surface is small, and the expression language carries the weight, PromQL in spirit here.</p>
+          <pre><code class="language-http">GET /api/v1/query_range
+    ?query=sum by (service) (rate(http_requests_total{status="500"}[5m]))
+    &amp;start=2025-10-07T10:00:00Z&amp;end=2025-10-07T16:00:00Z&amp;step=60s
+→ 200 { "result": [ { "labels": {"service": "checkout"},
+                      "values": [[1759831200, 4.2], ...] }, ... ] }
+
+GET /api/v1/series?match=node_cpu_seconds_total{region="us-east"}
+→ 200 { "series": [ ...label sets... ] }
+
+POST /api/v1/ingest        ← push path for batch jobs and edge agents
+{ "series": [ { "labels": {...}, "samples": [[ts, value], ...] } ] }
+</code></pre>
+
+          <h2>The data model in storage</h2>
+          <p>Logically the store is two structures: an index from label values to series IDs, and per-series sample streams. An inverted index, one posting list per label pair, is what makes <code>{service="checkout"}</code> resolve to its few hundred series without scanning ten million. The relational sketch makes the shape concrete even though the real engine is purpose-built.</p>
+          <pre><code class="language-sql">CREATE TABLE series (
+  series_id   BIGINT PRIMARY KEY,
+  metric_name TEXT NOT NULL,           -- e.g. http_requests_total
+  labels      JSONB NOT NULL           -- {"service":"checkout", ...}
+);
+-- inverted index: label pair → series ids, one row per (pair, series)
+CREATE INDEX series_by_label ON series USING gin (labels);
+
+CREATE TABLE samples (
+  series_id   BIGINT NOT NULL,
+  ts          BIGINT NOT NULL,         -- ms since epoch
+  value       DOUBLE PRECISION NOT NULL,
+  PRIMARY KEY (series_id, ts)          -- append-mostly, time-ordered
+);
+</code></pre>
+
+          <h2>The high-level architecture</h2>
+          <p>Collection comes in two flavors and a serious design supports both. Pull collection, the Prometheus model, has collectors discover targets through service discovery, the registry of what is running where, and scrape each target's metrics endpoint on a schedule; it wins inside a datacenter because the scraper controls load, a dead target is detected by the failed scrape itself, and nothing is configured on the monitored host. Push collection has agents send metrics through a gateway, and it wins for short-lived batch jobs that may finish between scrapes and for edge devices behind NAT that a scraper cannot reach. Either way, collected samples flow into Kafka, a durable distributed queue, before storage, which decouples the two sides: a storage deploy or a slow shard does not push back on collectors, and an ingest spike parks safely in the queue instead of being dropped. Storage nodes consume from the queue, partitioned so that each series consistently lands on one shard, and a query layer fans out across shards while the rule evaluator and dashboards sit on top of it.</p>
+          <div class="diagram"><svg width="100%" style="max-width: 760px" viewBox="0 0 760 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="End to end architecture of the metrics and alerting system"><defs><marker id="arr-mm1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#86868b"/></marker></defs><g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"><rect x="20" y="44" width="140" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="90" y="68" text-anchor="middle" font-size="14" fill="#1d1d1f">Fleet targets</text><text x="90" y="84" text-anchor="middle" font-size="11" fill="#5f5f66">100,000 servers</text><rect x="210" y="44" width="140" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="280" y="68" text-anchor="middle" font-size="14" fill="#1d1d1f">Collectors</text><text x="280" y="84" text-anchor="middle" font-size="11" fill="#5f5f66">scrape or push</text><rect x="400" y="44" width="130" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="465" y="68" text-anchor="middle" font-size="14" fill="#1d1d1f">Kafka</text><text x="465" y="84" text-anchor="middle" font-size="11" fill="#5f5f66">ingest buffer</text><rect x="580" y="44" width="160" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="660" y="68" text-anchor="middle" font-size="14" fill="#1d1d1f">TSDB shards</text><text x="660" y="84" text-anchor="middle" font-size="11" fill="#5f5f66">partitioned by series</text><rect x="580" y="166" width="160" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="660" y="190" text-anchor="middle" font-size="14" fill="#1d1d1f">Query service</text><text x="660" y="206" text-anchor="middle" font-size="11" fill="#5f5f66">fan out, merge</text><rect x="330" y="166" width="160" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="410" y="190" text-anchor="middle" font-size="14" fill="#1d1d1f">Rule evaluator</text><text x="410" y="206" text-anchor="middle" font-size="11" fill="#5f5f66">alert rules on a clock</text><rect x="330" y="288" width="160" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="410" y="312" text-anchor="middle" font-size="14" fill="#1d1d1f">Alert manager</text><text x="410" y="328" text-anchor="middle" font-size="11" fill="#5f5f66">dedup, group, route</text><rect x="580" y="288" width="160" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="660" y="319" text-anchor="middle" font-size="14" fill="#1d1d1f">Dashboards</text><rect x="80" y="288" width="160" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="160" y="319" text-anchor="middle" font-size="14" fill="#1d1d1f">On-call pager</text><path d="M160,70 H210" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-mm1)"/><path d="M350,70 H400" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-mm1)"/><path d="M530,70 H580" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-mm1)"/><path d="M660,166 V96" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-mm1)"/><text x="668" y="135" text-anchor="start" font-size="12" fill="#5f5f66">reads</text><path d="M660,288 V218" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-mm1)"/><path d="M490,192 H580" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-mm1)"/><text x="535" y="182" text-anchor="middle" font-size="12" fill="#5f5f66">queries</text><path d="M410,218 V288" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-mm1)"/><text x="418" y="257" text-anchor="start" font-size="12" fill="#5f5f66">firing</text><path d="M330,314 H240" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-mm1)"/><text x="285" y="304" text-anchor="middle" font-size="12" fill="#5f5f66">page</text></g></svg></div>
+          <p class="quiet">Samples flow left to right into sharded time-series storage; the query service fans out across shards for dashboards and for the rule evaluator, whose firing alerts pass through the alert manager before anyone is paged.</p>
+
+          <h2>The time-series storage engine</h2>
+          <p>A general-purpose B-tree database struggles here for a structural reason: one million samples per second arriving for ten million different series means writes land all over the key space, so the tree's pages churn randomly, write amplification climbs, and per-row overhead of dozens of bytes swamps 16-byte samples. The data, though, has exploitable shape. It is append-mostly, time-ordered within each series, and highly regular, and the engine that fits is the one Facebook described in the Gorilla paper. Timestamps are stored as delta-of-delta: scrapes arrive on a nearly fixed cadence, so instead of recording 1759831200, 1759831210, 1759831220, the engine records the difference between consecutive deltas, which is almost always zero and encodes in one or two bits. Values are stored by XOR: each float is XORed with its predecessor, and since adjacent samples of a gauge are usually close, the result is mostly zero bits that compress to a handful of meaningful ones. Gorilla reported an average around 1.37 bytes per 16-byte sample, a twelvefold reduction, and that single number is what makes the rest of the design affordable: 86.4 billion samples per day shrink from 1.4 TB to roughly 120 GB.</p>
+          <p>Each shard keeps the most recent two hours of its series in a compressed in-memory head block, writing a write-ahead log so a crash replays cleanly, and then flushes the head to an immutable, time-partitioned file on disk with its own index. Queries for recent data, which dominate dashboard traffic, are served from memory; older windows read a handful of immutable files. Compaction merges small files into larger ones in the background, and because files are immutable, deleting expired data is just removing whole files rather than rewriting anything.</p>
+
+          <h2>Retention and downsampling</h2>
+          <p>Nobody needs 10-second resolution from eight months ago, and the budget math shows why pretending otherwise fails: keeping raw samples for 5 years would cost about 120 GB times 1,825 days, around 220 TB, almost all of it never queried at full detail. Downsampling, replacing many fine-grained samples with fewer coarse aggregates over each window, is the standard escape. Raw samples are kept for 15 days, about 2 TB, which covers incident response and week-over-week comparison. A rollup job then reduces each series to per-minute aggregates, storing a sum and a count per minute so averages remain exact and rates remain computable: 10 million series times 1,440 minutes times 2 values is about 29 billion values per day, roughly 43 GB at the same compression, and 13 months of that is about 17 TB. A second tier keeps per-hour aggregates for 5 years at about 0.7 GB per day, 1.3 TB in total. The three tiers together cost around 20 TB against 220 TB for raw-everything, and the query layer picks the coarsest tier whose resolution still answers the question, so a one-year dashboard reads hourly points instead of dragging 3 billion raw samples per series-screen through the network. What is lost is real and worth stating: a sub-minute spike older than 15 days is invisible forever, and any percentile not precomputed cannot be recovered from sums and counts.</p>
+          <div class="diagram"><svg width="100%" style="max-width: 760px" viewBox="0 0 760 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Retention tiers with downsampling from raw samples to one minute and one hour rollups"><defs><marker id="arr-mm2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#86868b"/></marker></defs><g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"><rect x="30" y="40" width="700" height="64" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="46" y="65" text-anchor="start" font-size="14" fill="#1d1d1f">Raw samples · 10 s resolution · kept 15 days</text><text x="46" y="83" text-anchor="start" font-size="11" fill="#5f5f66">about 120 GB per day, 2 TB on disk</text><rect x="420" y="52" width="60" height="40" rx="6" fill="#f6f6f7" stroke="#d8d8de" stroke-width="1"/><text x="450" y="76" text-anchor="middle" font-size="11" fill="#5f5f66">2 h</text><rect x="490" y="52" width="60" height="40" rx="6" fill="#f6f6f7" stroke="#d8d8de" stroke-width="1"/><text x="520" y="76" text-anchor="middle" font-size="11" fill="#5f5f66">2 h</text><rect x="560" y="52" width="60" height="40" rx="6" fill="#f6f6f7" stroke="#d8d8de" stroke-width="1"/><text x="590" y="76" text-anchor="middle" font-size="11" fill="#5f5f66">2 h</text><rect x="630" y="52" width="60" height="40" rx="6" fill="#f6f6f7" stroke="#d8d8de" stroke-width="1"/><text x="660" y="76" text-anchor="middle" font-size="11" fill="#5f5f66">2 h</text><path d="M380,104 V134" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-mm2)"/><text x="392" y="124" text-anchor="start" font-size="12" fill="#5f5f66">downsample to 1 min</text><rect x="30" y="134" width="700" height="64" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="46" y="159" text-anchor="start" font-size="14" fill="#1d1d1f">1-minute rollups · kept 13 months</text><text x="46" y="177" text-anchor="start" font-size="11" fill="#5f5f66">sum and count per minute, about 43 GB per day, 17 TB total</text><path d="M380,198 V228" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-mm2)"/><text x="392" y="218" text-anchor="start" font-size="12" fill="#5f5f66">downsample to 1 h</text><rect x="30" y="228" width="700" height="64" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="46" y="253" text-anchor="start" font-size="14" fill="#1d1d1f">1-hour rollups · kept 5 years</text><text x="46" y="271" text-anchor="start" font-size="11" fill="#5f5f66">about 1.3 TB for the whole fleet</text><text x="380" y="316" text-anchor="middle" font-size="12" fill="#5f5f66">queries pick the coarsest tier whose resolution answers the time range</text></g></svg></div>
+          <p class="quiet">The raw tier holds immutable two-hour blocks at full resolution; rollup jobs feed the one-minute and one-hour tiers, and total storage lands near 20 TB instead of 220 TB for five years of raw data.</p>
+
+          <h2>Alerting and its state machine</h2>
+          <p>The rule evaluator runs each alert rule on a fixed clock, typically every 15 to 60 seconds, by issuing the rule's query through the same query layer the dashboards use, so an alert and a graph can never disagree about the data. Each rule's result drives a small state machine per label set: a rule is inactive while its condition is false, becomes pending when the condition first turns true, becomes firing only after the condition has held continuously for a configured duration, and resolves when it turns false again. The pending state is the flap suppressor: a CPU metric that spikes over the threshold for one scrape and drops back never pages anyone if the rule requires five minutes of sustained breach, because brief noise dies in pending. The cost is detection delay, exactly the configured duration, so rules for hard failures use short holds and rules for slow burns use long ones.</p>
+          <p>Firing alerts then pass through the alert manager, which exists because raw alerts at fleet scale would page someone hundreds of times for one outage. It deduplicates identical alerts arriving from redundant evaluators, groups related alerts so that fifty instances of one service failing produce one notification listing fifty members, honors silences during planned maintenance, and routes by severity: a page for the database primary being down, a chat message for a disk filling slowly. Escalation policies re-page up a chain when nobody acknowledges. One question closes the design: who watches the watcher? The standard answer is a dead-man's switch, an alert configured to fire continuously by definition, whose arrival a small external service expects every minute; when the heartbeat stops arriving, the external service pages directly, so silence from the monitoring system becomes the loudest signal it can send.</p>
+
+          <h2>Scaling, failures, and operations</h2>
+          <p>Each tier scales by its own rule. Collectors are stateless and partition the target list among themselves through the same service discovery they scrape from. Kafka scales by partitions, and sizing is mild: a million samples per second in batched, compressed form is on the order of 100 MB/s, well within a small cluster's comfort. Storage shards partition by hash of series, so ingest spreads evenly, and each shard replicates to a peer so a node loss costs no data and queries fail over; a shard that dies and returns replays the queue from its last consumed offset, which is the quiet payoff of buffering ingestion, since the queue absorbs hours of backlog while a shard rebuilds. Queries that span shards fan out and merge, and the expensive ones are protected by limits on the number of series a single query may touch, because one unbounded regex over label values can otherwise pull a shard's whole index into memory.</p>
+          <p>The failure stories worth rehearsing are the partial ones. If Kafka itself degrades, collectors buffer briefly in memory and then shed the oldest data first, on the argument that the newest samples matter most during an incident. If a rollup job falls behind, raw data simply lives a little longer before deletion, which costs disk rather than correctness. The rule evaluator runs as two replicas evaluating everything, with the alert manager deduplicating their output, so losing one evaluator changes nothing visible. And the alerting path is kept deliberately boring: few dependencies, its own small deployment, version pinned, because the one component that must work during a bad day is the one that tells you the day is bad.</p>
+
+          <h2>Follow-up questions</h2>
+          <ul>
+            <li><strong>Pull or push collection?</strong> Pull inside the datacenter: the scraper controls load, dead targets are detected by failed scrapes, and hosts need no config. Push for short-lived jobs and NAT-bound edge agents. Real fleets run pull with a push gateway at the edges.</li>
+            <li><strong>How do you stop a cardinality explosion before it lands?</strong> Enforce per-service series quotas at ingestion, reject label keys like user or request IDs by policy, and surface a "top series growth" report so the offending deploy is found in minutes, not after the RAM is gone.</li>
+            <li><strong>Why buffer ingestion through Kafka instead of writing straight to storage?</strong> It decouples failure domains: a storage deploy, a slow shard, or an ingest spike becomes queue lag instead of dropped samples, and a rebuilt shard replays from its offset.</li>
+            <li><strong>Why not store metrics in a relational database?</strong> Random-key writes at a million rows per second churn B-tree pages and pay tens of bytes of per-row overhead on 16-byte facts; delta-of-delta and XOR encoding in a purpose-built engine cut storage about twelvefold and serve recent data from memory.</li>
+            <li><strong>What does "pending for five minutes" actually buy?</strong> Flap suppression: threshold noise dies in the pending state and never pages. The price is exactly five minutes of detection delay, so hold durations are tuned per rule severity.</li>
+            <li><strong>Who alerts when the alerting system is down?</strong> A dead-man's switch: one rule fires by construction forever, and a tiny external service pages when that heartbeat stops arriving.</li>
+          </ul>
+
+          <h2>References</h2>
+          <ol class="refs">
+            <li>Pelkonen et al., <a href="http://www.vldb.org/pvldb/vol8/p1816-teller.pdf" target="_blank" rel="noreferrer">Gorilla: A Fast, Scalable, In-Memory Time Series Database</a> (VLDB 2015), on delta-of-delta and XOR compression.</li>
+            <li>Prometheus, <a href="https://prometheus.io/docs/introduction/overview/" target="_blank" rel="noreferrer">Overview documentation</a>, on the pull model, data model, and architecture.</li>
+            <li>Prometheus, <a href="https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/" target="_blank" rel="noreferrer">Alerting rules documentation</a>, on pending and firing semantics.</li>
+            <li>Kleppmann, <a href="https://dataintensive.net/" target="_blank" rel="noreferrer">Designing Data-Intensive Applications</a> (2017), on storage engines and stream processing.</li>
+            <li>Xu, <a href="https://www.amazon.com/System-Design-Interview-Insiders-Guide/dp/1736049119" target="_blank" rel="noreferrer">System Design Interview, Volume 2</a> (2022), chapter on metrics monitoring and alerting.</li>
+          </ol>
+        </article>
+      </div>
+    </section>
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (window.hljs) hljs.highlightAll();
+      });
+    </script>
+  </body>
+</html>

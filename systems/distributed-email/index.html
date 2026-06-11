@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Design a distributed email service · Stanley Jacob</title>
+    <meta name="description" content="An interview walkthrough of designing a Gmail-scale email service: SMTP gateways and MX records, the receive and send pipelines, content-addressed body storage with dedup, per-user search indexes, SPF, DKIM, DMARC, and layered spam filtering." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems" class="active">Systems</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/systems">← Systems</a></div>
+        <h1>Design a distributed email service</h1>
+        <p class="meta">Systems design · Social and messaging · Jul 2025</p>
+      </div>
+    </header>
+    <section style="padding-top: 0">
+      <div class="wrap">
+        <article class="prose article">
+          <p>This question asks for a webmail product at Gmail's scale: a billion accounts that can send, receive, read, search, and label mail, with spam filtered before it reaches the inbox. What makes email different from every other messaging design is that the service does not own both ends of the conversation. A chat system invents its own protocol and talks only to itself, while an email service must interoperate with every other mail server on the planet through protocols standardized decades ago, and it inherits their semantics, their retry conventions, and their abuse. Interviewers like the question because it combines a high-volume ingestion pipeline, a storage problem measured in exabytes, a per-user search engine, and an adversarial subsystem, spam, where the opponent adapts to whatever is built. The hard parts live in the receive pipeline that must never lose a message it has accepted, in the storage layout that makes a billion mailboxes affordable, and in the send path, where getting mail delivered is as much about reputation as about engineering.</p>
+
+          <h2>Scope and requirements</h2>
+          <p>The functional scope: receive mail from any server on the internet, deliver it to the right mailbox with spam scored on the way in, let users read, label, archive, and delete through the product's own web and mobile clients, search across a mailbox's full history, and send mail to any address in the world. The product's own clients talk to an HTTP API, which is simpler and richer than the legacy protocols, but the service still speaks the standard ones at its edges: SMTP, the Simple Mail Transfer Protocol, is how servers transfer mail to each other and is non-negotiable, while IMAP and POP, the older protocols that let third-party clients read a mailbox, are supported as legacy access for the minority who want them.</p>
+          <p>Non-functionally, accepted mail must never be lost, which makes durability the first constraint on the receive path: once this service tells a sending server "accepted," responsibility has transferred. Inbox reads should render in a couple hundred milliseconds, search in well under a second, and availability must be high enough that mail is effectively always receivable, since sending servers retry for only a few days before giving up. Mail content is sensitive, so encryption at rest and tight internal access controls are assumed throughout.</p>
+
+          <h2>Sizing the problem</h2>
+          <p>Take 1 billion users receiving an average of 50 emails a day, counting the spam that must be processed even when it is never shown. That is 50 billion deliveries a day, and dividing by 86,400 seconds gives about 580,000 messages per second on average, with peaks two to three times higher during weekday mornings across major time zones. Every one of those messages passes through acceptance, scanning, and delivery, so the pipeline is built for millions of messages per second of headroom.</p>
+          <p>Storage is the number that forces the architecture. At an average of 50 KB per message including attachments amortized in, 50 billion messages a day is 2.5 PB of new mail daily, which compounds to roughly 900 PB a year and several exabytes over five years, before replication multiplies it. Nobody stores that naively, and two levers make it affordable. Deduplication: identical content is stored once, which matters enormously for email because newsletters, notifications, and forwarded attachments are sent to thousands or millions of recipients each. A 5 MB attachment mailed to 1,000 recipients is 5 GB stored naively and 5 MB stored content-addressed, a 1,000-fold saving on exactly the heaviest objects. Tiering: mail older than a few months is rarely opened, so cold messages move to cheaper, denser storage with slightly slower retrieval, invisible to users beyond a moment's delay on a ten-year-old thread.</p>
+
+          <h2>The client API</h2>
+          <p>The product's own clients use an HTTP API that treats the mailbox as a database of threads and labels rather than a folder of files, with notifications pushed over a persistent channel so a new message appears without polling.</p>
+          <pre><code class="language-http">GET /api/v1/threads?label=inbox&amp;limit=50
+→ 200 { "threads": [ { "thread_id": "t8812", "subject": "Quarterly report",
+                       "snippet": "Attached is the...", "unread": true } ] }
+
+GET /api/v1/messages/m42751
+→ 200 { "from": "ana@example.org", "body_ref": "blob/9f31c2...", "labels": ["inbox"] }
+
+POST /api/v1/messages
+{ "to": ["ben@elsewhere.com"], "subject": "Re: Quarterly report", "body": "..." }
+→ 202 { "message_id": "m42788", "state": "queued" }
+
+POST /api/v1/messages/m42751/labels   { "add": ["archive"], "remove": ["inbox"] }
+</code></pre>
+          <p>Send returns 202 rather than 200 because sending is asynchronous by nature: the message enters an outbound queue, and actual delivery to the remote server happens, and possibly retries, long after the API call returns.</p>
+
+          <h2>The data model</h2>
+          <p>The storage split that makes the system work is metadata apart from bodies. Mailbox metadata, threads, labels, read flags, and per-message envelope fields, is small, hot, and queried in user-scoped patterns, so it lives in a distributed database partitioned by user ID with strong consistency inside a partition, since a user who archives a thread on their phone must see it archived on their laptop immediately. Bodies are large, immutable, and cold, so they live in object storage, content-addressed: the raw message, in MIME format, the standard envelope-and-parts encoding that lets one email carry text, HTML, and attachments together, is hashed, and the hash is both its name and its dedup key, so the thousandth copy of a newsletter stores nothing new and just increments a reference count.</p>
+          <pre><code class="language-sql">CREATE TABLE messages (         -- partitioned by user_id
+  user_id     BIGINT,
+  message_id  BIGINT,
+  thread_id   BIGINT,
+  from_addr   TEXT,
+  subject     TEXT,
+  snippet     TEXT,
+  labels      TEXT[],           -- inbox, sent, spam, user labels
+  body_ref    CHAR(64),         -- content hash into object storage
+  received_at TIMESTAMPTZ,
+  PRIMARY KEY (user_id, message_id)
+);
+
+CREATE TABLE blobs (
+  body_ref    CHAR(64) PRIMARY KEY,
+  size_bytes  BIGINT,
+  refcount    BIGINT            -- dedup bookkeeping
+);
+</code></pre>
+
+          <h2>The high-level architecture: receiving mail</h2>
+          <p>Receiving starts before the first byte arrives, with DNS. A domain's MX records, the DNS entries that name the mail servers willing to accept mail for that domain, point at a fleet of SMTP gateways behind regional load balancing. A gateway accepts the SMTP conversation, applies connection-level defenses such as rate limits and IP reputation checks, and writes the raw message to a durable intake log before acknowledging, because the acknowledgment is a promise. From there the pipeline is asynchronous: scanning classifies the message for spam and malware, the delivery service writes metadata into the recipient's partition and the body into object storage, the search index absorbs the new message, and a notification wakes any connected client.</p>
+          <div class="diagram"><svg width="100%" style="max-width: 760px" viewBox="0 0 760 310" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Email receive pipeline from the sending server through gateways, scanning, delivery, storage, index, and notification"><defs><marker id="arr-em1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#86868b"/></marker></defs><g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"><rect x="20" y="64" width="130" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="85" y="88" text-anchor="middle" font-size="14" fill="#1d1d1f">Sending MTA</text><text x="85" y="104" text-anchor="middle" font-size="11" fill="#5f5f66">external server</text><rect x="210" y="64" width="150" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="285" y="88" text-anchor="middle" font-size="14" fill="#1d1d1f">SMTP gateway</text><text x="285" y="104" text-anchor="middle" font-size="11" fill="#5f5f66">MX targets</text><rect x="410" y="64" width="150" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="485" y="88" text-anchor="middle" font-size="14" fill="#1d1d1f">Scanning tier</text><text x="485" y="104" text-anchor="middle" font-size="11" fill="#5f5f66">spam, virus, auth</text><rect x="610" y="64" width="130" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="675" y="95" text-anchor="middle" font-size="14" fill="#1d1d1f">Delivery service</text><rect x="20" y="230" width="160" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="100" y="254" text-anchor="middle" font-size="14" fill="#1d1d1f">Mailbox store</text><text x="100" y="270" text-anchor="middle" font-size="11" fill="#5f5f66">metadata, labels</text><rect x="230" y="230" width="150" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="305" y="254" text-anchor="middle" font-size="14" fill="#1d1d1f">Object store</text><text x="305" y="270" text-anchor="middle" font-size="11" fill="#5f5f66">raw MIME bodies</text><rect x="430" y="230" width="140" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="500" y="254" text-anchor="middle" font-size="14" fill="#1d1d1f">Search index</text><text x="500" y="270" text-anchor="middle" font-size="11" fill="#5f5f66">per-user, sharded</text><rect x="620" y="230" width="120" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="680" y="254" text-anchor="middle" font-size="14" fill="#1d1d1f">Notifications</text><text x="680" y="270" text-anchor="middle" font-size="11" fill="#5f5f66">to clients</text><path d="M150,90 H210" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-em1)"/><text x="180" y="82" text-anchor="middle" font-size="12" fill="#5f5f66">SMTP</text><path d="M360,90 H410" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-em1)"/><path d="M560,90 H610" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-em1)"/><path d="M625,116 V150 H100 V230" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-em1)"/><text x="240" y="142" text-anchor="middle" font-size="12" fill="#5f5f66">mailbox rows</text><path d="M643,116 V180 H305 V230" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-em1)"/><text x="380" y="172" text-anchor="middle" font-size="12" fill="#5f5f66">MIME body</text><path d="M661,116 V210 H500 V230" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-em1)"/><text x="560" y="202" text-anchor="middle" font-size="12" fill="#5f5f66">index update</text><path d="M679,116 V230" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-em1)"/><text x="688" y="180" text-anchor="start" font-size="12" fill="#5f5f66">notify</text></g></svg></div>
+          <p class="quiet">The gateway durably logs each accepted message before acknowledging the sender, and everything downstream of acceptance is asynchronous: delivery writes metadata and the body, updates the index, and wakes connected clients over the dashed notification path.</p>
+
+          <h2>Sending mail and the reputation game</h2>
+          <p>The outbound path starts at the submission service, which authenticates the user, applies per-account rate limits that keep a compromised password from becoming a spam cannon, and signs the message before queueing it for the outbound MTA pool, the mail transfer agents that actually connect to remote servers. Three authentication standards govern whether the world believes the mail. SPF lets a domain publish in DNS which servers are allowed to send mail on its behalf. DKIM attaches a cryptographic signature to each message so receivers can verify it was sent by the domain and not altered in transit. DMARC lets the domain tell receivers what to do when SPF and DKIM checks fail, and asks them to send back aggregate reports. A provider at this scale enforces all three on inbound mail and maintains them meticulously on outbound mail, because its sending reputation, tracked per outbound IP and per domain by every large receiver, decides whether a billion users' legitimate mail lands in inboxes or spam folders.</p>
+          <div class="diagram"><svg width="100%" style="max-width: 760px" viewBox="0 0 760 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Email send pipeline with authentication, signing, the outbound MTA pool, and the retry queue"><defs><marker id="arr-em2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#86868b"/></marker></defs><g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"><rect x="20" y="50" width="110" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="75" y="81" text-anchor="middle" font-size="14" fill="#1d1d1f">Client</text><rect x="190" y="50" width="160" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="270" y="74" text-anchor="middle" font-size="14" fill="#1d1d1f">Submission service</text><text x="270" y="90" text-anchor="middle" font-size="11" fill="#5f5f66">auth, rate limits</text><rect x="410" y="50" width="150" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="485" y="74" text-anchor="middle" font-size="14" fill="#1d1d1f">Outbound queue</text><text x="485" y="90" text-anchor="middle" font-size="11" fill="#5f5f66">DKIM-signed</text><rect x="620" y="50" width="120" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="680" y="81" text-anchor="middle" font-size="14" fill="#1d1d1f">Outbound MTA</text><rect x="410" y="180" width="150" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="485" y="204" text-anchor="middle" font-size="14" fill="#1d1d1f">Remote MX</text><text x="485" y="220" text-anchor="middle" font-size="11" fill="#5f5f66">recipient server</text><rect x="620" y="180" width="120" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="680" y="204" text-anchor="middle" font-size="14" fill="#1d1d1f">Retry queue</text><text x="680" y="220" text-anchor="middle" font-size="11" fill="#5f5f66">backoff timers</text><path d="M130,76 H190" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-em2)"/><circle cx="160" cy="58" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="160" y="62" text-anchor="middle" font-size="11" fill="#1d1d1f">1</text><path d="M350,76 H410" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-em2)"/><circle cx="380" cy="58" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="380" y="62" text-anchor="middle" font-size="11" fill="#1d1d1f">2</text><path d="M560,76 H620" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-em2)"/><circle cx="590" cy="58" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="590" y="62" text-anchor="middle" font-size="11" fill="#1d1d1f">3</text><path d="M650,102 V150 H490 V180" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-em2)"/><circle cx="570" cy="132" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="570" y="136" text-anchor="middle" font-size="11" fill="#1d1d1f">4</text><path d="M660,102 V180" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-em2)"/><circle cx="639" cy="141" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="639" y="145" text-anchor="middle" font-size="11" fill="#1d1d1f">5</text><path d="M700,180 V102" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-em2)"/><circle cx="721" cy="141" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="721" y="145" text-anchor="middle" font-size="11" fill="#1d1d1f">6</text></g></svg></div>
+          <p class="quiet">Step 1: the client submits through the authenticated API. Step 2: the submission service rate-limits and DKIM-signs the message into the outbound queue. Step 3: an outbound MTA picks it up. Step 4: the MTA attempts SMTP delivery to the recipient's MX. Step 5: a temporary 4xx response parks the message in the retry queue. Step 6: after backoff it is retried, while a permanent 5xx response instead generates a bounce back to the sender.</p>
+          <p>The retry discipline comes straight from SMTP's response codes. A 4xx response means temporary failure, the remote mailbox is over quota or the server is greylisting, and the correct behavior is to retry on a backoff schedule, typically minutes at first and stretching toward hours, for up to a few days before giving up. A 5xx response means permanent failure, no such user or mail refused by policy, and retrying is worse than useless because hammering a server with rejected mail damages reputation, so the message bounces immediately with a delivery failure notice to the sender. The outbound pool also shapes traffic per destination, because large receivers throttle by source IP, so queues are organized per destination domain and drained at each domain's tolerated pace.</p>
+
+          <h2>Search across a billion mailboxes</h2>
+          <p>Email search is a different problem from web search in a way that makes it tractable: no query ever spans users, so the index can be partitioned exactly like the mailbox. Each user gets their own inverted index, the structure that maps each term to the list of messages containing it, sharded on the same user ID as the metadata so a user's mail and index live together. On delivery, the pipeline tokenizes the subject and body, updates the user's index, and the change is visible to search within seconds; a delivery rate of 580,000 messages per second is also 580,000 index updates per second, which is why the index write path is built into the pipeline rather than batched overnight. The index stores term positions for phrase queries and structured fields for the filters users actually type, from, to, has attachment, date ranges. A median mailbox of a few gigabytes yields an index of a few hundred megabytes, which at a billion users is on the order of hundreds of petabytes of index, kept affordable the same way bodies are: the index for cold mail can be rebuilt or paged from cheaper storage, while the hot recent index stays on fast media.</p>
+
+          <h2>Spam as a layered system</h2>
+          <p>Spam filtering cannot be one classifier, because the adversary probes whatever single thing is deployed. The layers run from cheap to expensive. Connection-time checks reject the worst traffic before reading a byte of content: IP reputation lists, rate anomalies, and protocol fingerprints, which matters when a majority of all connection attempts are abusive. Authentication checks, SPF, DKIM, and DMARC results, then separate forged sender claims from real ones. Content rules catch known campaign signatures and malicious attachment types, and a machine-learned classifier scores everything that survives, trained on features from headers, body text, sender history, and the user's own past behavior toward similar mail. The user feedback loop closes the system: every "report spam" and "not spam" click is a labeled example flowing back into training, hundreds of millions of labels a day at this scale, which is the data advantage that makes a large provider's filter hard to evade. Scoring places mail in the inbox or the spam folder rather than silently dropping it except at the very highest confidence, because false positives, real mail marked as spam, are the costliest outcome the system can produce.</p>
+
+          <h2>Scaling, failures, and operations</h2>
+          <p>The tiers scale on different axes. Gateways and scanners are stateless and scale with connection volume, the mailbox store scales by adding user partitions, and object storage scales by hash space, the easiest kind. The intake log is the component whose failure semantics matter most: a gateway that crashes after acknowledging a message must not lose it, so acceptance writes to a replicated log (a Kafka-style commit log or equivalent) before the SMTP 250 response goes out, and delivery consumes from that log with at-least-once semantics, deduplicating on message ID so a replay never produces two copies in an inbox.</p>
+          <p>Multi-region design follows the mailbox. Each user's partition is homed to one region, with synchronous replication inside the region for durability and asynchronous replication to a second region for disaster recovery, so a regional failure means failing over mailboxes with a bounded few seconds of replication lag rather than reconciling a globally writable store. Inbound mail tolerates this gracefully because MX records list multiple gateways across regions, and a gateway in any region can accept mail and forward it to the home region's pipeline, with the sending server's own retry behavior covering brief gaps. The operational metrics that matter are acceptance-to-inbox latency, intake log consumer lag, bounce rates per outbound IP (the early warning that reputation is slipping), spam false positive reports, and storage dedup ratio, which quietly protects the largest line item in the budget.</p>
+
+          <h2>Follow-up questions</h2>
+          <ul>
+            <li><strong>Why object storage for bodies instead of the database?</strong> Bodies are large, immutable, and mostly cold, exactly object storage's design point, and content addressing gives dedup for free. The database keeps only what queries need: envelope fields, labels, flags, and the body hash.</li>
+            <li><strong>What stops a crashed gateway from losing mail?</strong> The SMTP acknowledgment is only sent after the message is in a replicated intake log, so a crash after acceptance replays from the log, and delivery dedup on message ID makes the replay harmless.</li>
+            <li><strong>Why are 4xx and 5xx handled so differently on send?</strong> 4xx is the remote server saying "not now," so backing off and retrying for days is correct, while 5xx is "never," so the message bounces immediately, because retrying permanent failures burns sender reputation.</li>
+            <li><strong>How does search stay fast at a billion users?</strong> By never being global: each user's inverted index is sharded with their mailbox, so a query touches one shard, and index updates ride the delivery pipeline so new mail is searchable in seconds.</li>
+            <li><strong>What is the single highest-leverage cost optimization?</strong> Content-addressed dedup of bodies and attachments. Bulk mail dominates volume and is identical across recipients, so storing each unique body once collapses the largest class of data by orders of magnitude.</li>
+            <li><strong>Why does the provider's own outbound mail need SPF, DKIM, and DMARC?</strong> Because other receivers judge it by the same rules it applies to them, and reputation is tracked per IP and domain. Misconfigured authentication at this scale means a billion users' mail starts landing in spam folders.</li>
+          </ul>
+
+          <h2>References</h2>
+          <ol class="refs">
+            <li>Klensin, <a href="https://datatracker.ietf.org/doc/html/rfc5321" target="_blank" rel="noreferrer">RFC 5321: Simple Mail Transfer Protocol</a> (2008).</li>
+            <li>Kucherawy and Zwicky, <a href="https://datatracker.ietf.org/doc/html/rfc7489" target="_blank" rel="noreferrer">RFC 7489: Domain-based Message Authentication, Reporting, and Conformance (DMARC)</a> (2015).</li>
+            <li>Crocker, Hansen, and Kucherawy, <a href="https://datatracker.ietf.org/doc/html/rfc6376" target="_blank" rel="noreferrer">RFC 6376: DomainKeys Identified Mail (DKIM) Signatures</a> (2011).</li>
+            <li>Xu, <a href="https://www.amazon.com/System-Design-Interview-Insiders-Guide/dp/1736049119" target="_blank" rel="noreferrer">System Design Interview, Volume 2</a> (2022), chapter on distributed email services.</li>
+            <li>Kleppmann, <a href="https://dataintensive.net/" target="_blank" rel="noreferrer">Designing Data-Intensive Applications</a> (2017), on logs, partitioning, and replication.</li>
+          </ol>
+        </article>
+      </div>
+    </section>
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (window.hljs) hljs.highlightAll();
+      });
+    </script>
+  </body>
+</html>

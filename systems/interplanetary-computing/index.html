@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Design an interplanetary distributed computing system · Stanley Jacob</title>
+    <meta name="description" content="An interview walkthrough of designing services that span Earth and Mars: light-time physics, why TCP fails, delay-tolerant networking and the Bundle Protocol, per-planet autonomy, CRDT reconciliation, and PKI at a 44 minute round trip." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems" class="active">Systems</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/systems">← Systems</a></div>
+        <h1>Design an interplanetary distributed computing system</h1>
+        <p class="meta">Systems design · Off the beaten path · Dec 2025</p>
+      </div>
+    </header>
+    <section style="padding-top: 0">
+      <div class="wrap">
+        <article class="prose article">
+          <p>Suppose there is a settlement on Mars with a few thousand people, and they need the boring things: software updates, a package registry, messaging with Earth, shared documents, an inventory system that both planets can read. The premise is playful, but the engineering deserves to be done straight, because every familiar assumption of distributed systems fails at once. There is no request-response, no health check, no "retry in five seconds," no quorum spanning the two sites, and for two weeks out of every twenty-six months there is no link at all. Interviewers who ask this are not testing space trivia; they are testing whether a candidate can rebuild their designs from first principles when the speed of light becomes the dominant line item in every latency budget.</p>
+          <p>This question is also a stress test of intellectual hygiene around consistency, since the usual hedge, "we will use strong consistency where we need it," stops being available when a single coordination round costs up to 44 minutes. What follows works through the physics, the networking layer that replaces TCP, what consistency can still mean, and how software actually gets shipped and operated across the gap.</p>
+
+          <h2>Scope and requirements</h2>
+          <p>Functionally, the system must give the Mars settlement working local infrastructure: compute, storage, software distribution, identity, and the everyday applications that run on them, and it must synchronize with Earth in three streams: content and software artifacts flowing outward, telemetry and science data flowing back, and shared application state, messages, documents, inventories, flowing both ways. Mars must remain fully operational with the link down, which is not an edge case but a scheduled fact of orbital mechanics.</p>
+          <p>Non-functionally, the design goals invert the usual ranking. Availability of local services dominates everything, since a Mars outage cannot wait on Earth for a fix; interplanetary freshness is explicitly sacrificed, with minutes-to-hours of staleness accepted as normal; and bandwidth efficiency matters the way it did in 1985, because every byte crossing deep space is contended, scheduled, and expensive. Durability of the sync streams must tolerate the link vanishing mid-transfer without losing or duplicating anything.</p>
+
+          <h2>Sizing the problem: the physics is the workload</h2>
+          <p>Earth and Mars range between about 55 and 400 million kilometers apart as the planets orbit, and dividing by the speed of light, 300,000 km/s, gives a one-way light time between roughly 183 seconds and 1,333 seconds: 3 minutes at closest approach, 22 minutes near maximum separation, so a round trip costs 6 to 44 minutes. No protocol cleverness reduces this; it is the floor. Every 26 months the Sun sits between the planets at solar conjunction and blacks out the link for about two weeks, so the system must budget for a planned fortnight of zero connectivity. Bandwidth is the third constraint: radio links through the Deep Space Network deliver megabit-class rates at best from Mars distance, historically a few Mbps down and far less up, while newer optical links have demonstrated hundreds of megabits near closest approach falling to tens of megabits when far. The arithmetic that disciplines every design decision: shipping 1 TB over a 10 Mbps link takes 8 times 10<sup>12</sup> bits over 10<sup>7</sup> bits per second, which is 800,000 seconds, about nine and a quarter days of continuous transmission, and the link is not even continuous, because ground stations and relay orbiters see each other only during scheduled contact windows of minutes to hours.</p>
+
+          <h2>The interface: bundles, not requests</h2>
+          <p>Application code cannot be written against a request-response interface when the response is 40 minutes away at best, so the programming model becomes message passing with delivery handled by the network over hours. The unit is a bundle, and the API makes the queueing explicit: send accepts a destination, a lifetime, and a custody flag, and returns immediately; delivery, if it happens, is reported asynchronously, possibly days later.</p>
+          <pre><code class="language-python">from dtn import Node
+
+node = Node("ipn:earth.registry")
+
+# enqueue for the next contact window; returns immediately
+receipt = node.send(
+    destination="ipn:mars.registry",
+    payload=artifact_block,          # content-addressed chunk
+    lifetime=timedelta(days=7),      # discard if undeliverable by then
+    custody=True,                    # each hop takes responsibility
+)
+
+@node.on_delivery(receipt)
+def acked(report):                   # may fire hours or days later
+    mark_replicated(report.bundle_id)
+
+@node.on_bundle("artifact/*")
+def receive(bundle):                 # idempotent: duplicates possible
+    store_if_new(bundle.content_hash, bundle.payload)
+</code></pre>
+
+          <h2>The data model: state built to merge</h2>
+          <p>Because both planets keep writing while disconnected, shared state is stored in forms designed for later merging rather than for locking. The two workhorses are append-only logs, where each site only ever adds records and sync is an exchange of missing suffixes, and CRDT state, covered in depth below. A sketch of the replicated layer:</p>
+          <pre><code class="language-sql">CREATE TABLE replicated_log (
+  site        CHAR(1)  NOT NULL,     -- 'e' or 'm', who wrote it
+  seq         BIGINT   NOT NULL,     -- per-site, gapless
+  hlc         BIGINT   NOT NULL,     -- hybrid logical clock timestamp
+  entry       JSONB    NOT NULL,
+  PRIMARY KEY (site, seq)            -- sync = ship suffixes both ways
+);
+
+CREATE TABLE crdt_state (
+  object_id   UUID  NOT NULL,
+  site        CHAR(1) NOT NULL,
+  payload     BYTEA NOT NULL,        -- per-site component, merged by type
+  PRIMARY KEY (object_id, site)
+);
+</code></pre>
+
+          <h2>The high-level architecture</h2>
+          <p>The shape is two autonomous regions joined by a store-and-forward relay chain. Each planet runs a complete, ordinary stack: services, databases with normal strong consistency inside the planet, a container registry, identity, monitoring, all of it answering in local milliseconds, because consensus among machines in the same settlement is as fast there as it is here. Nothing interactive ever spans the gap. Between the regions sits the delay-tolerant network: bundle gateways at each edge, ground stations, and relay orbiters, each holding bundles in persistent storage until the next scheduled contact window lets them move a hop closer.</p>
+          <div class="diagram"><svg width="100%" style="max-width: 760px" viewBox="0 0 760 355" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Earth and Mars autonomous regions joined by DTN gateways, ground stations, and a contact window link"><defs><marker id="arr-ic1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#86868b"/></marker></defs><g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"><rect x="20" y="44" width="160" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="100" y="68" text-anchor="middle" font-size="14" fill="#1d1d1f">Earth region</text><text x="100" y="84" text-anchor="middle" font-size="11" fill="#5f5f66">full stack, consensus inside</text><rect x="20" y="160" width="160" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="100" y="184" text-anchor="middle" font-size="14" fill="#1d1d1f">Earth DTN gateway</text><text x="100" y="200" text-anchor="middle" font-size="11" fill="#5f5f66">bundle store, custody</text><rect x="20" y="276" width="160" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="100" y="300" text-anchor="middle" font-size="14" fill="#1d1d1f">Ground station</text><text x="100" y="316" text-anchor="middle" font-size="11" fill="#5f5f66">Deep Space Network</text><rect x="580" y="44" width="160" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="660" y="68" text-anchor="middle" font-size="14" fill="#1d1d1f">Mars region</text><text x="660" y="84" text-anchor="middle" font-size="11" fill="#5f5f66">autonomous full stack</text><rect x="580" y="160" width="160" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="660" y="184" text-anchor="middle" font-size="14" fill="#1d1d1f">Mars DTN gateway</text><text x="660" y="200" text-anchor="middle" font-size="11" fill="#5f5f66">bundle store, custody</text><rect x="580" y="276" width="160" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="660" y="300" text-anchor="middle" font-size="14" fill="#1d1d1f">Relay orbiter</text><text x="660" y="316" text-anchor="middle" font-size="11" fill="#5f5f66">stores and forwards</text><path d="M100,96 V160" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-ic1)"/><text x="108" y="132" text-anchor="start" font-size="12" fill="#5f5f66">bundles</text><path d="M100,212 V276" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-ic1)"/><path d="M660,276 V212" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-ic1)"/><path d="M660,160 V96" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-ic1)"/><path d="M180,296 H580" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-ic1)"/><path d="M580,312 H180" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-ic1)"/><text x="380" y="284" text-anchor="middle" font-size="12" fill="#5f5f66">scheduled contact windows, 3 to 22 light minutes</text><text x="380" y="344" text-anchor="middle" font-size="12" fill="#5f5f66">about two weeks of blackout at solar conjunction</text></g></svg></div>
+          <p class="quiet">Each planet is a complete, internally consistent region; only bundles cross between them, hopping through gateways, ground stations, and relay orbiters that each store everything until the next contact window.</p>
+
+          <h2>Why TCP cannot make the trip</h2>
+          <p>It is worth being precise about why the ordinary Internet stack fails, because every piece of the replacement answers a specific failure. TCP opens with a three-way handshake, so before a single payload byte moves, one full round trip is spent, up to 44 minutes of silence. Its reliability comes from retransmission timers tuned in milliseconds, which at interplanetary delay either fire constantly and flood the link with spurious retransmits or are inflated until loss recovery takes hours. Its congestion control discovers safe sending rates from a feedback loop of acknowledgments, useless when feedback is 40 minutes stale, and an end-to-end connection assumes the path exists for the conversation's duration, while this path exists only during contact windows. Delay-tolerant networking, standardized as the Bundle Protocol in RFC 9171, replaces the conversation with custody of messages. A bundle is a self-contained unit, payload plus metadata plus a lifetime, and each DTN node persists every bundle it accepts to durable storage, forwarding it when a contact window opens toward the destination, which is store-and-forward in the old email sense applied to all traffic. With custody transfer, a hop that accepts a bundle takes responsibility for it, acknowledging hop-by-hop rather than end-to-end, so a bundle never needs to survive the whole path in one attempt, only the next hop, and routing is computed from the contact plan, the published schedule of future windows derived from orbital mechanics, rather than discovered by probing.</p>
+
+          <h2>Consistency at 44 minutes: regions and CRDTs</h2>
+          <p>Strong consistency means all replicas agree on a single order of updates, and the protocols that provide it, Paxos and Raft, require a majority round trip per decision. A consensus group spanning Earth and Mars would therefore take at least one interplanetary RTT per write, 6 to 44 minutes to commit a single change, and during conjunction it would commit nothing at all. So the design rule is absolute: no synchronous coordination crosses the gap, ever, for anything. Each planet runs strongly consistent infrastructure internally, and interplanetary state is reconciled asynchronously, which forces a real answer to the question of what happens when both sides changed the same thing during the hours or days between syncs.</p>
+          <p>CRDTs, conflict-free replicated data types, are data structures whose merge operation is commutative, associative, and idempotent, which together guarantee that replicas applying each other's updates in any order, any number of times, converge to the same state without coordination. The simplest is the grow-only counter: each site keeps its own component, only increments it, and the merged value is the per-site maximum, summed. Concretely, if Earth's replica of a "supply requests filed" counter holds earth 41, mars 7 while Mars holds earth 38, mars 9, the difference being writes the other side has not yet seen, then after a sync both compute max per component, earth 41, mars 9, and both read 50, with nothing lost and no coordinator consulted. Sets, maps, and sequence types follow the same discipline with more bookkeeping. The hazard lives in last-writer-wins registers, which resolve concurrent writes by keeping the one with the larger timestamp: with hybrid logical clocks, timestamps that combine physical time with a logical counter so causality is never inverted by clock skew, the rule is at least deterministic, but it still silently discards one side's concurrent write, which is unacceptable for anything like an inventory adjustment. The engineering posture is to use CRDTs where merge semantics are natural, counters, sets, presence, document edits, use append-only logs where every event must survive, and route genuinely conflicting business decisions, two sides allocating the same scarce resource during a blackout, into an explicit conflict queue for humans, because pretending a merge function can settle a resource dispute is how settlements end up with two owners for one rover.</p>
+          <div class="diagram"><svg width="100%" style="max-width: 760px" viewBox="0 0 760 310" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two replicas of a grow only counter incrementing independently and converging after a merge"><defs><marker id="arr-ic2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#86868b"/></marker></defs><g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"><rect x="60" y="44" width="180" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="150" y="68" text-anchor="middle" font-size="14" fill="#1d1d1f">Earth replica</text><text x="150" y="84" text-anchor="middle" font-size="11" fill="#5f5f66">g-counter, site e</text><rect x="520" y="44" width="180" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="610" y="68" text-anchor="middle" font-size="14" fill="#1d1d1f">Mars replica</text><text x="610" y="84" text-anchor="middle" font-size="11" fill="#5f5f66">g-counter, site m</text><circle cx="150" cy="113" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="150" y="117" text-anchor="middle" font-size="11" fill="#1d1d1f">1</text><rect x="60" y="130" width="180" height="40" rx="6" fill="#f6f6f7" stroke="#d8d8de" stroke-width="1"/><text x="150" y="154" text-anchor="middle" font-size="12" fill="#1d1d1f">{ e: 41, m: 7 }</text><rect x="520" y="130" width="180" height="40" rx="6" fill="#f6f6f7" stroke="#d8d8de" stroke-width="1"/><text x="610" y="154" text-anchor="middle" font-size="12" fill="#1d1d1f">{ e: 38, m: 9 }</text><path d="M240,142 H520" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-ic2)"/><path d="M520,158 H240" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-ic2)"/><text x="380" y="132" text-anchor="middle" font-size="12" fill="#5f5f66">state exchanged in bundles</text><circle cx="380" cy="185" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="380" y="189" text-anchor="middle" font-size="11" fill="#1d1d1f">2</text><path d="M150,170 V240" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-ic2)"/><text x="158" y="210" text-anchor="start" font-size="12" fill="#5f5f66">merge: max per site</text><path d="M610,170 V240" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-ic2)"/><rect x="60" y="240" width="180" height="40" rx="6" fill="#f6f6f7" stroke="#d8d8de" stroke-width="1"/><text x="150" y="264" text-anchor="middle" font-size="12" fill="#1d1d1f">{ e: 41, m: 9 } = 50</text><rect x="520" y="240" width="180" height="40" rx="6" fill="#f6f6f7" stroke="#d8d8de" stroke-width="1"/><text x="610" y="264" text-anchor="middle" font-size="12" fill="#1d1d1f">{ e: 41, m: 9 } = 50</text><circle cx="380" cy="260" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="380" y="264" text-anchor="middle" font-size="11" fill="#1d1d1f">3</text></g></svg></div>
+          <p class="quiet">Step 1: each site increments only its own component while disconnected. Step 2: at the next contact the full states cross as bundles, in either order. Step 3: both sides take the maximum per component and converge on 50 without any coordination.</p>
+
+          <h2>Shipping software, identity, and trust across the gap</h2>
+          <p>Most interplanetary traffic should be content, not conversation, and content can be shipped ahead of demand. The Mars region runs full mirrors, a container and package registry, documentation, media libraries, with popularity-weighted prefetch deciding what crosses the link before anyone asks, the CDN insight applied at planetary scale. Everything shipped is content-addressed, named by the hash of its bytes, so Mars verifies integrity locally and a re-sent chunk is recognized rather than re-stored, and large artifacts cross as resumable chunked bundles that survive window closures mid-transfer. Deployments are blue-green per planet, meaning the new version stands up alongside the old and traffic flips locally with an instant local rollback path, and no release process may ever require both planets to change together: every protocol version must interoperate with its predecessor, because the two sides will run different versions for days at minimum.</p>
+          <p>Identity and PKI need the same rethink. Certificate validation that phones home, OCSP checks or short-lived certificates renewed hourly, fails on Mars by construction, so the trust architecture becomes hierarchical and offline-capable: a Mars intermediate certificate authority, with its own hardware-protected keys, issues all local certificates, and only the intermediate's relationship with the Earth root crosses the link. Lifetimes stretch from hours to months, revocation travels as signed lists carried in the regular sync stream rather than as on-demand lookups, and the settlement holds enough root material, sealed and split among officers, to survive an extended blackout without trust expiring. Operations follow the same autonomy rule: a human on Earth learns of a Mars incident at least 3 and up to 22 minutes after it begins, plus however long until a contact window, so remediation must be local and automatic, runbooks executed by machines, with Earth receiving lagged telemetry summaries, sampled and compressed to respect the link budget, for forensics rather than firefighting.</p>
+
+          <h2>Scaling, failures, and operations</h2>
+          <p>Scaling within each planet is ordinary and needs no special treatment; scaling the link is the real axis, and it scales by adding relay orbiters, which both widens total contact time and adds path diversity, and by upgrading to optical terminals as they mature. The DTN layer scales by storage, since every node must buffer days of traffic, and a back-of-envelope check keeps it sane: a 25 Mbps average link fully utilized moves about 270 GB per day, so a two-week conjunction backlog is under 4 TB, a trivial amount of disk to buffer on each gateway, meaning the queue is never the constraint, the link is.</p>
+          <p>The failure drills write themselves from the constraints. A lost contact window, weather at a ground station or an orbiter safe-mode, means bundles wait under custody for the next window, applications notice nothing except staleness counters ticking up. Conjunction is rehearsed rather than feared: prefetch fills Mars caches in the weeks before, sync queues drain afterward in priority order, operational telemetry first and bulk content last. A corrupted artifact cannot install because content addresses do not match. The deepest risk is divergence that merging cannot express, which is contained by keeping the set of truly shared mutable state deliberately tiny, auditing it, and treating every addition to it as an architectural decision; the second deepest is operator drift between two stacks run by two teams 200 million kilometers apart, which is met with shared declarative configuration synced like any other content, so the planets converge on intent even when they cannot converse.</p>
+
+          <h2>Follow-up questions</h2>
+          <ul>
+            <li><strong>What changes for the Moon instead of Mars?</strong> The regime flips: 1.3 light seconds one way, about 2.6 seconds RTT, continuous links. Strong consistency across the gap becomes possible though unpleasant, interactive use works with care, and the right design is a high-latency terrestrial region, not a DTN island.</li>
+            <li><strong>Could you run Paxos across planets for rare, critical decisions?</strong> Mechanically yes: a commit costs one to several RTTs, tens of minutes to hours, and conjunction halts it for two weeks. For treaty-grade decisions made monthly that may be acceptable; it must never sit on any request path.</li>
+            <li><strong>Why bundles instead of just TCP with huge timeouts?</strong> Inflated timeouts still leave end-to-end retransmission across the whole path, congestion control with stale feedback, and connections that die at every window closure. Custody transfer moves responsibility hop by hop and needs each bundle to survive only one hop at a time.</li>
+            <li><strong>How do users on Earth see Mars data?</strong> As a lagged replica with provenance: every cross-planet object carries its origin site and sync timestamp, and UIs surface "as of 14:32 Mars time" rather than pretending freshness that physics forbids.</li>
+            <li><strong>What stops CRDTs from quietly losing writes?</strong> Choosing types whose merge keeps everything (grow-only structures, observed-remove sets, logs) for anything irreversible, confining last-writer-wins to genuinely overwrite-safe fields, and routing semantic conflicts, like double-allocating one resource, to a human review queue.</li>
+            <li><strong>Where does clock synchronization come from?</strong> Each planet maintains its own disciplined time from local atomic references; hybrid logical clocks order cross-planet events causally, since NTP across a 44 minute RTT with asymmetric paths cannot provide tight wall-clock agreement and nothing in the design requires it.</li>
+          </ul>
+
+          <h2>References</h2>
+          <ol class="refs">
+            <li>Burleigh et al., <a href="https://www.rfc-editor.org/rfc/rfc9171" target="_blank" rel="noreferrer">RFC 9171: Bundle Protocol Version 7</a> (2022), the delay-tolerant networking protocol.</li>
+            <li>Cerf et al., <a href="https://www.rfc-editor.org/rfc/rfc4838" target="_blank" rel="noreferrer">RFC 4838: Delay-Tolerant Networking Architecture</a> (2007), the architectural rationale.</li>
+            <li>Shapiro et al., <a href="https://hal.inria.fr/inria-00609399" target="_blank" rel="noreferrer">Conflict-free Replicated Data Types</a> (INRIA, 2011), the formal CRDT foundations.</li>
+            <li>NASA JPL, <a href="https://deepspace.jpl.nasa.gov/" target="_blank" rel="noreferrer">Deep Space Network</a>, on ground stations, scheduling, and link capabilities.</li>
+            <li>Kleppmann, <a href="https://dataintensive.net/" target="_blank" rel="noreferrer">Designing Data-Intensive Applications</a> (2017), on consistency, consensus, and convergence.</li>
+          </ol>
+        </article>
+      </div>
+    </section>
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (window.hljs) hljs.highlightAll();
+      });
+    </script>
+  </body>
+</html>

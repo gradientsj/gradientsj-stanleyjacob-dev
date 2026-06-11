@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Design a digital wallet · Stanley Jacob</title>
+    <meta name="description" content="An interview walkthrough of designing a digital wallet: stored-value accounts at a million transfers per second, sharding, two-phase commit versus try-confirm-cancel, event sourcing, Raft-replicated shards, and idempotent commands." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems" class="active">Systems</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/systems">← Systems</a></div>
+        <h1>Design a digital wallet</h1>
+        <p class="meta">Systems design · Reservations and money · Nov 2025</p>
+      </div>
+    </header>
+    <section style="padding-top: 0">
+      <div class="wrap">
+        <article class="prose article">
+          <p>A digital wallet gives users a stored-value account: a balance held by the platform that they top up from a card or bank account and spend or send instantly, the way a PayPal balance, a Venmo account, or an Alipay wallet works. Transfers between two wallet users never touch a bank, since both balances live in the same system, which is exactly why they can be instant and why the system holding them must be incorruptible. The interview phrasing usually attaches an aggressive number, a million transfers per second, and the question is really asking two things at once: can you scale a money store past a single database, and do you understand that scaling it multiplies the ways money can go missing.</p>
+          <p>The hard parts follow from that pairing. A transfer that debits one account and credits another is trivial inside one database and genuinely subtle across two, so the design hinges on how accounts are sharded and what protocol moves money between shards. And because the data is money, every mechanism has to leave an audit trail good enough to reconstruct any balance at any moment, which is what pushes the design toward an event-sourced core rather than a mutable table of numbers.</p>
+
+          <h2>Scope and requirements</h2>
+          <p>Functionally the wallet supports balance accounts, peer-to-peer transfers, top-ups from external payment methods, withdrawals back out, and a complete transaction history per account. Know-your-customer and anti-money-laundering obligations, the identity verification and monitoring that regulators require, are acknowledged as gates on what an account may do rather than designed in depth here, and the card-charging side of top-ups is delegated to a payment service provider.</p>
+          <p>The invariants deserve to be stated plainly, because they are the actual requirements. No balance may go negative. Money is never created or destroyed by a transfer, only moved, so the sum across all accounts changes only at top-up and withdrawal boundaries. Every movement must be attributable to a command from an identified actor. And history must be replayable for audit: given the record, an examiner can re-derive any balance at any past moment. Latency should be sub-second and the headline throughput is 1 million transfers per second, which the sizing below treats seriously rather than waving at.</p>
+
+          <h2>Sizing the problem</h2>
+          <p>Start with what one machine can do. A well-tuned relational database executing small transactions with synchronous durability, meaning each commit is on disk before it is acknowledged, manages somewhere in the range of 5,000 to 10,000 such transactions per second. Taking the generous end, 1,000,000 divided by 10,000 is 100 databases at full saturation, so a realistic deployment needs 200 or more shards once headroom, replication, and uneven load are budgeted. That gap of two full orders of magnitude between the requirement and a single node is the whole reason this design exists.</p>
+          <p>Sharding creates the next problem by arithmetic alone. If accounts are spread across 200 shards and transfer pairs are roughly random, the chance both parties land on the same shard is about 1 in 200, which means 99.5 percent of transfers cross shards. The cross-shard path is therefore the common case, not the corner case, and it has to be fast and safe. The event volume is equally sobering: 1 million transfers per second is 86.4 billion events per day, and at around 120 bytes per event that is roughly 10 TB of log per day, so the log must tier into cheap object storage while staying replayable. Even a skeptic who reads the million as a burst peak with a tenth of that sustained still faces tens of shards and terabytes of history.</p>
+
+          <h2>The API</h2>
+          <p>Amounts are integers in minor units, and every mutating call carries a client-generated operation ID, the wallet's idempotency key, so that a retried request applies once. Transfers are accepted and then settle through the machinery below, which is why the response is a 202 with a pending status rather than an instant final answer.</p>
+          <pre><code class="language-http">POST /api/v1/transfers
+Operation-Id: 0d9f3b71-2c44-4f8e-9a01-8be2f6c0d5a3
+{ "from_account": "acc_211", "to_account": "acc_870",
+  "amount": 2500, "currency": "usd" }
+→ 202 { "transfer_id": "tr_5512", "status": "pending" }
+
+GET  /api/v1/transfers/tr_5512        → 200 { "status": "completed" }
+GET  /api/v1/accounts/acc_211/balance → 200 { "available": 1175, "reserved": 0 }
+POST /api/v1/topups
+Operation-Id: 77c1a9e4-5b02-4d33-8f1c-09d4e2b6a7f0
+{ "account": "acc_211", "amount": 5000, "payment_method": "pm_card_tok" }
+</code></pre>
+
+          <h2>The data model, starting naive</h2>
+          <p>The baseline everything else is measured against is one database with an accounts table and a transactions table. A transfer is a single ACID transaction that debits one row, credits another, and records what it did, and on one node this is simply correct: the balance check and the debit are atomic, the constraint stops overdrafts, and crash recovery is the database's problem.</p>
+          <pre><code class="language-sql">CREATE TABLE accounts (
+  account_id  BIGINT PRIMARY KEY,
+  balance     BIGINT NOT NULL CHECK (balance &gt;= 0),   -- minor units
+  updated_at  TIMESTAMPTZ NOT NULL
+);
+
+BEGIN;
+UPDATE accounts SET balance = balance - 2500
+ WHERE account_id = 211 AND balance &gt;= 2500;          -- 0 rows = insufficient funds
+UPDATE accounts SET balance = balance + 2500
+ WHERE account_id = 870;
+INSERT INTO transactions (op_id, from_acct, to_acct, amount)
+VALUES ('0d9f3b71...', 211, 870, 2500);               -- unique op_id dedupes retries
+COMMIT;
+</code></pre>
+          <p>Everything that follows is an attempt to keep these exact guarantees while the two UPDATE statements move to different machines. Naming that explicitly in the interview frames every later choice as a recovery of something the single node gave for free.</p>
+
+          <h2>The high-level architecture</h2>
+          <p>Accounts are partitioned by account ID across shards, and each shard is not one database but a small replicated group whose nodes agree on an ordered command log. Balances are derived from per-shard event logs, with read models built off those logs serving queries, and snapshots keeping recovery fast.</p>
+          <div class="diagram"><svg width="100%" style="max-width: 760px" viewBox="0 0 760 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Sharded wallet architecture with per-shard Raft groups, event logs, read models, and snapshots"><defs><marker id="arr-wal1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#86868b"/></marker></defs><g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"><rect x="20" y="150" width="110" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="75" y="181" text-anchor="middle" font-size="14" fill="#1d1d1f">Client</text><rect x="180" y="150" width="140" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="250" y="174" text-anchor="middle" font-size="14" fill="#1d1d1f">API gateway</text><text x="250" y="190" text-anchor="middle" font-size="11" fill="#5f5f66">shards by account ID</text><rect x="390" y="40" width="160" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="470" y="64" text-anchor="middle" font-size="14" fill="#1d1d1f">Shard 1</text><text x="470" y="80" text-anchor="middle" font-size="11" fill="#5f5f66">Raft group + event log</text><rect x="390" y="150" width="160" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="470" y="174" text-anchor="middle" font-size="14" fill="#1d1d1f">Shard 2</text><text x="470" y="190" text-anchor="middle" font-size="11" fill="#5f5f66">Raft group + event log</text><rect x="390" y="260" width="160" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="470" y="284" text-anchor="middle" font-size="14" fill="#1d1d1f">Shard 3</text><text x="470" y="300" text-anchor="middle" font-size="11" fill="#5f5f66">Raft group + event log</text><rect x="620" y="40" width="120" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="680" y="64" text-anchor="middle" font-size="14" fill="#1d1d1f">Snapshots</text><text x="680" y="80" text-anchor="middle" font-size="11" fill="#5f5f66">fast recovery</text><rect x="620" y="150" width="120" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="680" y="174" text-anchor="middle" font-size="14" fill="#1d1d1f">Read models</text><text x="680" y="190" text-anchor="middle" font-size="11" fill="#5f5f66">balances, history</text><path d="M130,176 H180" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-wal1)"/><path d="M250,150 V66 H390" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-wal1)"/><path d="M320,176 H390" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-wal1)"/><text x="355" y="168" text-anchor="middle" font-size="12" fill="#5f5f66">commands</text><path d="M250,202 V286 H390" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-wal1)"/><path d="M550,56 H620" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-wal1)"/><text x="585" y="46" text-anchor="middle" font-size="12" fill="#5f5f66">snapshot</text><path d="M550,80 H585 V168 H620" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-wal1)"/><text x="592" y="128" text-anchor="start" font-size="12" fill="#5f5f66">events</text><path d="M550,176 H620" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-wal1)"/><path d="M550,286 H585 V184 H620" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-wal1)"/><text x="592" y="232" text-anchor="start" font-size="12" fill="#5f5f66">events</text></g></svg></div>
+          <p class="quiet">Commands route by account ID to a shard, each shard is a Raft-replicated state machine appending to its own event log, and projections off the logs build read models and snapshots. Dashed arrows are asynchronous.</p>
+
+          <h2>Cross-shard transfers</h2>
+          <p>A transfer between accounts on different shards is a distributed transaction, an operation that must appear atomic even though it spans machines that can fail independently, and the protocol choices are worth comparing through their failure stories rather than their happy paths.</p>
+          <p>Two-phase commit, or 2PC, is the database-level answer: a coordinator asks every participant to prepare, meaning each durably promises it can commit and holds locks while it waits, and once all vote yes the coordinator tells them to commit. The failure story is the famous hazard: if the coordinator crashes between the phases, participants are left in doubt, holding locks on account rows, unable to either commit or roll back until the coordinator returns. At hundreds of thousands of transfers per second, a blocked participant freezes a slice of all accounts on its shard, which is why high-volume money systems tend to avoid 2PC on the hot path.</p>
+          <p>Try-confirm-cancel, or TC/C, moves the transaction up into the application as two or three ordinary local transactions. The try step reserves funds on the debit side, moving 25.00 from available into a reserved bucket on shard A, a real committed row visible to audit. The confirm step applies the transfer, finalizing the debit on A and crediting the account on B. If anything fails after a successful try, the cancel step releases the reservation and the money never moved. Each step is idempotent and journaled, so a crashed coordinator is recovered by a scanner that finds in-flight transfers and drives them forward or backward; nothing blocks, because every intermediate state is a committed, legible business state rather than a held lock. The debit side always goes first, since the failure mode of credit-first ordering is a window where the recipient can spend money that was never successfully taken from the sender, which creates money out of a crash.</p>
+          <p>A saga generalizes the same idea: a sequence of local transactions where each step has a compensating action that undoes it if a later step fails. TC/C is essentially a two-step saga specialized for funds, and the specialization matters because reserving before spending is what preserves the no-negative-balance invariant mid-flight. The cost relative to 2PC is that the application owns the protocol, the recovery scanner, and the reserved-funds bookkeeping, and that users can briefly see a reserved amount on their balance; the gain is that no machine failure can leave locks pinned across the fleet.</p>
+          <div class="diagram"><svg width="100%" style="max-width: 760px" viewBox="0 0 760 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Cross-shard transfer via try-confirm-cancel with the cancel branch dashed"><defs><marker id="arr-wal2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#86868b"/></marker></defs><g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"><rect x="20" y="40" width="110" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="75" y="71" text-anchor="middle" font-size="14" fill="#1d1d1f">Client</text><rect x="290" y="40" width="180" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="380" y="64" text-anchor="middle" font-size="14" fill="#1d1d1f">Transfer coordinator</text><text x="380" y="80" text-anchor="middle" font-size="11" fill="#5f5f66">try, confirm, cancel</text><rect x="140" y="180" width="160" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="220" y="204" text-anchor="middle" font-size="14" fill="#1d1d1f">Shard A</text><text x="220" y="220" text-anchor="middle" font-size="11" fill="#5f5f66">debit side, account X</text><rect x="460" y="180" width="160" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="540" y="204" text-anchor="middle" font-size="14" fill="#1d1d1f">Shard B</text><text x="540" y="220" text-anchor="middle" font-size="11" fill="#5f5f66">credit side, account Y</text><path d="M130,58 H290" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-wal2)"/><circle cx="210" cy="42" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="210" y="46" text-anchor="middle" font-size="11" fill="#1d1d1f">1</text><path d="M330,92 V148 H220 V180" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-wal2)"/><circle cx="275" cy="134" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="275" y="138" text-anchor="middle" font-size="11" fill="#1d1d1f">2</text><path d="M430,92 V148 H540 V180" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-wal2)"/><circle cx="485" cy="134" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="485" y="138" text-anchor="middle" font-size="11" fill="#1d1d1f">3</text><path d="M310,92 V120 H160 V180" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-wal2)"/><circle cx="235" cy="106" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="235" y="110" text-anchor="middle" font-size="11" fill="#1d1d1f">4</text><path d="M290,76 H130" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-wal2)"/><circle cx="210" cy="92" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="210" y="96" text-anchor="middle" font-size="11" fill="#1d1d1f">5</text></g></svg></div>
+          <p class="quiet">Step 1: the client requests a transfer. Step 2, try: the coordinator reserves the amount on the debit shard. Step 3, confirm: it applies the credit on shard B and finalizes the debit. Step 4, the dashed cancel branch: any failure after the try releases the reservation, and no money moved. Step 5: the client sees the outcome.</p>
+
+          <h2>Event sourcing as the backbone</h2>
+          <p>Event sourcing means the balance is not a stored number but the fold of an append-only event log: the log records facts such as "transfer tr_5512 reserved 2500 from acc_211" and "tr_5512 confirmed," and the current state of any account is what you get by applying its events in order. Because replaying 86 billion events to answer a balance query would be absurd, each shard takes periodic snapshots, materialized states as of a log position, and a read is the latest snapshot plus the short tail of events after it.</p>
+          <p>What this buys is exactly what the invariants demanded. Audit comes free, because the log is the audit trail rather than a reconstruction of it. Recovery is deterministic replay: a node that crashes reloads its snapshot, replays the tail, and lands in provably the same state. Disputes get time travel, since "what was this balance last March 3rd at noon" is a fold up to a log position rather than a forensic project. What it costs is equally real: every queryable view, balances, histories, and statements, is a read model that must be built from the log and kept in sync, queries against those models are eventually consistent by some lag that must be monitored, and the log lives forever, which at 10 TB per day means aggressive tiering into object storage and a schema for events that can evolve without breaking replay of years-old records.</p>
+
+          <h2>Consensus, idempotency, and risk controls</h2>
+          <p>Each shard must itself survive machine failure without losing an acknowledged cent, and the standard tool is a replicated state machine: commands are sequenced through a consensus log using a protocol such as Raft, which gets a small cluster of replicas to agree on a single ordered log even when a minority of them fail. Every replica applies the same commands in the same order to the same deterministic logic, so every replica holds the same balances, and when a leader dies an election promotes a follower that already has the full sequence. The shard's event log and its Raft log are naturally the same ordered stream, which is a pleasing economy: consensus, durability, and audit share one structure.</p>
+          <p>Idempotency rides inside the state machine. Every command carries the client's operation ID, and the dedupe table mapping operation IDs to outcomes is itself part of the replicated state, so a retried transfer applies once even if the retry lands on a new leader after a failover; the new leader has the same dedupe table, because it has the same log. Risk controls sit on the command path before anything is appended: velocity checks, which are limits on rate and volume per account per time window, such as at most 50 transfers or 10,000.00 in a rolling hour, reject or hold commands synchronously, and KYC status gates capabilities, so an unverified account might receive but not send above a small threshold. Slow fraud models run asynchronously off the event stream and freeze accounts after the fact, which is a deliberate trade: the command path stays fast, and the freeze event is just another auditable command.</p>
+
+          <h2>Scaling, failures, and operations</h2>
+          <p>Shards scale by splitting account ranges: moving an account is replaying its events to the destination shard, pausing it briefly to drain in-flight operations, and cutting the routing table over, all of which event sourcing makes mechanical. Hot accounts are the asymmetry to watch, since a major merchant receiving thousands of credits per second can saturate its shard; the standard treatments are spreading a merchant across sub-accounts that aggregate in a read model, and batching micro-credits before they hit the state machine. The gateway and coordinators are stateless and scale flat; the recovery scanner that drives stuck TC/C transfers forward runs continuously, and its queue depth is a first-class health metric.</p>
+          <p>Failures map to short stories. A shard leader dies and Raft elects a new one in hundreds of milliseconds, with no acknowledged command lost because acknowledgment required replication. A coordinator dies mid-transfer and the scanner finds the journaled try without a confirm, and either confirms or cancels by policy and timeout. Read models lag and the balance endpoint serves slightly stale answers with the lag surfaced in monitoring, while commands keep validating against the authoritative shard state. The monitor that matters most is the conservation check, a continuous job folding per-shard sums plus in-flight reserves and comparing against the expected global total, because a nonzero drift there means an invariant broke somewhere, and finding it within minutes instead of at quarter close is the difference between a fix and an incident report.</p>
+
+          <h2>Follow-up questions</h2>
+          <ul>
+            <li><strong>Why not one big database on bigger hardware?</strong> The arithmetic gap is two orders of magnitude: 10,000 durable transactions per second per node versus 1,000,000 required. Vertical scaling buys perhaps one order, and a single node is also a single blast radius for all funds.</li>
+            <li><strong>Why TC/C over two-phase commit?</strong> 2PC holds locks while prepared and blocks if the coordinator dies, which at this rate freezes slices of the fleet. TC/C's intermediate states are committed, auditable rows, and recovery is a scanner, not a lock-resolution outage.</li>
+            <li><strong>What if the confirm on the credit shard keeps failing?</strong> Retry it, since a credit to a valid account cannot legitimately be refused once the try committed; if the account itself is gone, cancel and release the reservation. The transfer journal makes either path resumable.</li>
+            <li><strong>How does a retried transfer apply exactly once across failover?</strong> The operation-ID dedupe table is part of the replicated state machine, so any leader that could process the retry necessarily has the record of the first application.</li>
+            <li><strong>What does event sourcing actually cost?</strong> Read models to build and monitor, eventual consistency on queries, a log that grows about 10 TB per day at the headline rate, and event schema evolution that must keep years-old records replayable.</li>
+            <li><strong>Where do fraud and compliance checks run?</strong> Velocity limits run synchronously on the command path before append; heavier scoring runs asynchronously off the event stream and issues freeze commands, keeping the hot path fast while every intervention stays auditable.</li>
+          </ul>
+
+          <h2>References</h2>
+          <ol class="refs">
+            <li>Xu and Lam, <a href="https://www.amazon.com/System-Design-Interview-Insiders-Guide/dp/1736049119" target="_blank" rel="noreferrer">System Design Interview, Volume 2</a> (2022), chapter on digital wallets.</li>
+            <li>Fowler, <a href="https://martinfowler.com/eaaDev/EventSourcing.html" target="_blank" rel="noreferrer">Event Sourcing</a> (2005).</li>
+            <li>Ongaro and Ousterhout, <a href="https://raft.github.io/raft.pdf" target="_blank" rel="noreferrer">In Search of an Understandable Consensus Algorithm</a> (2014), the Raft paper.</li>
+            <li>Kleppmann, <a href="https://dataintensive.net/" target="_blank" rel="noreferrer">Designing Data-Intensive Applications</a> (2017), on distributed transactions, consensus, and total order broadcast.</li>
+          </ol>
+        </article>
+      </div>
+    </section>
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (window.hljs) hljs.highlightAll();
+      });
+    </script>
+  </body>
+</html>

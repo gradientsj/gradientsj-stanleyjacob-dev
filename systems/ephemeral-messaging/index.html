@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Design ephemeral messaging · Stanley Jacob</title>
+    <meta name="description" content="An interview walkthrough of designing ephemeral messaging: TTL-based storage, view-once semantics, the gap between logical and physical deletion, signed URLs for media, encrypted blobs, and 24-hour stories." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems" class="active">Systems</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/systems">← Systems</a></div>
+        <h1>Design ephemeral messaging</h1>
+        <p class="meta">Systems design · Social and messaging · Jul 2025</p>
+      </div>
+    </header>
+    <section style="padding-top: 0">
+      <div class="wrap">
+        <article class="prose article">
+          <p>Ephemeral messaging is the Snapchat-shaped product: messages that disappear after they are viewed, photos that can be opened exactly once, and stories that live for 24 hours and then vanish. Most chat questions are about getting data to people and keeping it forever, and this one inverts the second half, because here deletion is the product. Interviewers like the question because it looks like generic chat and then is not: a candidate has to reason about what "deleted" actually means in a distributed system, where copies live in databases, caches, content delivery networks, and backups, and has to be precise about which of those copies the service can truthfully promise to destroy. The hard parts live in the gap between marking data expired and physically removing it, in making a view-once photo burn on every one of the recipient's devices, and in the awkward truce between caching media for speed and erasing it on schedule.</p>
+
+          <h2>Scope and requirements</h2>
+          <p>The functional surface I would agree on: one-to-one disappearing messages with sender-chosen lifetimes, view-once photos and videos, 24-hour stories broadcast to friends or followers, screenshot notification, and delivery states similar to ordinary chat. Abuse reporting has to exist, which immediately complicates the deletion story, because reporting content the service has already destroyed is impossible, so a narrow carve-out for reported content is in scope from the start.</p>
+          <p>The non-functional requirements are where this design departs from chat. Deletion must really happen within a bounded and stated window, not merely hide content from the interface, since the product's entire promise is that the service does not keep what you sent. Delivery latency should match a normal messenger, a few hundred milliseconds when both parties are online. Durability is required only within a message's lifetime: losing a message that was going to be destroyed tomorrow is still a failure today, so the store replicates like any other. The pleasant consequence of the product is cost: because the corpus is small and rolling rather than monotonically growing, the storage bill stays roughly flat as the service ages, and the design should preserve that property instead of accidentally hoarding data in side channels like logs and caches.</p>
+
+          <h2>Sizing the problem</h2>
+          <p>Assume 30 million daily active users sending 30 messages each per day, which is 900 million messages per day, or about 10,400 per second on average and call it 50,000 per second at peak. Suppose half the messages carry media averaging 1 MB after client-side compression, so the service ingests around 450 million media objects per day, roughly 450 TB of blob traffic daily.</p>
+          <p>Now the ephemeral arithmetic. A keep-forever service ingesting 450 TB per day grows by about 165 PB a year and never stops. This service, with everything expiring within 24 hours of viewing or posting, holds a steady-state corpus of roughly one to two days of traffic, on the order of 1 PB including replication, forever. Text rows are negligible next to that: 900 million rows at 300 bytes of metadata each is 270 GB per day, and the rolling window keeps the table under a terabyte. The whole storage tier for a 30-million-user product fits in what a single day costs the keep-forever competitor, which is the business reason ephemerality is more than a gimmick.</p>
+
+          <h2>The interface</h2>
+          <p>Clients hold a WebSocket, a persistent two-way connection upgraded from HTTP, to a socket tier for real-time delivery, and use plain HTTP for media. Media never travels through the socket: the client asks the API for an upload target and receives a signed URL, which is an object-storage link carrying a cryptographic signature that grants one specific operation on one specific object for a short time, so clients talk to storage directly without holding any credentials.</p>
+          <pre><code class="language-http">POST /api/v1/media/upload-urls
+{ "content_type": "image/jpeg", "bytes": 812400 }
+→ 200 { "media_key": "m/7f3a9c", "put_url": "https://blobs.example.com/m/7f3a9c?sig=...&amp;expires=300" }
+
+// then over the socket
+→ { "type": "send", "to": "u815", "media_key": "m/7f3a9c",
+    "view_policy": "once", "ttl_seconds": 86400, "client_msg_id": "k21" }
+← { "type": "ack", "client_msg_id": "k21", "msg_id": 99312, "state": "sent" }
+
+POST /api/v1/stories
+{ "media_key": "m/2cc41e", "ttl_seconds": 86400 }   → 201
+</code></pre>
+          <p>Every send carries an explicit lifetime. The server treats the time-to-live, the number of seconds a row is allowed to exist, as a first-class column rather than an afterthought, because every downstream system from the database to the sweeper keys off it.</p>
+
+          <h2>The data model</h2>
+          <p>Messages land in a wide-column or key-value store with native row expiry, and both major candidates have it: DynamoDB lets you name a TTL attribute and Cassandra accepts a TTL on any write. The schema looks like ordinary chat with two additions, the expiry timestamp and the view state.</p>
+          <pre><code class="language-sql">CREATE TABLE messages (
+  conversation_id BIGINT,
+  msg_id          BIGINT,
+  sender_id       BIGINT,
+  media_key       TEXT,          -- pointer into object storage
+  view_policy     TEXT,          -- 'once' or 'timed'
+  view_state      TEXT,          -- unviewed / viewed / expired
+  expires_at      TIMESTAMP,     -- the native TTL column
+  PRIMARY KEY ((conversation_id), msg_id)
+);
+</code></pre>
+          <p>It is worth saying plainly how native TTL works, because the mechanism defines what the product can promise. The store does not run around deleting rows the second they expire. Instead, expiry is lazy: a read that touches an expired row filters it out as if it were gone, and the bytes are physically reclaimed later during compaction, the background process in log-structured stores that rewrites data files and drops dead entries. That creates a gap between logical deletion, the moment no query can return the row, and physical deletion, the moment the bytes no longer exist on disk, and in a busy Cassandra cluster that gap can be hours to days depending on compaction cadence. The design has to state which one the product promise refers to, and the defensible answer is logical deletion immediately at expiry with physical deletion guaranteed within a stated window, enforced by scheduling compaction aggressively on these tables and by keeping message bodies out of long-retention systems such as backups and diagnostic logs entirely.</p>
+
+          <h2>The high-level architecture</h2>
+          <p>The shape resembles a chat system, deliberately, with a socket tier delivering frames and a store holding rows, but every storage component carries expiry and a sweeper exists as a first-class service. Media lives in object storage as encrypted blobs reachable only through signed URLs, and the push service covers recipients with no live socket.</p>
+          <div class="diagram"><svg width="100%" style="max-width: 760px" viewBox="0 0 760 370" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Ephemeral messaging architecture with TTL-bearing message store, sweeper, object storage with signed URLs, and push service"><defs><marker id="arr-eph1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#86868b"/></marker></defs><g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"><rect x="20" y="64" width="130" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="85" y="95" text-anchor="middle" font-size="14" fill="#1d1d1f">Sender device</text><rect x="250" y="64" width="150" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="325" y="88" text-anchor="middle" font-size="14" fill="#1d1d1f">Socket tier</text><text x="325" y="104" text-anchor="middle" font-size="11" fill="#5f5f66">chat servers</text><rect x="20" y="244" width="130" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="85" y="275" text-anchor="middle" font-size="14" fill="#1d1d1f">Recipient device</text><rect x="560" y="20" width="180" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="650" y="44" text-anchor="middle" font-size="14" fill="#1d1d1f">Message store</text><text x="650" y="60" text-anchor="middle" font-size="11" fill="#5f5f66">TTL on every row</text><rect x="560" y="110" width="180" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="650" y="134" text-anchor="middle" font-size="14" fill="#1d1d1f">TTL sweeper</text><text x="650" y="150" text-anchor="middle" font-size="11" fill="#5f5f66">lazy expiry, compaction</text><rect x="560" y="200" width="180" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="650" y="224" text-anchor="middle" font-size="14" fill="#1d1d1f">Object storage</text><text x="650" y="240" text-anchor="middle" font-size="11" fill="#5f5f66">encrypted media blobs</text><rect x="560" y="290" width="180" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="650" y="314" text-anchor="middle" font-size="14" fill="#1d1d1f">Push service</text><text x="650" y="330" text-anchor="middle" font-size="11" fill="#5f5f66">APNs / FCM</text><path d="M150,90 H250" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-eph1)"/><text x="200" y="82" text-anchor="middle" font-size="12" fill="#5f5f66">send</text><path d="M250,105 H195 V270 H150" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-eph1)"/><text x="163" y="185" text-anchor="middle" font-size="12" fill="#5f5f66">deliver</text><path d="M400,78 H490 V46 H560" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-eph1)"/><text x="465" y="38" text-anchor="middle" font-size="12" fill="#5f5f66">persist + TTL</text><path d="M650,72 V110" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-eph1)"/><text x="662" y="95" text-anchor="start" font-size="12" fill="#5f5f66">purge expired</text><path d="M400,96 H470 V226 H560" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-eph1)"/><text x="462" y="160" text-anchor="end" font-size="12" fill="#5f5f66">signed URLs</text><path d="M400,112 H440 V316 H560" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-eph1)"/><text x="432" y="250" text-anchor="end" font-size="12" fill="#5f5f66">offline push</text></g></svg></div>
+          <p class="quiet">Every row in the message store carries a TTL and the sweeper turns logical expiry into physical deletion; clients upload and download media directly against object storage using short-lived signed URLs minted through the socket tier's API.</p>
+
+          <h2>Making deletion real</h2>
+          <p>Database rows are the easy third of the problem, since TTL plus aggressive compaction handles them. Media blobs are harder because they are large, cached, and replicated for speed, and a content delivery network, the geographically distributed cache tier that serves static content from locations near users, is precisely a machine for making copies the origin does not control. There is real tension here: caching a popular story's video at the edge makes playback fast, but every cached copy is a deletion obligation, and CDN purge APIs are best-effort with propagation delays. The design resolves the tension differently per content type: view-once media skips the CDN entirely, served straight from object storage since it will be fetched exactly once anyway, while stories may use a CDN with cache lifetimes capped well below the 24-hour content lifetime so edge copies die of natural causes before the deadline.</p>
+          <p>The strongest tool is encryption as deletion. Each media object is encrypted at upload with its own random data key, the blob in object storage is ciphertext, and the data key lives in the message row, which carries the TTL. When the row expires, the key is gone, and every remaining copy of the blob, in storage, in a cache, on a misplaced disk, becomes unreadable bytes; deleting one small key is equivalent to deleting every copy of the content at once. The blob itself is still removed by a cleanup job for cost reasons, but the promise no longer depends on that job winning a race against replication. This technique, usually called crypto-shredding, converts a distributed deletion problem into a local one, which is the kind of move worth naming explicitly in an interview.</p>
+          <p>Two scope limits keep the promise truthful. First, expired does not mean unsendable history is rewritten everywhere: the recipient's phone displayed the photo, and a phone can screenshot it or another camera can photograph the screen, so the guarantee is strictly about the service's storage, never about the recipient's behavior, and screenshot detection is a notification feature, the sender gets told, not a prevention mechanism, because the platform cannot stop a determined capture. Second, reported content is the deliberate exception: when a user reports a message, the service copies it into a separate quarantine store with its own access controls and a retention clock scoped to the investigation, and a legal hold can extend that clock. The product copy should reflect both limits, and the architecture should make the quarantine path the only door out of the ephemeral world.</p>
+
+          <h2>View-once and the multi-device wrinkle</h2>
+          <p>View-once is a server-side state machine, not a client promise. The view state lives in the message row, and when a recipient opens the photo, the client reports the view, the server transitions <code>unviewed → viewed</code> atomically, starts a short fuse on the media key, and writes a tombstone, a small marker row that says this message existed and was consumed, so late-syncing devices learn the message is burned rather than seeing it vanish mysteriously. The atomic transition matters because two devices can race: a user with a phone and a tablet might open the same photo on both within a second, and the compare-and-set on the view state lets exactly one open succeed as the first view while the other renders the burned placeholder. That is the multi-device wrinkle in one sentence: viewing on one device must burn the message on all devices, so the burn is a server event fanned out like any other message, and clients holding a cached preview discard it on receipt.</p>
+          <div class="diagram"><svg width="100%" style="max-width: 760px" viewBox="0 0 760 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Message lifecycle from sent through delivered, viewed, expired, and purged"><defs><marker id="arr-eph2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#86868b"/></marker></defs><g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"><rect x="20" y="50" width="130" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="85" y="74" text-anchor="middle" font-size="14" fill="#1d1d1f">Sent</text><text x="85" y="90" text-anchor="middle" font-size="11" fill="#5f5f66">stored with TTL</text><rect x="250" y="50" width="130" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="315" y="74" text-anchor="middle" font-size="14" fill="#1d1d1f">Delivered</text><text x="315" y="90" text-anchor="middle" font-size="11" fill="#5f5f66">on recipient device</text><rect x="480" y="50" width="130" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="545" y="74" text-anchor="middle" font-size="14" fill="#1d1d1f">Viewed</text><text x="545" y="90" text-anchor="middle" font-size="11" fill="#5f5f66">burn fanned out</text><rect x="250" y="170" width="130" height="52" rx="8" fill="#ffffff" stroke="#d8d8de" stroke-width="1.25"/><text x="315" y="194" text-anchor="middle" font-size="14" fill="#1d1d1f">Expired</text><text x="315" y="210" text-anchor="middle" font-size="11" fill="#5f5f66">logical delete</text><rect x="480" y="170" width="130" height="52" rx="8" fill="#ffffff" stroke="#0066cc" stroke-width="1.25"/><text x="545" y="194" text-anchor="middle" font-size="14" fill="#1d1d1f">Purged</text><text x="545" y="210" text-anchor="middle" font-size="11" fill="#5f5f66">physical delete</text><path d="M150,76 H250" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-eph2)"/><circle cx="200" cy="58" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="200" y="62" text-anchor="middle" font-size="11" fill="#1d1d1f">1</text><path d="M380,76 H480" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-eph2)"/><circle cx="430" cy="58" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="430" y="62" text-anchor="middle" font-size="11" fill="#1d1d1f">2</text><path d="M495,102 V150 H340 V170" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-eph2)"/><circle cx="430" cy="132" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="430" y="136" text-anchor="middle" font-size="11" fill="#1d1d1f">3</text><path d="M315,102 V170" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr-eph2)"/><circle cx="336" cy="136" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="336" y="140" text-anchor="middle" font-size="11" fill="#1d1d1f">4</text><path d="M380,196 H480" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#arr-eph2)"/><circle cx="430" cy="178" r="9" fill="#f6f6f7" stroke="#d8d8de"/><text x="430" y="182" text-anchor="middle" font-size="11" fill="#1d1d1f">5</text></g></svg></div>
+          <p class="quiet">Step 1: the message is persisted with its TTL and delivered. Step 2: the recipient opens it and the server records the first view atomically. Step 3: the view starts the burn timer and the message transitions to expired, invisible to every query. Step 4: the dashed branch covers messages whose TTL fires without a view. Step 5: compaction, key deletion, and the blob cleanup job make the deletion physical.</p>
+
+          <h2>Stories, counters, and the sweep</h2>
+          <p>A story is a broadcast with a fixed 24-hour TTL, and the delivery question is the usual fanout choice. Posting writes the story row once, then fans out a lightweight reference into each follower's story tray, the per-user list the app renders along the top of the screen; for a typical friend graph of a few hundred connections that is a few hundred 50-byte writes per post, which is cheap, while accounts with millions of followers flip to read-time merging exactly like large channels in a chat system, so the tray render pulls their active stories on demand. Tray references carry the same expiry as the story, which means the tray cleans itself: a client that opens the app at hour 25 simply gets no reference, and no synchronous mass-delete across millions of trays ever needs to happen.</p>
+          <p>View counts and viewer lists are the one place ephemerality meets a counter, and the counters are deliberately approximate in flight: view events stream through a queue and increment a per-story aggregate, the viewer list is a set keyed by story with the story's TTL, and both disappear with the story. The cleanup sweep is the service's background heartbeat: it walks expiring partitions, deletes orphaned blobs whose key rows are gone, verifies that compaction is keeping the physical-deletion window inside the published bound, and emits metrics on the lag between logical and physical deletion, because that lag is the product promise expressed as a number an operator can watch.</p>
+
+          <h2>Scaling, failures, and operations</h2>
+          <p>The socket tier scales like any chat connection tier, horizontally with a session registry mapping users to servers, and the message store scales by conversation partitions; nothing ephemeral changes those rules. What changes is the failure analysis around deletion. If the sweeper falls behind, no user-visible feature breaks, which is exactly why it needs explicit monitoring: the deletion-lag metric has to alarm on its own, because nothing else will. If compaction stalls on a store node, expired rows persist physically past the window, and the response is operational, prioritizing compaction on the affected ranges, plus the crypto-shredding backstop, which keeps the content unreadable regardless. Caches deserve suspicion everywhere: application-level caches of message bodies are simply banned, and any cache that does exist must carry TTLs no longer than the content's remaining lifetime.</p>
+          <p>Backups are the failure mode people forget. A nightly snapshot of the message store quietly extends every message's life by the backup retention period, which contradicts the product. The resolution is to back up metadata needed for recovery, accounts, social graph, configuration, while excluding message content tables, accepting that a catastrophic store loss loses in-flight messages, a defensible trade for this product since everything in the store was about to be deleted anyway. Push notifications must not leak content either, so they carry only "new message from Ana" with the actual payload fetched over the socket. And the quarantine store for reported content runs the opposite regime from everything else: durable, backed up, access-logged, and small, with every entry tied to a case and a clock.</p>
+
+          <h2>Follow-up questions</h2>
+          <ul>
+            <li><strong>What does "deleted" actually mean here?</strong> Logically deleted at expiry, meaning no query can return the row, and physically deleted within a stated window enforced by compaction scheduling and the sweeper, with crypto-shredding making stray copies unreadable in the meantime.</li>
+            <li><strong>Why not just run a cron job that deletes expired rows?</strong> At hundreds of millions of rows a day, scan-and-delete competes with live traffic and always lags. Native store TTLs make expiry a property of the row, and compaction reclaims space as part of work the store does anyway.</li>
+            <li><strong>How does view-once survive a user with two devices?</strong> The view state is server-side and the first-view transition is a compare-and-set, so one device wins, and the burn is fanned out as an event that all the user's devices apply, discarding any cached preview.</li>
+            <li><strong>Can the service promise the recipient cannot keep a copy?</strong> No, and the design should say so: screenshots and second cameras are outside the trust boundary. The promise covers the service's storage, and screenshot detection only notifies the sender.</li>
+            <li><strong>How do you cache media on a CDN if it must disappear?</strong> Cap edge cache lifetimes below the content's remaining TTL so copies expire on their own, skip the CDN for view-once media, and encrypt blobs so key expiry neutralizes any copy that outlives a purge call.</li>
+            <li><strong>What happens when someone reports a message that then expires?</strong> Reporting copies the content into a quarantine store before the ephemeral clock can destroy it, with scoped access and case-bound retention; a legal hold extends retention there, never in the main store.</li>
+          </ul>
+
+          <h2>References</h2>
+          <ol class="refs">
+            <li>AWS, <a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/TTL.html" target="_blank" rel="noreferrer">DynamoDB Time to Live (TTL)</a>, official documentation on lazy expiry semantics.</li>
+            <li>AWS, <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/ShareObjectPreSignedURL.html" target="_blank" rel="noreferrer">Sharing objects with presigned URLs</a>, Amazon S3 documentation.</li>
+            <li>Signal, <a href="https://signal.org/blog/disappearing-messages/" target="_blank" rel="noreferrer">Disappearing messages for Signal</a> (2016), on timer-based deletion in a messenger.</li>
+            <li>Apache Cassandra, <a href="https://cassandra.apache.org/doc/latest/" target="_blank" rel="noreferrer">official documentation</a>, on TTL, tombstones, and compaction.</li>
+            <li>Kleppmann, <a href="https://dataintensive.net/" target="_blank" rel="noreferrer">Designing Data-Intensive Applications</a> (2017), on log-structured storage and compaction.</li>
+          </ol>
+        </article>
+      </div>
+    </section>
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (window.hljs) hljs.highlightAll();
+      });
+    </script>
+  </body>
+</html>
