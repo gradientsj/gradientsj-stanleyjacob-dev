@@ -16,6 +16,7 @@ Re-run after changing the checklist or any implementation:
 """
 
 import html
+import json
 import pathlib
 import re
 
@@ -248,33 +249,44 @@ def render_trick(hook):
     return text
 
 
-def render_index(topics):
+def problem_blurb(name, hook, descriptions):
+    text = descriptions.get(name)
+    if text:
+        return html.escape(text, quote=False)
+    return render_trick(hook)
+
+
+def render_index(topics, descriptions):
     toc = []
     sections = []
     for i, (topic, problems) in enumerate(topics):
         tid, desc, links = TOPIC_META[topic]
+        n_solved = sum(1 for p in problems if p[0] in SOLUTIONS)
         toc.append(
             f'          <a class="tag" href="#{tid}">{html.escape(topic)} · {len(problems)}</a>'
         )
         rows = []
         for name, lc, diff, hook in problems:
-            url = f"https://leetcode.com/problems/{lc_slug(name)}/"
+            slug = lc_slug(name)
             rows.append(
                 "            <li><div class=\"prob\">"
-                f'<a href="{url}" target="_blank" rel="noreferrer">{html.escape(name)}</a>'
-                f'<p class="trick">{render_trick(hook)}</p></div>'
+                f'<a href="/algorithms/{tid}#{slug}">{html.escape(name)}</a>'
+                f'<p class="trick">{problem_blurb(name, hook, descriptions)}</p></div>'
                 f'<span class="date diff-{diff.lower()}">{diff} · LC {lc}</span></li>'
             )
         link_line = ""
         if links:
             parts = " · ".join(f'<a href="{href}">{html.escape(label)}</a>' for label, href in links)
             link_line = f'\n          <p class="deep-links">Deep dives: {parts}</p>'
+        kicker = f"{i + 1:02d} · {len(problems)} problems"
+        if n_solved:
+            kicker += f" · {n_solved} solved in four languages"
         soft = ' class="soft"' if i % 2 == 0 else ""
         sections.append(f"""    <section id="{tid}"{soft}>
       <div class="wrap">
         <div class="section-head">
-          <div class="kicker">{i + 1:02d} · {len(problems)} problems</div>
-          <h2>{html.escape(topic)}</h2>
+          <div class="kicker">{kicker}</div>
+          <h2><a href="/algorithms/{tid}">{html.escape(topic)}</a></h2>
           <p>{desc}</p>{link_line}
         </div>
         <ul class="notes tricks">
@@ -305,11 +317,10 @@ def render_index(topics):
         <p class="lead">
           The NeetCode 250 problem set, organized the way NeetCode subdivides it: eighteen topics
           in roadmap order, where each one builds on the techniques of the ones before it. Every
-          problem links to LeetCode and carries its key idea underneath, the one line about how the
-          solution works and what the trick is that you would want to recall before writing any
-          code. The pattern pages show the same canonical implementation side by side in Python,
-          C++, Rust, and TypeScript, each verified by unit tests against the official examples
-          before it appears here.
+          problem carries a refresher underneath covering what it asks, how the solution works, and
+          the trick behind it, and links to its topic page, where solutions appear side by side in
+          Python, C++, Rust, and TypeScript with a language switcher. A solution is published only
+          after its implementation passes unit tests against the official LeetCode examples.
         </p>
         <div class="cta-row">
           <a class="btn primary" href="/algorithms/graph-traversal">Graph traversal in four languages</a>
@@ -328,6 +339,81 @@ def render_index(topics):
 """
 
 
+def render_topic_page(i, topic, problems, descriptions):
+    tid, desc, links = TOPIC_META[topic]
+    n_solved = sum(1 for p in problems if p[0] in SOLUTIONS)
+    if n_solved:
+        solved_note = (
+            f" {n_solved} of the {len(problems)} problems here have full solutions in Python, "
+            "C++, Rust, and TypeScript; the tabs switch every snippet on the page at once. The "
+            "rest gain solutions as their implementations pass tests."
+        )
+    else:
+        solved_note = (
+            " Solutions in Python, C++, Rust, and TypeScript are being added topic by topic, "
+            "and each appears only after its implementation passes unit tests against the "
+            "official LeetCode examples."
+        )
+    link_line = ""
+    if links:
+        parts = " · ".join(f'<a href="{href}">{html.escape(label)}</a>' for label, href in links)
+        link_line = f'\n        <p class="deep-links">Deep dives: {parts}</p>'
+    body = []
+    for j, (name, lc, diff, hook) in enumerate(problems, 1):
+        slug = lc_slug(name)
+        lc_url = f"https://leetcode.com/problems/{slug}/"
+        section = [
+            f'          <h2 id="{slug}">{j}. {html.escape(name)}</h2>',
+            f'          <p class="quiet"><span class="diff-{diff.lower()}">{diff}</span> · '
+            f'<a href="{lc_url}" target="_blank" rel="noreferrer">LC {lc}</a></p>',
+            f"          <p>{problem_blurb(name, hook, descriptions)}</p>",
+        ]
+        if name in SOLUTIONS:
+            section.append(render_code_tabs(SOLUTIONS[name]))
+        body.append("\n".join(section))
+    body_html = "\n".join(body)
+
+    return f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{html.escape(topic)} · Algorithms · Stanley Jacob</title>
+    <meta name="description" content="{html.escape(topic)} from the NeetCode 250: every problem with a description of what it asks, how the solution works, and the trick behind it, plus solutions in Python, C++, Rust, and TypeScript." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="{FAVICON}" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" />
+  </head>
+  <body>
+{NAV}
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/algorithms">← Algorithms</a></div>
+        <h1>{html.escape(topic)}</h1>
+        <p class="meta">Topic {i + 1:02d} of 18 · {len(problems)} problems</p>
+        <p class="lead">{desc}{solved_note}</p>{link_line}
+      </div>
+    </header>
+    <section style="padding-top: 0">
+      <div class="wrap">
+        <article class="prose article">
+{body_html}
+        </article>
+      </div>
+    </section>
+{FOOTER}
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="/code-tabs.js"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {{
+        if (window.hljs) hljs.highlightAll();
+      }});
+    </script>
+  </body>
+</html>
+"""
+
+
 # --------------------------------------------------------- code extraction
 
 def _lines(path):
@@ -341,8 +427,17 @@ def _find(lines, prefix):
     raise SystemExit(f"marker not found: {prefix!r}")
 
 
-def extract_py_def(lines, name):
-    start = _find(lines, f"def {name}(")
+def _find_re(lines, pattern):
+    rx = re.compile(pattern)
+    for i, line in enumerate(lines):
+        if line and not line[0].isspace() and rx.search(line):
+            return i
+    raise SystemExit(f"regex marker not found: {pattern!r}")
+
+
+def extract_py_item(lines, header):
+    """A col-0 Python def/class through the end of its indented body."""
+    start = _find(lines, header)
     end = start + 1
     while end < len(lines):
         line = lines[end]
@@ -354,16 +449,23 @@ def extract_py_def(lines, name):
     return "\n".join(lines[start:end])
 
 
-def extract_block(lines, prefix):
-    """A brace-language item plus its contiguous leading comments, to col-0 '}'."""
-    start = _find(lines, prefix)
+def _block_from(lines, start):
+    """A brace-language item plus contiguous leading comments, to col-0 '}' or '};'."""
     first = start
     while first > 0 and lines[first - 1].lstrip().startswith(("//", "///", "/**", "*", "*/")):
         first -= 1
     end = start
-    while end < len(lines) and lines[end].rstrip() != "}":
+    while end < len(lines) and lines[end].rstrip() not in ("}", "};"):
         end += 1
     return "\n".join(lines[first:end + 1])
+
+
+def extract_block(lines, prefix):
+    return _block_from(lines, _find(lines, prefix))
+
+
+def extract_blockre(lines, pattern):
+    return _block_from(lines, _find_re(lines, pattern))
 
 
 def extract_line(lines, prefix):
@@ -376,24 +478,39 @@ def extract_range(lines, start_prefix, end_prefix):
     return "\n".join(lines[start:end + 1])
 
 
-SRC = {
-    "py_bfs": _lines(PY_BFS),
-    "py_dfs": _lines(PY_DFS),
-    "cpp": _lines(CPP),
-    "rs": _lines(RS),
-    "ts": _lines(TS),
+SOURCES = {
+    "py_bfs": PY_BFS,
+    "py_dfs": PY_DFS,
+    "cpp": CPP,
+    "rs": RS,
+    "ts": TS,
+    "py_ah": ALGO / "python" / "neetcode" / "arrays_hashing.py",
+    "cpp_ah": ALGO / "cpp" / "tests" / "arrays_hashing_tests.cpp",
+    "rs_ah": ALGO / "rust" / "src" / "arrays_hashing.rs",
+    "ts_ah": ALGO / "typescript" / "src" / "arraysHashing.ts",
 }
+_SRC_CACHE = {}
+
+
+def src_lines(key):
+    if key not in _SRC_CACHE:
+        _SRC_CACHE[key] = _lines(SOURCES[key])
+    return _SRC_CACHE[key]
 
 
 def snippet(parts):
     """parts: list of (kind, source, *args) -> joined code text."""
     out = []
     for part in parts:
-        kind, src = part[0], SRC[part[1]]
+        kind, src = part[0], src_lines(part[1])
         if kind == "pydef":
-            out.append(extract_py_def(src, part[2]))
+            out.append(extract_py_item(src, f"def {part[2]}("))
+        elif kind == "pyclass":
+            out.append(extract_py_item(src, f"class {part[2]}"))
         elif kind == "block":
             out.append(extract_block(src, part[2]))
+        elif kind == "blockre":
+            out.append(extract_blockre(src, part[2]))
         elif kind == "line":
             out.append(extract_line(src, part[2]))
         elif kind == "range":
@@ -687,6 +804,85 @@ VARIANTS = [
 
 LANG_LABELS = [("python", "Python"), ("cpp", "C++"), ("rust", "Rust"), ("typescript", "TypeScript")]
 
+# ------------------------------------------------------------ descriptions
+
+DESC_DIR = ALGO / "leetcode_150" / "descriptions"
+
+
+def load_descriptions():
+    """name -> long description, from the per-topic JSON files."""
+    desc = {}
+    for f in sorted(DESC_DIR.glob("*.json")):
+        for item in json.loads(f.read_text(encoding="utf-8")):
+            desc[item["name"]] = item["description"]
+    return desc
+
+
+# ------------------------------------------------- per-problem solutions
+
+def _ah_fn(snake, camel):
+    return {
+        "python": [("pydef", "py_ah", snake)],
+        "cpp": [("blockre", "cpp_ah", rf"^\S.*\b{camel}\(")],
+        "rust": [("block", "rs_ah", f"pub fn {snake}(")],
+        "typescript": [("block", "ts_ah", f"export function {camel}(")],
+    }
+
+
+def _ah_class(cls):
+    return {
+        "python": [("pyclass", "py_ah", cls)],
+        "cpp": [("blockre", "cpp_ah", rf"^class {cls}\b")],
+        "rust": [("block", "rs_ah", f"pub struct {cls}"), ("block", "rs_ah", f"impl {cls}")],
+        "typescript": [("block", "ts_ah", f"export class {cls}")],
+    }
+
+
+_VARIANT_CODE = {v["id"]: v["code"] for v in VARIANTS}
+
+# problem name (verbatim from the checklist) -> 4-language extraction specs.
+# Only problems listed here get code tabs; everything else shows its
+# description until tested implementations land.
+SOLUTIONS = {
+    # backed by the graph_traversal modules (already tested)
+    "Binary Tree Level Order Traversal": _VARIANT_CODE["level-order"],
+    "Rotting Oranges": _VARIANT_CODE["multi-source"],
+    "Word Ladder": _VARIANT_CODE["bidirectional"],
+    "Course Schedule": _VARIANT_CODE["cycle-detection"],
+    "Course Schedule II": _VARIANT_CODE["kahn"],
+    "Number of Islands": _VARIANT_CODE["flood-fill"],
+    "Word Search": _VARIANT_CODE["word-search"],
+    "Diameter of Binary Tree": _VARIANT_CODE["diameter"],
+    # arrays & hashing modules
+    "Concatenation of Array": _ah_fn("get_concatenation", "getConcatenation"),
+    "Contains Duplicate": _ah_fn("contains_duplicate", "containsDuplicate"),
+    "Valid Anagram": _ah_fn("is_anagram", "isAnagram"),
+    "Two Sum": _ah_fn("two_sum", "twoSum"),
+    "Longest Common Prefix": _ah_fn("longest_common_prefix", "longestCommonPrefix"),
+    "Group Anagrams": _ah_fn("group_anagrams", "groupAnagrams"),
+    "Remove Element": _ah_fn("remove_element", "removeElement"),
+    "Majority Element": _ah_fn("majority_element", "majorityElement"),
+    "Design HashSet": _ah_class("MyHashSet"),
+    "Design HashMap": _ah_class("MyHashMap"),
+    "Sort an Array": _ah_fn("sort_array", "sortArray"),
+    "Sort Colors": _ah_fn("sort_colors", "sortColors"),
+    "Top K Frequent Elements": _ah_fn("top_k_frequent", "topKFrequent"),
+    "Encode and Decode Strings": {
+        "python": [("pydef", "py_ah", "encode"), ("pydef", "py_ah", "decode")],
+        "cpp": [("blockre", "cpp_ah", r"^\S.*\bencode\("), ("blockre", "cpp_ah", r"^\S.*\bdecode\(")],
+        "rust": [("block", "rs_ah", "pub fn encode("), ("block", "rs_ah", "pub fn decode(")],
+        "typescript": [("block", "ts_ah", "export function encode("), ("block", "ts_ah", "export function decode(")],
+    },
+    "Range Sum Query 2D Immutable": _ah_class("NumMatrix"),
+    "Product of Array Except Self": _ah_fn("product_except_self", "productExceptSelf"),
+    "Valid Sudoku": _ah_fn("is_valid_sudoku", "isValidSudoku"),
+    "Longest Consecutive Sequence": _ah_fn("longest_consecutive", "longestConsecutive"),
+    "Best Time to Buy And Sell Stock II": _ah_fn("max_profit", "maxProfit"),
+    "Majority Element II": _ah_fn("majority_element_ii", "majorityElementII"),
+    "Subarray Sum Equals K": _ah_fn("subarray_sum", "subarraySum"),
+    "First Missing Positive": _ah_fn("first_missing_positive", "firstMissingPositive"),
+}
+
 
 def render_code_tabs(code_cfg):
     buttons = []
@@ -794,10 +990,25 @@ def write(path, text):
 
 def main():
     topics = parse_checklist()
-    total = sum(len(p) for _, p in topics)
+    descriptions = load_descriptions()
+    all_names = [p[0] for _, ps in topics for p in ps]
+    missing = [n for n in all_names if n not in descriptions]
+    if missing:
+        print(f"warning: {len(missing)} problems lack descriptions (hook fallback), e.g. {missing[:3]}")
+    unknown = [n for n in SOLUTIONS if n not in all_names]
+    if unknown:
+        raise SystemExit(f"SOLUTIONS names not in checklist: {unknown}")
+
     out_index = SITE / "algorithms" / "index.html"
-    write(out_index, render_index(topics))
-    print(f"wrote {out_index} ({total} problems, {len(topics)} topics)")
+    write(out_index, render_index(topics, descriptions))
+    print(f"wrote {out_index} ({len(all_names)} problems, {len(topics)} topics)")
+
+    for i, (topic, problems) in enumerate(topics):
+        tid = TOPIC_META[topic][0]
+        out = SITE / "algorithms" / tid / "index.html"
+        write(out, render_topic_page(i, topic, problems, descriptions))
+    n_solved = sum(1 for n in all_names if n in SOLUTIONS)
+    print(f"wrote {len(topics)} topic pages ({n_solved} problems with 4-language solutions)")
 
     out_trav = SITE / "algorithms" / "graph-traversal" / "index.html"
     write(out_trav, render_traversal())
