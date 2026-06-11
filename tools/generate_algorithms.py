@@ -883,6 +883,243 @@ SOLUTIONS = {
     "First Missing Positive": _ah_fn("first_missing_positive", "firstMissingPositive"),
 }
 
+# ---------------------------------------------- remaining topics, by table
+# Each topic maps problem name (verbatim from the checklist) to its symbol:
+# camelCase = function (snake_case derived for Python/Rust), Capitalized =
+# class (pyclass / cpp class / rust struct+impl / ts export class), list =
+# multiple symbols shown together. Topics are wired into SOLUTIONS only
+# once listed in ENABLED_TOPICS, after their four implementations pass
+# tests.
+
+TOPIC_SYMBOLS = {
+    "two-pointers": {
+        "Reverse String": "reverseString", "Valid Palindrome": "isPalindrome",
+        "Valid Palindrome II": "validPalindrome", "Merge Strings Alternately": "mergeAlternately",
+        "Merge Sorted Array": "mergeSortedArray", "Remove Duplicates From Sorted Array": "removeDuplicates",
+        "Two Sum II Input Array Is Sorted": "twoSumSorted", "3Sum": "threeSum", "4Sum": "fourSum",
+        "Rotate Array": "rotateArray", "Container With Most Water": "maxArea",
+        "Boats to Save People": "numRescueBoats", "Trapping Rain Water": "trap",
+    },
+    "sliding-window": {
+        "Contains Duplicate II": "containsNearbyDuplicate",
+        "Best Time to Buy And Sell Stock": "maxProfit",
+        "Longest Substring Without Repeating Characters": "lengthOfLongestSubstring",
+        "Longest Repeating Character Replacement": "characterReplacement",
+        "Permutation In String": "checkInclusion", "Minimum Size Subarray Sum": "minSubArrayLen",
+        "Find K Closest Elements": "findClosestElements", "Minimum Window Substring": "minWindow",
+        "Sliding Window Maximum": "maxSlidingWindow",
+    },
+    "stack": {
+        "Baseball Game": "calPoints", "Valid Parentheses": "isValidParentheses",
+        "Implement Stack Using Queues": "MyStack", "Implement Queue using Stacks": "MyQueue",
+        "Min Stack": "MinStack", "Evaluate Reverse Polish Notation": "evalRPN",
+        "Asteroid Collision": "asteroidCollision", "Daily Temperatures": "dailyTemperatures",
+        "Online Stock Span": "StockSpanner", "Car Fleet": "carFleet", "Simplify Path": "simplifyPath",
+        "Decode String": "decodeString", "Maximum Frequency Stack": "FreqStack",
+        "Largest Rectangle In Histogram": "largestRectangleArea",
+    },
+    "binary-search": {
+        "Binary Search": "binarySearch", "Search Insert Position": "searchInsert",
+        "Guess Number Higher Or Lower": "guessNumber", "Sqrt(x)": "mySqrt",
+        "Search a 2D Matrix": "searchMatrix", "Koko Eating Bananas": "minEatingSpeed",
+        "Capacity to Ship Packages Within D Days": "shipWithinDays",
+        "Find Minimum In Rotated Sorted Array": "findMin",
+        "Search In Rotated Sorted Array": "searchRotated",
+        "Search In Rotated Sorted Array II": "searchRotatedII",
+        "Time Based Key Value Store": "TimeMap", "Split Array Largest Sum": "splitArray",
+        "Median of Two Sorted Arrays": "findMedianSortedArrays",
+        "Find in Mountain Array": "findInMountainArray",
+    },
+    "linked-list": {
+        "Reverse Linked List": "reverseList", "Merge Two Sorted Lists": "mergeTwoLists",
+        "Linked List Cycle": "hasCycle", "Reorder List": "reorderList",
+        "Remove Nth Node From End of List": "removeNthFromEnd",
+        "Copy List With Random Pointer": "copyRandomList", "Add Two Numbers": "addTwoNumbers",
+        "Find The Duplicate Number": "findDuplicate", "Reverse Linked List II": "reverseBetween",
+        "Design Circular Queue": "MyCircularQueue", "LRU Cache": "LRUCache", "LFU Cache": "LFUCache",
+        "Merge K Sorted Lists": "mergeKLists", "Reverse Nodes In K Group": "reverseKGroup",
+    },
+    "trees": {
+        "Binary Tree Inorder Traversal": "inorderTraversal",
+        "Binary Tree Preorder Traversal": "preorderTraversal",
+        "Binary Tree Postorder Traversal": "postorderTraversal",
+        "Invert Binary Tree": "invertTree", "Maximum Depth of Binary Tree": "maxDepth",
+        "Balanced Binary Tree": "isBalanced", "Same Tree": "isSameTree",
+        "Subtree of Another Tree": "isSubtree",
+        "Lowest Common Ancestor of a Binary Search Tree": "lowestCommonAncestor",
+        "Insert into a Binary Search Tree": "insertIntoBST", "Delete Node in a BST": "deleteNode",
+        "Binary Tree Right Side View": "rightSideView", "Construct Quad Tree": "constructQuadTree",
+        "Count Good Nodes In Binary Tree": "goodNodes", "Validate Binary Search Tree": "isValidBST",
+        "Kth Smallest Element In a Bst": "kthSmallest",
+        "Construct Binary Tree From Preorder And Inorder Traversal": "buildTree",
+        "House Robber III": "robTree", "Delete Leaves With a Given Value": "removeLeafNodes",
+        "Binary Tree Maximum Path Sum": "maxPathSum",
+        "Serialize And Deserialize Binary Tree": "Codec",
+    },
+    "heap": {
+        "Kth Largest Element In a Stream": "KthLargest", "Last Stone Weight": "lastStoneWeight",
+        "K Closest Points to Origin": "kClosest", "Kth Largest Element In An Array": "findKthLargest",
+        "Task Scheduler": "leastInterval", "Design Twitter": "Twitter",
+        "Single Threaded CPU": "getOrder", "Reorganize String": "reorganizeString",
+        "Longest Happy String": "longestDiverseString", "Car Pooling": "carPooling",
+        "Find Median From Data Stream": "MedianFinder", "IPO": "findMaximizedCapital",
+    },
+    "backtracking": {
+        "Sum of All Subsets XOR Total": "subsetXORSum", "Subsets": "subsets",
+        "Combination Sum": "combinationSum", "Combination Sum II": "combinationSum2",
+        "Combinations": "combine", "Permutations": "permute", "Subsets II": "subsetsWithDup",
+        "Permutations II": "permuteUnique", "Generate Parentheses": "generateParenthesis",
+        "Palindrome Partitioning": "partition",
+        "Letter Combinations of a Phone Number": "letterCombinations",
+        "Matchsticks to Square": "makesquare",
+        "Partition to K Equal Sum Subsets": "canPartitionKSubsets",
+        "N Queens": "solveNQueens", "N Queens II": "totalNQueens", "Word Break II": "wordBreakII",
+    },
+    "tries": {
+        "Implement Trie Prefix Tree": "Trie",
+        "Design Add And Search Words Data Structure": "WordDictionary",
+        "Extra Characters in a String": "minExtraChar", "Word Search II": "findWords",
+    },
+    "graphs": {
+        "Island Perimeter": "islandPerimeter", "Verifying An Alien Dictionary": "isAlienSorted",
+        "Find the Town Judge": "findJudge", "Max Area of Island": "maxAreaOfIsland",
+        "Clone Graph": "cloneGraph", "Walls And Gates": "wallsAndGates",
+        "Pacific Atlantic Water Flow": "pacificAtlantic",
+        "Surrounded Regions": "solveSurroundedRegions", "Open The Lock": "openLock",
+        "Graph Valid Tree": "validTree", "Course Schedule IV": "checkIfPrerequisite",
+        "Number of Connected Components In An Undirected Graph": "countComponents",
+        "Redundant Connection": "findRedundantConnection", "Accounts Merge": "accountsMerge",
+        "Evaluate Division": "calcEquation", "Minimum Height Trees": "findMinHeightTrees",
+    },
+    "advanced-graphs": {
+        "Path with Minimum Effort": "minimumEffortPath", "Network Delay Time": "networkDelayTime",
+        "Reconstruct Itinerary": "findItinerary",
+        "Min Cost to Connect All Points": "minCostConnectPoints",
+        "Swim In Rising Water": "swimInWater", "Alien Dictionary": "alienOrder",
+        "Cheapest Flights Within K Stops": "findCheapestPrice",
+        "Find Critical and Pseudo Critical Edges in Minimum Spanning Tree": "findCriticalAndPseudoCriticalEdges",
+        "Build a Matrix With Conditions": "buildMatrix",
+        "Greatest Common Divisor Traversal": "canTraverseAllPairs",
+    },
+    "dp-1d": {
+        "Climbing Stairs": "climbStairs", "Min Cost Climbing Stairs": "minCostClimbingStairs",
+        "N-th Tribonacci Number": "tribonacci", "House Robber": "rob", "House Robber II": "robCircle",
+        "Longest Palindromic Substring": "longestPalindrome",
+        "Palindromic Substrings": "countSubstrings", "Decode Ways": "numDecodings",
+        "Coin Change": "coinChange", "Maximum Product Subarray": "maxProduct",
+        "Word Break": "wordBreak", "Longest Increasing Subsequence": "lengthOfLIS",
+        "Partition Equal Subset Sum": "canPartition", "Combination Sum IV": "combinationSum4",
+        "Perfect Squares": "numSquares", "Integer Break": "integerBreak",
+        "Stone Game III": "stoneGameIII",
+    },
+    "dp-2d": {
+        "Unique Paths": "uniquePaths", "Unique Paths II": "uniquePathsWithObstacles",
+        "Minimum Path Sum": "minPathSum", "Longest Common Subsequence": "longestCommonSubsequence",
+        "Last Stone Weight II": "lastStoneWeightII",
+        "Best Time to Buy And Sell Stock With Cooldown": "maxProfitWithCooldown",
+        "Coin Change II": "change", "Target Sum": "findTargetSumWays",
+        "Interleaving String": "isInterleave", "Stone Game": "stoneGame",
+        "Stone Game II": "stoneGameII", "Longest Increasing Path In a Matrix": "longestIncreasingPath",
+        "Distinct Subsequences": "numDistinct", "Edit Distance": "minDistance",
+        "Burst Balloons": "maxCoins", "Regular Expression Matching": "isMatch",
+    },
+    "greedy": {
+        "Lemonade Change": "lemonadeChange", "Maximum Subarray": "maxSubArray",
+        "Maximum Sum Circular Subarray": "maxSubarraySumCircular",
+        "Longest Turbulent Subarray": "maxTurbulenceSize", "Jump Game": "canJump",
+        "Jump Game II": "jump", "Jump Game VII": "canReach", "Gas Station": "canCompleteCircuit",
+        "Hand of Straights": "isNStraightHand", "Dota2 Senate": "predictPartyVictory",
+        "Merge Triplets to Form Target Triplet": "mergeTriplets",
+        "Partition Labels": "partitionLabels", "Valid Parenthesis String": "checkValidString",
+        "Candy": "candy",
+    },
+    "intervals": {
+        "Insert Interval": "insertInterval", "Merge Intervals": "mergeIntervals",
+        "Non Overlapping Intervals": "eraseOverlapIntervals", "Meeting Rooms": "canAttendMeetings",
+        "Meeting Rooms II": "minMeetingRooms", "Meeting Rooms III": "mostBooked",
+        "Minimum Interval to Include Each Query": "minInterval",
+    },
+    "math-geometry": {
+        "Excel Sheet Column Title": "convertToTitle",
+        "Greatest Common Divisor of Strings": "gcdOfStrings",
+        "Insert Greatest Common Divisors in Linked List": "insertGreatestCommonDivisors",
+        "Transpose Matrix": "transpose", "Rotate Image": "rotateImage", "Spiral Matrix": "spiralOrder",
+        "Set Matrix Zeroes": "setZeroes", "Happy Number": "isHappy", "Plus One": "plusOne",
+        "Roman to Integer": "romanToInt", "Pow(x, n)": "myPow", "Multiply Strings": "multiplyStrings",
+        "Detect Squares": "DetectSquares",
+    },
+    "bit-manipulation": {
+        "Single Number": "singleNumber", "Number of 1 Bits": "hammingWeight",
+        "Counting Bits": "countBits", "Add Binary": "addBinary", "Reverse Bits": "reverseBits",
+        "Missing Number": "missingNumber", "Sum of Two Integers": "getSum",
+        "Reverse Integer": "reverseInteger", "Bitwise AND of Numbers Range": "rangeBitwiseAnd",
+        "Minimum Array End": "minEnd",
+    },
+}
+
+# topics whose four-language implementations have passed tests
+ENABLED_TOPICS = {"two-pointers", "sliding-window", "stack", "binary-search", "linked-list", "trees"}
+
+TS_MODULE_NAMES = {"stack": "stackProblems", "dp_1d": "dp1d", "dp_2d": "dp2d"}
+
+
+def _camel_module(snake_tid):
+    if snake_tid in TS_MODULE_NAMES:
+        return TS_MODULE_NAMES[snake_tid]
+    head, *rest = snake_tid.split("_")
+    return head + "".join(part.capitalize() for part in rest)
+
+
+def snake_name(camel):
+    s = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", camel)
+    s = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", s)
+    return s.lower()
+
+
+def _symbol_specs(symbol, keys):
+    pyk, cppk, rsk, tsk = keys
+    if symbol[0].isupper():  # a design-problem class
+        return {
+            "python": [("pyclass", pyk, symbol)],
+            "cpp": [("blockre", cppk, rf"^class {symbol}\b")],
+            "rust": [("block", rsk, f"pub struct {symbol}"), ("block", rsk, f"impl {symbol}")],
+            "typescript": [("block", tsk, f"export class {symbol}")],
+        }
+    sn = snake_name(symbol)
+    return {
+        "python": [("pydef", pyk, sn)],
+        "cpp": [("blockre", cppk, rf"^\S.*\b{symbol}\(")],
+        "rust": [("block", rsk, f"pub fn {sn}(")],
+        "typescript": [("block", tsk, f"export function {symbol}(")],
+    }
+
+
+def _register_topic_sources():
+    for tid in TOPIC_SYMBOLS:
+        m = tid.replace("-", "_")
+        SOURCES[f"py_{m}"] = ALGO / "python" / "neetcode" / f"{m}.py"
+        SOURCES[f"cpp_{m}"] = ALGO / "cpp" / "tests" / f"{m}_tests.cpp"
+        SOURCES[f"rs_{m}"] = ALGO / "rust" / "src" / f"{m}.rs"
+        SOURCES[f"ts_{m}"] = ALGO / "typescript" / "src" / f"{_camel_module(m)}.ts"
+
+
+def _build_topic_solutions():
+    for tid in ENABLED_TOPICS:
+        m = tid.replace("-", "_")
+        keys = (f"py_{m}", f"cpp_{m}", f"rs_{m}", f"ts_{m}")
+        for name, symbols in TOPIC_SYMBOLS[tid].items():
+            if isinstance(symbols, str):
+                symbols = [symbols]
+            merged = {"python": [], "cpp": [], "rust": [], "typescript": []}
+            for sym in symbols:
+                for lang, parts in _symbol_specs(sym, keys).items():
+                    merged[lang].extend(parts)
+            SOLUTIONS[name] = merged
+
+
+_register_topic_sources()
+_build_topic_solutions()
+
 
 def render_code_tabs(code_cfg):
     buttons = []
