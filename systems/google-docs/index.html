@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Design a collaborative editor (Google Docs) · Stanley Jacob</title>
+    <meta name="description" content="An in-depth walkthrough of designing a collaborative document editor like Google Docs: why snapshots lose edits, operations and Operational Transformation, OT versus CRDT, sequencing on a central server, compaction, and sharding connections by document with a consistent hash ring." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems" class="active">Systems</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/systems">← Systems</a></div>
+        <h1>Design a collaborative editor (Google Docs)</h1>
+        <p class="meta">Systems design · Social and messaging · Jul 2026</p>
+      </div>
+    </header>
+    <section style="padding-top: 0">
+      <div class="wrap">
+        <article class="prose article">
+          <div class="reader" data-reader data-audio="listen.mp3"></div>
+          <p>A collaborative editor lets many people type into one document at the same time and see each other's changes and cursors appear within a fraction of a second. The difficulty is not the text box. It is that everyone is editing the same shared state at once, so two people who type in the same spot at the same moment must both keep their change and end up looking at an identical document, no matter which edit reached the server first. Get that wrong and you produce the worst bug in the category, which is a keystroke that silently disappears.</p>
+          <div class="takeaway"><strong>The one-line version.</strong> Never send the whole document. Send small <em>operations</em> like <code>insert(5, ", world")</code> and <code>delete(6)</code>. A central server puts them in one canonical order and <mark>transforms concurrent operations so their positions stay correct</mark>, which is what keeps every editor converging on the same text. That transform step, Operational Transformation, is the center of the design, and the cap of 100 editors per document is what lets it all fit on a single server.</div>
+
+          <h2>Scope and requirements</h2>
+          <p>Functionally, a user creates a document, many users edit it at the same time, everyone sees the others' edits live, and everyone sees the others' cursors and whether they are present. Rich text, permissions, and version history are real features that the interviewer will happily park once they are named, so this stays a plain-text editor to keep the focus on multi-writer consistency.</p>
+          <p>Non-functionally, four constraints shape the design. Every editor must <strong>converge on the same document</strong>, and this only needs to be eventual, since two people do not have to see edits in the same physical order as long as they end up with identical text. Updates must land in <span class="win">under 100 milliseconds</span> so typing feels shared rather than laggy. The system must hold <strong>millions of concurrent users across billions of documents</strong>. And there is one deliberately load-bearing limit, <mark>at most 100 concurrent editors per document</mark>, which is what makes it possible to keep all of a document's connections and operations in the memory of one server. Real Google Docs does the same, dropping extra people to read-only past a threshold. Durability rounds it out, since edits have to survive a server restart.</p>
+
+          <h2>Sizing the problem</h2>
+          <p>The 100-editor cap is the number the whole design leans on. It means a document is never a throughput problem, so one Document Service server can own a document outright, hold its operations in memory, and order edits without coordinating with anyone. The pressure lives elsewhere. Shipping the full document on every keystroke would move <span class="warn">the whole document on every key press</span>, which is the first reason that approach dies. Storage is the other one, since billions of documents at roughly 50 KB each is about 50 TB, and a busy document accumulates operations without end, so something has to collapse that log. A single unscaled server handles only a few thousand users total, which is what forces the connection-sharding work later.</p>
+
+          <h2>Why sending the whole document loses edits</h2>
+          <p>The first design has each editor send the entire document to the server on every change, with the server keeping the latest copy. It fails immediately under concurrency. If User A and User B both edit at the same moment, each sends a full snapshot built from what they saw a moment ago, and <span class="warn">whichever snapshot arrives last overwrites the other completely</span>. A's paragraph vanishes because B's snapshot never contained it. This is last-write-wins on the whole document, and it silently destroys concurrent edits, on top of the bandwidth problem. The fix is to stop sending documents and start sending <strong>operations</strong>, small deltas like insert this text at this position or delete this many characters here.</p>
+
+          <h2>Core entities and the data model</h2>
+          <p>Four nouns carry the design. An <strong>Editor</strong> is a user in a document. A <strong>Document</strong> is the text being edited. An <strong>Edit</strong>, or operation, is a single change such as <code>insert(pos, text)</code> or <code>delete(pos, count)</code>. A <strong>Cursor</strong> is an editor's position and, by extension, their presence.</p>
+          <p>The stores split by how they are used. Document metadata is small and stable, so it lives in <a href="/software/notes/postgresql">Postgres</a>, holding the document id, title, and a <code>documentVersionId</code> that points at the current version. The operations are large and append-heavy, so they live in <a href="/software/notes/cassandra">Cassandra</a>, partitioned by document id and ordered by a server-assigned timestamp. The important idea is that the document is <mark>not stored as a blob</mark>. It is stored as the sequence of operations that built it, and the text is reconstructed by replaying them. Opening a document reads its version pointer from Postgres, reads that version's operations from Cassandra, and replays them.</p>
+          <pre><code class="language-text">metadata (Postgres)          operations (Cassandra, partition = docId, order = ts)
+  docId                        docId | version | ts        | op
+  title                        d1    | 41      | ...       | insert(0, "H")
+  documentVersionId  ---------&gt; d1    | 42      | ...       | insert(1, "i")
+                               d1    | 43      | ...       | delete(0, 1)</code></pre>
+
+          <h2>The connection model</h2>
+          <p>Editing is a two-way, high-frequency stream. The client is constantly pushing keystrokes and cursor moves up, and the server is constantly pushing other people's edits down, so the connection is a <strong>WebSocket</strong>, one per open document. Server-sent events are one-directional and cannot carry the client's own edits back up, which rules them out here even though they fit a read-only feed. Polling cannot meet the 100-millisecond target without wasting a request on every quiet interval. A user with three documents open holds three sockets, which is fine because those are usually separate tabs anyway.</p>
+
+          <h2>The high-level design</h2>
+          <p>Creating a document is ordinary web-service work. The client calls an API gateway, a CRUD service writes the id and title to Postgres, and returns the id. Editing is where the design earns its keep. A client sends each change as an operation to the <strong>Document Service</strong>, the stateful server that owns the document in memory. That server transforms the operation against the operations it has already ordered, appends it to Cassandra with a server-set timestamp that fixes its place in the canonical order, and only <span class="win">acknowledges the client after the durable write</span> so a lost operation is simply retried. It then broadcasts the operation to every other editor over their sockets. On connect, the server replays all of the document's prior operations to the newcomer so everyone starts from the same baseline.</p>
+          <div class="diagram"><svg width="100%" style="max-width:780px" viewBox="0 0 780 262" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Editors hold WebSockets to one Document Service that runs OT, orders operations, appends them to a Cassandra operations log, and tracks the version pointer in Postgres">
+<defs><marker id="gd1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#86868b"/></marker></defs>
+<g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+<rect x="20" y="44" width="120" height="48" rx="9" fill="#fff" stroke="#d8d8de" stroke-width="1.25"/><text x="80" y="72" text-anchor="middle" font-size="12.5" fill="#1d1d1f">Editor A</text>
+<rect x="20" y="150" width="120" height="48" rx="9" fill="#fff" stroke="#d8d8de" stroke-width="1.25"/><text x="80" y="178" text-anchor="middle" font-size="12.5" fill="#1d1d1f">Editor B</text>
+<rect x="280" y="55" width="180" height="132" rx="9" fill="#eaf2fb" stroke="#0066cc" stroke-width="1.6"/><text x="370" y="106" text-anchor="middle" font-size="13" fill="#1d1d1f">Document Service</text><text x="370" y="124" text-anchor="middle" font-size="10.5" fill="#5f5f66">owns the doc in memory</text><text x="370" y="140" text-anchor="middle" font-size="10.5" fill="#5f5f66">OT, sequences, broadcasts</text>
+<path d="M560,52 L560,88 A85,9 0 0 0 730,88 L730,52 Z" fill="#f6f6f7"/><path d="M560,52 L560,88 A85,9 0 0 0 730,88 L730,52" fill="none" stroke="#d8d8de" stroke-width="1.25"/><ellipse cx="645" cy="52" rx="85" ry="9" fill="#f6f6f7" stroke="#d8d8de" stroke-width="1.25"/><text x="645" y="72" text-anchor="middle" font-size="12" fill="#1d1d1f">Operations log</text><text x="645" y="87" text-anchor="middle" font-size="10.5" fill="#5f5f66">Cassandra, by docId</text>
+<path d="M560,178 L560,214 A85,9 0 0 0 730,214 L730,178 Z" fill="#f6f6f7"/><path d="M560,178 L560,214 A85,9 0 0 0 730,214 L730,178" fill="none" stroke="#d8d8de" stroke-width="1.25"/><ellipse cx="645" cy="178" rx="85" ry="9" fill="#f6f6f7" stroke="#d8d8de" stroke-width="1.25"/><text x="645" y="198" text-anchor="middle" font-size="12" fill="#1d1d1f">Doc metadata</text><text x="645" y="213" text-anchor="middle" font-size="10.5" fill="#5f5f66">Postgres, version ptr</text>
+<path d="M140,74 H280" fill="none" stroke="#86868b" stroke-width="1.4" marker-start="url(#gd1)" marker-end="url(#gd1)"/><text x="210" y="66" text-anchor="middle" font-size="10.5" fill="#5f5f66">edits + cursors</text>
+<path d="M140,168 H280" fill="none" stroke="#86868b" stroke-width="1.4" marker-start="url(#gd1)" marker-end="url(#gd1)"/><text x="210" y="188" text-anchor="middle" font-size="10.5" fill="#5f5f66">WebSocket</text>
+<path d="M460,92 H560" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#gd1)"/><text x="510" y="84" text-anchor="middle" font-size="10.5" fill="#5f5f66">append ops</text>
+<path d="M460,160 H560" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#gd1)"/><text x="510" y="152" text-anchor="middle" font-size="10.5" fill="#5f5f66">version ptr</text>
+</g></svg></div>
+          <p class="quiet">Every editor of a document holds a WebSocket to the one server that owns it. That server orders operations, appends them to the Cassandra log, tracks the version pointer in Postgres, and fans edits back out. Databases are drawn as cylinders.</p>
+
+          <h2>Operational Transformation, the heart of it</h2>
+          <p>An operation carries an index, and that index is only meaningful against the exact document state it was created on. A <code>delete(6)</code> means delete the character at position 6 as of the moment the user pressed backspace. If someone else's insert lands first and shifts everything to the right, position 6 now points at a different character, and applying the delete as written removes the wrong one. Operational Transformation fixes this by rewriting an incoming operation against the operations already ordered ahead of it, so it still does what the user meant.</p>
+          <p>The document is <code>"Hello!"</code>, and the exclamation mark is its sixth character. User A sends <code>insert(5, ", world")</code>, which drops seven characters in just after <code>Hello</code>, and User B sends <code>delete(6)</code> to remove the mark. The server orders A first, so those seven characters now sit ahead of the mark, which has slid from the sixth character to the thirteenth. B's delete is transformed from <code>delete(6)</code> into <code>delete(13)</code>, so the exclamation mark is still what gets removed, and both editors end up with <code>"Hello, world"</code>.</p>
+          <div class="diagram"><svg width="100%" style="max-width:880px" viewBox="0 0 900 226" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Operational Transformation example: with insert of seven characters ordered first, a delete at position 6 is transformed to a delete at position 13 so the intended character is still removed">
+<defs><marker id="gd2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#86868b"/></marker></defs>
+<g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+<rect x="16" y="84" width="104" height="50" rx="9" fill="#fff" stroke="#d8d8de" stroke-width="1.25"/><text x="68" y="105" text-anchor="middle" font-size="12.5" fill="#1d1d1f">"Hello!"</text><text x="68" y="121" text-anchor="middle" font-size="10" fill="#5f5f66">base</text>
+<rect x="156" y="30" width="180" height="46" rx="9" fill="#fff" stroke="#0066cc" stroke-width="1.5"/><text x="246" y="52" text-anchor="middle" font-size="11.5" fill="#1d1d1f">A: insert(5, ", world")</text><text x="246" y="67" text-anchor="middle" font-size="10" fill="#5f5f66">7 characters</text>
+<rect x="156" y="142" width="150" height="46" rx="9" fill="#fff" stroke="#0066cc" stroke-width="1.5"/><text x="231" y="164" text-anchor="middle" font-size="11.5" fill="#1d1d1f">B: delete(6)</text><text x="231" y="179" text-anchor="middle" font-size="10" fill="#5f5f66">the "!"</text>
+<rect x="380" y="84" width="150" height="50" rx="9" fill="#fff" stroke="#d8d8de" stroke-width="1.25"/><text x="455" y="106" text-anchor="middle" font-size="12" fill="#1d1d1f">order: A, then B</text><text x="455" y="122" text-anchor="middle" font-size="10" fill="#5f5f66">server sequences</text>
+<rect x="574" y="78" width="176" height="62" rx="9" fill="#eaf2fb" stroke="#0066cc" stroke-width="1.75"/><text x="662" y="102" text-anchor="middle" font-size="12" fill="#1d1d1f">transform</text><text x="662" y="122" text-anchor="middle" font-size="12" fill="#1d1d1f">delete(6) &#8594; <tspan font-weight="700">delete(13)</tspan></text>
+<rect x="792" y="84" width="96" height="50" rx="9" fill="#fff" stroke="#1d8a4e" stroke-width="1.75"/><text x="840" y="105" text-anchor="middle" font-size="11.5" fill="#1d8a4e">"Hello,</text><text x="840" y="121" text-anchor="middle" font-size="11.5" fill="#1d8a4e">world"</text>
+<path d="M120,102 L156,66" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#gd2)"/>
+<path d="M120,116 L156,158" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#gd2)"/>
+<path d="M336,58 L380,100" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#gd2)"/>
+<path d="M306,164 L380,120" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#gd2)"/>
+<path d="M530,109 H574" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#gd2)"/>
+<path d="M750,109 H792" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#gd2)"/>
+<text x="450" y="205" text-anchor="middle" font-size="11" fill="#5f5f66">A added <tspan fill="#0066cc" font-weight="700">7</tspan> characters before position 6, so 6 + 7 = <tspan fill="#0066cc" font-weight="700">13</tspan></text>
+</g></svg></div>
+          <p class="quiet">The delete is re-expressed against the insert that was ordered ahead of it, so the intended character is still the one removed. Green is the converged result both editors see.</p>
+          <p>The central server is the single source of the canonical order, so there is one ground truth to transform against. And each client transforms locally too. A client applies its own edits <strong>optimistically</strong> the instant they are typed, so the editor feels immediate, and holds them unacknowledged. When a remote operation arrives, the client transforms it against its own unacknowledged operations before applying it. The physical order of edits therefore differs per screen, yet everyone converges on the same text, which is the guarantee OT gives.</p>
+          <pre><code class="language-python"># an operation is a small delta, never the whole document
+#   ("insert", pos, text)   e.g. ("insert", 5, ", world")
+#   ("delete", pos, count)  e.g. ("delete", 6, 1)
+
+def transform_against_insert(op, ins):
+    """Re-express op so it still means what the user intended, given that
+    `ins` (an insert) was ordered before it."""
+    _, ins_pos, ins_text = ins
+    kind, pos, arg = op
+    if pos >= ins_pos:                  # the insert landed at or before us
+        pos += len(ins_text)            # ... so shift right by its length
+    return (kind, pos, arg)
+
+# "Hello!", A = insert(5, ", world") sequenced first, B = delete(6)
+transform_against_insert(("delete", 6, 1), ("insert", 5, ", world"))
+#   -> ("delete", 13, 1)   the "!" is still the character removed</code></pre>
+          <pre><code class="language-python"># client -> server: each edit is an operation tagged with the version it was made against
+ws.send({"type": "insert", "pos": 5, "text": ", world", "baseVersion": 41})
+
+# the Document Service that owns this doc
+def on_op(op, base_version):
+    for prior in ops_since(base_version):      # transform against newer ordered ops
+        op = transform(op, prior)
+    version = append_to_cassandra(doc_id, op)  # server timestamp fixes the order
+    ack(op, version)                           # only ACK after the durable write
+    broadcast_to_others(doc_id, op, version)   # local fan-out, all editors are here</code></pre>
+
+          <h2>OT versus CRDT, and what will not work</h2>
+          <p>The other way to make concurrent edits converge is a <strong>conflict-free replicated data type</strong>. A CRDT gives every character a unique, immutable position identifier that never changes once assigned. The identifiers are densely orderable, so a character inserted between positions 4 and 5 gets something like 4.3, built from a random value plus a per-site tiebreaker so that two people inserting in the same spot still get distinct, orderable ids. A new character slots between two existing ones without touching either, and because merges commute and need no referee, CRDTs can run <strong>peer to peer and offline</strong>. The cost is heavier metadata on every character and tombstones for deletes. Libraries like Yjs and Automerge implement CRDTs for exactly this kind of text.</p>
+          <p>The trade is clean. OT is light on memory and fits text well, but it needs a central server to order operations. CRDT needs no central authority but carries more metadata on every character, and OT is in turn the one that is notoriously hard to prove correct once the central server is removed, which is much of why CRDTs exist. <mark>Google Docs uses OT</mark>, because it already runs a central stateful server for durability and broadcast, and because the 100-editor cap and plain-text focus erase the advantages a CRDT would bring. You would reach for a CRDT when you have far more collaborators, a peer-to-peer target over WebRTC, or serious offline editing.</p>
+          <div class="takeaway"><strong>The approaches that definitely do not work.</strong> <span class="warn">Full-document snapshots</span> lose every concurrent edit to last-write-wins and move the whole document on every key press. <span class="warn">Raw index edits with no transformation</span> corrupt intent, since a delete at position 6 removes the wrong character once someone else's insert has shifted the text. <span class="warn">Locking the whole document</span> so one person edits at a time removes the entire feature. And <span class="warn">Kafka on the realtime write path</span> adds latency for no durability gain, because a database commit is already a commit, and buffering edits through a long outage hides conflicts and corrupts the document rather than saving it.</div>
+
+          <h2>Keeping storage bounded with compaction</h2>
+          <p>Storing the operation log and replaying it is clean until the log gets long. Billions of documents push storage toward tens of terabytes, a long-lived document accumulates millions of operations that are slow to transfer and replay on join, and active documents sit in a server's memory. Compaction fixes all three by collapsing many operations into one, so a whole document becomes a single <code>insert(0, contents)</code>. Compaction writes a <strong>new version</strong> and then flips the <code>documentVersionId</code> pointer in Postgres with a compare-and-swap.</p>
+          <p>The timing is the subtle part. Compaction rewrites the operations that follow, so it must not corrupt a document that is being edited. Cassandra offers only row-level transactions, so the design leans on that version pointer as the atomic swap, and if new edits arrive mid-compaction the compaction is aborted. The easy case, and the one to lead with, is <strong>offline compaction that runs when the last editor disconnects</strong>, because at that instant the Document Service holds every operation in memory, owns the document exclusively, and has no one to coordinate with. A common and reasonable extension writes a full snapshot to object storage and keeps only the tail of recent operations in Cassandra, which is the same shape as a database checkpoint plus its write-ahead log.</p>
+
+          <h2>Sharding connections by document</h2>
+          <p>One server cannot hold millions of sockets, and it is a single point of failure. The constraint that decides how to scale is that OT needs <mark>all of a document's operations and all of its editors on one server</mark>, so the shard key is the document. The Document Service runs as a ring of servers placed by consistent hashing on the document id, with ZooKeeper holding the ring. A client opens a plain HTTP connection to any server with the document id, that server checks the ring, and if it is not the owner it redirects the client to the one that is. The owner upgrades the connection to a WebSocket and loads the document's operations from Cassandra if they are not already in memory. Every editor of that document is now on one server, so a broadcast is a local fan-out.</p>
+          <div class="diagram"><svg width="100%" style="max-width:760px" viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Document Service servers on a consistent hash ring keyed by document id, coordinated by ZooKeeper, with a client redirected from any server to the owner of its document">
+<defs><marker id="gd3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#86868b"/></marker></defs>
+<g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+<rect x="20" y="120" width="120" height="54" rx="9" fill="#fff" stroke="#d8d8de" stroke-width="1.25"/><text x="80" y="144" text-anchor="middle" font-size="12.5" fill="#1d1d1f">Editor</text><text x="80" y="160" text-anchor="middle" font-size="10.5" fill="#5f5f66">opens docId</text>
+<rect x="300" y="20" width="180" height="46" rx="9" fill="#fff" stroke="#d8d8de" stroke-width="1.25"/><text x="390" y="42" text-anchor="middle" font-size="12" fill="#1d1d1f">ZooKeeper</text><text x="390" y="57" text-anchor="middle" font-size="10.5" fill="#5f5f66">holds the ring config</text>
+<circle cx="470" cy="180" r="86" fill="none" stroke="#d8d8de" stroke-width="1.5" stroke-dasharray="4 5"/>
+<rect x="420" y="86" width="100" height="40" rx="8" fill="#fff" stroke="#0066cc" stroke-width="1.5"/><text x="470" y="103" text-anchor="middle" font-size="11" fill="#1d1d1f">DS 1</text><text x="470" y="117" text-anchor="middle" font-size="9.5" fill="#5f5f66">hash 0-90</text>
+<rect x="540" y="160" width="100" height="40" rx="8" fill="#eaf2fb" stroke="#0066cc" stroke-width="1.75"/><text x="590" y="177" text-anchor="middle" font-size="11" fill="#1d1d1f">DS 2 (owner)</text><text x="590" y="191" text-anchor="middle" font-size="9.5" fill="#5f5f66">hash 90-180</text>
+<rect x="420" y="234" width="100" height="40" rx="8" fill="#fff" stroke="#0066cc" stroke-width="1.5"/><text x="470" y="251" text-anchor="middle" font-size="11" fill="#1d1d1f">DS 3</text><text x="470" y="265" text-anchor="middle" font-size="9.5" fill="#5f5f66">hash 180-270</text>
+<rect x="300" y="160" width="100" height="40" rx="8" fill="#fff" stroke="#0066cc" stroke-width="1.5"/><text x="350" y="177" text-anchor="middle" font-size="11" fill="#1d1d1f">DS 4</text><text x="350" y="191" text-anchor="middle" font-size="9.5" fill="#5f5f66">hash 270-360</text>
+<path d="M140,140 C220,130 250,182 300,180" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#gd3)"/><text x="220" y="150" text-anchor="middle" font-size="10.5" fill="#5f5f66">any server</text>
+<path d="M400,180 C470,180 500,180 540,180" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#gd3)"/><text x="470" y="172" text-anchor="middle" font-size="10.5" fill="#5f5f66">redirect to owner</text>
+<path d="M470,66 V86" fill="none" stroke="#86868b" stroke-width="1.3" stroke-dasharray="4 4" marker-end="url(#gd3)"/>
+</g></svg></div>
+          <p class="quiet">Servers sit on a consistent hash ring keyed by document id, so adding or removing one reshuffles only a small slice of documents. A client is redirected to the owner of its document, which then holds the WebSocket and the in-memory operations.</p>
+          <p>Consistent hashing keeps a membership change cheap, since only a fraction of documents move, but the cost is that a ring change has to <strong>move state</strong>, displacing editors so they reconnect to the new owner and migrating the document's operations. This is also why <a href="/systems/chat-system">chat-style</a> Redis pub/sub fan-out, which works when a channel's users can sit on different stateless servers, does not fit here. OT needs every operation for a document on one stateful server, so a server publishing only to itself buys nothing, and because pub/sub is fire-and-forget, a client that drops for a moment simply misses the operations it needed, which the one owning server would otherwise have replayed.</p>
+
+          <h2>Questions and answers</h2>
+          <p>The core ideas as questions with the answers given outright. Each wrong multiple-choice option is marked with why it is wrong, and the ordering ones show the correct sequence.</p>
+          <div class="qa">
+          <div class="qa-item">
+            <div class="qa-q"><span class="qa-num">1</span><span>In the naive design, every editor sends the full document as a snapshot on each edit. Why does this cause concurrent edits to be lost?</span></div>
+            <ul class="qa-opts">
+              <li class="qa-opt correct"><span class="qmark">&#10003;</span><span class="qa-txt">When two snapshots arrive close together, the one that lands last overwrites the other, so the earlier user's change is gone</span></li>
+              <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">Snapshots are too big to fit in a single WebSocket frame, so the server truncates them and drops edits. <span class="qa-why">Size is not the failure here, and the server does not truncate. Even a tiny snapshot still overwrites.</span></span></li>
+              <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">The server cannot hold two snapshots in memory at once, so it deletes the older one to save space. <span class="qa-why">The server can hold both. The problem is that a snapshot replaces the whole document.</span></span></li>
+              <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">Snapshots leave out cursor and presence data, so the server rejects them and the edit never applies. <span class="qa-why">Snapshots are not rejected, and presence is tracked separately from the text.</span></span></li>
+            </ul>
+            <div class="qa-explain"><strong>Why:</strong> It is tempting to blame the size of a snapshot, but bandwidth is not the failure here. A snapshot is a full replacement of the document, so whichever one writes last wins and silently erases the other person's work. Even tiny, fast snapshots would still clobber each other. The fix is to send small operations like insert and delete so the server can order them and keep both changes.</div>
+          </div>
+          <div class="qa-item">
+            <div class="qa-q"><span class="qa-num">2</span><span>Put the sequence of events in order for how two concurrent edits get lost when editors send full-document snapshots.</span></div>
+            <ol class="qa-seq">
+              <li>Two users open the same document at the same time</li>
+              <li>Each user makes a different change in their own editor</li>
+              <li>Each editor sends the entire document back as a snapshot</li>
+              <li>The two snapshots reach the server one after the other</li>
+              <li>The snapshot that arrives last overwrites the other, so one user's change is lost</li>
+            </ol>
+            <div class="qa-explain"><strong>Why:</strong> You might assume the server could just compare the two snapshots and merge them, but a snapshot carries no record of what actually changed, only the final text. With nothing to merge against, the server keeps whichever wrote last. Sending operations instead of snapshots is what gives the server the per-edit information it needs to order both changes and keep them.</div>
+          </div>
+          <div class="qa-item">
+            <div class="qa-q"><span class="qa-num">3</span><span>In this collaborative editor design, which statement best describes an EDIT (operation)?</span></div>
+            <ul class="qa-opts">
+              <li class="qa-opt correct"><span class="qmark">&#10003;</span><span class="qa-txt">A single change such as insert(position, text) or delete(position, count)</span></li>
+              <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">The full text content that the editor manages. <span class="qa-why">That is the Document, the text being managed, not an Edit.</span></span></li>
+              <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">A user's caret or selection position along with their online presence. <span class="qa-why">That is a Cursor, a position and presence, not an Edit.</span></span></li>
+              <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">A snapshot of the whole document that is sent on every change. <span class="qa-why">That is the naive snapshot approach that loses concurrent edits, not an operation.</span></span></li>
+            </ul>
+            <div class="qa-explain"><strong>Why:</strong> It is tempting to picture an edit as shipping the new document state, but that is the naive snapshot approach that loses concurrent changes under last write wins. An edit is a small operation like insert or delete, which is exactly why the server can order and transform it without clobbering another user's work.</div>
+          </div>
+          <div class="qa-item">
+            <div class="qa-q"><span class="qa-num">4</span><span>Because moving your caret is a kind of action, a cursor update is treated as an edit operation applied to the document.</span></div>
+            <ul class="qa-opts">
+              <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">True</span></li>
+              <li class="qa-opt correct"><span class="qmark">&#10003;</span><span class="qa-txt">False</span></li>
+            </ul>
+            <div class="qa-explain"><strong>Why:</strong> Moving the caret feels like doing something, but it does not change the text content, so it is not an edit. A cursor is presence data (position plus online state) that is high frequency but disposable, while an edit is a durable operation like insert or delete that must be ordered and never lost.</div>
+          </div>
+          <div class="qa-item">
+            <div class="qa-q"><span class="qa-num">5</span><span>In OT, what is the central server's job when two edits to the same document arrive at nearly the same time?</span></div>
+            <ul class="qa-opts">
+              <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">It keeps whichever full-document snapshot arrived last and drops the other one.. <span class="qa-why">That is the snapshot path that silently loses edits, not what OT does.</span></span></li>
+              <li class="qa-opt correct"><span class="qmark">&#10003;</span><span class="qa-txt">It picks one order for the operations that all clients follow, and transforms the later ones so their indices still point at the right characters.</span></li>
+              <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">It locks the document so only the first editor's change lands and the other user has to retype.. <span class="qa-why">Locking kills concurrent editing. OT keeps both edits and reorders them.</span></span></li>
+              <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">It gives every character a permanent id up front so edits never need transforming at all.. <span class="qa-why">Assigning permanent ids up front is the CRDT idea. OT transforms indices instead.</span></span></li>
+            </ul>
+            <div class="qa-explain"><strong>Why:</strong> It is tempting to picture the server just merging the two edits or letting the last one win, but that is the snapshot path that quietly loses changes. OT keeps both operations and rewrites the index of the later one, which is exactly why no edit gets dropped.</div>
+          </div>
+          <div class="qa-item">
+            <div class="qa-q"><span class="qa-num">6</span><span>The document reads "Hello!". User A sends INSERT(5, ", world") and User B sends DELETE(6) to remove the "!". A's insert reaches the server first. Put the steps in the order they happen as B's delete propagates to everyone.</span></div>
+            <ol class="qa-seq">
+              <li>User A sends INSERT(5, ", world") and User B sends DELETE(6) to the central server.</li>
+              <li>The server picks the total order and applies A's insert first, turning "Hello!" into "Hello, world!".</li>
+              <li>Because 7 characters now sit before position 6, the server rewrites B's DELETE(6) into DELETE(13).</li>
+              <li>The server applies DELETE(13) to drop the "!" and broadcasts the ordered operations to every client.</li>
+            </ol>
+            <div class="qa-explain"><strong>Why:</strong> A natural but wrong assumption is that the transform comes first and the ordering second, or that each client patches its own indices. The server has to fix the order first, because only once it knows A's 7 characters landed before position 6 can it turn DELETE(6) into DELETE(13).</div>
+          </div>
+          <div class="qa-item">
+            <div class="qa-q"><span class="qa-num">7</span><span>In a CRDT-based editor, a user types a character between two existing characters. Why do the two neighbors' position identifiers stay exactly the same?</span></div>
+            <ul class="qa-opts">
+              <li class="qa-opt correct"><span class="qmark">&#10003;</span><span class="qa-txt">The identifiers are densely orderable and infinitely subdividable, so a new identifier can always be generated that sorts between the two neighbors without touching either one</span></li>
+              <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">A central server renumbers every identifier after the insertion point and pushes the new numbering out to all clients. <span class="qa-why">CRDTs have no central renumbering. The identifiers are immutable once assigned.</span></span></li>
+              <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">The editor shifts the index of every character to the right of the insertion by one, the same way OT does. <span class="qa-why">Shifting every index to the right is OT's model, not CRDT. CRDT identifiers never move.</span></span></li>
+              <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">The existing identifiers are re-spaced evenly on each insert so a fresh gap opens up for the new character. <span class="qa-why">Existing identifiers are not re-spaced. A fresh identifier is minted strictly between the two neighbors.</span></span></li>
+            </ul>
+            <div class="qa-explain"><strong>Why:</strong> It is tempting to picture this like inserting into an array, where everything after the gap has to slide over to make room. CRDT identifiers are not array indices. They live in a continuous, infinitely subdividable space like the real numbers, so there is always room to mint a new id strictly between any two existing ones. Nothing slides and nothing gets renumbered, which is exactly what lets the ids stay immutable.</div>
+          </div>
+          <div class="qa-item">
+            <div class="qa-q"><span class="qa-num">8</span><span>Order the steps a CRDT replica follows to insert a character between two existing characters and share it with everyone else.</span></div>
+            <ol class="qa-seq">
+              <li>Find the identifiers of the left and right neighbors that bound the spot where the new character goes</li>
+              <li>Generate a new identifier that sorts strictly between those two neighbors, using the dense subdivision of the identifier space</li>
+              <li>Attach that new immutable identifier to the character while leaving every existing identifier unchanged</li>
+              <li>Send the character and its identifier to the other replicas</li>
+              <li>Each replica places the character in identifier order and reaches the same document, with no central server deciding the order</li>
+            </ol>
+            <div class="qa-explain"><strong>Why:</strong> A natural but wrong assumption is that a server hands out the identifier or decides the final order first. The new id cannot be minted until you know which two neighbors it must fall between, so locating the neighbors has to come first. And because every replica sorts by the same immutable identifiers, the merge lands on the same result on its own. No central sequencer is involved, which is the property OT does not have.</div>
+          </div>
+          <div class="qa-item">
+            <div class="qa-q"><span class="qa-num">9</span><span>Which statement correctly describes the tradeoff between Operational Transformation (OT) and CRDTs for a collaborative editor?</span></div>
+            <ul class="qa-opts">
+              <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">OT works peer to peer with no central server, while CRDTs need a central server to merge everyone's changes.. <span class="qa-why">This is backwards. OT is the one that needs a central server, and CRDTs are the ones that can run without one.</span></span></li>
+              <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">CRDTs use lighter metadata than OT because each character only has to store its current index.. <span class="qa-why">CRDTs carry more per-character metadata, not less, and they do not use array indices at all.</span></span></li>
+              <li class="qa-opt correct"><span class="qmark">&#10003;</span><span class="qa-txt">OT keeps each operation lightweight but relies on a central server to set the order, while CRDTs drop the central authority and pay for it with heavier per-character metadata.</span></li>
+              <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">OT and CRDT are the same technique under two names, so the choice between them makes no real difference.. <span class="qa-why">They are genuinely different approaches with real trade-offs, so the choice matters.</span></span></li>
+            </ul>
+            <div class="qa-explain"><strong>Why:</strong> The tempting read is that 'no central server' makes CRDTs the lighter, simpler option. It is actually the reverse. Dropping the central sequencer is exactly what forces every character to carry its own unique, immutable identifier, so a CRDT trades server dependence for more metadata and harder code. Google Docs went with OT because a central server ordering the operations lets each edit stay small.</div>
+          </div>
+          <div class="qa-item">
+            <div class="qa-q"><span class="qa-num">10</span><span>Locking the whole document so only one person can edit at a time is a workable way to build a real-time collaborative editor like Google Docs.</span></div>
+            <ul class="qa-opts">
+              <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">True</span></li>
+              <li class="qa-opt correct"><span class="qmark">&#10003;</span><span class="qa-txt">False</span></li>
+            </ul>
+            <div class="qa-explain"><strong>Why:</strong> Whole-document locking feels safe because it prevents conflicts by construction, but that is the wrong goal. The point of a collaborative editor is many people editing at once and seeing each other within a fraction of a second, and a lock serializes everyone down to a single editor, which kills exactly that. The real job is to merge concurrent edits, not to forbid concurrency, which is why Google Docs uses OT instead.</div>
+          </div>
+          <div class="qa-item">
+            <div class="qa-q"><span class="qa-num">11</span><span>A Document Service instance holds an active document's operations in memory. Why does offline compaction run at the moment the last client disconnects?</span></div>
+            <ul class="qa-opts">
+              <li class="qa-opt correct"><span class="qmark">&#10003;</span><span class="qa-txt">At that moment the service has the full set of operations, exclusive ownership of the document, and no active editors to coordinate with, so it can safely collapse operations into a snapshot.</span></li>
+              <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">Compaction needs to lock the whole document, and locking is only safe once nobody is editing it.. <span class="qa-why">It is not about locking. The owner already holds every operation in memory.</span></span></li>
+              <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">Ownership passes to a backup Document Service instance on disconnect, and that instance rebuilds the document from a fresh snapshot.. <span class="qa-why">Ownership does not hand off to a backup on disconnect. The same owner runs the compaction.</span></span></li>
+              <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">Connected clients block snapshot writes over their WebSocket, so the write has to wait until every socket closes.. <span class="qa-why">Clients do not block writes over the socket. The trigger is simply that no editors remain to coordinate with.</span></span></li>
+            </ul>
+            <div class="qa-explain"><strong>Why:</strong> You might picture compaction as a background timer that fires on a schedule no matter who is connected. The problem is that rewriting history while editors are still streaming operations you have not sequenced yet risks dropping or reordering their edits. The last client leaving is the signal that the in-memory operation set is complete and there is nobody left to coordinate with, which is what makes the collapse safe.</div>
+          </div>
+          <div class="qa-item">
+            <div class="qa-q"><span class="qa-num">12</span><span>True or False: while a single document is being actively edited, several Document Service instances can each hold it in memory at once to share the editing load.</span></div>
+            <ul class="qa-opts">
+              <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">True</span></li>
+              <li class="qa-opt correct"><span class="qmark">&#10003;</span><span class="qa-txt">False</span></li>
+            </ul>
+            <div class="qa-explain"><strong>Why:</strong> It feels natural to scale a hot document by spreading it across many instances, the same way you would scale stateless web servers. But one instance takes exclusive ownership of a document precisely so there is a single authoritative place to order operations. Scaling comes from sharding different documents across instances, not from copying one document onto several.</div>
+          </div>
+          <div class="qa-item">
+            <div class="qa-q"><span class="qa-num">13</span><span>Put the steps for loading an active document from storage into the correct order. Storage is an append-only operation log with periodic snapshots.</span></div>
+            <ol class="qa-seq">
+              <li>Find the most recent snapshot saved for the document.</li>
+              <li>Load that snapshot into memory as the document's starting state.</li>
+              <li>Read the operations from the append-only log that were written after that snapshot.</li>
+              <li>Replay those operations in order to rebuild the document's current state.</li>
+            </ol>
+            <div class="qa-explain"><strong>Why:</strong> It is tempting to think loading means replaying the whole operation log from the very first edit. That gets slower and slower as a document ages. Snapshots exist so you can start from a recent saved state and only replay the operations recorded since, which is also why compaction folds old operations into a fresh snapshot.</div>
+          </div>
+          <div class="qa-item">
+            <div class="qa-q"><span class="qa-num">14</span><span>You are building the live editing transport for a collaborative document editor. Why hold a persistent WebSocket per client instead of using SSE or polling?</span></div>
+            <ul class="qa-opts">
+              <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">WebSocket compresses each edit, so it moves less data than SSE or polling, and that bandwidth saving is the reason it was chosen.. <span class="qa-why">Bandwidth is not the reason. The reason is constant two-way, keystroke-rate traffic.</span></span></li>
+              <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">SSE and polling cannot send any data from the server to the client, so only WebSocket can show a user the edits other people make.. <span class="qa-why">SSE can push and polling can fetch server data. What they cannot do well is carry the client's constant upstream edits.</span></span></li>
+              <li class="qa-opt correct"><span class="qmark">&#10003;</span><span class="qa-txt">WebSocket is bidirectional, so one persistent connection carries the client's own edits upstream and other people's edits back down. SSE only flows server to client so it cannot carry edits upstream, and polling is too slow and wasteful at keystroke rate.</span></li>
+              <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">WebSocket makes operations arrive in the correct total order, which SSE and polling cannot guarantee.. <span class="qa-why">The total order comes from the server sequencing operations, not from the transport.</span></span></li>
+            </ul>
+            <div class="qa-explain"><strong>Why:</strong> The easy mistake is assuming an editor only needs to receive other people's changes, which SSE already does well. But each editor also has to push its own keystrokes up to the server, and SSE runs one direction only, server to client, so it cannot carry those edits upstream. Ordering is not the transport's job either, the central server sets the total order, so that is not the deciding factor. WebSocket wins because it moves both directions over one low latency connection.</div>
+          </div>
+          </div>
+
+          <h2>References</h2>
+          <ol class="refs">
+            <li>Ellis and Gibbs, <a href="https://dl.acm.org/doi/10.1145/67544.66963" target="_blank" rel="noreferrer">Concurrency Control in Groupware Systems</a> (1989), the original Operational Transformation paper.</li>
+            <li>Shapiro et al., <a href="https://inria.hal.science/inria-00609399/document" target="_blank" rel="noreferrer">Conflict-free Replicated Data Types</a> (2011).</li>
+            <li>Google Drive Engineering, <a href="https://drive.googleblog.com/2010/09/whats-different-about-new-google-docs.html" target="_blank" rel="noreferrer">What's different about the new Google Docs</a> (2010), on managing edits server-side.</li>
+            <li>Kleppmann, <a href="https://dataintensive.net/" target="_blank" rel="noreferrer">Designing Data-Intensive Applications</a> (2017), on logs, snapshots, and consistency.</li>
+          </ol>
+        </article>
+      </div>
+    </section>
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/reader.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (window.hljs) hljs.highlightAll();
+      });
+    </script>
+  </body>
+</html>
