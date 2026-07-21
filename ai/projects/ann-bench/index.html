@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Benchmarking vector search, from the embedding model to the index · Stanley Jacob</title>
+    <meta name="description" content="Project write-up: a reproducible RAG benchmark that embeds a corpus, builds five quantized FAISS indexes, and measures recall, latency, and memory — with a six-model embedder sweep on BEIR and the same code running from a laptop CPU to a GPU." />
+    <link rel="stylesheet" href="/style.css" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E"
+    />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai" class="active">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/ai">← AI</a></div>
+        <h1>Benchmarking vector search, from the embedding model to the index</h1>
+        <p class="meta">Project write-up · retrieval &amp; vector search · Jul 2026</p>
+      </div>
+    </header>
+
+    <section style="padding-top: 0">
+      <div class="wrap">
+        <article class="prose article">
+          <p>
+            Every retrieval-augmented system rests on one operation repeated billions of
+            times: turn a piece of text into a vector, then find the handful of stored vectors
+            nearest to a query vector. The quality of an answer is capped by whether that search
+            surfaced the right passage, and the cost of the product is set by how fast and how
+            cheaply the search runs at scale, so the two numbers that matter most in a RAG system
+            live at opposite ends of this one step and are usually measured by two different
+            teams, if they are measured at all.
+          </p>
+          <p>
+            The purpose of this project is to measure both ends honestly, with one codebase, on
+            real data. It embeds a text corpus, builds five different quantized approximate-
+            nearest-neighbour indexes over it, and reports recall, latency, and memory for each,
+            alongside a separate head-to-head of six embedding models scored against human
+            relevance judgments. A second purpose shaped the design more than the first: to keep
+            the two questions strictly apart. <em>Retrieval quality</em> — did the embedding model
+            put the right document near the top — is graded against official qrels. <em>ANN
+            fidelity</em> — did the approximate index reproduce what exact search would have
+            returned — is graded against a brute-forced ground truth the project computes itself.
+            They are different questions, they fail for different reasons, and a benchmark that
+            blends them into one number is worse than no benchmark at all.
+          </p>
+          <p>
+            The same code runs in three tiers selected purely by a config file: a CPU tier over a
+            small synthetic corpus that finishes in seventy-five seconds so the whole pipeline can
+            run anywhere, a GPU tier on my desktop's RTX 4090 that embeds a million-plus real
+            MS&nbsp;MARCO passages through vLLM, and a cloud tier designed for a Lambda instance and
+            hundreds of millions to a billion chunks. The reusable half is a library; the benchmark
+            is an application on top of it, so the next retrieval project reuses the platform
+            unchanged. The code is at
+            <a href="https://github.com/gradientsj/rag-platform" target="_blank" rel="noreferrer">github.com/gradientsj/rag-platform</a>.
+            This page walks through the decisions first and the measured results after, because the
+            decisions are what make the numbers mean something.
+          </p>
+
+          <h2>The pipeline at a glance</h2>
+          <p>
+            Six stages compose, each a command that takes only the config and the output of the
+            stage before it, so any one can be re-run in isolation and the whole thing resumes
+            after a crash rather than starting over.
+          </p>
+          <pre class="flow">
+ingest ──▶ embed ──▶ groundtruth ──▶ build-index ──▶ bench ──▶ report
+  │          │            │               │            │          │
+stream a   Ray Data     exact brute-    Flat, HNSW,   recall +   markdown +
+corpus →   over a GPU   force top-k     SQ8, IVF-PQ,  latency    matplotlib
+chunk →    actor pool   (faiss-gpu)     RaBitQ        sweep →    from the
+parquet    → FP16        → qrels         → build       SQLite     run DB
+shards +   vectors                       records      run DB
+manifest</pre>
+          <p>
+            The manifest is the spine. It records every shard, its content hash, and whether its
+            vectors have been written, so a preempted run re-reads it and skips the work already
+            done. Ray gives fault tolerance <em>inside</em> a run; the manifest gives it
+            <em>across</em> runs, and at the scale this is built for, both matter.
+          </p>
+
+          <h2>Step 1: three tiers, one config, no forked code</h2>
+          <p>
+            The temptation in a project like this is to write a quick local script and a separate
+            "real" pipeline for the cloud, and then to watch them drift until only one of them
+            works. The whole thing is instead a single typed configuration — corpus sources,
+            chunking, embedder, index specifications, sweep grids — with three profiles that differ
+            only in their values. The CPU profile points at a deterministic synthetic corpus and a
+            384-dimension MiniLM model; the GPU profile points at MS&nbsp;MARCO and a 1024-dimension
+            Qwen3 embedder served by vLLM; the cloud profile stacks Wikipedia and web text and
+            writes its artifacts to S3. Nothing in the code hardcodes a path, a model, a dimension,
+            or a GPU count, which is what lets the seventy-five-second CPU run and the multi-hour
+            GPU run exercise the same lines.
+          </p>
+          <p>
+            A small piece of this earns its place quietly: before the GPU tier loads a model, it
+            reads the card's free memory and fails with a clear message and a smaller-model
+            suggestion if the embedder will not fit, rather than dying halfway through a run with an
+            out-of-memory stack trace. The check is torch-free on purpose, so the config layer stays
+            cheap to import and testable on a machine with no GPU at all.
+          </p>
+
+          <h2>Step 2: streaming ingestion and a manifest you can resume from</h2>
+          <p>
+            Corpora at this scale do not fit in memory, and the disk is not much better once
+            billion-scale vectors enter the picture, so ingestion streams: each source yields
+            documents one at a time, a chunker cuts them into overlapping token windows, and fixed-
+            row parquet shards are written as they fill. Every source — a deterministic synthetic
+            generator, MS&nbsp;MARCO through <span class="mono">ir_datasets</span>, Wikipedia and
+            FineWeb streamed from the Hugging Face hub — sits behind one interface, so the profiles
+            compose them without the ingestion code knowing which is which. Document ids are made
+            globally unique as <span class="mono">{source}:{native_id}:{chunk}</span>, and the
+            per-source counts and licenses are recorded in the manifest, because at a billion chunks
+            "which of these am I even allowed to ship" is a real question with a real answer.
+          </p>
+          <p>
+            The resumability is unit-tested by killing a run mid-way and asserting that the next run
+            embeds exactly the shards the first one missed. That test caught more than one ordering
+            bug, and it is the difference between a preemption on a rented GPU costing a few minutes
+            and costing the whole run.
+          </p>
+
+          <h2>Step 3: the embedding model is the ceiling, so measure it first</h2>
+          <p>
+            No index can retrieve a document the embedding model failed to place near the query;
+            the model sets the ceiling and the index decides how cheaply you approach it. So before
+            comparing indexes, six embedding models were run head-to-head on two small benchmarks
+            from BEIR — SciFact and NFCorpus — small enough that every document is embedded and the
+            retrieval-quality numbers are exact, with no sampling. Each model was given its own
+            documented retrieval prompt (BGE's "Represent this sentence…", E5's "query:"/"passage:",
+            Qwen3's instruction prefix), because scoring them with a shared prompt would quietly
+            handicap the ones that expect their own.
+          </p>
+          <p>
+            SciFact, three hundred scientific-claim queries over five thousand abstracts:
+          </p>
+          <table>
+            <thead>
+              <tr><th>model</th><th class="num">dim</th><th class="num">nDCG@10</th><th class="num">MRR@10</th><th class="num">recall@100</th><th class="num">docs/s</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>bge-base-en-v1.5</td><td class="num">768</td><td class="num"><strong>0.740</strong></td><td class="num">0.703</td><td class="num">0.967</td><td class="num">320</td></tr>
+              <tr><td>gte-small</td><td class="num">384</td><td class="num">0.727</td><td class="num">0.694</td><td class="num">0.950</td><td class="num"><strong>1675</strong></td></tr>
+              <tr><td>bge-small-en-v1.5</td><td class="num">384</td><td class="num">0.713</td><td class="num">0.682</td><td class="num">0.942</td><td class="num">745</td></tr>
+              <tr><td>qwen3-emb-0.6b</td><td class="num">1024</td><td class="num">0.699</td><td class="num">0.667</td><td class="num">0.953</td><td class="num">114</td></tr>
+              <tr><td>e5-small-v2</td><td class="num">384</td><td class="num">0.688</td><td class="num">0.658</td><td class="num">0.928</td><td class="num">732</td></tr>
+              <tr><td>all-MiniLM-L6-v2</td><td class="num">384</td><td class="num">0.654</td><td class="num">0.607</td><td class="num">0.932</td><td class="num">1152</td></tr>
+            </tbody>
+          </table>
+          <p>
+            NFCorpus, three hundred medical queries with many relevant documents each, a harder set
+            where every model scores lower:
+          </p>
+          <table>
+            <thead>
+              <tr><th>model</th><th class="num">dim</th><th class="num">nDCG@10</th><th class="num">MRR@10</th><th class="num">recall@100</th><th class="num">docs/s</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>bge-base-en-v1.5</td><td class="num">768</td><td class="num"><strong>0.374</strong></td><td class="num">0.563</td><td class="num">0.337</td><td class="num">320</td></tr>
+              <tr><td>qwen3-emb-0.6b</td><td class="num">1024</td><td class="num">0.357</td><td class="num">0.561</td><td class="num">0.328</td><td class="num">114</td></tr>
+              <tr><td>gte-small</td><td class="num">384</td><td class="num">0.348</td><td class="num">0.538</td><td class="num">0.337</td><td class="num"><strong>1675</strong></td></tr>
+              <tr><td>bge-small-en-v1.5</td><td class="num">384</td><td class="num">0.343</td><td class="num">0.527</td><td class="num">0.311</td><td class="num">745</td></tr>
+              <tr><td>e5-small-v2</td><td class="num">384</td><td class="num">0.325</td><td class="num">0.521</td><td class="num">0.297</td><td class="num">732</td></tr>
+              <tr><td>all-MiniLM-L6-v2</td><td class="num">384</td><td class="num">0.310</td><td class="num">0.495</td><td class="num">0.305</td><td class="num">1152</td></tr>
+            </tbody>
+          </table>
+          <p>
+            Three findings in those tables were worth the whole exercise. The first is that
+            <strong>bigger is not better</strong>: Qwen3-Embedding at 0.6&nbsp;billion parameters and
+            1024 dimensions, the largest and by far the slowest model in the sweep at 114 documents
+            per second, lands in the middle of the pack on both datasets and is beaten on SciFact by
+            <span class="mono">gte-small</span>, a 384-dimension model that runs fifteen times faster.
+            The second is that <strong>the sweet spot is small</strong>: <span class="mono">bge-base</span>,
+            a 110-million-parameter model, wins both benchmarks while embedding at a rate that makes
+            a billion-chunk corpus tractable, and the 384-dimension models trail it by only two to
+            four points at a quarter of the vector storage. The third is a check on the harness
+            itself — these scores land within a point or two of the published BEIR numbers for the
+            same models, which is the evidence that the measurement is trustworthy before any of it
+            is used to make a decision. A pooled "big models are better" intuition would have picked
+            Qwen3 and paid for it in both quality and latency; the per-model rows are what turned
+            that into "measure on your own data, and the 768-dimension model is the buy."
+          </p>
+          <p>
+            One caveat belongs next to that table: these are two small English benchmarks, chosen
+            because they are fully embeddable and carry trustworthy judgments, not because they
+            settle the question for every domain. The ranking is a starting point and a reusable
+            harness, not a universal verdict.
+          </p>
+
+          <h2>Step 4: exact ground truth, and why recall needs two definitions</h2>
+          <p>
+            An approximate index is only worth measuring against the truth, so the project computes
+            that truth itself: for a held-out set of queries it does an exact brute-force top-100
+            search over the full corpus — sharded across the GPU with faiss, each shard's partial
+            result merged on the driver with a heap — and persists it as qrels. Every recall number
+            for an ANN index is scored against this, never against another approximate index, which
+            would only measure how two approximations agree.
+          </p>
+          <p>
+            This is where the two eval tracks earn their separation, because the word "recall" means
+            two different things depending on which track you are in. In the retrieval-quality track,
+            recall@100 is the fraction of the documents a human judged relevant that appear in the top
+            hundred — a statement about the <em>model</em>. In the ANN-fidelity track, recall@10 is the
+            fraction of the exact top ten that the approximate index also returned — a statement about
+            the <em>index</em>. Same word, different denominator, different question. The run database
+            keeps them in separate tables and the report keeps them in separate sections, and that
+            discipline is the difference between a benchmark you can reason about and a pile of
+            numbers.
+          </p>
+
+          <h2>Step 5: five FAISS indexes and what each one trades away</h2>
+          <p>
+            Every index type is a different point on the recall-speed-memory triangle, and you only
+            ever get to pick two. The project builds five, from exact to aggressively compressed, so
+            the trade-off is measured rather than assumed.
+          </p>
+          <ul>
+            <li>
+              <strong>Flat</strong> stores every vector uncompressed and scans all of them per query.
+              It is exact — it <em>is</em> the ground truth — but at a million vectors of 1024
+              dimensions that scan is a quarter of a second per query. It is the honest baseline the
+              others are measured against.
+            </li>
+            <li>
+              <strong>SQ8</strong> is still an exhaustive scan, but each float is compressed from four
+              bytes to one by mapping every dimension onto 256 levels. Four times smaller, a fraction
+              of a point of recall lost.
+            </li>
+            <li>
+              <strong>HNSW</strong> builds a navigable small-world graph: each vector links to its
+              nearest neighbours, sparse upper layers act as highways, and a query greedily hops toward
+              its target while keeping a candidate frontier whose width, <span class="mono">efSearch</span>,
+              trades recall for speed. It is the fastest index here by three orders of magnitude, at the
+              cost of storing the full vectors plus the graph.
+            </li>
+            <li>
+              <strong>IVF-PQ</strong> partitions the space into cells with k-means, scans only the
+              <span class="mono">nprobe</span> nearest cells, and inside them replaces each vector with a
+              product-quantized code — the 1024-dimension vector split into 64 sub-vectors, each stored as
+              a single byte, for a sixty-four-fold compression. It fit a million vectors into a hundred
+              megabytes, and it is where a real bug lived (below).
+            </li>
+            <li>
+              <strong>RaBitQ</strong> is a newer one-bit-per-dimension quantizer with a provable error
+              bound; it produced the smallest index of all, at a recall the write-up reports rather than
+              hides.
+            </li>
+          </ul>
+          <p>
+            Every build path trains its coarse quantizer and codebooks on the GPU when a GPU is
+            present, moves the finished index to the CPU for serving — the realistic deployment for
+            these quantization schemes at this scale — and writes a build record: parameters, wall
+            time, on-disk size, in-memory size, peak memory. The report reads those records so the
+            memory column in the results is measured, not estimated.
+          </p>
+
+          <h2>The index benchmark, over 1.2 million real vectors</h2>
+          <p>
+            On the GPU tier, 1.2 million MS&nbsp;MARCO passages were embedded with Qwen3 into 1024-
+            dimension vectors, and all five index types were built and searched against the exact
+            ground truth. Recall is the best over the search-parameter sweep; latency is single-query,
+            closed-loop:
+          </p>
+          <table>
+            <thead>
+              <tr><th>index</th><th class="num">recall@10</th><th class="num">p50 latency</th><th class="num">QPS</th><th class="num">in-memory</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Flat (exact)</td><td class="num">1.000</td><td class="num">241 ms</td><td class="num">4</td><td class="num">4.9 GB</td></tr>
+              <tr><td>SQ8</td><td class="num">0.995</td><td class="num">—</td><td class="num">—</td><td class="num">1.2 GB</td></tr>
+              <tr><td>HNSW (efSearch 16)</td><td class="num"><strong>0.991</strong></td><td class="num"><strong>0.23 ms</strong></td><td class="num"><strong>4257</strong></td><td class="num">5.2 GB</td></tr>
+              <tr><td>IVF-SQ8 (nprobe 1)</td><td class="num">0.979</td><td class="num">0.90 ms</td><td class="num">1094</td><td class="num">1.2 GB</td></tr>
+              <tr><td>IVF-PQ</td><td class="num">0.648</td><td class="num">—</td><td class="num">—</td><td class="num">0.10 GB</td></tr>
+            </tbody>
+          </table>
+          <p>
+            That table is the entire argument for approximate search in one row. Flat is exact and
+            useless in production: a quarter of a second per query is four queries a second, and no
+            serving budget survives it. HNSW returns the same neighbours 99.1% of the time in
+            0.23&nbsp;milliseconds — a <strong>thousand times faster</strong> than exact search, at
+            four thousand queries a second — which is why it is the default answer for latency-bound
+            retrieval when memory is available. IVF-SQ8 gives up a point of recall to fit in a
+            quarter of the memory, and IVF-PQ gives up a great deal more to fit the whole index into a
+            hundred megabytes, which is the trade you take at a billion vectors when a GPU-resident
+            index is the only affordable option. There is no best index in that table, only a curve,
+            and the point of the project is to draw the curve on your data rather than repeat someone
+            else's.
+          </p>
+
+          <h2>How to read these numbers</h2>
+          <p>
+            Every metric here scores a ranked list against a set of relevance judgments and then
+            averages over queries; they differ only in what they reward. Take one query whose relevant
+            documents are D3 (highly relevant, grade 3) and D7 (relevant, grade 1), with a system that
+            returned <span class="mono">[D5, D3, D9, D7, D1]</span>.
+          </p>
+          <p>
+            <strong>Recall@k</strong> asks whether the relevant documents were found at all: the
+            fraction of the relevant set that appears in the top&nbsp;k, ignoring order. Here recall@5
+            is 2/2 = 1.0 — both relevant documents made the top five. It is a coverage measure, which
+            is why recall@100 is the generous "did the model surface the answer anywhere near the top"
+            number in the model sweep.
+          </p>
+          <p>
+            <strong>MRR@k</strong>, mean reciprocal rank, asks how high the <em>first</em> relevant
+            document sits: one over its rank, or zero if none is in the top&nbsp;k. Here the first
+            relevant document is D3 at rank two, so the reciprocal rank is 1/2 = 0.5. It only looks at
+            the first hit and ignores everything after, which makes it the right metric when there is
+            essentially one correct answer and it needs to be at the top.
+          </p>
+          <p>
+            <strong>nDCG@k</strong>, normalized discounted cumulative gain, is the complete one, and
+            the one worth being able to derive on a whiteboard. It uses graded relevance and rewards
+            putting more-relevant documents higher. Walk down the ranking and sum each document's grade
+            discounted by its position, <span class="mono">grade / log2(rank + 1)</span>, so a great
+            document at rank one is worth more than at rank ten. For this list the discounted gain is
+            <span class="mono">3/log2(3) + 1/log2(5) = 1.893 + 0.431 = 2.324</span>. Then compute the
+            same sum for the <em>ideal</em> ranking, D3 then D7, which is
+            <span class="mono">3/log2(2) + 1/log2(3) = 3.0 + 0.631 = 3.631</span>, and divide: nDCG@5 =
+            2.324 / 3.631 = <strong>0.640</strong>. Normalizing by the ideal puts every query on a
+            [0,&nbsp;1] scale regardless of how many relevant documents it has, so the average across
+            queries is meaningful. nDCG rewards finding relevant documents, ranking the most relevant
+            ones first, and putting them near the top, all at once, which is why it is the number the
+            BEIR and MTEB leaderboards report and the number the model sweep is ranked on.
+          </p>
+
+          <h2>The bugs only real hardware and real data will show you</h2>
+          <p>
+            The unit tests were green throughout and the type checker was clean, and none of that
+            prevented six genuine bugs that appeared only when the code met a GPU and a real corpus.
+            Cataloguing them is the point, because the fixes are the part of the project a
+            reader learns the most from.
+          </p>
+          <ul>
+            <li>
+              <strong>Ray workers that could not import Ray.</strong> Under <span class="mono">uv</span>,
+              Ray 2.56 detected the launcher and started its workers with a copy of the project that had
+              no dependencies installed, so the pipeline hung with the workers unable to
+              <span class="mono">import ray</span>. The fix was to disable that auto-detection and let
+              workers use the installed environment directly.
+            </li>
+            <li>
+              <strong>A CUDA library load-order conflict.</strong> Importing faiss before torch loaded
+              faiss's older bundled cuBLAS, which was missing a symbol; importing torch first, so its
+              newer CUDA libraries win, resolved it. A one-line helper now guarantees the order.
+            </li>
+            <li>
+              <strong>IVF-PQ recall that fell as you searched harder.</strong> Product quantization
+              encodes the residual from a cell's centroid, which is only metric-correct under L2; built
+              under inner product, its recall dropped as <span class="mono">nprobe</span> rose — exactly
+              backwards. Because the embeddings are unit-normalized, nearest by inner product equals
+              nearest by L2, so building IVF-PQ under L2 restored monotonic recall.
+            </li>
+            <li>
+              <strong>A passage vLLM refused to embed.</strong> A real MS&nbsp;MARCO passage tokenized to
+              513 tokens against a 512 limit, and the engine rejected it rather than truncating; passing
+              a truncation flag fixed it. Real corpora contain the inputs your tests never generate.
+            </li>
+            <li>
+              <strong>A single-GPU deadlock in the distributed layer.</strong> Ray's actor pool restarted
+              the vLLM worker after its engine stalled, but the dead engine never released its twenty
+              gigabytes of VRAM, so the restart waited forever. On one GPU the distributed machinery was
+              pure overhead and this failure mode; the fix routes the single-actor case through a plain
+              sequential loop and keeps Ray for the multi-GPU case it is actually for.
+            </li>
+            <li>
+              <strong>A latent bug an adversarial review caught before any run.</strong> A panel of
+              review agents reading the code flagged that the GPU ground-truth path under an L2 metric
+              negated its distances and would have selected the <em>farthest</em> neighbours; it was
+              unreachable by the inner-product profiles but real, and it is fixed.
+            </li>
+          </ul>
+
+          <h2>Limitations</h2>
+          <p>
+            The billion-scale tier is designed, documented, and costed against Lambda pricing, but it
+            has not been run; the largest run here is 1.2 million vectors on a single desktop GPU. The
+            model sweep is two small English benchmarks, chosen for exact evaluability, not a broad
+            multilingual or long-document study. The retrieval-quality MRR on MS&nbsp;MARCO itself is
+            not reported: computing it requires embedding the full corpus through vLLM, and a stability
+            issue in that engine under sustained embedding — the same one behind the deadlock above —
+            made the reliable path the sentence-transformers backend, which is what the model sweep
+            runs on. Every GPU code path is exercised on real data, but the full-corpus single-engine
+            embed is gated on that mitigation. And everything is one run per configuration; the numbers
+            come with their configs in the repository, so anyone can rebuild the identical benchmark and
+            shake them.
+          </p>
+
+          <h2>Links</h2>
+          <ul>
+            <li><a href="https://github.com/gradientsj/rag-platform" target="_blank" rel="noreferrer">Source on GitHub</a> — the platform, the three config profiles, and the tests.</li>
+            <li><a href="https://github.com/gradientsj/rag-platform/blob/main/BUILD_LOG.md" target="_blank" rel="noreferrer">Build log</a> — the engineering narrative, phase by phase, with every bug and fix.</li>
+            <li><a href="https://github.com/gradientsj/rag-platform/blob/main/infra/PROD_RUNBOOK.md" target="_blank" rel="noreferrer">Production runbook</a> — the Lambda provisioning and the billion-scale cost projection.</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+  </body>
+</html>
