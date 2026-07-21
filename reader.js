@@ -20,7 +20,7 @@
         if (child.nodeType !== 1) continue;
         var tag = child.tagName.toLowerCase();
         if (SKIP_TAGS[tag]) continue;
-        if (child.classList && (child.classList.contains("quiz") ||
+        if (child.classList && (child.classList.contains("quiz") || child.classList.contains("qa") ||
           child.classList.contains("reader") || child.classList.contains("diagram"))) continue;
         if (READ_TAGS[tag]) {
           var t = child.textContent.replace(/\s+/g, " ").trim();
