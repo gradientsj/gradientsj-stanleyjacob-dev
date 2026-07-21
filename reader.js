@@ -85,8 +85,8 @@
     var note = document.createElement("span");
     note.className = "reader-note";
 
-    bar.appendChild(btn); bar.appendChild(speed); bar.appendChild(stop); bar.appendChild(note);
-    root.appendChild(bar);
+    bar.appendChild(btn); bar.appendChild(speed); bar.appendChild(stop);
+    root.appendChild(bar); root.appendChild(note);
 
     var supportsSpeech = "speechSynthesis" in window;
     var mode = null, audio = null;
