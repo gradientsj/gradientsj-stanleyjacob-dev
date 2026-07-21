@@ -63,29 +63,12 @@
     var btn = document.createElement("button");
     btn.type = "button"; btn.className = "reader-btn";
 
-    var speed = document.createElement("div");
-    speed.className = "reader-speed"; speed.setAttribute("role", "group");
-    speed.setAttribute("aria-label", "Playback speed");
-    var rate = 1, rateBtns = [];
-    [1, 2, 3, 4].forEach(function (r) {
-      var s = document.createElement("button");
-      s.type = "button"; s.textContent = r + "x"; s.setAttribute("data-rate", r);
-      if (r === 1) s.className = "active";
-      s.addEventListener("click", function () {
-        rate = r;
-        rateBtns.forEach(function (x) { x.classList.remove("active"); });
-        s.classList.add("active");
-        applyRate();
-      });
-      rateBtns.push(s); speed.appendChild(s);
-    });
-
     var stop = document.createElement("button");
     stop.type = "button"; stop.className = "reader-stop"; stop.textContent = "Stop"; stop.hidden = true;
     var note = document.createElement("span");
     note.className = "reader-note";
 
-    bar.appendChild(btn); bar.appendChild(speed); bar.appendChild(stop);
+    bar.appendChild(btn); bar.appendChild(stop);
     root.appendChild(bar); root.appendChild(note);
 
     var supportsSpeech = "speechSynthesis" in window;
@@ -113,18 +96,10 @@
     }
     function finish() { speaking = false; paused = false; mode = null; clearHi(); note.textContent = ""; label(false); }
 
-    function applyRate() {
-      if (mode === "audio" && audio) { audio.playbackRate = rate; }
-      else if (mode === "speech" && speaking && !paused) {
-        window.speechSynthesis.cancel();  // restart current block at the new rate
-        speakFrom(idx);
-      }
-    }
     function speakFrom(i) {
       if (i >= chunks.length) { finish(); return; }
       idx = i; highlight(i); note.textContent = chunks[i].text;
       var u = new SpeechSynthesisUtterance(chunks[i].text);
-      u.rate = rate;
       var v = pickVoice(); if (v) u.voice = v;
       u.onend = function () { if (speaking && !paused) speakFrom(i + 1); };
       window.speechSynthesis.speak(u);
@@ -137,7 +112,7 @@
       label(true); speakFrom(0);
     }
     function startAudio() {
-      mode = "audio"; audio = new Audio(audioUrl); audio.playbackRate = rate;
+      mode = "audio"; audio = new Audio(audioUrl);
       note.textContent = "natural narration";
       audio.addEventListener("ended", finish);
       label(true); audio.play();
