@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Elasticsearch · Stanley Jacob</title>
+    <meta name="description" content="How Elasticsearch works from the inverted index up: analysis, immutable Lucene segments, refresh and translog, shards and query-then-fetch, BM25 scoring, aggregations, and when not to use it as a primary store." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" />
+  </head>
+  <body>
+
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software" class="active">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/software">← Software</a></div>
+        <h1>Elasticsearch</h1>
+        <p class="meta">Software &amp;amp; architecture · databases · Jul 2026</p>
+      </div>
+    </header>
+    <section style="padding-top: 0">
+      <div class="wrap">
+        <article class="prose article">
+          <div class="reader" data-reader data-audio="listen.mp3"></div>
+          <p>Elasticsearch is a distributed search and analytics engine that stores JSON documents and answers full-text, structured, geospatial, and aggregation queries over them through a REST API. It is best understood as a coordination layer wrapped around Apache Lucene, the low-level Java search library that has been in development since 1999. Lucene does the actual indexing and matching on a single machine. Elasticsearch adds sharding, replication, cluster membership, a JSON query DSL, and near-real-time semantics on top, so that a bag of Lucene indexes spread across dozens of nodes behaves like one searchable collection.</p>
+          <p>The core design bet is that search data can be a <strong>read-optimized copy</strong> rather than the system of record. Every structure inside it, from the inverted index to immutable segment files, trades write flexibility and update cost for fast reads over data that rarely changes in place. That bet shapes both how you use it, feeding it denormalized documents from an authoritative database through change data capture, and how it fails, which is mostly when people treat it as a primary store or hit it with update-heavy workloads.</p>
+          <div class="takeaway"><strong>The one-line version.</strong> Elasticsearch is a distributed coordination layer over Lucene. Writes land in an in-memory buffer and a durable translog, a refresh every second turns the buffer into an immutable searchable segment, background merges compact segments and purge deletes, and queries scatter to shards in a query phase then fetch only the global top documents.</div>
+          <h2>What it is and the mental model</h2>
+          <p>The vocabulary maps loosely onto relational terms. A <strong>document</strong> is a JSON object, the unit you index and retrieve. An <strong>index</strong> is a named collection of documents, roughly a table. A <strong>mapping</strong> is the index schema. It declares each field's type and, for text, how it gets analyzed. The two most important types are <code>text</code>, which is tokenized and normalized for full-text matching, and <code>keyword</code>, which is stored as a single exact value for filtering, sorting, and aggregations. Numeric, date, and geo fields get their own structures, including BKD trees for <code>geo_point</code> and numeric ranges.</p>
+          <p>The physical picture is a set of nesting dolls. A <strong>cluster</strong> is made of nodes with roles, one elected master for cluster state, data nodes that hold shards, coordinating nodes that front client requests, and optional ingest nodes for transform pipelines. Each index is split into <strong>primary shards</strong>, and each primary can have <strong>replica</strong> copies on other nodes. A shard is exactly one Lucene index, and a Lucene index is a collection of immutable <strong>segments</strong>, each of which is a self-contained mini search engine with its own inverted index, doc values, stored fields, and a bitmap of live documents.</p>
+          <p>Almost every behavior that surprises people follows from two facts. Segments are immutable, so updates and deletes are bookkeeping plus background rewriting. And new writes become searchable only when a refresh produces a new segment, so search is <em>near</em> real time rather than read-your-writes.</p>
+          <div class="takeaway"><strong>One line to remember.</strong> An Elasticsearch shard <em>is</em> a Lucene index. Everything above the shard is distribution and coordination, everything below it is Lucene.</div>
+          <h2>How to use it</h2>
+          <p>Everything goes through the REST API as JSON. A realistic setup declares the analyzer chain and the mapping up front rather than relying on dynamic mapping, since unmapped or wrongly mapped fields waste memory and cannot be fixed without reindexing. The example below builds a small product catalog, indexes a document, and runs a search that combines full-text matching, a structured filter, and two aggregations in one round trip.</p>
+          <p>The <code>bool</code> query separates <strong>query context</strong> from <strong>filter context</strong>, and the distinction matters for performance. Clauses under <code>must</code> contribute to the relevance score. Clauses under <code>filter</code> are yes-or-no predicates, skip scoring entirely, and their results are cached as bitsets that later queries reuse. Anything that does not need to influence ranking belongs in <code>filter</code>.</p>
+          <p>Concurrent updates use optimistic concurrency control. Every write returns <code>_seq_no</code> and <code>_primary_term</code>, and a conditional update passes them back as <code>if_seq_no</code> and <code>if_primary_term</code> so the write fails cleanly if someone else changed the document first. The older <code>?version=N</code> mechanism was removed for this purpose in favor of sequence numbers. For pagination, <code>from</code> and <code>size</code> work for shallow pages but every shard must produce <code>from + size</code> candidates, so the default <code>index.max_result_window</code> caps it at 10,000 results. Deep pagination uses <code>search_after</code> with the sort values of the last hit, optionally combined with a point-in-time (PIT) handle that pins the set of segments being read so results stay consistent while the index changes underneath.</p>
+          <pre><code class="language-http">PUT /products
+{
+  &quot;settings&quot;: {
+    &quot;number_of_shards&quot;: 3,
+    &quot;number_of_replicas&quot;: 1,
+    &quot;analysis&quot;: {
+      &quot;analyzer&quot;: {
+        &quot;english_folded&quot;: {
+          &quot;type&quot;: &quot;custom&quot;,
+          &quot;tokenizer&quot;: &quot;standard&quot;,
+          &quot;filter&quot;: [&quot;lowercase&quot;, &quot;asciifolding&quot;, &quot;porter_stem&quot;]
+        }
+      }
+    }
+  },
+  &quot;mappings&quot;: {
+    &quot;properties&quot;: {
+      &quot;name&quot;:     { &quot;type&quot;: &quot;text&quot;, &quot;analyzer&quot;: &quot;english_folded&quot; },
+      &quot;brand&quot;:    { &quot;type&quot;: &quot;keyword&quot; },
+      &quot;price&quot;:    { &quot;type&quot;: &quot;float&quot; },
+      &quot;rating&quot;:   { &quot;type&quot;: &quot;float&quot; },
+      &quot;added_at&quot;: { &quot;type&quot;: &quot;date&quot; }
+    }
+  }
+}
+
+POST /products/_doc
+{
+  &quot;name&quot;: &quot;Trail running shoes&quot;,
+  &quot;brand&quot;: &quot;Salomon&quot;,
+  &quot;price&quot;: 129.95,
+  &quot;rating&quot;: 4.6,
+  &quot;added_at&quot;: &quot;2026-07-01&quot;
+}
+
+GET /products/_search
+{
+  &quot;query&quot;: {
+    &quot;bool&quot;: {
+      &quot;must&quot;:   [ { &quot;match&quot;: { &quot;name&quot;: &quot;running shoe&quot; } } ],
+      &quot;filter&quot;: [ { &quot;range&quot;: { &quot;price&quot;: { &quot;lte&quot;: 150 } } } ]
+    }
+  },
+  &quot;aggs&quot;: {
+    &quot;by_brand&quot;:   { &quot;terms&quot;: { &quot;field&quot;: &quot;brand&quot; } },
+    &quot;avg_rating&quot;: { &quot;avg&quot;:   { &quot;field&quot;: &quot;rating&quot; } }
+  },
+  &quot;size&quot;: 10
+}</code></pre>
+          <h2>Analysis and the inverted index</h2>
+          <p>Full-text search works because both documents and queries pass through the same <strong>analyzer</strong>, a pipeline of character filters, then a tokenizer, then token filters. The default standard analyzer splits on Unicode word boundaries and lowercases, and custom chains add stemming, ASCII folding, synonyms, or n-grams. In the mapping above, "Trail running shoes" becomes the terms <code>trail</code>, <code>run</code>, <code>shoe</code>, and the query "running shoe" becomes <code>run</code>, <code>shoe</code>, which is why they match. If index-time and query-time analysis disagree, matching silently breaks, which is the most common beginner failure mode (<a href="https://www.elastic.co/docs/manage-data/data-store/text-analysis" target="_blank" rel="noreferrer">Elastic docs</a>).</p>
+          <p>The terms feed the <strong>inverted index</strong>, the structure that makes lookup fast. Instead of storing documents and scanning them for words, it stores every unique term once, in a sorted <strong>term dictionary</strong>, and attaches to each term a <strong>postings list</strong> of the document IDs containing it, along with per-document term frequencies and positions for phrase queries. Lucene keeps an in-memory finite state transducer as a compact prefix index into the on-disk term dictionary, so locating a term is cheap even with hundreds of millions of unique terms. Postings lists store doc IDs in ascending order with delta compression and skip pointers, so intersecting the lists for a multi-term query can leapfrog through the longer list. Query execution starts from the rarest term because the intersection can never be larger than the shortest postings list, which is why a query for "bill nye" is driven by the few hundred <code>nye</code> postings rather than the millions of <code>bill</code> ones.</p>
+          <p>An inverted index answers "which documents contain this term" but is useless for "give me the price of these 200 matches to sort them." That is what <strong>doc values</strong> are for, a columnar, disk-backed layout that stores one field's values for all documents in a segment contiguously, exactly the trick that column stores use for analytics. Sorting, aggregations, and script field access all read doc values. So every indexed field effectively exists twice, once inverted (term to documents) for matching, and once columnar (document to value) for sorting and aggregating.</p>
+          <div class="takeaway"><strong>Design rule.</strong> The inverted index answers term-to-documents, doc values answer document-to-value. Elasticsearch is fast because it maintains both copies and picks the right one per operation.</div>
+          <h2>The write path inside a shard</h2>
+          <p>When an indexing request reaches the primary shard, the document is analyzed and added to an <strong>in-memory indexing buffer</strong>, and the operation is appended to the <strong>translog</strong>, a sequential write-ahead log on disk. With the default <code>index.translog.durability: request</code>, the translog is fsynced on the primary and on every allocated replica before the client gets an acknowledgement, so an acknowledged write survives process crashes and power loss. Setting durability to <code>async</code> moves the fsync to a background timer, <code>sync_interval</code> defaulting to five seconds, which buys indexing throughput at the cost of losing up to that window of acknowledged writes on a crash (<a href="https://www.elastic.co/docs/reference/elasticsearch/index-settings/translog" target="_blank" rel="noreferrer">Elastic docs</a>).</p>
+          <p>Documents in the buffer are not yet searchable. A <strong>refresh</strong>, by default every one second on indices that have been searched in the last thirty seconds, writes the buffer out as a brand new Lucene segment. The trick that makes this cheap is that the segment goes to the operating system's filesystem cache, not through an expensive fsync, and once the file is in the cache it can be opened and searched like any other file (<a href="https://www.elastic.co/docs/manage-data/data-store/near-real-time-search" target="_blank" rel="noreferrer">Elastic docs</a>). This is the entire meaning of "near real time": a write becomes visible at the next refresh, about a second later, long before it is durably committed by Lucene. Durability in the gap is the translog's job. A <strong>flush</strong> performs a real Lucene commit, fsyncing segments to disk and trimming the translog, and is triggered automatically, by default once the translog reaches 10 GB.</p>
+          <p>Segments are <strong>immutable</strong>. A delete never touches segment data, it just marks the document dead in a per-segment live-docs bitmap, and an update is a soft delete plus a reindex of the new version into the current buffer. Dead documents still occupy space and still get skipped at query time, so the <strong>merge scheduler</strong> continuously picks groups of similar-sized segments, using Lucene's tiered merge policy, and rewrites them into one larger segment with the deleted documents dropped. Merges are disk-IO throttled and run in the background with smaller merges prioritized over larger ones so they do not starve indexing (<a href="https://www.elastic.co/docs/reference/elasticsearch/index-settings/merge" target="_blank" rel="noreferrer">Elastic docs</a>).</p>
+          <p>Immutability is what pays for everything else. Segment files can be cached by the OS and by Elasticsearch's own filter and query caches without invalidation logic, compressed aggressively because they are written once, and read lock-free because nothing ever changes under a running query. The price is write amplification. Reclaiming a handful of updated documents can eventually mean rewriting a multi-hundred-megabyte segment, which is exactly why update-heavy workloads hurt.</p>
+          <div class="diagram"><svg width="100%" style="max-width:900px" viewBox="0 0 1010 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Flow diagram of an Elasticsearch write. A client write goes to the in-memory indexing buffer and is appended to the translog, which is fsynced before acknowledgement. A refresh every second turns the buffer into a new searchable segment in the OS cache. A flush fsyncs segments to disk as committed immutable files and trims the translog, which is replayed into the buffer after a crash. The merge scheduler rewrites groups of similar-sized committed segments into one larger segment, dropping deleted documents."><defs><marker id="swp11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#86868b"/></marker></defs><g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"><rect x="20" y="136" width="110" height="56" rx="9" fill="#fff" stroke="#d8d8de" stroke-width="1.25"/><text x="75" y="160" text-anchor="middle" font-size="12.5" fill="#1d1d1f">Client</text><text x="75" y="176" text-anchor="middle" font-size="10.5" fill="#5f5f66">index / bulk request</text><path d="M215,33 L215,81 A85,9 0 0 0 385,81 L385,33 Z" fill="#f6f6f7"/><path d="M215,33 L215,81 A85,9 0 0 0 385,81 L385,33" fill="none" stroke="#d8d8de" stroke-width="1.25"/><ellipse cx="300" cy="33" rx="85" ry="9" fill="#f6f6f7" stroke="#d8d8de" stroke-width="1.25"/><text x="300" y="54" text-anchor="middle" font-size="12.5" fill="#1d1d1f">In-memory buffer</text><text x="300" y="70" text-anchor="middle" font-size="10.5" fill="#5f5f66">not yet searchable</text><path d="M215,257 L215,305 A85,9 0 0 0 385,305 L385,257 Z" fill="#f6f6f7"/><path d="M215,257 L215,305 A85,9 0 0 0 385,305 L385,257" fill="none" stroke="#d8d8de" stroke-width="1.25"/><ellipse cx="300" cy="257" rx="85" ry="9" fill="#f6f6f7" stroke="#d8d8de" stroke-width="1.25"/><text x="300" y="278" text-anchor="middle" font-size="12.5" fill="#1d1d1f">Translog</text><text x="300" y="294" text-anchor="middle" font-size="10.5" fill="#5f5f66">fsync per request</text><rect x="410" y="24" width="170" height="56" rx="9" fill="#eaf2fb" stroke="#0066cc" stroke-width="1.75"/><text x="495" y="48" text-anchor="middle" font-size="12.5" fill="#1d1d1f">New segment</text><text x="495" y="64" text-anchor="middle" font-size="10.5" fill="#5f5f66">OS cache, searchable</text><path d="M605,145 L605,193 A85,9 0 0 0 775,193 L775,145 Z" fill="#f6f6f7"/><path d="M605,145 L605,193 A85,9 0 0 0 775,193 L775,145" fill="none" stroke="#d8d8de" stroke-width="1.25"/><ellipse cx="690" cy="145" rx="85" ry="9" fill="#f6f6f7" stroke="#d8d8de" stroke-width="1.25"/><text x="690" y="166" text-anchor="middle" font-size="12.5" fill="#1d1d1f">Committed segments</text><text x="690" y="182" text-anchor="middle" font-size="10.5" fill="#5f5f66">immutable, on disk</text><rect x="800" y="136" width="170" height="56" rx="9" fill="#fff" stroke="#0066cc" stroke-width="1.5"/><text x="885" y="160" text-anchor="middle" font-size="12.5" fill="#1d1d1f">Merge scheduler</text><text x="885" y="176" text-anchor="middle" font-size="10.5" fill="#5f5f66">tiered merge policy</text><path d="M130,164 L300,90" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#swp11)"/><text x="215" y="120" text-anchor="middle" font-size="10.5" fill="#5f5f66">1. add document</text><path d="M75,192 L300,248" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#swp11)"/><text x="187.5" y="213" text-anchor="middle" font-size="10.5" fill="#5f5f66">2. append, fsync, ack</text><path d="M385,57 L410,52" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#swp11)"/><text x="397.5" y="47.5" text-anchor="middle" font-size="10.5" fill="#5f5f66">refresh, every 1s</text><path d="M495,80 L690,136" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#swp11)"/><text x="592.5" y="101" text-anchor="middle" font-size="10.5" fill="#5f5f66">flush fsyncs, trims log</text><path d="M300,248 L300,90" fill="none" stroke="#86868b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#swp11)"/><text x="308" y="169" text-anchor="start" font-size="10.5" fill="#5f5f66">replay on recovery</text><path d="M775,169 L800,164" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#swp11)"/><text x="787.5" y="159.5" text-anchor="middle" font-size="10.5" fill="#5f5f66">similar-sized inputs</text><path d="M800,164 L775,169" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#swp11)"/><text x="787.5" y="159.5" text-anchor="middle" font-size="10.5" fill="#5f5f66">merged, deletes purged</text></g></svg></div>
+          <p class="quiet">A write is durable via the translog almost immediately, searchable at the next refresh, and committed by a later flush. Merges compact the resulting segments in the background.</p>
+          <div class="takeaway"><strong>Three separate moments.</strong> A write is <em>acknowledged</em> when the translog is fsynced, <em>searchable</em> after the next refresh, and <em>committed</em> at the next flush. Interviews often conflate these, the system never does.</div>
+          <h2>Shards, replicas, and query then fetch</h2>
+          <p>Documents are routed to a primary shard by <code>hash(_id) % number_of_primary_shards</code> unless a custom routing key is supplied. Because placement is a function of the shard count, the number of primaries is fixed at index creation, and growing it later means the split API or a full reindex into a new index. This makes shard sizing a real capacity-planning decision, with Elastic's published guidance keeping individual shards in the range of tens of gigabytes. Each primary replicates its operations to its replica shards, which serve two purposes, surviving node loss and multiplying read throughput, since the coordinating node balances searches across all copies of each shard.</p>
+          <p>Search executes in two phases, called <strong>query then fetch</strong>. In the query phase, the coordinating node fans the query out to one copy of every shard of the index. Each shard runs the query locally against its segments and returns only a lightweight priority queue of the top <code>from + size</code> entries, doc IDs plus scores or sort values, not documents. The coordinator merge-sorts these per-shard queues into the global top results. In the fetch phase it asks only the shards that own the winning documents for their <code>_source</code>, highlights, and stored fields. This is why deep pagination is expensive, page one thousand forces every shard to score, sort, and ship ten thousand candidates so the coordinator can discard almost all of them.</p>
+          <p>The same fan-out explains why the coordinating node never needs to know which shards contain a term. It cannot know, so it broadcasts, and the per-shard inverted indexes do the actual pruning. It also explains the consistency model. Replicas refresh independently and a search hits one arbitrary copy per shard, so two identical queries a second apart can see slightly different worlds. Elasticsearch is eventually consistent for search by construction.</p>
+          <h2>Relevance scoring with BM25, and aggregations</h2>
+          <p>When no explicit sort is given, hits are ordered by <code>_score</code>, computed since Elasticsearch 5.0 by <strong>Okapi BM25</strong> rather than classic TF-IDF. BM25 keeps the same three intuitions, rarer terms matter more, more occurrences matter more, and long documents get discounted, but it bounds them. The inverse document frequency component penalizes terms that appear in many documents. The <code>k1</code> parameter, defaulting to 1.2, makes term frequency saturate, so the fifth occurrence of a term adds far less than the first and a keyword-stuffed document cannot run away with the ranking, where TF-IDF's term frequency grew without bound. The <code>b</code> parameter, defaulting to 0.75, controls how strongly the score is normalized by document length relative to the average field length in the index (<a href="https://www.elastic.co/blog/practical-bm25-part-2-the-bm25-algorithm-and-its-variables" target="_blank" rel="noreferrer">Elastic, Practical BM25</a>).</p>
+          <p>One distributed-systems wrinkle is that scores are computed per shard against shard-local term statistics. With few documents or skewed routing, the same document can score differently depending on which shard holds it. The <code>dfs_query_then_fetch</code> search type adds a round trip to gather global term statistics first, and is mostly useful for small or test indexes where the skew is visible.</p>
+          <p><strong>Aggregations</strong> are the analytics half of the engine and the reason Kibana dashboards exist. Metric aggregations compute values like <code>avg</code>, <code>sum</code>, and percentiles, bucket aggregations group documents by term, range, date histogram, or geo grid, and the two nest arbitrarily, average rating per brand per month is one request. They execute during the query phase, each shard aggregates its local documents by scanning doc values, and the coordinator reduces the partial results. Some of that reduction is deliberately approximate. A <code>terms</code> aggregation returns each shard's top buckets, so global counts can be off when a term is popular on one shard and marginal on others, and <code>cardinality</code> uses HyperLogLog++ to estimate distinct counts in fixed memory.</p>
+          <pre><code class="language-text">BM25 score for query q against document D:
+
+score(D, q) = sum over terms t in q of
+
+  IDF(t) * ( tf(t, D) * (k1 + 1) )
+              / ( tf(t, D) + k1 * (1 - b + b * |D| / avgdl) )
+
+k1 = 1.2  -&gt; term-frequency saturation (higher = slower saturation)
+b  = 0.75 -&gt; document length normalization (0 = off, 1 = full)
+avgdl     -&gt; average field length across the index</code></pre>
+          <h2>Trade-offs, and when not to use it</h2>
+          <p><strong>Do not make it the system of record.</strong> The Jepsen analysis of Elasticsearch 1.5.0 found it lost acknowledged writes in every failure scenario tested, roughly 10 percent of acknowledged documents on crashed nodes, and 22 percent when a primary was isolated by a network partition, and recommended keeping data in a safer database and continuously upserting into Elasticsearch (<a href="https://aphyr.com/posts/323-jepsen-elasticsearch-1-5-0" target="_blank" rel="noreferrer">Jepsen</a>). Modern versions are dramatically better, version 7.0 replaced the old Zen discovery with a formally modeled cluster coordination layer and replication now uses sequence numbers and primary terms, but the industry-standard architecture is unchanged, an authoritative store such as Postgres or DynamoDB in front, with change data capture feeding the search index.</p>
+          <p><strong>Update-heavy and counter-like workloads fight the storage engine.</strong> Every update is a soft delete plus a full reindex of the document, and reclaiming the dead versions means merges rewriting large immutable segments. A field like a like-count that changes constantly generates enormous churn for data that probably should not be searchable anyway. High-volume append-only ingestion, by contrast, is a strength, which is why log and time-series pipelines work so well.</p>
+          <p><strong>Search results are stale by design.</strong> Between the refresh interval, independent replica refreshes, and indexing lag from the CDC pipeline, results trail the source of truth by seconds or more. Most search products tolerate this happily, workflows needing read-your-writes do not.</p>
+          <p><strong>It is not relational.</strong> There are no joins and no multi-document transactions, so data must be denormalized per access pattern, the same discipline as query-first modeling in Cassandra, and a page of results should come from one or two queries. Nested fields and parent-join exist but carry real query-time costs. And below roughly a few hundred thousand documents the operational weight is rarely justified, Postgres full-text search with a GIN index handles a surprising share of "we need search" requirements with zero extra infrastructure to keep in sync, since index drift between the primary store and the search cluster is one of the most common real-world bug sources.</p>
+          <div class="takeaway"><strong>Decision heuristic.</strong> Reach for Elasticsearch when reads are complex (full text, facets, geo, ranking) and writes are append-mostly. Keep the truth elsewhere and treat the index as a disposable, rebuildable projection.</div>
+          <h2>How it shows up in production</h2>
+          <p>The canonical deployment is a projection pipeline. Writes go to the authoritative database, a CDC tool such as Debezium tails the replication log (or DynamoDB Streams on AWS), changes flow through Kafka, and an indexer service applies them to Elasticsearch with the source system's primary key as the document <code>_id</code> so updates are idempotent upserts. Because the index is rebuildable from the source, teams reindex from scratch to change mappings or analyzers rather than migrating in place.</p>
+          <p>The scale numbers from real operators show both the power and the limits. Uber described storing more than 800 billion documents across its marketplace Elasticsearch clusters, sustaining over 1.5 million document writes per second and scanning billions of documents every second to serve thousands of queries, operated by a three-person team running more than one hundred ingestion jobs (<a href="https://www.infoq.com/presentations/uber-elasticsearch-clusters/" target="_blank" rel="noreferrer">InfoQ, QCon London 2018</a>). The limits show up in Uber's logging platform, which ran on ELK from 2014 at millions of log lines per second from thousands of services with petabytes retained, and was ultimately migrated to ClickHouse because schema-on-write and per-node cost hurt at that scale, a single ClickHouse node ingested about ten times the log throughput of a single Elasticsearch node (<a href="https://www.uber.com/us/en/blog/logging/" target="_blank" rel="noreferrer">Uber Engineering</a>).</p>
+          <p>Log and metrics analytics through the ELK stack (Elasticsearch, Logstash or Beats, Kibana) is still probably the most widely deployed pattern, and it leans on time-based index management. Data streams roll over to a fresh backing index by age or size, and index lifecycle management migrates aging indices across hot, warm, cold, and frozen data tiers, from fast NVMe nodes down to searchable snapshots on object storage, so retention cost tracks how often anyone actually queries the data. Product search is the other big family, Wikipedia's on-site search runs on Elasticsearch through its CirrusSearch extension, and the same engine increasingly serves hybrid retrieval, BM25 plus dense vector similarity, for RAG-style applications.</p>
+          <h2>Follow-up questions</h2>
+          <ul>
+            <li><strong>Why is Elasticsearch called near-real-time instead of real-time?</strong> New documents sit in an in-memory buffer that is not searchable. A refresh, every one second by default on indices that have been searched recently, writes the buffer into a new Lucene segment in the filesystem cache, and only then can searches see it. So visibility lags writes by up to the refresh interval, plus any lag in the pipeline feeding the index.</li>
+            <li><strong>If refreshed segments are not fsynced, how does an acknowledged write survive a crash?</strong> Through the translog. Every operation is appended to this write-ahead log and, with the default request durability, fsynced on the primary and replicas before the client is acknowledged. After a crash, the shard reloads the last committed segments and replays the translog. A flush performs the real Lucene commit and trims the log, by default once it reaches 10 GB.</li>
+            <li><strong>How do updates and deletes work if segments are immutable?</strong> A delete just flips a bit in the segment's live-docs bitmap, and an update soft-deletes the old version and reindexes the new one as a fresh document. Dead documents keep consuming space until a background tiered merge rewrites the segments and drops them, which is the write amplification that makes update-heavy workloads a poor fit.</li>
+            <li><strong>Walk through what happens when a search request hits the cluster.</strong> The coordinating node broadcasts the query to one copy of every shard. In the query phase each shard returns only the top from-plus-size doc IDs with their scores or sort values. The coordinator merge-sorts those into the global top N, then in the fetch phase retrieves the actual documents from just the shards that own the winners. Deep pagination is expensive because every shard must produce all preceding candidates.</li>
+            <li><strong>Why is the primary shard count fixed at index creation?</strong> Routing places each document with hash of the ID modulo the number of primaries. Changing the count would invalidate the placement of every existing document, so growing an index means the split API or reindexing into a new index, which is why shard sizing is planned up front, typically keeping shards to tens of gigabytes.</li>
+            <li><strong>What does BM25 improve over TF-IDF?</strong> Two bounded corrections. Term frequency saturates via k1, default 1.2, so repeated occurrences of a term give diminishing returns instead of growing without limit, and document length normalization via b, default 0.75, discounts matches in long documents relative to the average field length. Both defaults are tunable per field through the similarity setting.</li>
+          </ul>
+          <h2>References</h2>
+          <ol class="refs">
+            <li><a href="https://www.elastic.co/docs/manage-data/data-store/near-real-time-search" target="_blank" rel="noreferrer">Elastic Docs: Near real-time search</a>, The indexing buffer, refresh, segments in the filesystem cache, and the one second default refresh interval on recently searched indices.</li>
+            <li><a href="https://www.elastic.co/docs/reference/elasticsearch/index-settings/translog" target="_blank" rel="noreferrer">Elastic Docs: Translog settings</a>, Durability modes (request vs async), fsync on primary and every allocated replica before acknowledgement, the five second sync interval, and the 10 GB flush threshold.</li>
+            <li><a href="https://www.elastic.co/docs/manage-data/data-store/text-analysis" target="_blank" rel="noreferrer">Elastic Docs: Text analysis</a>, Overview of analyzers, tokenization, and normalization, the entry point to analyzer anatomy and index-time versus search-time analysis.</li>
+            <li><a href="https://www.elastic.co/blog/practical-bm25-part-2-the-bm25-algorithm-and-its-variables" target="_blank" rel="noreferrer">Elastic Blog: Practical BM25, Part 2</a>, The BM25 formula with the k1 = 1.2 and b = 0.75 defaults, saturation, and length normalization.</li>
+            <li><a href="https://aphyr.com/posts/323-jepsen-elasticsearch-1-5-0" target="_blank" rel="noreferrer">Jepsen: Elasticsearch 1.5.0</a>, Measured loss of acknowledged writes under partitions and crashes, about 10 percent on crashed nodes and 22 percent with isolated primaries, and the keep-the-truth-elsewhere recommendation.</li>
+            <li><a href="https://www.infoq.com/presentations/uber-elasticsearch-clusters/" target="_blank" rel="noreferrer">InfoQ: Scaling Uber's Elasticsearch Clusters</a>, Production scale numbers, more than 800 billion documents and 1.5 million writes per second, run by a three-person team.</li>
+          </ol>
+        </article>
+      </div>
+    </section>
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/reader.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (window.hljs) hljs.highlightAll();
+      });
+    </script>
+  </body>
+</html>
