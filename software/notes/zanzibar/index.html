@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Google Zanzibar · Stanley Jacob</title>
+    <meta name="description" content="An in-depth look at Google Zanzibar: relationship-based authorization with relation tuples, userset rewrites, the new-enemy problem and zookies, the Leopard index, and when you would actually reach for it." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software" class="active">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/software">← Software</a></div>
+        <h1>Google Zanzibar</h1>
+        <p class="meta">Software &amp; architecture · authorization · Jul 2026</p>
+      </div>
+    </header>
+    <section style="padding-top: 0">
+      <div class="wrap">
+        <article class="prose article">
+          <div class="reader" data-reader data-audio="listen.mp3"></div>
+          <p>Zanzibar is the authorization system that answers one question for most of Google, from Drive to Maps to Photos, and answers it the same way everywhere: <mark>can this user do this thing to this object right now?</mark> It was described in a 2019 paper, and it matters because it solves a problem every growing company eventually hits, which is that permissions start as a column in a table and end as a tangle of copy-pasted access checks scattered across dozens of services, each with its own bugs and its own idea of who can see what.</p>
+          <p>The core move is to pull authorization out of every application and into one service with one data model. Instead of each team writing its own <code>can_user_access</code> logic against its own tables, they all write and query a shared store of <strong>relationships</strong>. That model is called <strong>relationship-based access control</strong>, or ReBAC, and it is what lets Zanzibar express not just roles but the messy real rules like this document is shared with that group, that group is nested inside another group, and this folder's viewers can see everything inside it.</p>
+          <div class="takeaway"><strong>The one-line version.</strong> Zanzibar stores permissions as <em>relationship tuples</em> like <code>doc:readme#viewer@user:bob</code>, resolves a permission check by walking those relationships (through groups and folders), and uses tokens called <mark>zookies</mark> plus Spanner's global clock to guarantee a check never reflects an ACL older than the content the user is looking at. That last guarantee is the hard part and the reason the system exists.</p>
+
+          <h2>Relation tuples, the whole data model</h2>
+          <p>Everything in Zanzibar is a <strong>relation tuple</strong>, and the entire model fits in one line: <code>object#relation@user</code>. The object is a namespaced id like <code>doc:roadmap</code>, the relation is a named role on that object like <code>viewer</code> or <code>owner</code>, and the user is either a specific account like <code>user:bob</code> or, and this is the important part, another <strong>userset</strong> like <code>group:eng#member</code>. A tuple is a single fact: <span class="win">this user has this relation to this object</span>.</p>
+          <pre><code class="language-text">doc:roadmap#owner@user:alice          # alice owns the roadmap doc
+doc:roadmap#parent@folder:eng         # the roadmap doc lives in the eng folder
+folder:eng#viewer@group:eng#member    # anyone in group eng can view the eng folder
+group:eng#member@user:bob             # bob is a member of group eng</code></pre>
+          <p>Because the user side of a tuple can itself be a userset, relationships chain. Bob is not written anywhere near the roadmap document, yet he can view it, because the tuples connect <code>doc:roadmap</code> to <code>folder:eng</code> to <code>group:eng</code> to <code>user:bob</code>. This is why the model beats a flat permissions table. Sharing with a group, nesting groups, and inheriting a folder's access all become the same operation, which is <mark>adding one tuple</mark>.</p>
+
+          <h2>Userset rewrites, where the rules live</h2>
+          <p>Raw tuples say who is directly related to what. The interesting rules, like every editor is also a viewer, or a document's viewers include the viewers of its parent folder, live in the <strong>namespace configuration</strong> as <strong>userset rewrites</strong>. A relation's effective members are computed by combining three building blocks with union, intersection, and exclusion.</p>
+          <ul>
+            <li><strong><code>_this</code></strong> is the set of users written directly in tuples for this relation.</li>
+            <li><strong><code>computed_userset</code></strong> pulls in another relation on the same object, which is how <em>every editor is a viewer</em> is expressed.</li>
+            <li><strong><code>tuple_to_userset</code></strong> is the powerful one. It follows a relation to another object and then reads a relation there, which is how <em>a document inherits its folder's viewers</em> works.</li>
+          </ul>
+          <pre><code class="language-text">name: "doc"
+relation { name: "owner" }
+relation { name: "editor"
+  userset_rewrite { union {
+    child { _this {} }
+    child { computed_userset { relation: "owner" } }   # owners are editors
+  }}}
+relation { name: "viewer"
+  userset_rewrite { union {
+    child { _this {} }
+    child { computed_userset { relation: "editor" } }   # editors are viewers
+    child { tuple_to_userset {
+      tupleset { relation: "parent" }                   # follow doc -> its folder
+      computed_userset { relation: "viewer" }           # ... to that folder's viewers
+    }}
+  }}}</code></pre>
+          <p>A permission check is then a recursive walk over this rewrite. To answer <code>check(doc:roadmap#viewer@user:bob)</code>, Zanzibar unions the direct viewers, the editors (and their owners), and the viewers of the parent folder, and the folder branch expands <code>group:eng#member</code> until it finds Bob. The diagram below traces exactly that path.</p>
+          <div class="diagram"><svg width="100%" style="max-width:880px" viewBox="0 0 900 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Resolving a Zanzibar check by walking relation tuples through a folder and a nested group down to the user">
+<defs><marker id="zz1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#86868b"/></marker></defs>
+<g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+<rect x="16" y="150" width="196" height="60" rx="10" fill="#eaf2fb" stroke="#0066cc" stroke-width="1.75"/><text x="114" y="176" text-anchor="middle" font-size="13" fill="#1d1d1f">check</text><text x="114" y="194" text-anchor="middle" font-size="11.5" fill="#5f5f66">doc:roadmap#viewer @ bob</text>
+<rect x="270" y="30" width="180" height="50" rx="9" fill="#fff" stroke="#d8d8de" stroke-width="1.25"/><text x="360" y="53" text-anchor="middle" font-size="12" fill="#1d1d1f">direct viewers</text><text x="360" y="69" text-anchor="middle" font-size="10.5" fill="#5f5f66">_this (none match)</text>
+<rect x="270" y="100" width="180" height="50" rx="9" fill="#fff" stroke="#d8d8de" stroke-width="1.25"/><text x="360" y="123" text-anchor="middle" font-size="12" fill="#1d1d1f">editors, then owners</text><text x="360" y="139" text-anchor="middle" font-size="10.5" fill="#5f5f66">computed_userset</text>
+<rect x="270" y="176" width="180" height="58" rx="9" fill="#fff" stroke="#0066cc" stroke-width="1.5"/><text x="360" y="200" text-anchor="middle" font-size="12" fill="#1d1d1f">parent folder viewers</text><text x="360" y="216" text-anchor="middle" font-size="10.5" fill="#5f5f66">tuple_to_userset: parent</text>
+<rect x="510" y="176" width="170" height="58" rx="9" fill="#fff" stroke="#0066cc" stroke-width="1.5"/><text x="595" y="200" text-anchor="middle" font-size="12" fill="#1d1d1f">folder:eng#viewer</text><text x="595" y="216" text-anchor="middle" font-size="10.5" fill="#5f5f66">= group:eng#member</text>
+<rect x="720" y="176" width="164" height="58" rx="9" fill="#fff" stroke="#0066cc" stroke-width="1.5"/><text x="802" y="200" text-anchor="middle" font-size="12" fill="#1d1d1f">group:eng#member</text><text x="802" y="216" text-anchor="middle" font-size="10.5" fill="#5f5f66">expand members</text>
+<rect x="720" y="270" width="164" height="52" rx="9" fill="#fff" stroke="#1d8a4e" stroke-width="1.75"/><text x="802" y="293" text-anchor="middle" font-size="12.5" fill="#1d8a4e">user:bob</text><text x="802" y="309" text-anchor="middle" font-size="10.5" fill="#5f5f66">match, allowed</text>
+<path d="M212,168 C240,120 245,70 270,58" fill="none" stroke="#86868b" stroke-width="1.3" marker-end="url(#zz1)"/>
+<path d="M212,176 C240,150 250,133 270,127" fill="none" stroke="#86868b" stroke-width="1.3" marker-end="url(#zz1)"/>
+<path d="M212,192 C238,198 250,203 270,205" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#zz1)"/>
+<path d="M450,205 H510" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#zz1)"/>
+<path d="M680,205 H720" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#zz1)"/>
+<path d="M802,234 V270" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#zz1)"/>
+<text x="240" y="120" text-anchor="middle" font-size="10" fill="#5f5f66" transform="rotate(-38 240 120)">union</text>
+</g></svg></div>
+          <p class="quiet">The check unions three branches. The folder branch is a <code>tuple_to_userset</code> that hops from the doc to its parent folder, then to the folder's viewers, which resolve to a group, whose members are expanded until Bob is found. Blue boxes are recursive lookups, the green box is the match.</p>
+
+          <h2>The Check API, and the two harder ones</h2>
+          <p>The read side is small. <strong>Check</strong> answers a single yes or no. <strong>Expand</strong> returns the full effective userset tree for a relation, which powers UIs that show everyone who can see a thing. On the write side, <strong>Read</strong> and <strong>Write</strong> manage tuples, Write can carry a precondition so you can safely do compare-and-set on permissions, and <strong>Watch</strong> streams tuple changes so downstream systems, including Zanzibar's own indexes, can stay current.</p>
+          <pre><code class="language-python"># Check: may bob view the roadmap, consistent with the content he is looking at?
+resp = zanzibar.check(
+    object="doc:roadmap",
+    relation="viewer",
+    subject="user:bob",
+    consistency=at_least_as_fresh(zookie),   # the zookie from his last content load
+)
+assert resp.allowed is True   # resolved via folder -> group -> bob</code></pre>
+
+          <h2>The new-enemy problem, and why zookies exist</h2>
+          <p>Authorization data changes, content changes, and the two must not be reordered relative to each other, or you leak. That danger is what separates Zanzibar from a permissions table with a cache in front of it, and the paper names the failure the <strong>new-enemy problem</strong>. It has two shapes.</p>
+          <p>First shape: Alice removes Bob from a document, then adds sensitive new content she only wants the remaining people to see. If a permission check is allowed to run against a <span class="warn">stale ACL snapshot</span> from before the removal, Bob still passes the check and reads content that was added specifically to keep him out. Second shape: Alice removes Bob from a folder's ACL, then a document is moved into that folder, and because documents inherit their folder's access, the safety of that move depends on the removal being applied first. If the two ACL updates land out of order, a check sees the document sitting in the folder but misses Bob's removal, and he reads it. In both, the bug is not a wrong tuple, it is <mark>reading the right tuples at the wrong point in time</mark>.</p>
+          <p>The fix is a token called a <strong>zookie</strong>. When content is written or read, the application gets back an opaque zookie that encodes a timestamp. When it later asks Zanzibar to check a permission for that content, it passes the zookie, and Zanzibar evaluates the check against an ACL snapshot <span class="win">at least as fresh as that timestamp</span>. Bob's removal, which happened before the content he is now trying to read, is therefore always visible to the check. This works because tuples are stored in <a href="https://research.google/pubs/spanner-googles-globally-distributed-database-2/" target="_blank" rel="noreferrer">Spanner</a>, whose TrueTime clock gives every write a globally meaningful timestamp and lets any server take a consistent snapshot read at a chosen time. The <a href="/software/notes/cap-theorem">consistency</a> guarantee that sounds like magic is really just Spanner's external consistency, exposed through the zookie.</p>
+          <div class="diagram"><svg width="100%" style="max-width:860px" viewBox="0 0 900 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Without a zookie a check can read a stale ACL and leak, with a zookie it reads an ACL at least as fresh as the content and denies correctly">
+<defs><marker id="zz2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#86868b"/></marker></defs>
+<g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+<text x="20" y="70" font-size="12.5" fill="#b4232a" font-weight="600">No zookie</text><text x="20" y="87" font-size="10.5" fill="#5f5f66">can leak</text>
+<rect x="140" y="52" width="150" height="44" rx="8" fill="#fff" stroke="#b4232a" stroke-width="1.5"/><text x="215" y="72" text-anchor="middle" font-size="11" fill="#1d1d1f">remove bob</text><text x="215" y="87" text-anchor="middle" font-size="10" fill="#5f5f66">ACL updated</text>
+<rect x="330" y="52" width="160" height="44" rx="8" fill="#fff" stroke="#b4232a" stroke-width="1.5"/><text x="410" y="72" text-anchor="middle" font-size="11" fill="#1d1d1f">add secret content</text><text x="410" y="87" text-anchor="middle" font-size="10" fill="#5f5f66">bob loads it</text>
+<rect x="540" y="52" width="200" height="44" rx="8" fill="#fbeaea" stroke="#b4232a" stroke-width="1.25" stroke-dasharray="5 4"/><text x="640" y="72" text-anchor="middle" font-size="11" fill="#b4232a">check reads old ACL</text><text x="640" y="87" text-anchor="middle" font-size="10" fill="#b4232a">bob still allowed</text>
+<path d="M290,74 H330" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#zz2)"/>
+<path d="M490,74 H540" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#zz2)"/>
+<text x="760" y="79" font-size="14" fill="#b4232a">&#10007;</text>
+<text x="20" y="184" font-size="12.5" fill="#1d8a4e" font-weight="600">With zookie</text><text x="20" y="201" font-size="10.5" fill="#5f5f66">safe</text>
+<rect x="140" y="166" width="150" height="44" rx="8" fill="#fff" stroke="#1d8a4e" stroke-width="1.5"/><text x="215" y="186" text-anchor="middle" font-size="11" fill="#1d1d1f">remove bob</text><text x="215" y="201" text-anchor="middle" font-size="10" fill="#5f5f66">at time T</text>
+<rect x="330" y="166" width="160" height="44" rx="8" fill="#fff" stroke="#1d8a4e" stroke-width="1.5"/><text x="410" y="186" text-anchor="middle" font-size="11" fill="#1d1d1f">content + zookie</text><text x="410" y="201" text-anchor="middle" font-size="10" fill="#5f5f66">zookie &#8805; T</text>
+<rect x="540" y="166" width="200" height="44" rx="8" fill="#eef8f1" stroke="#1d8a4e" stroke-width="1.5"/><text x="640" y="186" text-anchor="middle" font-size="11" fill="#1d8a4e">check reads ACL &#8805; T</text><text x="640" y="201" text-anchor="middle" font-size="10" fill="#1d8a4e">bob denied</text>
+<path d="M290,188 H330" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#zz2)"/>
+<path d="M490,188 H540" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#zz2)"/>
+<text x="760" y="193" font-size="14" fill="#1d8a4e">&#10003;</text>
+</g></svg></div>
+          <p class="quiet">The zookie pins the check to an ACL snapshot at least as fresh as the content the user is viewing, so a removal that happened before that content is always seen. Most checks do not need this and run against a slightly stale but faster default snapshot.</p>
+          <p>Zanzibar does not force strong consistency on every call. The default is a recent, cached snapshot that is fast and almost always fine, and the zookie is the opt-in for the specific checks where a stale answer would leak. Paying for consistency only where it matters is what keeps the median check cheap.</p>
+
+          <h2>Scaling checks, and the Leopard index</h2>
+          <p>At Google's scale this store holds trillions of relation tuples and serves millions of checks per second, with a 95th-percentile check latency under 10 milliseconds and availability above 99.999 percent across three years of production, according to the paper. Most of that speed comes from aggressive <a href="/software/notes/caching">caching</a> of subproblems and from spreading tuples across many Spanner shards, but one case breaks the simple recursive walk, which is <strong>deeply nested or very large groups</strong>. Checking whether a user is in a group that contains groups that contain groups can fan out into a huge traversal on the hot path.</p>
+          <p>That is what the <strong>Leopard</strong> indexing system is for. Leopard consumes the Watch stream of tuple changes and maintains a flattened, denormalized index that answers group membership as fast set operations over sorted id lists, so a nested-group check becomes a union and intersection of precomputed sets rather than a live tree walk. It trades a background pipeline and some index staleness, bounded and tracked, for turning the worst-case check into a cheap one. The pattern is the same one behind <a href="/software/notes/database-indexing">secondary indexes</a> everywhere, which is precompute the expensive traversal so the read is a lookup.</p>
+          <div class="diagram"><svg width="100%" style="max-width:820px" viewBox="0 0 860 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Zanzibar architecture: aclservers evaluate checks against Spanner tuple storage and a Leopard index kept current by the watch stream">
+<defs><marker id="zz3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#86868b"/></marker></defs>
+<g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+<rect x="20" y="98" width="110" height="54" rx="9" fill="#fff" stroke="#d8d8de" stroke-width="1.25"/><text x="75" y="122" text-anchor="middle" font-size="12.5" fill="#1d1d1f">App</text><text x="75" y="138" text-anchor="middle" font-size="10.5" fill="#5f5f66">check / write</text>
+<rect x="200" y="90" width="150" height="70" rx="9" fill="#eaf2fb" stroke="#0066cc" stroke-width="1.6"/><text x="275" y="118" text-anchor="middle" font-size="12.5" fill="#1d1d1f">aclserver</text><text x="275" y="134" text-anchor="middle" font-size="10.5" fill="#5f5f66">evaluates checks</text><text x="275" y="148" text-anchor="middle" font-size="10.5" fill="#5f5f66">caches subproblems</text>
+<path d="M470,70 L470,106 A75,9 0 0 0 620,106 L620,70 Z" fill="#f6f6f7"/><path d="M470,70 L470,106 A75,9 0 0 0 620,106 L620,70" fill="none" stroke="#d8d8de" stroke-width="1.25"/><ellipse cx="545" cy="70" rx="75" ry="9" fill="#f6f6f7" stroke="#d8d8de" stroke-width="1.25"/><text x="545" y="88" text-anchor="middle" font-size="12.5" fill="#1d1d1f">Spanner</text><text x="545" y="104" text-anchor="middle" font-size="10.5" fill="#5f5f66">relation tuples</text>
+<path d="M470,175 L470,205 A75,9 0 0 0 620,205 L620,175 Z" fill="#f6f6f7"/><path d="M470,175 L470,205 A75,9 0 0 0 620,205 L620,175" fill="none" stroke="#0066cc" stroke-width="1.5"/><ellipse cx="545" cy="175" rx="75" ry="9" fill="#f6f6f7" stroke="#0066cc" stroke-width="1.5"/><text x="545" y="192" text-anchor="middle" font-size="12.5" fill="#1d1d1f">Leopard index</text><text x="545" y="207" text-anchor="middle" font-size="10.5" fill="#5f5f66">flattened groups</text>
+<rect x="700" y="160" width="140" height="52" rx="9" fill="#fff" stroke="#d8d8de" stroke-width="1.25"/><text x="770" y="184" text-anchor="middle" font-size="12" fill="#1d1d1f">Watch stream</text><text x="770" y="200" text-anchor="middle" font-size="10.5" fill="#5f5f66">tuple changes</text>
+<path d="M130,125 H200" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#zz3)"/>
+<path d="M350,112 C410,100 430,95 468,92" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#zz3)"/><text x="410" y="86" text-anchor="middle" font-size="10" fill="#5f5f66">read tuples</text>
+<path d="M350,140 C410,160 430,178 468,186" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#zz3)"/><text x="404" y="176" text-anchor="middle" font-size="10" fill="#5f5f66">group checks</text>
+<path d="M620,150 C660,160 670,168 700,178" fill="none" stroke="#86868b" stroke-width="1.4" marker-end="url(#zz3)"/>
+<path d="M770,160 C760,130 700,120 620,128" fill="none" stroke="#86868b" stroke-width="1.3" stroke-dasharray="5 4" marker-end="url(#zz3)"/><text x="700" y="120" text-anchor="middle" font-size="10" fill="#5f5f66">keeps index fresh</text>
+</g></svg></div>
+          <p class="quiet">aclservers evaluate checks against the tuple store in Spanner and, for large or nested groups, the Leopard index, which the Watch stream keeps current. Databases are drawn as cylinders.</p>
+
+          <h2>When you would use it, and when you would not</h2>
+          <p>Reach for a Zanzibar-style system when authorization is <strong>relationship-shaped and shared across services</strong>. The signals are concrete. You have per-object sharing rather than just global roles, meaning access to <em>this specific document</em>, not just admin versus user. You have groups, nested groups, or resource hierarchies like folders and projects. Several services need to agree on the same permission answers, so a single source of truth beats each team reimplementing checks. And you care about correctness under concurrent permission and content changes, which is exactly the new-enemy guarantee. Collaboration and sharing products, think Docs, Drive, GitHub-style repo access, or any B2B app with org, team, and resource nesting, land here naturally.</p>
+          <div class="takeaway"><strong>Do not reach for it when the shape is simpler.</strong> If your authorization is a handful of roles inside one application, a <span class="warn">roles-and-permissions table with normal RBAC is less to run and less to reason about</span>. Zanzibar earns its complexity at fine granularity, cross-service scope, and scale. Below that bar it is a globally-distributed answer to a local question.</p>
+          <p>You do not have to build it. The ideas are available as open source, so you can adopt the model without Google's infrastructure. <a href="https://authzed.com/spicedb" target="_blank" rel="noreferrer">SpiceDB</a> from Authzed and <a href="https://openfga.dev/" target="_blank" rel="noreferrer">OpenFGA</a>, a CNCF project seeded by Auth0, are the two most active Zanzibar-inspired engines, and <a href="https://www.ory.sh/keto/" target="_blank" rel="noreferrer">Ory Keto</a> is another. They give you relation tuples, userset rewrites, and a check API on infrastructure you can actually run, and they are where most teams should start rather than porting the paper by hand.</p>
+
+          <h2>Questions and answers</h2>
+          <p>The ideas that matter most, as questions with the answers given outright. Each wrong option is marked with why it is wrong, since the wrong turns are where the intuition forms.</p>
+          <div class="qa">
+            <div class="qa-item">
+              <div class="qa-q"><span class="qa-num">1</span><span>What is a Zanzibar relation tuple, at its most basic?</span></div>
+              <ul class="qa-opts">
+                <li class="qa-opt correct"><span class="qmark">&#10003;</span><span class="qa-txt">A single fact of the form object#relation@user, where the user may itself be another userset like group:eng#member</span></li>
+                <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">A row that lists every permission a user holds across the whole system. <span class="qa-why">Each tuple is one relationship, not a per-user permission list. The full set of a user's access is derived by walking many tuples.</span></span></li>
+                <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">A cryptographic token the client sends to prove its identity. <span class="qa-why">That is authentication. Zanzibar handles authorization and assumes the caller is already authenticated.</span></span></li>
+                <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">A cached copy of a SQL row used to speed up permission reads. <span class="qa-why">Tuples are the source of truth for relationships, not a cache of some other table.</span></span></li>
+              </ul>
+              <div class="qa-explain"><strong>Why:</strong> The whole model is relationships expressed as object#relation@user tuples. Letting the user side be another userset is what makes groups, nesting, and hierarchies all reduce to adding a tuple.</div>
+            </div>
+            <div class="qa-item">
+              <div class="qa-q"><span class="qa-num">2</span><span>How does ReBAC differ from plain role-based access control (RBAC)?</span></div>
+              <ul class="qa-opts">
+                <li class="qa-opt correct"><span class="qmark">&#10003;</span><span class="qa-txt">RBAC grants access by global role, while ReBAC grants it by relationships to specific objects, so it can express per-document sharing, nested groups, and folder inheritance</span></li>
+                <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">ReBAC is just RBAC with more roles. <span class="qa-why">Adding roles does not capture object-specific sharing or hierarchy. ReBAC models relationships between users and individual objects.</span></span></li>
+                <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">ReBAC removes the need to authenticate users. <span class="qa-why">Authentication is a separate concern. Both models still need to know who the user is.</span></span></li>
+                <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">ReBAC only works for a single application, unlike RBAC. <span class="qa-why">It is the reverse. A shared relationship store is precisely what lets many services agree on one answer.</span></span></li>
+              </ul>
+              <div class="qa-explain"><strong>Why:</strong> Roles answer "what kind of user is this." Relationships answer "how is this user connected to this exact object," which is what real sharing and hierarchy need.</div>
+            </div>
+            <div class="qa-item">
+              <div class="qa-q"><span class="qa-num">3</span><span>The new-enemy problem is fundamentally a bug about what?</span></div>
+              <ul class="qa-opts">
+                <li class="qa-opt correct"><span class="qmark">&#10003;</span><span class="qa-txt">Ordering in time: reading correct ACL tuples at the wrong point relative to a content change, so a stale permission snapshot leaks newer content</span></li>
+                <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">A malformed or incorrect tuple being written. <span class="qa-why">The tuples are correct. The failure is evaluating a check against a snapshot older than the content it protects.</span></span></li>
+                <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">A user guessing another user's credentials. <span class="qa-why">That is an authentication attack, unrelated to snapshot ordering of ACLs.</span></span></li>
+                <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">Running out of space to store trillions of tuples. <span class="qa-why">It is a correctness-under-concurrency problem, not a capacity one.</span></span></li>
+              </ul>
+              <div class="qa-explain"><strong>Why:</strong> If a check can run against ACLs from before a revocation, a removed user still passes for content added after the removal. The bug is time ordering, not a wrong tuple.</div>
+            </div>
+            <div class="qa-item">
+              <div class="qa-q"><span class="qa-num">4</span><span>What does a zookie actually guarantee?</span></div>
+              <ul class="qa-opts">
+                <li class="qa-opt correct"><span class="qmark">&#10003;</span><span class="qa-txt">That the check is evaluated against an ACL snapshot at least as fresh as the content the zookie was minted for</span></li>
+                <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">That every check always reads the single latest global state. <span class="qa-why">Default checks run on a slightly stale, faster snapshot. The zookie asks for "at least as fresh as this," not "the newest possible."</span></span></li>
+                <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">That the user is who they claim to be. <span class="qa-why">That is authentication again. A zookie is about snapshot freshness, not identity.</span></span></li>
+                <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">That the tuple write has been replicated to every region. <span class="qa-why">It encodes a timestamp for consistent snapshot reads, built on Spanner, not a replication receipt.</span></span></li>
+              </ul>
+              <div class="qa-explain"><strong>Why:</strong> The zookie carries a timestamp so the check reads ACLs no older than the content, which closes the new-enemy gap while still allowing fast default reads elsewhere.</div>
+            </div>
+            <div class="qa-item">
+              <div class="qa-q"><span class="qa-num">5</span><span>Why does Zanzibar need the Leopard index instead of always walking tuples live?</span></div>
+              <ul class="qa-opts">
+                <li class="qa-opt correct"><span class="qmark">&#10003;</span><span class="qa-txt">Deeply nested or very large groups make a live traversal expensive, so Leopard precomputes flattened group membership as fast set operations</span></li>
+                <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">Spanner cannot store relation tuples, so Leopard is the real database. <span class="qa-why">Spanner is the tuple store. Leopard is a derived index for the group-expansion hot path.</span></span></li>
+                <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">Leopard replaces zookies for consistency. <span class="qa-why">Consistency comes from zookies and Spanner. Leopard is about check latency for nested groups.</span></span></li>
+                <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">It encrypts the tuples at rest. <span class="qa-why">Leopard is a performance index, not an encryption layer.</span></span></li>
+              </ul>
+              <div class="qa-explain"><strong>Why:</strong> Nested-group checks can fan out badly. Leopard consumes the Watch stream and keeps a denormalized membership index so those checks become set unions and intersections instead of deep tree walks.</div>
+            </div>
+            <div class="qa-item">
+              <div class="qa-q"><span class="qa-num">6</span><span>When is a Zanzibar-style system the wrong choice?</span></div>
+              <ul class="qa-opts">
+                <li class="qa-opt correct"><span class="qmark">&#10003;</span><span class="qa-txt">When authorization is a few global roles inside one application, where a normal RBAC table is simpler to run and reason about</span></li>
+                <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">Whenever you have more than one user. <span class="qa-why">Scale of users is not the signal. Relationship shape, cross-service scope, and hierarchy are.</span></span></li>
+                <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">Any time you need per-document sharing across services. <span class="qa-why">That is exactly where it fits, not where it fails.</span></span></li>
+                <li class="qa-opt wrong"><span class="qmark">&#10007;</span><span class="qa-txt">When you want to use open source instead of building it. <span class="qa-why">SpiceDB, OpenFGA, and Ory Keto exist precisely so you can adopt the model without building it.</span></span></li>
+              </ul>
+              <div class="qa-explain"><strong>Why:</strong> The model pays for itself at fine granularity, cross-service scope, and scale. For a handful of roles in one app it is a globally-distributed answer to a local question.</div>
+            </div>
+          </div>
+
+          <h2>References</h2>
+          <ol class="refs">
+            <li>Pang et al., <a href="https://research.google/pubs/zanzibar-googles-consistent-global-authorization-system/" target="_blank" rel="noreferrer">Zanzibar: Google's Consistent, Global Authorization System</a>, USENIX ATC (2019).</li>
+            <li>Corbett et al., <a href="https://research.google/pubs/spanner-googles-globally-distributed-database-2/" target="_blank" rel="noreferrer">Spanner: Google's Globally-Distributed Database</a> (2012), the storage and TrueTime clock underneath.</li>
+            <li>Authzed, <a href="https://authzed.com/spicedb" target="_blank" rel="noreferrer">SpiceDB</a>, an open-source Zanzibar-inspired engine.</li>
+            <li><a href="https://openfga.dev/" target="_blank" rel="noreferrer">OpenFGA</a>, a CNCF fine-grained authorization project in the same lineage.</li>
+          </ol>
+        </article>
+      </div>
+    </section>
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/reader.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (window.hljs) hljs.highlightAll();
+      });
+    </script>
+  </body>
+</html>

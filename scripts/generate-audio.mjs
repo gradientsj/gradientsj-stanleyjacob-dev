@@ -13,12 +13,26 @@
  * data-audio="listen.mp3", so once the file exists the page uses it automatically.
  *
  * Requires Node 18+ (built-in fetch).
+ *
+ * Voice / provider alternatives that also work (each just needs to output an mp3 you save
+ * as listen.mp3 next to the article):
+ *   - ElevenLabs (this script). Natural. Male voices: Adam, Brian, Bill. Female: Rachel, Sarah.
+ *   - OpenAI TTS API (tts-1 or tts-1-hd), voices "onyx" or "echo" for a natural male read.
+ *   - Azure or Google Cloud Neural TTS, or Play.ht. All export an mp3.
+ *   - Fully offline: Piper or Coqui TTS. Decent and free, no API key at all.
+ * What will NOT work, and why:
+ *   - Putting any TTS API key in client-side JS. The key ships to every visitor and gets
+ *     stolen and billed. That is exactly why this runs server-side and pre-generates the file.
+ *   - Leaning on the browser's built-in speechSynthesis for a natural voice. It is robotic and
+ *     differs per operating system. Good as the free fallback, not as the main narration.
+ *   - One giant TTS request for a long article. Providers cap request length, so this script
+ *     splits the text into chunks and concatenates the audio.
  */
 import { readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 const API_KEY = process.env.ELEVENLABS_API_KEY;
-const VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM";
+const VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "pNInz6obpgDQGcFmaJgB"; // "Adam", a warm natural male voice; override with ELEVENLABS_VOICE_ID
 const MODEL_ID = process.env.ELEVENLABS_MODEL_ID || "eleven_multilingual_v2";
 
 function fail(msg) { console.error("error: " + msg); process.exit(1); }
