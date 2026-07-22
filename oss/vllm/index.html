@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>vLLM walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A walkthrough of the vLLM repository: how to use it in five minutes, how PagedAttention and continuous batching work, and a guided reading path from the entry points to the scheduler and kernels." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>vLLM</h1>
+        <p class="lead">
+          <a href="https://github.com/vllm-project/vllm" target="_blank" rel="noreferrer">vLLM</a>
+          is the reference open source engine for serving large language models,
+          born from the PagedAttention paper at UC Berkeley (Kwon et al., SOSP
+          2023) and now the default answer to "how do I serve this checkpoint
+          fast." This walkthrough covers how to use it in five minutes, the two
+          ideas that make it fast, and a guided path for reading the repository.
+          It pairs with my <a href="/systems/llm-inference">LLM serving platform
+          design write-up</a>, which derives the same ideas from requirements
+          instead of from code.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Using it in five minutes</h2>
+          <p>
+            vLLM has two front doors. The offline one is a Python class, good
+            for batch jobs and evaluation sweeps:
+          </p>
+          <pre><code>pip install vllm</code></pre>
+          <pre><code>from vllm import LLM, SamplingParams
+
+llm = LLM(model="Qwen/Qwen2.5-7B-Instruct")
+params = SamplingParams(temperature=0.7, max_tokens=256)
+outputs = llm.generate(["Explain KV caching in one paragraph."], params)
+print(outputs[0].outputs[0].text)</code></pre>
+          <p>
+            The online one is an OpenAI-compatible server, which is why swapping
+            a proprietary API for a self-hosted model is usually a one-line base
+            URL change in the client:
+          </p>
+          <pre><code>vllm serve Qwen/Qwen2.5-7B-Instruct</code></pre>
+          <pre><code>from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
+resp = client.chat.completions.create(
+    model="Qwen/Qwen2.5-7B-Instruct",
+    messages=[{"role": "user", "content": "Hello"}],
+)</code></pre>
+          <p>
+            The flags that matter most in practice: <code>--tensor-parallel-size</code>
+            to split a model across GPUs, <code>--gpu-memory-utilization</code>
+            to set how much VRAM the KV cache may claim,
+            <code>--max-model-len</code> to cap context length, and
+            <code>--enable-prefix-caching</code> to reuse computation across
+            requests that share a prompt prefix (on by default in recent
+            versions).
+          </p>
+
+          <h2>Idea one: PagedAttention</h2>
+          <p>
+            Decoding is dominated by the KV cache, the stored keys and values of
+            every token seen so far. Before vLLM, engines allocated each
+            request's cache as one contiguous region sized for the maximum
+            possible length, and the PagedAttention paper measured the
+            consequence: most of that memory was wasted, through internal
+            fragmentation (reserved but never reached) and external
+            fragmentation (free but not contiguous). Since batch size is limited
+            by KV memory, wasted cache is wasted throughput.
+          </p>
+          <p>
+            vLLM's answer is the operating-systems move: <mark>treat the KV
+            cache like virtual memory and page it</mark>. The cache is carved
+            into fixed-size blocks, 16 tokens by default, a sequence's blocks
+            need not be contiguous, and a per-sequence block table maps logical
+            positions to physical blocks, so waste collapses to a fraction of
+            the final block. Paging also makes sharing natural: parallel samples
+            from one prompt share prefix blocks copy-on-write, and prefix
+            caching is just looking up blocks by content hash before computing
+            them. The attention kernel pays a small indirection cost to gather
+            from the block table, which is the trade the whole design happily
+            accepts.
+          </p>
+
+          <h2>Idea two: continuous batching</h2>
+          <p>
+            The second idea governs time rather than memory. Static batching
+            runs a batch until every sequence finishes, so one long generation
+            holds hostages. Continuous batching, which vLLM inherits from the
+            Orca paper, reschedules <mark>every iteration</mark>: after each
+            model step, finished sequences leave, waiting requests join, and the
+            batch is rebuilt. Together with paging this is why vLLM sustains
+            high GPU utilization under ragged real-world traffic, and the
+            combination is worth internalizing: iteration-level scheduling
+            creates constant churn in batch membership, and paged memory is what
+            makes that churn cheap. When memory does run out, the scheduler
+            preempts a sequence and either recomputes its cache later or swaps
+            it out, a policy you can read directly in the scheduler code.
+          </p>
+
+          <h2>Reading the repository</h2>
+          <p>
+            The repo is large, but one request's life touches everything worth
+            reading, so follow a single generate call. Note that vLLM went
+            through a V1 engine rewrite (the <code>vllm/v1/</code> tree), which
+            is the default in current releases; the module names below are
+            stable concepts even where exact paths have moved between versions.
+          </p>
+          <p>
+            Start at the entry points in <code>vllm/entrypoints/</code>: the
+            <code>LLM</code> class and the OpenAI server both funnel into the
+            engine, so the API layer is thin and readable. The engine loop is
+            the heartbeat: each step asks the scheduler what to run, executes
+            one forward pass, samples, and streams results back. From there read
+            the scheduler, which owns admission, preemption, and chunked
+            prefill (splitting long prompt processing across steps so decode
+            latency stays flat), and the KV cache manager beside it, which is
+            PagedAttention's bookkeeping half: block allocation, reference
+            counts, copy-on-write, and the prefix-cache hash table. The
+            compute half lives in the model runner and the attention backends,
+            where vLLM dispatches to FlashAttention, FlashInfer, or its own
+            kernels, and the custom CUDA lives under <code>csrc/</code>, paged
+            attention and the fused ops. Model definitions in
+            <code>vllm/model_executor/models/</code> are surprisingly plain
+            PyTorch, which is the point: architecture code stays legible because
+            the cleverness is concentrated in memory and scheduling.
+          </p>
+          <p>
+            A good first session is ninety minutes: run the offline example
+            under a debugger, break inside the engine step, and watch one
+            iteration of schedule, forward, sample. The block table indirection
+            and the batch churn stop being abstract the first time you inspect
+            them live. If you want the kernel-level view of why attention can
+            stream through memory it never holds at once, the
+            <a href="/ml/softmax">softmax page</a> derives the online-softmax
+            trick that paged and flash attention kernels are built on.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> vLLM is two ideas executed
+            thoroughly. Page the KV cache so memory stops being wasted, and
+            reschedule every iteration so time stops being wasted; everything
+            else in the repository is the engineering that lets those two ideas
+            survive contact with real models, real GPUs, and real traffic.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+  </body>
+</html>
