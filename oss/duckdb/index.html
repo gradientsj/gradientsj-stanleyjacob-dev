@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DuckDB walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A walkthrough of the DuckDB repository: how to query Parquet files in five minutes, how in-process columnar-vectorized execution works, what morsel-driven parallelism means, and a guided reading path from the parser to the pipeline executor." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>DuckDB</h1>
+        <p class="lead">
+          <a href="https://github.com/duckdb/duckdb" target="_blank" rel="noreferrer">DuckDB</a>
+          is an in-process analytical database, a single MIT-licensed library
+          that runs full SQL with no server and no dependencies, started at the
+          CWI research institute in Amsterdam by Mark Raasveldt and Hannes
+          Mühleisen and often summarized as SQLite for analytics. It matters
+          because it moved serious columnar query execution into the places
+          data scientists actually work, a Python process, a notebook, a
+          laptop, and made "just query the Parquet file" a normal thing to
+          type. This walkthrough covers how to use it in five minutes, the
+          execution ideas that make it fast, and a guided path for reading the
+          repository.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Using it in five minutes</h2>
+          <p>
+            The command-line shell installs with one line and starts in an
+            in-memory database, and because DuckDB treats file paths as table
+            names, the first query can run against a raw Parquet file with no
+            import step:
+          </p>
+          <pre><code>curl https://install.duckdb.org | sh</code></pre>
+          <pre><code>duckdb
+SELECT city, avg(price) FROM 'listings.parquet' GROUP BY city;
+SELECT count(*) FROM 'logs/*.csv.gz';</code></pre>
+          <p>
+            The Python client is the same engine as a module, and it is where
+            most people meet DuckDB:
+          </p>
+          <pre><code>pip install duckdb</code></pre>
+          <pre><code>import duckdb
+
+duckdb.sql("SELECT 42").show()
+duckdb.sql("SELECT city, avg(price) FROM 'listings.parquet' GROUP BY city").show()
+
+con = duckdb.connect("analytics.db")   # persistent single-file database
+con.sql("CREATE TABLE test AS SELECT * FROM 'listings.parquet'")</code></pre>
+          <p>
+            With no argument, <code>connect</code> gives an in-memory database;
+            with a path, everything persists to one file. Query results
+            convert to and from pandas DataFrames and Arrow tables directly,
+            and you can query a DataFrame sitting in your Python process by
+            simply naming the variable in SQL, which is the feature that tends
+            to convert people on first contact.
+          </p>
+
+          <h2>In-process, columnar, vectorized</h2>
+          <p>
+            The first design decision is where the database lives: inside your
+            process, like SQLite, rather than across a socket, like Postgres.
+            There is no server to operate, and result sets do not have to be
+            serialized across a connection, since the engine can hand columns
+            of memory to the host language, which is what makes the Arrow and
+            pandas integration close to free. The whole engine compiles into
+            an amalgamation needing only a C++ compiler, which is why the same
+            code runs on a laptop, in a lambda, and in the browser via
+            WebAssembly.
+          </p>
+          <p>
+            The second decision is how queries execute. Row-at-a-time
+            interpreters like SQLite and classic Postgres pay function call
+            and dispatch overhead per value, and compiling queries to machine
+            code avoids that at the cost of enormous complexity. DuckDB takes
+            the middle path worked out in the vectorized execution literature:
+            <mark>the interpreter still walks an operator tree, but each call
+            processes a vector of values, 2048 by default, so the overhead of
+            interpretation is amortized across thousands of values while the
+            inner loops stay tight, cache-friendly, and amenable to SIMD.</mark>
+            Data moves between operators as chunks of column vectors, and the
+            operators themselves are push-based: sources push chunks through
+            pipelines of operators into sinks, which is the shape that makes
+            the parallelism story below work.
+          </p>
+
+          <h2>Morsel-driven parallelism</h2>
+          <p>
+            DuckDB parallelizes queries using the approach from the
+            morsel-driven parallelism paper by Leis, Boncz, Kemper, and
+            Neumann, and the idea is worth having in your head independent of
+            DuckDB. Instead of planning up front which thread handles which
+            partition of the data, the input is divided into many small
+            fragments, morsels, and a pool of worker threads repeatedly grabs
+            the next available morsel and pushes it through the current
+            pipeline. <mark>Scheduling becomes self-balancing: a thread that
+            gets slow data or a slow core simply takes fewer morsels, and no
+            thread ever waits on a partitioning decision made before the data
+            was seen.</mark> A query plan is broken at its pipeline breakers,
+            the operators like hash join builds and aggregations that must
+            consume all input before producing output, and each pipeline is
+            then executed morsel by morsel across however many threads the
+            machine has.
+          </p>
+          <p>
+            The storage format is shaped to serve this. Tables in DuckDB's own
+            single-file format are stored column by column within row groups
+            of 122,880 rows, and the row group is the natural unit of
+            parallel scanning, so a large table presents itself as a long
+            queue of independently scannable chunks. The same chunking is why
+            checkpointing, compression choices, and scan parallelism all line
+            up on the same boundaries.
+          </p>
+
+          <h2>Querying data where it lives</h2>
+          <p>
+            The feature that made DuckDB a habit is that it treats external
+            files as first-class tables. A replacement scan turns
+            <code>'listings.parquet'</code> in a FROM clause into a table
+            function call, the Parquet reader scans with projection and filter
+            pushdown so only the referenced columns and the row groups whose
+            statistics might match are ever read, and the same works for CSV
+            with a sniffer that infers delimiters and types, and for glob
+            patterns over many files. With the httpfs extension the path can
+            be an HTTP URL or an S3 object, read with range requests rather
+            than downloaded whole, and Arrow data in the host process is
+            queried zero-copy. The practical effect is that a great deal of
+            work that used to require loading data into a warehouse becomes a
+            single process reading columns straight off files; my
+            <a href="/software/notes/databases-for-system-design">databases
+            note</a> places this pattern among the other analytical options.
+          </p>
+
+          <h2>Reading the repository</h2>
+          <p>
+            The C++ source under <code>src/</code> is organized as the
+            textbook pipeline, and you can read it in query order:
+            <code>parser</code>, <code>planner</code>, <code>optimizer</code>,
+            <code>execution</code>, with <code>storage</code>,
+            <code>catalog</code>, <code>transaction</code>, and
+            <code>function</code> supporting them and <code>main</code>
+            holding the connection and client context that tie it together.
+            The parser is derived from Postgres's grammar, so DuckDB speaks a
+            thoroughly debugged SQL dialect; the planner's Binder resolves
+            names against the catalog and produces logical operators, the
+            optimizer rewrites them, and the execution layer turns them into
+            the physical operators that do the work.
+          </p>
+          <p>
+            The two most instructive corners are <code>common/types/</code>,
+            where the Vector and DataChunk types define the unit of data every
+            operator consumes and produces, including the compressed vector
+            representations that let constant and dictionary data flow through
+            without expansion, and <code>parallel/</code>, where pipelines,
+            events, and the task scheduler implement the morsel-driven design
+            from the previous section. The Parquet reader lives in the
+            <code>extension/</code> tree along with JSON, httpfs, and the
+            other bundled extensions, which is a deliberate statement that
+            even core features go through the public extension interface. A
+            good first session is to build the shell, run a GROUP BY over a
+            Parquet file under <code>EXPLAIN</code> and then
+            <code>EXPLAIN ANALYZE</code>, and match the printed pipelines and
+            operator timings to the operator classes in
+            <code>src/execution/operator/</code>; the push-based pipeline
+            model becomes concrete as soon as you see a plan split at its hash
+            aggregate.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> DuckDB is what happens when the
+            last two decades of analytical database research, columnar
+            storage, vectorized execution, morsel-driven parallelism, are
+            packaged as a dependency-free library instead of a server: the
+            hard ideas live in the engine, and the user-facing result is that
+            SQL over a Parquet file on your laptop is one install command and
+            one query away.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+  </body>
+</html>

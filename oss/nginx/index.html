@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>nginx walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A walkthrough of the nginx source: how to use it in five minutes, the event-driven master/worker architecture, the eleven phases of request processing, the config as a declarative language, and a guided reading path." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>nginx</h1>
+        <p class="lead">
+          <a href="https://nginx.org" target="_blank" rel="noreferrer">nginx</a>
+          is the web server, reverse proxy, and load balancer that Igor Sysoev
+          wrote to handle enormous connection counts on early-2000s hardware
+          and that now fronts a huge share of the internet's traffic; the
+          canonical source lives at nginx.org with an official mirror at
+          <a href="https://github.com/nginx/nginx" target="_blank" rel="noreferrer">github.com/nginx/nginx</a>.
+          This walkthrough covers how to use it in five minutes, the three
+          ideas that make a codebase from 2004 still the tool of choice, and a
+          guided path for reading the C source without getting lost.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Using it in five minutes</h2>
+          <p>
+            Every package manager carries it, so install is one line and the
+            three commands you will actually use daily are check, reload, and
+            stop:
+          </p>
+          <pre><code>sudo apt install nginx     # Debian/Ubuntu
+brew install nginx         # macOS</code></pre>
+          <pre><code>nginx -t          # parse and validate the config, without touching the running server
+nginx -s reload   # apply new config with zero dropped connections
+nginx -s quit     # graceful shutdown</code></pre>
+          <p>
+            The canonical minimal use is a reverse proxy in front of an
+            application server. Drop this into a file in
+            <code>conf.d/</code> or <code>sites-enabled/</code>, depending on
+            how your distro lays things out, then <code>nginx -t</code> and
+            <code>nginx -s reload</code>:
+          </p>
+          <pre><code>server {
+    listen 80;
+    server_name example.com;
+
+    location /static/ {
+        root /var/www/myapp;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+}</code></pre>
+          <p>
+            Static files are served directly, everything else is forwarded to
+            the app listening on port 8000, and that one block is the shape of
+            most nginx deployments in the wild, with TLS termination, caching,
+            compression, and rate limiting layered on as extra directives
+            rather than extra software.
+          </p>
+
+          <h2>Idea one: the event-driven master/worker architecture</h2>
+          <p>
+            nginx was designed against the C10K problem, the observation that
+            the thread-per-connection and process-per-connection servers of
+            its era collapsed under ten thousand concurrent connections
+            because each connection carried a stack, a scheduler entry, and
+            context-switch overhead. nginx's answer is a small fixed set of
+            processes: one master that reads the configuration, binds the
+            listening sockets, and supervises, plus a handful of workers,
+            typically one per CPU core, that do all the actual work.
+            <mark>Each worker is a single-threaded event loop that multiplexes
+            tens of thousands of connections over non-blocking sockets</mark>,
+            asking the kernel via epoll on Linux or kqueue on BSD which
+            connections are ready and running a short callback for each, so
+            concurrency scales with memory per connection rather than with
+            threads. The same process model is what makes operations graceful:
+            on <code>nginx -s reload</code> the master parses the new config,
+            starts fresh workers with it, and tells the old workers to finish
+            their in-flight requests and exit, so configuration changes and
+            even binary upgrades happen without dropping a connection. The
+            discipline this imposes on the code is the part worth
+            internalizing: nothing in a worker may block, so every module is
+            written as a state machine that can be suspended whenever it would
+            wait.
+          </p>
+
+          <h2>Idea two: request processing as a pipeline of phases</h2>
+          <p>
+            Inside a worker, an HTTP request does not run through one big
+            function; it advances through a fixed pipeline of eleven phases,
+            from post-read after the headers are parsed, through the rewrite
+            phases, location lookup, pre-access and access checks, a
+            pre-content phase for things like <code>try_files</code>, the
+            content phase that produces the response, and finally the log
+            phase. <mark>Modules never call each other; they register handlers
+            at phases, and the phase engine calls them in order</mark>, with
+            each handler able to pass control onward, finalize the request, or
+            park it and resume later when an event arrives. Response bodies
+            then flow out through a separate chain of filters, which is how
+            gzip, chunking, byte ranges, and SSI compose without knowing about
+            one another. This is why nginx modules feel like configuration
+            rather than plugins: access control runs in the access phase
+            whether it is IP-based, password-based, or a subrequest to an auth
+            service, and rate limiting is just a pre-access phase handler, the
+            same leaky-bucket idea I work through in my
+            <a href="/systems/rate-limiter">rate limiter design write-up</a>.
+          </p>
+
+          <h2>Idea three: the config is a declarative language</h2>
+          <p>
+            The nginx config file looks like settings but behaves like a small
+            declarative language. Directives live in nested contexts, main,
+            <code>http</code>, <code>server</code>, <code>location</code>, and
+            values set at an outer level are inherited by inner ones unless
+            overridden, so a config reads as a tree of increasingly specific
+            answers to "what should happen to a request that looks like
+            this." Crucially there is no general control flow: you declare
+            which server names and location patterns exist, and nginx selects
+            among them with fixed, documented matching rules at request time.
+            The implementation mirrors the surface: every module declares the
+            directives it understands along with which contexts they may
+            appear in, the core config parser reads tokens and dispatches to
+            the owning module, and the whole file is compiled at startup into
+            per-module configuration structs that request processing then
+            consults without ever re-parsing anything. That is why
+            <code>nginx -t</code> can prove a config valid before it goes
+            live, and why the sharp edges people hit, such as
+            <code>if</code> inside <code>location</code> behaving strangely,
+            are really places where an imperative-looking directive leaks the
+            declarative machinery underneath.
+          </p>
+
+          <h2>Reading the repository</h2>
+          <p>
+            The source is compact C under a single <code>src/</code> tree, and
+            the layout maps cleanly onto the ideas above:
+            <code>src/core/</code> holds the primitive types and
+            infrastructure, strings, memory pools, the red-black tree, and the
+            cycle object that represents one lifetime of a loaded
+            configuration; <code>src/event/</code> is the event loop with the
+            platform pollers under <code>src/event/modules/</code>;
+            <code>src/http/</code> is the HTTP machinery with the optional
+            modules in <code>src/http/modules/</code>; and
+            <code>src/os/unix/</code> is the platform layer. Start at
+            <code>src/core/nginx.c</code>, where <code>main()</code> lives,
+            and follow it into <code>src/os/unix/ngx_process_cycle.c</code> to
+            read the master process loop and the worker loop, which is the
+            master/worker story in perhaps a thousand lines. Then read the
+            event core in <code>src/event/ngx_event.c</code> alongside the
+            epoll module to see what "process events and timers" concretely
+            means. For HTTP, <code>src/http/ngx_http_request.c</code> takes a
+            connection from accepted to parsed request, and
+            <code>src/http/ngx_http_core_module.c</code> contains the phase
+            engine that walks the eleven phases; with those two files
+            understood, any module in <code>src/http/modules/</code> becomes
+            readable as "handlers hooked into known places," and
+            <code>ngx_http_upstream.c</code> is the biggest and most
+            rewarding of them, the shared machinery behind proxying. The
+            <a href="https://nginx.org/en/docs/dev/development_guide.html" target="_blank" rel="noreferrer">official
+            development guide</a> on nginx.org is unusually good and worth
+            keeping open beside the code.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> nginx endures because three ideas
+            reinforce each other: a few single-threaded workers that never
+            block, a fixed phase pipeline that lets independent modules
+            compose, and a declarative config compiled once at startup. Read
+            the process cycle, the event loop, and the phase engine, and the
+            rest of the codebase turns from folklore into pattern.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+  </body>
+</html>

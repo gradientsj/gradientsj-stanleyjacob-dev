@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PyTorch walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A walkthrough of the PyTorch repository: how to use it in five minutes, how autograd records and replays the backward pass, what the dispatcher does on every operator call, and how torch.compile fits on top." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>PyTorch</h1>
+        <p class="lead">
+          <a href="https://github.com/pytorch/pytorch" target="_blank" rel="noreferrer">PyTorch</a>
+          is the dominant open source deep learning framework, started at Meta
+          AI and now governed by the PyTorch Foundation under the Linux
+          Foundation, and it is the substrate that most of modern ML research
+          and a large share of production training runs on. This walkthrough
+          covers how to use it in five minutes, what actually happens when you
+          call <code>loss.backward()</code>, the dispatcher that sits under
+          every operator, a high-level view of <code>torch.compile</code>, and
+          a guided path for reading a repository that can feel bottomless.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Using it in five minutes</h2>
+          <p>
+            Installation is one line, and the selector on pytorch.org will give
+            you the right variant for your CUDA version if you need a specific
+            one:
+          </p>
+          <pre><code>pip install torch</code></pre>
+          <p>
+            The whole training idiom fits in a screen. You define a module,
+            run a forward pass, compute a loss, call backward to populate
+            gradients, and let an optimizer apply them:
+          </p>
+          <pre><code>import torch
+import torch.nn as nn
+
+model = nn.Sequential(nn.Linear(784, 128), nn.ReLU(), nn.Linear(128, 10))
+opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+loss_fn = nn.CrossEntropyLoss()
+
+x = torch.randn(64, 784)
+y = torch.randint(0, 10, (64,))
+
+logits = model(x)
+loss = loss_fn(logits, y)
+loss.backward()
+opt.step()
+opt.zero_grad()</code></pre>
+          <p>
+            Since the 2.0 release the same model can be handed to the compiler
+            with one call, and the eager code above keeps working unchanged:
+          </p>
+          <pre><code>compiled = torch.compile(model)
+logits = compiled(x)</code></pre>
+          <p>
+            Everything else, moving to GPU with <code>.to("cuda")</code>,
+            mixed precision with <code>torch.autocast</code>, distributed
+            training with <code>torch.distributed</code>, is layered on top of
+            this loop rather than replacing it, which is a large part of why
+            the framework won.
+          </p>
+
+          <h2>Idea one: autograd is a tape recorded at runtime</h2>
+          <p>
+            PyTorch's original bet was define-by-run. There is no separate
+            graph-construction phase; your model is ordinary Python, and the
+            graph that backpropagation needs is recorded as a side effect of
+            executing the forward pass. Every time an operator runs on a
+            tensor that requires gradients, the output tensor gets a
+            <code>grad_fn</code> pointing at a node that knows how to compute
+            that operator's derivative, and each node holds edges to the nodes
+            that produced its inputs. By the time you have a scalar loss, you
+            are holding the root of a directed acyclic graph that describes,
+            in reverse, everything the forward pass did.
+          </p>
+          <p>
+            So <code>loss.backward()</code> is not magic, it is a graph
+            traversal. The autograd engine seeds the root with a gradient of
+            one, then walks the graph from the loss backwards, calling each
+            node's backward function to transform the incoming gradient and
+            passing the results along the edges, using dependency counts so a
+            node fires only after all gradients flowing into it have arrived.
+            At the leaves, the tensors you created with
+            <code>requires_grad=True</code>, special accumulator nodes add the
+            arriving gradient into the <code>.grad</code> field, which is why
+            gradients accumulate across calls and why training loops call
+            <code>zero_grad()</code>. <mark>The forward pass writes the tape
+            and backward replays it in reverse, so control flow, loops, and
+            data-dependent branches differentiate for free because the tape
+            only ever records what actually ran.</mark> The derivative
+            formulas themselves are not written by hand at every call site;
+            they are declared once per operator in a YAML file and code
+            generation produces the graph-node classes, which is a pattern you
+            will meet again reading the repo.
+          </p>
+
+          <h2>Idea two: the dispatcher</h2>
+          <p>
+            The second load-bearing idea is less visible but explains most of
+            the repository's shape. A call like <code>torch.add</code> has to
+            end up in very different code depending on whether the tensors are
+            on CPU or CUDA, whether they are dense or sparse, whether autograd
+            needs to record the call, whether autocast wants to change the
+            dtype, and whether something like <code>torch.vmap</code> or a
+            quantization wrapper is active. PyTorch resolves this with a
+            dispatcher: every tensor carries a set of dispatch keys, every
+            operator has a table of kernels registered per key, and each call
+            finds the highest-priority relevant key and jumps to its kernel.
+            Crucially the layers stack, so the autograd kernel does its
+            recording and then re-dispatches to the device kernel below it,
+            the way nested virtual method calls would.
+          </p>
+          <p>
+            <mark>Think of the dispatcher as an extensibility point rather
+            than a switch statement: features like autograd, autocast,
+            functorch transforms, and out-of-tree backends are all just
+            dispatch keys, which is how they compose without knowing about
+            each other.</mark> The operator inventory lives in a single
+            schema file, <code>native_functions.yaml</code>, that declares
+            every native operator's signature and which kernel implements it
+            per backend, and code generation turns those declarations into
+            the registration glue. Once you know this, the answer to "where
+            is the code for operator X" stops being a mystery: find its entry
+            in the YAML, and the entry names the C++ functions to read.
+          </p>
+
+          <h2>Idea three: torch.compile, at altitude</h2>
+          <p>
+            Eager execution pays a price: every operator is a separate kernel
+            launch with Python overhead between launches, and no one gets to
+            optimize across operator boundaries. <code>torch.compile</code>
+            attacks this without giving up define-by-run, and it is best
+            understood as a pipeline of three named components. TorchDynamo
+            hooks Python frame evaluation and symbolically walks your
+            function's bytecode, extracting the tensor operations into a
+            graph and installing guards, cheap runtime checks on things like
+            shapes and dtypes, so the captured graph is reused only when it
+            is still valid; when it hits Python it cannot capture, it breaks
+            the graph and falls back to eager for that piece. AOTAutograd
+            then traces ahead-of-time through the autograd machinery so the
+            backward pass becomes a graph too, not just the forward. Finally
+            TorchInductor compiles the graphs, generating Triton kernels on
+            GPU and C++ with OpenMP on CPU, fusing chains of pointwise
+            operations into single kernels so intermediate tensors never
+            touch memory. The design goal running through all three is
+            graceful partiality: unsupported code degrades to eager instead
+            of failing, which is what makes the one-line adoption story
+            honest.
+          </p>
+
+          <h2>Reading the repository</h2>
+          <p>
+            The repo is one of the largest in open source, so do not read it
+            breadth-first; follow one operator call and one backward call, and
+            let the layers reveal themselves. A useful map first: pure Python
+            lives under <code>torch/</code>, the C++ tensor and operator
+            library is ATen under <code>aten/src/ATen/</code>, the small core
+            that both depend on (TensorImpl, dispatch keys, device
+            abstractions) is <code>c10/</code>, and the C++ that binds it all
+            to Python, autograd engine included, is <code>torch/csrc/</code>.
+          </p>
+          <p>
+            Start where users start, in <code>torch/nn/modules/</code>,
+            which is plain readable Python: <code>Module</code> with its
+            parameter registration and hooks, then a layer like
+            <code>Linear</code> that bottoms out in a call to a functional
+            op. Chase that op downward into ATen: the schema entry in
+            <code>native_functions.yaml</code> under
+            <code>aten/src/ATen/native/</code>, then the CPU and CUDA
+            kernels in the same directory tree. Next read the autograd half:
+            <code>tools/autograd/derivatives.yaml</code> declares each
+            operator's derivative, and the engine that executes the recorded
+            graph is in <code>torch/csrc/autograd/</code>, where
+            <code>engine.cpp</code> is long but rewards a careful read,
+            since the ready queue and dependency counting are exactly the
+            traversal described above. Then the compiler stack in Python:
+            <code>torch/_dynamo/</code> for capture and guards and
+            <code>torch/_inductor/</code> for code generation, with
+            <code>torchgen/</code> explaining how the YAML files become
+            generated C++. A good exercise is to pick one tiny operator and
+            trace it through all four layers, Python surface, dispatcher
+            registration, kernel, derivative; after one full pass the
+            repository stops feeling bottomless because every file you open
+            slots into one of those layers. If you want the numerical side
+            of what these frameworks compute, the
+            <a href="/ml">ML implementations section</a> builds several of
+            the core pieces from scratch.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> PyTorch is a runtime-recorded
+            autograd tape sitting on an extensible operator dispatcher, with
+            a compiler bolted on top that captures graphs opportunistically
+            instead of demanding them up front. Learn those three layers and
+            the enormous repository resolves into a small number of ideas
+            executed at industrial scale.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+  </body>
+</html>

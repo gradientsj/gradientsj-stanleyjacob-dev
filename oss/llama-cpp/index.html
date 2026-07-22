@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>llama.cpp walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A walkthrough of the llama.cpp repository: how to run a model in five minutes, how ggml, GGUF, and block-wise quantization make local inference work, and a guided reading path from the CLI tools down to the kernels." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>llama.cpp</h1>
+        <p class="lead">
+          <a href="https://github.com/ggml-org/llama.cpp" target="_blank" rel="noreferrer">llama.cpp</a>
+          is the C/C++ inference engine that made running large language models
+          on your own hardware normal. Georgi Gerganov started it in early 2023
+          as a weekend port of LLaMA to plain C, and it has since grown, under
+          the ggml-org organization, into the substrate for most local AI
+          tooling, from Ollama to the GGUF ecosystem on Hugging Face. This
+          walkthrough covers how to run a model in five minutes, the three ideas
+          that make local inference practical, and a guided path for reading the
+          repository.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Using it in five minutes</h2>
+          <p>
+            You can install prebuilt binaries from a package manager, or build
+            from source, which takes about a minute on a laptop because the
+            project has essentially no dependencies:
+          </p>
+          <pre><code>brew install llama.cpp</code></pre>
+          <pre><code>git clone https://github.com/ggml-org/llama.cpp
+cd llama.cpp
+cmake -B build
+cmake --build build --config Release</code></pre>
+          <p>
+            Add <code>-DGGML_CUDA=ON</code> (or the Vulkan, SYCL, or HIP
+            equivalent) to the first cmake call to build a GPU backend; on Apple
+            Silicon the Metal backend is on by default. The fastest way to try a
+            model is the <code>-hf</code> flag, which downloads a GGUF file
+            straight from Hugging Face and drops you into an interactive chat:
+          </p>
+          <pre><code>llama-cli -hf ggml-org/gemma-3-1b-it-GGUF</code></pre>
+          <p>
+            The same flag works for the server, which speaks the OpenAI API and
+            ships a built-in web UI:
+          </p>
+          <pre><code>llama-server -hf ggml-org/gemma-3-1b-it-GGUF --port 8080</code></pre>
+          <pre><code>from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="unused")
+resp = client.chat.completions.create(
+    model="gemma-3-1b-it",
+    messages=[{"role": "user", "content": "Hello"}],
+)</code></pre>
+          <p>
+            The flags worth knowing first: <code>-m</code> points at a local
+            GGUF file instead of a Hugging Face repo, <code>-ngl</code> sets how
+            many layers to offload to the GPU (a large value like 99 means all
+            of them), <code>-c</code> sets the context size, and
+            <code>-t</code> sets CPU threads. Partial offload is the
+            distinctive one: a model that does not fit in VRAM can put some
+            layers on the GPU and run the rest on the CPU.
+          </p>
+
+          <h2>Idea one: ggml, the tensor library underneath</h2>
+          <p>
+            Everything in llama.cpp sits on ggml, a C tensor library that lives
+            in-tree under <code>ggml/</code> and is developed alongside it. ggml
+            has no third-party dependencies, builds anywhere a C compiler runs,
+            and represents a model's forward pass as an explicit static
+            computation graph that is constructed first and executed afterwards.
+            That sounds austere next to PyTorch, but it is the design decision
+            the whole project flows from: because the graph is explicit and the
+            runtime is tiny, backends for CUDA, Metal, Vulkan, SYCL, and plain
+            CPU with SIMD can each implement the same small set of operations,
+            and the scheduler can split one graph across several of them at
+            once. <mark>The point of ggml is not to be the fastest tensor
+            library on any one chip but to make the same model file run on
+            nearly every chip</mark>, which is why the <code>-ngl</code> flag
+            can slide a model between CPU and GPU layer by layer instead of
+            demanding all-or-nothing.
+          </p>
+
+          <h2>Idea two: GGUF and block-wise quantization</h2>
+          <p>
+            A model for llama.cpp is a single GGUF file, a binary format that
+            packs the architecture metadata, the tokenizer, and every tensor
+            into one memory-mappable blob. Because the file is mmapped, loading
+            is nearly instant and the weights live in page cache rather than
+            being copied, and because the metadata is self-describing key-value
+            pairs, one file works across machines and versions with no sidecar
+            configs. You produce one with the <code>convert_hf_to_gguf.py</code>
+            script at the repo root, then shrink it with
+            <code>llama-quantize</code>.
+          </p>
+          <p>
+            Quantization is where most of the project's accumulated cleverness
+            sits. Weights are quantized block-wise, small groups of values
+            sharing scale factors, at rates from 8-bit down past 2-bit. The
+            K-quants (names like <code>Q4_K_M</code>) use super-blocks with
+            quantized scales and mix precision across tensor types, spending
+            more bits where errors hurt most, and the community consensus that
+            Q4_K_M is the size-to-quality sweet spot has held for a long time.
+            The IQ series pushes below 3 bits and leans on an importance matrix,
+            computed from calibration text and passed to the quantizer, to
+            protect the weights that matter. <mark>The bet behind all of it is
+            that memory bandwidth, not arithmetic, bounds local inference, so
+            every bit shaved off the weights is speed as well as space.</mark>
+          </p>
+
+          <h2>Idea three: the server</h2>
+          <p>
+            llama-server turns the library into a self-hosted OpenAI-compatible
+            endpoint with a web UI, and it is more capable than its size
+            suggests: it handles concurrent requests with slot-based continuous
+            batching, supports speculative decoding, and serves embedding and
+            reranking models. It is worth being clear about positioning. An
+            engine like <a href="/oss/vllm">vLLM</a> assumes a datacenter GPU
+            and optimizes aggregate throughput across many users, while
+            llama-server assumes your hardware and optimizes for a handful of
+            users at the lowest possible footprint; the right choice follows
+            directly from which assumption matches your deployment.
+          </p>
+
+          <h2>Reading the repository</h2>
+          <p>
+            The layout separates cleanly into the tensor library, the model
+            library, and the tools, and reading in that order top-down works
+            well. Start in <code>tools/</code>, where <code>llama-cli</code> and
+            the server live along with <code>quantize</code> and
+            <code>perplexity</code>; the CLI's main loop is a readable tour of
+            the public API, tokenize, decode, sample, repeat, with the shared
+            argument and chat plumbing in <code>common/</code>.
+          </p>
+          <p>
+            The core library is the public header <code>llama.h</code> with its
+            implementation under <code>src/</code>, split into files whose names
+            are a map of the domain: <code>llama-model.cpp</code> for loading
+            and architecture definitions, <code>llama-vocab.cpp</code> for
+            tokenizers, <code>llama-kv-cache.cpp</code> for cache management,
+            <code>llama-graph.cpp</code> for building the forward graph, and
+            <code>llama-sampler.cpp</code> for the sampling chain. Below that,
+            <code>ggml/</code> holds the tensor library, with the core API in
+            one header and each backend in its own subdirectory of
+            <code>ggml/src/</code>, which is where the CUDA, Metal, and
+            SIMD-heavy CPU kernels live; the attention kernels are a good place
+            to apply the <a href="/ml/softmax">online softmax</a> ideas if you
+            want to read them closely. The GGUF side is
+            <code>gguf-py/</code> plus the conversion scripts at the root. A
+            good first session is to convert and quantize a tiny model yourself,
+            then run <code>llama-cli</code> under a debugger and step one token
+            through graph build, backend dispatch, and sampling.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> llama.cpp is what you get when you
+            optimize for reach instead of peak throughput: a dependency-free
+            tensor library that runs the same graph on nearly any chip, a
+            single-file model format built for mmap, and quantization schemes
+            that trade bits for bandwidth, which together turned local LLM
+            inference from a research stunt into infrastructure.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lucene walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A walkthrough of the Apache Lucene repository: how to index and search in five minutes, how the inverted index and immutable segments work, what codecs and BM25 scoring do, and a guided reading path through the core module." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>Lucene</h1>
+        <p class="lead">
+          <a href="https://github.com/apache/lucene" target="_blank" rel="noreferrer">Apache Lucene</a>
+          is a full-text search engine library written in Java, started by Doug
+          Cutting in 1999 and an Apache project since the early 2000s, and it
+          sits under nearly every open source search deployment you have used:
+          Elasticsearch, OpenSearch, and Solr are all distribution, APIs, and
+          operations wrapped around a Lucene core. This walkthrough covers how
+          to index and search in five minutes, the inverted index and segment
+          model that make it work, how postings and scoring are implemented,
+          and a guided path for reading the repository. It pairs with my
+          <a href="/systems/search-service">search service design write-up</a>,
+          which builds the same inverted index from requirements instead of
+          from code.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Using it in five minutes</h2>
+          <p>
+            Lucene is a library with no server and no query language of its
+            own beyond what you opt into; you add one dependency and call Java
+            APIs. The core artifact is all you need to start:
+          </p>
+          <pre><code>&lt;dependency&gt;
+  &lt;groupId&gt;org.apache.lucene&lt;/groupId&gt;
+  &lt;artifactId&gt;lucene-core&lt;/artifactId&gt;
+  &lt;version&gt;10.1.0&lt;/version&gt;
+&lt;/dependency&gt;</code></pre>
+          <p>
+            The front-page example from Lucene's own documentation is worth
+            typing out once, because the whole library is visible in it.
+            Indexing is an analyzer, a directory, and a writer:
+          </p>
+          <pre><code>Analyzer analyzer = new StandardAnalyzer();
+Directory directory = FSDirectory.open(indexPath);
+IndexWriter writer = new IndexWriter(directory, new IndexWriterConfig(analyzer));
+
+Document doc = new Document();
+doc.add(new Field("body", "This is the text to be indexed.", TextField.TYPE_STORED));
+writer.addDocument(doc);
+writer.close();</code></pre>
+          <p>
+            Searching opens a point-in-time reader over the same directory,
+            parses a query against the same analyzer, and asks for the top
+            hits:
+          </p>
+          <pre><code>DirectoryReader reader = DirectoryReader.open(directory);
+IndexSearcher searcher = new IndexSearcher(reader);
+Query query = new QueryParser("body", analyzer).parse("text");
+ScoreDoc[] hits = searcher.search(query, 10).scoreDocs;
+StoredFields stored = searcher.storedFields();
+for (int i = 0; i &lt; hits.length; i++) {
+  Document hit = stored.document(hits[i].doc);
+}</code></pre>
+          <p>
+            The query parser lives in the separate <code>lucene-queryparser</code>
+            module and most real analyzers in <code>lucene-analysis-common</code>;
+            the repository's demo module contains complete IndexFiles and
+            SearchFiles programs that index a directory of text files and
+            search it interactively, which is the fastest way to get a real
+            index on disk to look at.
+          </p>
+
+          <h2>The inverted index, made of immutable segments</h2>
+          <p>
+            The data structure is the classic one: instead of storing documents
+            and scanning them, Lucene analyzes each document into terms and
+            stores, for every term, the list of documents that contain it,
+            along with frequencies and positions. A query then becomes an
+            intersection or union of these postings lists rather than a scan,
+            which is why searching a hundred million documents for two words
+            is cheap.
+          </p>
+          <p>
+            What makes Lucene distinctive is how that index reaches disk.
+            IndexWriter buffers documents in memory and periodically flushes
+            them as a segment, a self-contained mini-index in its own set of
+            files, and <mark>a segment, once written, is never modified;
+            updates are a delete plus a reinsert, and deletes themselves are
+            just a bitmask of live documents consulted at search time.</mark>
+            Background merges fold small segments into larger ones and drop the
+            dead documents for real. Immutability is the decision the rest of
+            the design falls out of: readers need no locks and can rely on the
+            OS page cache aggressively, a commit is just an atomic update of
+            the file naming the current segments, and a searcher sees a
+            perfectly consistent point-in-time snapshot for as long as it holds
+            its reader open. It also explains the operational behavior of the
+            systems built on top: an Elasticsearch shard is exactly one Lucene
+            index, and its refresh interval is the cadence at which new
+            segments become visible to searches, a mechanism I go into in my
+            <a href="/software/notes/elasticsearch">Elasticsearch note</a>.
+          </p>
+
+          <h2>Postings and codecs: how the index is encoded</h2>
+          <p>
+            Within a segment, the term dictionary is stored as blocks of terms
+            on disk with a compact in-memory index over it, built on Lucene's
+            finite state transducer implementation, so looking up a term costs
+            a small in-memory walk plus one block read, and prefix and range
+            queries fall out naturally from the ordered structure. The
+            postings themselves store document ids delta-encoded and
+            bit-packed in fixed-size blocks with embedded skip data, so a
+            conjunction can leapfrog through two lists without decoding
+            everything in between. Alongside postings, segments carry doc
+            values, a column-oriented store per field that serves sorting,
+            faceting, and aggregations, which is a useful reminder that Lucene
+            has been a hybrid row and column store for a long time.
+          </p>
+          <p>
+            All of this lives behind the codec API, which is the part of the
+            design that makes evolution possible. <mark>A codec is a versioned,
+            pluggable specification of every on-disk structure in a segment,
+            and each segment records which codec wrote it</mark>, so a single
+            index can contain segments written by different Lucene versions and
+            the backward-codecs module keeps old ones readable. When the
+            project improves compression or postings layout, it ships a new
+            codec generation and old segments simply get rewritten at merge
+            time. The file extensions you see in an index directory, the terms
+            dictionary and its index, the postings, the doc values, map one to
+            one onto codec formats, which makes the format unusually
+            inspectable for a storage engine.
+          </p>
+
+          <h2>Scoring: BM25 and the Similarity abstraction</h2>
+          <p>
+            Ranking is factored out behind the Similarity class, and since
+            Lucene 6.0 the default has been BM25, with the old TF-IDF scoring
+            kept available under the name ClassicSimilarity. BM25 keeps the
+            same signals, how often the term occurs, how rare it is across the
+            corpus, how long the field is, but shapes them better: term
+            frequency saturates, so the twentieth occurrence of a word adds
+            almost nothing, and length normalization is relative to the average
+            field length rather than absolute. At execution time a Query is
+            compiled into a Weight and then per-segment Scorers, and modern
+            Lucene stores per-block score upper bounds so that top-k search
+            can skip whole blocks of documents that cannot make the current
+            top ten, the block-max WAND family of optimizations that arrived
+            with Lucene 8. The practical consequence is that fetching the top
+            ten results does not require scoring every matching document.
+          </p>
+
+          <h2>Reading the repository</h2>
+          <p>
+            The repository is a Gradle build with everything under the
+            <code>lucene/</code> directory, one module per artifact:
+            <code>core</code>, <code>analysis</code>, <code>queryparser</code>,
+            <code>codecs</code>, <code>facet</code>, <code>suggest</code>,
+            <code>highlighter</code>, <code>demo</code>, and friends. Almost
+            everything in this walkthrough lives in <code>lucene/core</code>
+            under the <code>org.apache.lucene</code> namespace, and the
+            packages map cleanly onto the concepts: <code>document</code> and
+            <code>analysis</code> for what goes in, <code>index</code> for the
+            write side, <code>search</code> for the read side,
+            <code>store</code> for the Directory abstraction over files, and
+            <code>codecs</code> for the formats.
+          </p>
+          <p>
+            Read the demo programs first, then follow an addDocument call into
+            IndexWriter, which is the largest and most instructive class in
+            the project: it owns the in-memory buffering, the flush that
+            creates a segment, the merge policy and scheduler, and the commit
+            protocol. On the read side, start at IndexSearcher and follow one
+            search through Query, Weight, and Scorer down to a postings
+            enumeration over a single segment, noticing that every search is
+            really a loop over independent per-segment searches whose results
+            are merged. The store package rewards a short visit for
+            MMapDirectory, which is why Lucene leans so hard on the page
+            cache, and the util package hides the two famous data structures,
+            the FST behind the term index and the BKD tree behind numeric and
+            geo points. A good first session is to index a few hundred
+            documents with the demo, list the index directory, and match each
+            file extension to the codec format that wrote it; the index stops
+            being a black box the moment the files have names you recognize.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> Lucene is the inverted index plus
+            one ruthless constraint, that segments are immutable, and from
+            that constraint follow its lock-free reads, its snapshot
+            consistency, its merge-based lifecycle, and the refresh and shard
+            semantics of every system built on top of it; the codec layer and
+            the Similarity abstraction are what have let a library from 1999
+            keep swapping its encoding and its ranking without breaking anyone.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+  </body>
+</html>

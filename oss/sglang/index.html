@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SGLang walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A walkthrough of the SGLang repository: how to serve a model in five minutes, how RadixAttention prefix caching and grammar-constrained generation work, what the frontend DSL adds, and a guided reading path through the runtime." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>SGLang</h1>
+        <p class="lead">
+          <a href="https://github.com/sgl-project/sglang" target="_blank" rel="noreferrer">SGLang</a>
+          is a serving framework for large language and vision-language models
+          that began as a research project from Stanford and Berkeley (Zheng et
+          al., NeurIPS 2024) and now lives under the LMSYS non-profit, with
+          production deployments at companies like xAI running it at enormous
+          GPU scale. Its founding claim is that the runtime and the programming
+          interface should be co-designed, and this walkthrough covers how to
+          serve a model in five minutes, the three ideas that follow from that
+          claim, and a guided path for reading the repository.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Using it in five minutes</h2>
+          <p>
+            SGLang installs from PyPI (the docs recommend the uv installer and
+            pin matching PyTorch builds, so check the install guide if you hit
+            version friction) and launches as a server process:
+          </p>
+          <pre><code>pip install sglang</code></pre>
+          <pre><code>python3 -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --host 0.0.0.0 --port 30000</code></pre>
+          <p>
+            The server is OpenAI-compatible, so the usual client works with a
+            base URL change:
+          </p>
+          <pre><code>from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="unused")
+resp = client.chat.completions.create(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    messages=[{"role": "user", "content": "Hello"}],
+)</code></pre>
+          <p>
+            The same package also contains the frontend language the project is
+            named for, a Python-embedded DSL that runs against the server you
+            just launched:
+          </p>
+          <pre><code>from sglang import function, gen, system, user, assistant, RuntimeEndpoint
+from sglang.lang.api import set_default_backend
+
+set_default_backend(RuntimeEndpoint("http://localhost:30000"))
+
+@function
+def basic_qa(s, question):
+    s += system("You are a helpful assistant.")
+    s += user(question)
+    s += assistant(gen("answer", max_tokens=512))
+
+state = basic_qa("List 3 countries and their capitals.")
+print(state["answer"])</code></pre>
+
+          <h2>Idea one: RadixAttention</h2>
+          <p>
+            Real workloads repeat themselves. Multi-turn chats resend the whole
+            conversation each turn, few-shot prompts share their examples across
+            thousands of requests, and agent loops replay long histories with
+            small additions, so the same prompt prefixes get re-processed
+            constantly. Prefix caching, reusing the KV cache of a shared prefix
+            instead of recomputing it, is the fix, and
+            <a href="/oss/vllm">vLLM</a> offers it as a lookup layered over its
+            paged cache. SGLang's contribution was to promote it from a feature
+            to the organizing principle of the runtime.
+            <mark>RadixAttention keeps the entire KV cache pool indexed by a
+            radix tree over token sequences, so every cached prefix of every
+            past request is a candidate for reuse</mark>, with cold branches
+            evicted LRU when memory runs short. Because the tree makes reuse
+            visible ahead of time, the scheduler can be cache-aware, ordering
+            waiting requests so that ones sharing prefixes run near each other
+            and hit rates stay high, which is why SGLang shines on exactly the
+            workloads above.
+          </p>
+
+          <h2>Idea two: structured generation as a fast path</h2>
+          <p>
+            Constrained decoding usually means compiling a JSON schema, regex,
+            or grammar into an automaton and masking invalid tokens at each
+            step, which guarantees valid output but pays the full per-token
+            decoding cost even for characters the grammar has already decided.
+            SGLang's insight, introduced as jump-forward decoding with a
+            compressed finite state machine, is that <mark>whenever the grammar
+            permits exactly one continuation, the server can append those
+            tokens directly and skip the forward passes entirely</mark>, so the
+            model only ever decodes where it has a real choice. In a JSON
+            object that is most of the punctuation and every fixed key. The
+            grammar engine itself is pluggable, with
+            <a href="https://github.com/mlc-ai/xgrammar" target="_blank" rel="noreferrer">XGrammar</a>
+            as the default backend, and it is all reachable through the OpenAI
+            API's structured-output parameters, so clients get schema-guaranteed
+            JSON without knowing any of this is happening.
+          </p>
+
+          <h2>Idea three: the frontend DSL</h2>
+          <p>
+            The name stands for Structured Generation Language, and the
+            frontend is the co-design half of the paper: if callers describe
+            whole programs instead of issuing isolated completion calls, the
+            runtime can see structure it could never infer from raw requests. A
+            function decorated with <code>@function</code> builds up a prompt
+            state with primitives like <code>gen</code>, <code>select</code>,
+            and <code>fork</code>, using ordinary Python control flow in
+            between. <code>gen</code> is non-blocking, <code>select</code> asks
+            the model to choose among fixed options by comparing their
+            probabilities, and <code>fork</code> branches one state into
+            parallel continuations, which the runtime executes concurrently
+            while the radix tree shares the common prefix's KV cache among all
+            branches. In practice most production users drive SGLang through
+            the plain OpenAI API and the DSL is the less-traveled half of the
+            project, but it explains the architecture: the runtime is built to
+            exploit exactly the sharing and parallelism the language expresses.
+          </p>
+
+          <h2>Reading the repository</h2>
+          <p>
+            Almost everything lives under <code>python/sglang/</code>, split
+            between <code>lang/</code>, the frontend language, and
+            <code>srt/</code>, the SGLang Runtime, which is the serving engine
+            and the part worth most of your time.
+            <code>launch_server.py</code> is the entry point; from there the
+            HTTP layer in <code>srt/entrypoints/</code> hands requests to a
+            pipeline of processes you can read in
+            <code>srt/managers/</code>: a tokenizer manager feeding a
+            scheduler feeding a detokenizer, connected by queues so
+            tokenization never blocks the GPU. The scheduler is the heart, it
+            owns continuous batching and the cache-aware policy, and it leans
+            on <code>srt/mem_cache/</code>, where the radix cache and the KV
+            allocators implement RadixAttention's bookkeeping. Model execution
+            is <code>srt/model_executor/</code> plus the attention backends and
+            layers under <code>srt/layers/</code>, with grammar-constrained
+            decoding wired in under <code>srt/constrained/</code>. Custom CUDA
+            kernels live in the separate <code>sgl-kernel/</code> package at
+            the repo root, and the Rust model gateway beside it routes traffic
+            across replicas with the same cache-awareness applied one level up.
+            A good first session is to launch the server with one small model,
+            send the same long prompt twice, and watch the logs report the
+            second request's prefix hit; then read the radix cache with that
+            observation in hand. For how these serving-layer choices compose
+            into a whole platform, my
+            <a href="/systems/llm-inference">LLM serving design write-up</a>
+            covers the same ground from the requirements side.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> SGLang is a bet on structure: index
+            the whole KV cache so any shared prefix is reusable, let grammars
+            skip the tokens they have already determined, and give callers a
+            language whose programs expose that structure on purpose; the
+            runtime is what those three commitments look like when engineered
+            to production quality.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+  </body>
+</html>

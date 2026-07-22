@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RocksDB walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A walkthrough of the RocksDB repository: how to use it in five minutes, how memtables, SST files, and compaction fit together, what column families are for, and a guided reading path from the public headers to the write path and compaction code." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>RocksDB</h1>
+        <p class="lead">
+          <a href="https://github.com/facebook/rocksdb" target="_blank" rel="noreferrer">RocksDB</a>
+          is an embeddable persistent key-value store from Meta's database
+          engineering team, built on the earlier LevelDB work of Sanjay Ghemawat
+          and Jeff Dean, and it has quietly become the storage engine that other
+          systems are made of: MyRocks puts it under MySQL, TiKV and Kafka
+          Streams and Flink's state backend all keep their bytes in it. It is
+          the LSM tree in production form, and this walkthrough covers how to
+          use it in five minutes, the ideas that define it, and a guided path
+          for reading the repository. It pairs with my
+          <a href="/systems/key-value-store">key-value store design
+          write-up</a>, which derives the same LSM structure from requirements
+          instead of from code.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Using it in five minutes</h2>
+          <p>
+            RocksDB is a library, not a server. There is no daemon to start and
+            no port to bind; you link it into your process and it manages a
+            directory of files on disk. The canonical way in is to build from
+            source, though prebuilt packages exist on most platforms
+            (<code>librocksdb-dev</code> on Debian and Ubuntu, a
+            <code>rocksdb</code> formula on Homebrew):
+          </p>
+          <pre><code>git clone https://github.com/facebook/rocksdb.git
+cd rocksdb
+make static_lib
+cd examples &amp;&amp; make all</code></pre>
+          <p>
+            The entire public API lives behind a handful of headers, and the
+            minimal program is short enough to read in one breath:
+          </p>
+          <pre><code>#include "rocksdb/db.h"
+#include "rocksdb/options.h"
+
+rocksdb::Options options;
+options.create_if_missing = true;
+options.IncreaseParallelism();
+options.OptimizeLevelStyleCompaction();
+
+rocksdb::DB* db;
+rocksdb::Status s = rocksdb::DB::Open(options, "/tmp/testdb", &amp;db);
+assert(s.ok());
+
+s = db-&gt;Put(rocksdb::WriteOptions(), "key1", "value");
+std::string value;
+s = db-&gt;Get(rocksdb::ReadOptions(), "key1", &amp;value);</code></pre>
+          <p>
+            This is a lightly trimmed version of
+            <code>examples/simple_example.cc</code> in the repository, which
+            goes on to show <code>WriteBatch</code> for atomic multi-key writes
+            and <code>PinnableSlice</code> for copy-free reads. Every call
+            returns a <code>Status</code> rather than throwing, iterators give
+            you ordered range scans with <code>Seek</code> and
+            <code>Next</code>, and the repository ships two inspection tools
+            worth knowing early: <code>ldb</code> for poking at a live database
+            from the command line and <code>sst_dump</code> for reading the
+            files it produces.
+          </p>
+
+          <h2>The write path: memtables, WAL, and SST files</h2>
+          <p>
+            RocksDB describes itself in its own README as a
+            log-structured-merge database, and the write path is the cleanest
+            place to see what that means. A write goes to two places: it is
+            appended to a write-ahead log for durability, and it is inserted
+            into the memtable, an in-memory sorted structure that is a skiplist
+            by default. Nothing else happens at write time, which is why writes
+            are fast and why they never depend on how much data is already on
+            disk. When the memtable fills (64 MB by default, the
+            <code>write_buffer_size</code> option), it becomes immutable, a
+            fresh memtable takes over, and a background thread flushes the
+            frozen one to disk as an SST file, a sorted string table holding
+            keys in order alongside an index block and optional bloom filter.
+          </p>
+          <p>
+            <mark>The LSM tree turns random writes into sequential I/O by
+            absorbing them in memory and only ever writing sorted, immutable
+            files.</mark> The cost is paid on the read side: a Get must consult
+            the memtables first, then the SST files from newest to oldest,
+            because a newer file may shadow an older value for the same key.
+            Bloom filters let most files answer "definitely not here" without a
+            disk read, and the block cache keeps hot data blocks (about 4 KB
+            uncompressed by default) in memory, but the fundamental tension
+            remains: the more files accumulate, the more expensive reads
+            become. Managing that accumulation is the job of compaction.
+          </p>
+
+          <h2>Compaction is where the trade-offs live</h2>
+          <p>
+            Compaction rewrites SST files in the background, merging
+            overlapping files, dropping overwritten and deleted entries, and
+            keeping read cost bounded. The README frames the whole engine as
+            offering flexible trade-offs between write amplification, read
+            amplification, and space amplification, and the compaction style is
+            the main lever. <mark>You cannot minimize all three at once, and
+            choosing a compaction strategy is choosing which one you are
+            willing to pay.</mark>
+          </p>
+          <p>
+            Leveled compaction, the default, organizes files into levels of
+            exponentially increasing size (roughly ten times per level by
+            default) where each level except L0 is a single sorted run;
+            freshly flushed files land in L0, and once enough of them pile up
+            (four by default) they are merged down into L1 and onward. This
+            keeps space and read amplification low at the price of rewriting
+            data as it migrates down, which is write amplification. Universal
+            compaction is the tiered alternative: it merges files of similar
+            size into larger sorted runs without rewriting the destination,
+            trading much lower write amplification for temporarily higher space
+            use and more runs to check on reads, which suits ingest-heavy
+            workloads. FIFO compaction barely compacts at all; it simply drops
+            the oldest files once a size budget is exceeded, which makes
+            RocksDB behave like a persistent cache for time-ordered data.
+          </p>
+
+          <h2>Column families and the knobs that matter</h2>
+          <p>
+            A column family is an independent keyspace inside one database:
+            each has its own memtable, its own SST files, and its own options,
+            so one family can run universal compaction with heavy compression
+            while its neighbor runs leveled with none. What they share is the
+            write-ahead log, and that sharing is the point, because it gives
+            you atomic writes across families and a consistent view when
+            reading from several at once. The pattern shows up everywhere
+            RocksDB is embedded: a system stores its data in one family and
+            its metadata or secondary index in another, tuned differently but
+            committed together.
+          </p>
+          <p>
+            The options surface is famously large, but a small set carries
+            most of the weight in practice: <code>write_buffer_size</code> and
+            <code>max_write_buffer_number</code> control how much RAM absorbs
+            writes before flushes and stalls, the L0 file triggers control
+            when compaction starts and when writes are throttled, the block
+            cache size controls read hit rates, bloom filter bits per key
+            trade memory for skipped reads, and per-level compression lets you
+            keep upper levels fast and the bottom level small. The defaults
+            are deliberately conservative, and the wiki's tuning guide is
+            honest that most users should change only a few of these; my
+            <a href="/software/notes/databases-for-system-design">databases
+            note</a> covers where an LSM engine fits relative to B-tree
+            storage when you are choosing rather than tuning.
+          </p>
+
+          <h2>Reading the repository</h2>
+          <p>
+            Start where users start, in <code>include/rocksdb/</code>: the
+            headers <code>db.h</code> and <code>options.h</code> are the
+            contract everything else implements, and the options comments are
+            some of the best documentation in the project. Then read
+            <code>examples/simple_example.cc</code> and its siblings, which
+            demonstrate column families, transactions, and compaction filters
+            in a page each.
+          </p>
+          <p>
+            The implementation of the DB interface lives under
+            <code>db/</code>, with the DBImpl class as the hub; follow a Put
+            through the write path to see the WAL append and memtable insert,
+            including the group commit logic that batches concurrent writers.
+            Memtable implementations live in <code>memtable/</code>, and the
+            SST file format, block layout, bloom filters, and table reader and
+            builder live under <code>table/</code>, with the block-based table
+            as the default format. Compaction has its own corner of
+            <code>db/</code>, split between the pickers, which decide what to
+            compact under each style, and the job that does the merging; beside
+            it, the version set code is worth real attention because it holds
+            the metadata heart of the engine, the MANIFEST log that records
+            which SST files constitute each level at each point in time, which
+            is how the database recovers its shape after a crash. The block
+            cache lives in <code>cache/</code>, and <code>utilities/</code>
+            holds the optional layers, transactions, backup, and TTL among
+            them, that show how far the core primitives stretch.
+          </p>
+          <p>
+            A good first session is to run the simple example, then look at
+            what it left behind: list the database directory, run
+            <code>sst_dump</code> on an SST file to see blocks and properties,
+            open the LOG file and read the compaction statistics RocksDB
+            prints. The LSM tree stops being a diagram the first time you
+            watch level sizes shift under load.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> RocksDB is the LSM tree taken
+            seriously as an engineering artifact. Writes are absorbed in
+            memory and logged, files on disk are sorted and immutable, and
+            compaction continuously renegotiates the balance between write,
+            read, and space amplification; column families and the options
+            surface exist so that each embedded use can strike that balance
+            differently without forking the engine.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+  </body>
+</html>

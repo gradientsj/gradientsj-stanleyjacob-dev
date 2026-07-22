@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Kubernetes walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A walkthrough of the Kubernetes repository: how to use it in five minutes, the reconcile loop as the one design pattern, the API server and etcd as the source of truth, informers and watch, and where to actually start reading an enormous codebase." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>Kubernetes</h1>
+        <p class="lead">
+          <a href="https://github.com/kubernetes/kubernetes" target="_blank" rel="noreferrer">Kubernetes</a>
+          is the container orchestrator that came out of Google's decade of
+          running Borg, was open sourced in 2014, and became the founding
+          project of the Cloud Native Computing Foundation and the de facto
+          operating system of the cloud. This walkthrough covers how to get a
+          cluster running in five minutes, the small set of ideas that the
+          entire enormous codebase repeats, and an honest reading path that
+          starts at the readable cores instead of the front door.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Using it in five minutes</h2>
+          <p>
+            You do not install the repository; you run a distribution of it.
+            The fastest local option is kind, which boots a conformant cluster
+            inside a Docker container, with minikube as the equally standard
+            alternative:
+          </p>
+          <pre><code>go install sigs.k8s.io/kind@latest   # or: brew install kind
+kind create cluster</code></pre>
+          <pre><code>kubectl create deployment web --image=nginx --replicas=3
+kubectl get pods</code></pre>
+          <p>
+            The five-minute experiment that teaches the most is to fight the
+            system and lose. Delete a pod and watch the deployment's
+            replacement appear within seconds; scale the deployment and watch
+            the pod count follow:
+          </p>
+          <pre><code>kubectl delete pod &lt;one-of-the-pod-names&gt;
+kubectl get pods          # three pods again, one very young
+kubectl scale deployment web --replicas=5</code></pre>
+          <p>
+            Nothing you did was a command to start or stop containers; every
+            command edited a record of desired state, and something else made
+            reality match. That "something else" is the entire subject of this
+            walkthrough.
+          </p>
+
+          <h2>The one design pattern: the reconcile loop</h2>
+          <p>
+            Kubernetes has essentially one design pattern, applied at every
+            scale. A controller watches two things, the desired state written
+            in an object's <code>spec</code> and the observed state of the
+            world, and repeatedly acts to converge one toward the other,
+            recording what it sees in the object's <code>status</code>. The
+            deployment controller reconciles deployments into replica sets,
+            the replica set controller reconciles those into pods, the
+            scheduler is a controller that reconciles "pods with no node" into
+            "pods bound to a node," and the kubelet on each machine is a
+            controller that reconciles "pods bound to my node" into running
+            containers. <mark>The loops are level-triggered rather than
+            edge-triggered: each iteration compares full desired state against
+            full observed state, so a controller that crashes, restarts, or
+            misses an event simply converges on the next pass.</mark> That is
+            the property that makes the system self-healing without any
+            component being responsible for healing, and it is why deleting a
+            pod above was so uneventful: no alarm fired, the replica set
+            controller just noticed two is less than three. Once you see this
+            pattern you see it everywhere, and the codebase stops being ten
+            systems and becomes one idea with many instances.
+          </p>
+
+          <h2>The API server and etcd as the source of truth</h2>
+          <p>
+            The pattern only works because there is exactly one place state
+            lives. Every object, pods, deployments, nodes, secrets, is a
+            record persisted in etcd, the Raft-based consistent key-value
+            store, and the API server is the sole component allowed to touch
+            it. <mark>No Kubernetes component talks to another directly;
+            controllers, the scheduler, the kubelet, and kubectl all read and
+            write objects through the API server's REST interface, and
+            coordination happens entirely through this shared state.</mark>
+            This hub-and-spoke design buys enormous simplifications: there is
+            one place to enforce authentication, authorization, admission
+            policy, and validation; components can be restarted or upgraded
+            independently because none of them holds state that matters; and
+            extending the system means registering a new object type, which is
+            what custom resources are, rather than teaching processes new
+            protocols. Optimistic concurrency via resource versions replaces
+            distributed locking, and the API server's watch mechanism streams
+            changes to anyone interested, which turns the "poll the world"
+            picture of the reconcile loop into something that reacts in
+            milliseconds. If you have read my <a href="/systems">systems
+            design write-ups</a>, this is the rare production system that is
+            genuinely architected the way the whiteboard version says.
+          </p>
+
+          <h2>Informers: making a thousand watchers cheap</h2>
+          <p>
+            A naive controller polling the API server would melt it, and a
+            naive watcher still pays a network round trip per read. The
+            client-go library's informer machinery is the load-bearing
+            optimization: an informer opens one watch per resource type,
+            maintains a local in-memory cache that the watch stream keeps
+            current, and hands the controller events plus a read-only lens
+            over the cache, so a controller's reads cost nothing and the API
+            server serves one stream instead of a thousand queries. Shared
+            informer factories let every controller in a process share the
+            same caches, and the standard shape of a controller, informer
+            events feeding keys into a rate-limited work queue drained by
+            reconcile workers that read from the cache, is repeated so
+            uniformly across the ecosystem that reading one controller
+            teaches you all of them. The design also explains a famous
+            Kubernetes behavior: because caches are eventually consistent,
+            controllers are written to tolerate stale reads, which is the
+            level-triggered philosophy again, pushed down into the client
+            library.
+          </p>
+
+          <h2>Reading the repository</h2>
+          <p>
+            Honesty first: kubernetes/kubernetes is millions of lines of Go,
+            and trying to read it front to back, or starting from
+            <code>cmd/kube-apiserver/</code>, is how most attempts die. The
+            repo's shape is worth knowing, <code>cmd/</code> for the binaries'
+            entry points, <code>pkg/</code> for their implementations,
+            <code>api/</code> for API specifications, and
+            <code>staging/src/k8s.io/</code> for the code published as
+            separate libraries, including client-go, but the right strategy
+            is to read the small readable cores that the ideas above live in.
+            Start outside the main repo entirely with
+            <a href="https://github.com/kubernetes/sample-controller" target="_blank" rel="noreferrer">kubernetes/sample-controller</a>,
+            the official minimal controller, a few hundred lines that wire an
+            informer to a work queue to a reconcile function with nothing
+            else in the way. Then read one real controller,
+            <code>pkg/controller/replicaset/</code> being the classic choice
+            because its job fits in one sentence, and compare it with its
+            siblings under <code>pkg/controller/</code> to watch the same
+            skeleton repeat. For the scheduler, the readable core is the
+            plugins under <code>pkg/scheduler/framework/plugins/</code>,
+            where what were historically called the fit predicates live:
+            <code>noderesources</code>, <code>nodeaffinity</code>,
+            <code>tainttoleration</code>, and <code>interpodaffinity</code>
+            are each a self-contained answer to "can this pod go on this
+            node, and how good a fit is it." The informer machinery itself is
+            in client-go under <code>staging/src/k8s.io/client-go/tools/cache/</code>,
+            worth reading once to demystify the reflector, the store, and the
+            event distribution. The kubelet under <code>pkg/kubelet/</code>
+            is the hardest of these, but grepping for its sync loop shows the
+            reconcile pattern one more time, now against a container
+            runtime instead of etcd.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> Kubernetes is one pattern and one
+            place: level-triggered reconcile loops converging the world
+            toward desired state, and a single API server over etcd where
+            that state lives. The repository is enormous, but it is enormous
+            the way a crystal is large, the same structure repeated, so read
+            one controller, one scheduler plugin, and the informer machinery,
+            and you have read the whole design.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+  </body>
+</html>

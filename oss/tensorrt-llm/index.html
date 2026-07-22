@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TensorRT-LLM walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A walkthrough of the TensorRT-LLM repository: how to serve a model in five minutes, what ahead-of-time engine building and in-flight batching mean, how NVIDIA co-designs quantization with its GPUs, and a guided reading path through the Python and C++ layers." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>TensorRT-LLM</h1>
+        <p class="lead">
+          <a href="https://github.com/NVIDIA/TensorRT-LLM" target="_blank" rel="noreferrer">TensorRT-LLM</a>
+          is NVIDIA's open source LLM inference library, the successor to
+          FasterTransformer and the vendor's own answer to how far its GPUs can
+          be pushed, which makes it the engine to study when the question is
+          peak performance on NVIDIA hardware rather than portability. This
+          walkthrough covers how to serve a model in five minutes, the
+          compile-ahead-of-time philosophy and its recent PyTorch-shaped
+          revision, in-flight batching, quantization co-designed with the
+          silicon, and a guided path for reading a repository that spans Python
+          and a large C++ core.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Using it in five minutes</h2>
+          <p>
+            TensorRT-LLM is Linux-plus-NVIDIA-GPU software with real system
+            prerequisites (matching CUDA toolkit, a specific PyTorch build, and
+            OpenMPI), which is why the docs steer many users toward the
+            prebuilt NGC container; on a machine that meets them, installation
+            is a pip command:
+          </p>
+          <pre><code>pip3 install tensorrt_llm</code></pre>
+          <p>
+            The front door is the LLM API, which loads a Hugging Face
+            checkpoint directly:
+          </p>
+          <pre><code>from tensorrt_llm import LLM, SamplingParams
+
+llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+params = SamplingParams(temperature=0.8, top_p=0.95)
+
+for output in llm.generate(["The capital of France is"], params):
+    print(output.outputs[0].text)</code></pre>
+          <p>
+            The online equivalent is an OpenAI-compatible server, with
+            <code>trtllm-bench</code> and <code>trtllm-eval</code> beside it
+            for benchmarking and accuracy checks:
+          </p>
+          <pre><code>trtllm-serve "TinyLlama/TinyLlama-1.1B-Chat-v1.0"</code></pre>
+          <pre><code>curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+       "messages": [{"role": "user", "content": "Hello"}]}'</code></pre>
+
+          <h2>Idea one: ahead-of-time engine building, and its revision</h2>
+          <p>
+            TensorRT-LLM inherits its worldview from TensorRT, NVIDIA's
+            general inference compiler: instead of interpreting a model graph
+            at runtime, you compile it once into an engine, a serialized plan
+            in which layers have been fused, precisions decided, and kernels
+            selected and tuned for one specific GPU architecture. The classic
+            workflow made this explicit, convert the checkpoint, run
+            <code>trtllm-build</code>, deploy the resulting engine file, and
+            the payoff is real: <mark>work that other engines do on every
+            forward pass, choosing kernels, fusing operations, planning memory,
+            is done once at build time, so the runtime simply replays an
+            optimized plan</mark>. The cost is rigidity, since every new model
+            architecture and every attention variant had to be expressible in
+            the compiler before it could run at all. That cost is why the 1.0
+            release rebuilt the project around a PyTorch-native backend, now
+            the default, in which models are ordinary PyTorch modules calling
+            into the same hand-tuned kernels, and the engine-building path
+            survives as a legacy workflow. The lesson generalizes beyond this
+            repo: in a field where model architectures change monthly,
+            flexibility won, and the compile-time philosophy retreated into the
+            kernels, where it belongs.
+          </p>
+
+          <h2>Idea two: in-flight batching in a C++ runtime</h2>
+          <p>
+            In-flight batching is NVIDIA's name for continuous batching, the
+            iteration-level scheduling that <a href="/oss/vllm">vLLM</a>
+            popularized: finished sequences leave the batch after each step,
+            waiting requests join immediately, and prefill and decode for
+            different requests share the same iterations, so the GPU never
+            idles while work is queued. TensorRT-LLM pairs it with a paged KV
+            cache and chunked prefill, the same trio found in every serious
+            engine, but what distinguishes the implementation is where it
+            lives: the batch manager and executor are C++, sitting under
+            <code>cpp/tensorrt_llm/</code>, with Python bindings above them.
+            <mark>The scheduling loop runs in C++ precisely because at high
+            request rates the scheduler itself becomes the bottleneck</mark>,
+            and keeping it out of Python is part of how the engine sustains
+            throughput at production request rates. The same executor API is
+            what Triton Inference Server drives when TensorRT-LLM is deployed
+            behind it in a datacenter.
+          </p>
+
+          <h2>Idea three: quantization co-designed with the hardware</h2>
+          <p>
+            Every inference engine quantizes; TensorRT-LLM is where
+            quantization meets the silicon first, because the formats are
+            NVIDIA's own. FP8 arrived with Hopper's transformer engine and
+            FP4 with Blackwell, each backed by dedicated tensor-core
+            datapaths, and this library carries the kernels that exploit them,
+            from fused attention through the CUTLASS-based GEMM extensions in
+            the C++ tree. The checkpoints themselves typically come from the
+            TensorRT Model Optimizer toolkit, and NVIDIA publishes
+            pre-quantized FP8 and FP4 versions of popular open models on
+            Hugging Face so that serving them is a model-name change rather
+            than a calibration project. The practical takeaway is that on
+            recent NVIDIA hardware, low-precision floating point is not an
+            accuracy compromise bolted on afterwards but the intended operating
+            point the chips were designed around, and this repository is where
+            that intent becomes runnable code.
+          </p>
+
+          <h2>Reading the repository</h2>
+          <p>
+            The repo is two codebases sharing a roof: the Python package in
+            <code>tensorrt_llm/</code> and the C++ core in
+            <code>cpp/tensorrt_llm/</code>. Start on the Python side with the
+            LLM API under <code>llmapi/</code>, the class from the quickstart,
+            and the CLI entry points under <code>commands/</code>, which show
+            how <code>trtllm-serve</code> assembles the same pieces. The
+            PyTorch backend lives under <code>_torch/</code>, and it is the
+            most instructive read in the project: model definitions, attention
+            backends, and the glue that swaps standard modules for optimized
+            kernels, with the model zoo in <code>models/</code> and the
+            quantization interfaces in <code>quantization/</code> beside it.
+            The <code>executor/</code> package is the bridge downward into
+            C++, where <code>batch_manager/</code> owns request scheduling and
+            the KV cache, <code>runtime/</code> owns engine and buffer
+            management, and <code>kernels/</code> with
+            <code>cutlass_extensions/</code> holds the attention and GEMM
+            code, bound back to Python through the torch ops in
+            <code>thop/</code>. The <code>examples/</code> tree keeps
+            per-model scripts including the legacy engine-build flow. A good
+            first session is to run the LLM API example, then trace one
+            generate call from <code>llmapi/</code> through the executor
+            bindings until you cross the C++ boundary; my
+            <a href="/systems/llm-inference">LLM serving design write-up</a>
+            is a useful companion for why each layer you pass through exists.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> TensorRT-LLM shows what inference
+            looks like when the engine and the silicon come from the same
+            company: compile-time optimization pushed as far as it can go, then
+            deliberately pulled back into the kernels when model velocity made
+            whole-graph compilation a liability, wrapped around a C++ runtime
+            and quantization formats the GPUs themselves were designed to run.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+  </body>
+</html>

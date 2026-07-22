@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>FlashAttention walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A walkthrough of the Dao-AILab flash-attention repository: how to use it in five minutes, why IO-awareness and tiling with online softmax make exact attention fast, how the CUDA and CUTLASS kernels are organized, and a guided reading path." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>flash-attention</h1>
+        <p class="lead">
+          <a href="https://github.com/Dao-AILab/flash-attention" target="_blank" rel="noreferrer">flash-attention</a>
+          is Tri Dao's reference implementation of FlashAttention, the
+          IO-aware exact attention algorithm from the 2022 paper and its
+          successors, and it is quietly one of the most consequential
+          repositories in ML: nearly every serious training and inference
+          stack, PyTorch and vLLM included, either links these kernels or
+          reimplements their algorithm. This walkthrough covers how to use it
+          in five minutes, the two ideas that let exact attention run without
+          ever materializing the attention matrix, how the CUDA and CUTLASS
+          code is organized, and a guided path for reading a repository that
+          is mostly kernels.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Using it in five minutes</h2>
+          <p>
+            The package compiles CUDA at install time unless a prebuilt wheel
+            matches your environment, so the install line is famous for both
+            its flag and its patience requirement:
+          </p>
+          <pre><code>pip install flash-attn --no-build-isolation</code></pre>
+          <p>
+            The core API is a single function that behaves like a fused
+            replacement for the softmax-attention computation, taking query,
+            key, and value tensors in fp16 or bf16 on an Ampere or newer GPU,
+            with shape (batch, seqlen, nheads, headdim):
+          </p>
+          <pre><code>import torch
+from flash_attn import flash_attn_func
+
+q = torch.randn(2, 4096, 16, 64, dtype=torch.bfloat16, device="cuda")
+k = torch.randn(2, 4096, 16, 64, dtype=torch.bfloat16, device="cuda")
+v = torch.randn(2, 4096, 16, 64, dtype=torch.bfloat16, device="cuda")
+
+out = flash_attn_func(q, k, v, causal=True)</code></pre>
+          <p>
+            Variants cover the shapes real systems need:
+            <code>flash_attn_varlen_func</code> takes packed
+            variable-length sequences with cumulative-length offsets so
+            padding tokens are never computed,
+            <code>flash_attn_qkvpacked_func</code> takes a fused QKV tensor,
+            and <code>flash_attn_with_kvcache</code> serves incremental
+            decoding against a KV cache. In practice, though, most people
+            never import the package directly; PyTorch exposes the algorithm
+            through <code>torch.nn.functional.scaled_dot_product_attention</code>,
+            and Hugging Face models take
+            <code>attn_implementation="flash_attention_2"</code> in
+            <code>from_pretrained</code>, so the repository's reach is far
+            larger than its import count.
+          </p>
+
+          <h2>Idea one: attention is bound by memory traffic, not math</h2>
+          <p>
+            The starting observation is about hardware, not algorithms. A GPU
+            has a small amount of very fast on-chip SRAM per streaming
+            multiprocessor and a large pool of high-bandwidth memory that is,
+            relative to the compute units, painfully slow, so for operations
+            that do little arithmetic per byte the runtime is set by memory
+            traffic rather than FLOPs. Standard attention is the worst
+            offender: it computes the full N by N score matrix, writes it to
+            HBM, reads it back to take a softmax, writes the result again,
+            and reads it once more to multiply by V, moving quadratically
+            much data through the slow memory for what is fundamentally two
+            matrix multiplies and a normalization.
+          </p>
+          <p>
+            <mark>FlashAttention's reframing is that attention should be
+            counted in memory accesses, and an exact algorithm that never
+            writes the score matrix to HBM will beat a mathematically
+            identical one that does, without any approximation.</mark> That
+            is the meaning of IO-aware in the paper's title, and it is why
+            the speedup came as a surprise: the community had spent years on
+            sparse and low-rank approximations to reduce FLOPs, when the
+            dominant cost for realistic sequence lengths was the quadratic
+            memory traffic, which tiling removes while keeping the answer
+            bit-for-bit exact in exact arithmetic. Memory use for the
+            attention computation drops from quadratic to linear in sequence
+            length as a corollary, since the N by N matrix simply never
+            exists.
+          </p>
+
+          <h2>Idea two: tiling with online softmax, and recomputation</h2>
+          <p>
+            The obstacle to tiling attention was always the softmax, because
+            its denominator sums over a full row of scores, which seems to
+            require having the whole row before any output can be produced.
+            The escape is the online softmax recurrence: process the row in
+            blocks, and for each new block update a running maximum and a
+            running sum of exponentials, rescaling the partial output
+            accumulated so far by the factor the new maximum implies. Each
+            key/value block can then be loaded into SRAM, multiplied against
+            the query block, folded into the running statistics, and
+            discarded, so <mark>the kernel streams over a matrix it never
+            holds, keeping one tile and three running quantities where the
+            naive algorithm kept N squared scores</mark>. I derive this
+            recurrence step by step, with kernels, on my
+            <a href="/ml/softmax">softmax page</a>, and it is worth working
+            through once by hand because the whole repository is this one
+            identity plus engineering.
+          </p>
+          <p>
+            The backward pass adds a second trade. Backpropagating through
+            attention normally needs the score matrix that forward refused to
+            store, so FlashAttention recomputes the tiles during the backward
+            pass instead, keeping only the output and the per-row softmax
+            statistics from forward. That spends extra FLOPs to avoid
+            quadratic reads and writes, and on memory-bound hardware the
+            recomputation is the cheaper side of the ledger, which is the
+            same compute-for-memory exchange as activation checkpointing but
+            applied inside a single operator. FlashAttention-2, the 2023
+            follow-up that is the repository's current mainline, kept the
+            algorithm and reworked the parallelization: it splits work across
+            the sequence-length dimension as well as batch and heads, so long
+            sequences at small batch sizes still fill the GPU, and it
+            rebalances the work between warps to cut shared-memory traffic
+            within a thread block.
+          </p>
+
+          <h2>Idea three: what the kernels are made of</h2>
+          <p>
+            The CUDA under <code>csrc/</code> is written against NVIDIA's
+            CUTLASS, vendored as a submodule, and mostly against CuTe, its
+            layout-algebra layer, in which tensors carry their shapes and
+            strides in the type system and the partitioning of a tile across
+            warps and threads is expressed algebraically rather than with
+            hand-written index arithmetic. This is what keeps a kernel family
+            covering multiple head dimensions, dtypes, causal and
+            non-causal masking, and forward and backward passes maintainable:
+            the algorithm is written once over abstract layouts, and C++
+            templates instantiate the concrete variants. It also explains the
+            repository's generational structure, because each GPU
+            architecture changes what the fastest kernel looks like. The
+            FlashAttention-2 kernels target Ampere and Ada, while
+            FlashAttention-3, which lives separately under
+            <code>hopper/</code> with its own build, rewrites the pipeline
+            around Hopper's asynchronous hardware, using warp specialization
+            so some warps move data while others compute, overlapping the
+            matrix multiplies with softmax, and adding an FP8 forward path.
+            Same mathematics, new choreography per chip, which is the clearest
+            illustration in open source of how short the shelf life of a
+            state-of-the-art kernel is.
+          </p>
+
+          <h2>Reading the repository</h2>
+          <p>
+            Read it in three altitudes, and resist starting at the bottom.
+            The top is the Python package in <code>flash_attn/</code>: the
+            interface module there (<code>flash_attn_interface.py</code>)
+            defines the public functions and the
+            <code>torch.autograd.Function</code> subclasses that bind the
+            forward and backward CUDA launches into PyTorch's autograd, and
+            it is short enough to read completely; next to it,
+            <code>flash_attn/modules/</code> has an <code>mha.py</code>
+            showing how the authors embed the kernels in a full attention
+            module, and <code>flash_attn/ops/</code> collects auxiliary
+            Triton and fused kernels beyond attention itself.
+          </p>
+          <p>
+            The middle altitude is the C++ dispatch under
+            <code>csrc/flash_attn/</code>, where the API translation unit
+            validates shapes and strides, fills a parameter struct, and
+            selects a kernel instantiation by head dimension and dtype; it
+            is worth reading because it documents the actual contract, what
+            layouts are accepted, what gets padded, and which variants
+            exist. The bottom is the kernel source in the <code>src/</code>
+            subdirectory below that, where the forward kernel is the right
+            first read: find the main loop over key/value blocks and match
+            each stage, load tile, matrix multiply, running max and sum
+            update, rescale, against the online-softmax recurrence, keeping
+            the derivation beside you. After that, the backward kernel shows
+            the recomputation story, <code>hopper/</code> shows the
+            FlashAttention-3 rewrite, and <code>tests/test_flash_attn.py</code>
+            is the ground truth throughout, since it checks every variant
+            against a plain PyTorch reference implementation, which also
+            makes it the best catalog of what the library actually supports.
+            The benchmarking scripts under <code>benchmarks/</code> are the
+            honest way to see what the kernels do for your shapes on your
+            hardware.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> flash-attention is one algorithmic
+            identity, the online softmax, deployed with total commitment to a
+            hardware fact, that attention is bound by memory traffic. Tile
+            the computation so the score matrix never touches slow memory,
+            recompute instead of store in the backward pass, and re-express
+            the same mathematics for each GPU generation; everything in the
+            repository is one of those three moves.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+  </body>
+</html>

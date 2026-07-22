@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Redis walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A walkthrough of the Redis source: how to use it in five minutes, how the event loop, the object system with its listpack and skiplist encodings, and RDB/AOF persistence work, and a guided reading path from server.c to a command's reply." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>Redis</h1>
+        <p class="lead">
+          <a href="https://github.com/redis/redis" target="_blank" rel="noreferrer">Redis</a>
+          is an in-memory data structure server, created in 2009 by Salvatore
+          Sanfilippo and stewarded today by Redis Ltd, which after a period
+          under source-available licenses is offered under the AGPLv3 again as
+          of Redis 8. It is the default cache, queue, and leaderboard of the
+          industry, and it is also one of the most readable C codebases you
+          will ever open. This walkthrough covers how to use it in five
+          minutes, the single-threaded event loop, the object system and its
+          space-saving encodings, how persistence works from a process that
+          never wants to block, and a reading path that follows one command
+          from socket to reply.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Using it in five minutes</h2>
+          <p>
+            Install the server from your package manager or run the official
+            container, start it, and talk to it with the bundled client:
+          </p>
+          <pre><code>sudo apt install redis-server   # or: brew install redis
+redis-server                    # or: docker run -p 6379:6379 redis</code></pre>
+          <pre><code>$ redis-cli
+127.0.0.1:6379&gt; SET user:1000:name "Ada"
+OK
+127.0.0.1:6379&gt; GET user:1000:name
+"Ada"
+127.0.0.1:6379&gt; EXPIRE user:1000:name 60
+(integer) 1
+127.0.0.1:6379&gt; INCR pageviews
+(integer) 1
+127.0.0.1:6379&gt; ZADD leaderboard 3172 ada 2891 lin
+(integer) 2
+127.0.0.1:6379&gt; ZRANGE leaderboard 0 -1 WITHSCORES
+1) "lin"
+2) "2891"
+3) "ada"
+4) "3172"</code></pre>
+          <p>
+            That session already shows the shape of the product: strings with
+            expiry give you a cache, atomic counters give you rate limiting,
+            and sorted sets give you a leaderboard, each a data structure with
+            commands rather than tables with queries. The protocol is plain
+            text over TCP, so every language has a client, and
+            <code>redis-cli MONITOR</code> in a second terminal is the best
+            free tour of what an application actually asks its cache to do.
+          </p>
+
+          <h2>Idea one: one thread and an event loop</h2>
+          <p>
+            The core of Redis is a single thread running an event loop, written
+            from scratch in <code>ae.c</code> in a few hundred lines over
+            epoll, kqueue, or select depending on the platform. Every client
+            socket is registered with the loop, and when data arrives the
+            handler reads a command, executes it, and queues the reply, one
+            command at a time for the whole server. This sounds like a
+            limitation until you notice what it buys: <mark>because commands
+            run one at a time against data that lives entirely in memory, every
+            command is atomic by construction and the code has no locks, no
+            data races, and no lost wakeups to reason about.</mark> The design
+            works because the workload cooperates: typical operations are O(1)
+            or O(log n) touches of RAM taking microseconds, so the bottleneck
+            is the network rather than the CPU, and modern Redis lets extra
+            I/O threads handle reading and writing sockets while command
+            execution stays single-threaded. The famous corollary is that one
+            slow command, a <code>KEYS *</code> against a big keyspace, stalls
+            everyone behind it, which is why the documentation is so insistent
+            about avoiding O(n) commands in production. When one box is not
+            enough you shard across many, which is Redis Cluster's job and the
+            subject of my <a href="/systems/distributed-cache">distributed
+            cache design write-up</a>.
+          </p>
+
+          <h2>Idea two: the object system and its encodings</h2>
+          <p>
+            Every value in Redis is a <code>robj</code>, a small header
+            defined in <code>server.h</code> and managed in
+            <code>object.c</code>, carrying a type, strings, lists, sets,
+            hashes, sorted sets and more, and separately an encoding, the
+            concrete representation currently in use. That separation is the
+            trick: <mark>a type keeps one command interface while swapping its
+            underlying data structure based on size, so small collections are
+            stored as a listpack, a compact serialized buffer scanned
+            linearly, and converted to a real hash table or skiplist only when
+            they grow past configured thresholds.</mark> A small hash is
+            therefore a few contiguous bytes rather than a pointer-chasing
+            table, a list is a quicklist, a linked list whose nodes are
+            listpacks, and a large sorted set becomes the classic pairing of a
+            skiplist for order plus a dict for O(1) score lookup, implemented
+            in <code>t_zset.c</code>. The same economy shows up in strings,
+            which come in an integer encoding, an embedded short-string
+            encoding allocated inline with the header, and a general raw
+            encoding built on <code>sds.c</code>, Redis's length-prefixed
+            dynamic strings. You can watch all of this from the client with
+            <code>OBJECT ENCODING key</code>, growing a hash element by
+            element until it flips representation, which is the cheapest
+            systems lesson available anywhere.
+          </p>
+
+          <h2>Idea three: persistence without blocking</h2>
+          <p>
+            An in-memory server still has to survive restarts, and Redis offers
+            two answers with one shared trick. RDB, in <code>rdb.c</code>, is a
+            point-in-time binary snapshot of the whole dataset, and AOF, in
+            <code>aof.c</code>, is a log of every write command, replayable at
+            startup and periodically rewritten into a compact form, with
+            fsync policy configurable between every write, every second, or
+            never. The shared trick is <code>fork()</code>: for a background
+            save the process forks, and the child walks a frozen copy of the
+            dataset provided for free by the kernel's copy-on-write pages
+            while the parent keeps serving traffic, at the cost of extra
+            memory as pages diverge under write-heavy load. The practical
+            posture most deployments land on is AOF with everysec fsync for
+            durability plus RDB snapshots for fast restarts and backups, and
+            the same snapshot machinery doubles as the transfer format when a
+            replica first synchronizes.
+          </p>
+
+          <h2>Reading the repository</h2>
+          <p>
+            Everything lives flat in <code>src/</code>, and the right way in is
+            to follow one command. Start in <code>server.c</code>, where
+            <code>main()</code> loads the config, calls the server
+            initialization that creates the event loop and listening sockets,
+            and enters <code>aeMain()</code>; read <code>ae.c</code> in full,
+            it is short and self-contained with the platform backends in
+            <code>ae_epoll.c</code> and friends. Then trace a
+            <code>SET</code>: the readable event fires
+            <code>readQueryFromClient()</code> in <code>networking.c</code>,
+            the RESP protocol parser builds an argument vector, and
+            <code>processCommand()</code> in <code>server.c</code> looks up the
+            command in a table that recent versions generate from the JSON
+            specs under <code>src/commands/</code>, checks ACLs and memory, and
+            dispatches to <code>setCommand()</code> in <code>t_string.c</code>,
+            which stores the value through the keyspace dict from
+            <code>dict.c</code> and queues the reply back in
+            <code>networking.c</code>. The type files <code>t_list.c</code>,
+            <code>t_hash.c</code>, <code>t_set.c</code>, and
+            <code>t_zset.c</code> all follow the same pattern over the
+            structures in <code>listpack.c</code>, <code>quicklist.c</code>,
+            and <code>dict.c</code>, whose incremental rehashing is a gem worth
+            reading on its own. With that spine in place, <code>rdb.c</code>,
+            <code>aof.c</code>, <code>replication.c</code>, and the background
+            thread pool in <code>bio.c</code> each read as an extension of a
+            loop you already understand.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> Redis is a demonstration that doing
+            one thing at a time can be a performance strategy: a single-threaded
+            loop over in-memory data structures makes every command atomic and
+            lock-free, adaptive encodings make those structures cheap, and fork
+            with copy-on-write lets durability happen off to the side without
+            ever stopping the loop.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+  </body>
+</html>

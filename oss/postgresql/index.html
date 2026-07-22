@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PostgreSQL walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A walkthrough of the PostgreSQL source: how to use it in five minutes, how MVCC and vacuum, the write-ahead log, the process model, and extensions fit together, and a guided reading path down the query pipeline from postmaster to executor." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>PostgreSQL</h1>
+        <p class="lead">
+          <a href="https://github.com/postgres/postgres" target="_blank" rel="noreferrer">PostgreSQL</a>
+          is the open source relational database, descended from Michael
+          Stonebraker's POSTGRES project at Berkeley and developed since 1996
+          by the PostgreSQL Global Development Group, a community that takes
+          patches by mailing list rather than pull request; the canonical
+          repository lives at git.postgresql.org with a read-only mirror on
+          GitHub. It has quietly become the default backing store for new
+          applications, and its source tree is one of the best-commented large
+          C codebases in existence. This walkthrough covers how to use it in
+          five minutes, the ideas that carry the system, MVCC and vacuum, the
+          write-ahead log, the process model and its extension points, and a
+          reading path straight down the query pipeline.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Using it in five minutes</h2>
+          <p>
+            The quickest zero-install route is the official container, which
+            gives you a full server and the <code>psql</code> client:
+          </p>
+          <pre><code>docker run -d -e POSTGRES_PASSWORD=secret -p 5432:5432 postgres:17
+docker exec -it $(docker ps -lq) psql -U postgres</code></pre>
+          <p>
+            On a real machine the package manager sets up a cluster and a
+            <code>postgres</code> system user for you:
+          </p>
+          <pre><code>sudo apt install postgresql      # or: brew install postgresql@17
+sudo -u postgres createdb demo
+sudo -u postgres psql demo</code></pre>
+          <pre><code>demo=# CREATE TABLE events(id bigserial PRIMARY KEY, kind text, at timestamptz DEFAULT now());
+demo=# INSERT INTO events(kind) SELECT 'signup' FROM generate_series(1, 100000);
+demo=# CREATE INDEX ON events(kind);
+demo=# EXPLAIN ANALYZE SELECT count(*) FROM events WHERE kind = 'signup';</code></pre>
+          <p>
+            That last command is the one to remember, because
+            <code>EXPLAIN ANALYZE</code> prints the plan the optimizer chose
+            with estimated and actual costs side by side, and reading its
+            output is the daily interface to everything the rest of this page
+            describes.
+          </p>
+
+          <h2>Idea one: MVCC, or never update in place</h2>
+          <p>
+            PostgreSQL's answer to concurrency is multi-version concurrency
+            control, and its particular flavor is radical: <mark>an UPDATE
+            never modifies a row in place but writes a whole new row version,
+            and every version carries the transaction IDs that created and
+            deleted it, so each transaction simply ignores versions that are
+            not visible to its snapshot.</mark> Readers therefore never block
+            writers and writers never block readers, which is a large part of
+            why Postgres behaves so well under mixed workloads. The bill
+            arrives later: superseded and deleted row versions, dead tuples,
+            accumulate in table files as bloat, and reclaiming them is the job
+            of vacuum, run continuously by the autovacuum daemon. Vacuum also
+            has a second, non-negotiable duty, because transaction IDs are
+            32-bit counters that wrap around, so old row versions must
+            periodically be frozen, marked visible to everyone, before the
+            counter laps them. Most operational Postgres lore, from tuning
+            autovacuum on hot tables to fearing wraparound on neglected ones,
+            is a direct corollary of this one storage decision, and it is the
+            central trade-off I lean on in my
+            <a href="/software/notes/databases-for-system-design">databases
+            note</a>.
+          </p>
+
+          <h2>Idea two: everything flows through the WAL</h2>
+          <p>
+            Durability rests on a single mechanism: before any change touches a
+            table or index page, a record describing it is appended to the
+            write-ahead log, and a commit means the WAL, not the data files,
+            has reached disk. Data pages are modified in a shared buffer cache
+            and written back lazily, with periodic checkpoints bounding how
+            much log must be replayed after a crash. What makes the WAL the
+            most load-bearing component in the system is how much else turned
+            out to be the same problem: <mark>crash recovery, streaming
+            replication, and point-in-time recovery are all one mechanism,
+            because a replica is just a server replaying the primary's WAL and
+            a restore is just a base backup replayed forward to a chosen
+            moment.</mark> Logical replication and change-data-capture tools
+            decode the same stream into row-level events, which is why the WAL
+            is also the integration point for the wider data ecosystem.
+          </p>
+
+          <h2>Idea three: a process per connection, extensible at every joint</h2>
+          <p>
+            Architecturally the server is a family of processes rather than
+            threads: the postmaster listens for connections and forks a
+            dedicated backend process for each one, cooperating through shared
+            memory that holds the buffer cache and lock tables, while
+            background processes, the checkpointer, the WAL writer, the
+            autovacuum launcher and its workers, do the housekeeping. The
+            model buys isolation, since a crashing backend cannot silently
+            corrupt its siblings, at the price of connections being expensive,
+            which is why serious deployments put a pooler such as PgBouncer in
+            front. The other defining trait is extensibility, inherited from
+            the original Berkeley design: types, operators, functions, and
+            even index access methods are rows in system catalogs rather than
+            hardcoded lists, so an extension loaded with
+            <code>CREATE EXTENSION</code> can add all of them. That is how
+            PostGIS turns Postgres into a geospatial database and how
+            pg_stat_statements, foreign data wrappers, and the vector-search
+            extensions work, and it is the main reason Postgres keeps
+            absorbing workloads that once required specialized systems.
+          </p>
+
+          <h2>Reading the repository</h2>
+          <p>
+            Clone the <a href="https://github.com/postgres/postgres" target="_blank" rel="noreferrer">mirror</a>
+            and live in <code>src/backend/</code>, whose subdirectories map
+            almost one-to-one onto the pipeline, and read the README files
+            scattered through the tree, which are genuinely excellent, with
+            <code>src/backend/optimizer/README</code> the standout. Begin at
+            <code>postmaster/postmaster.c</code> to see the fork-per-connection
+            model, then move to <code>tcop/postgres.c</code>, the traffic cop,
+            where <code>exec_simple_query()</code> is the spine of the whole
+            system: a query string goes to the parser in <code>parser/</code>
+            with the grammar in <code>gram.y</code>, through the rewriter in
+            <code>rewrite/</code> where views and rules are expanded, into the
+            planner via <code>optimizer/plan/planner.c</code>, which builds
+            candidate paths in <code>optimizer/path/allpaths.c</code> and
+            prices them with the cost model in
+            <code>optimizer/path/costsize.c</code> using statistics gathered
+            by ANALYZE, and finally to the executor in <code>executor/</code>,
+            starting at <code>execMain.c</code>, where plan nodes pull tuples
+            from each other one at a time. Below that, row storage and
+            visibility live in <code>access/heap/</code>, vacuum's hard work in
+            <code>access/heap/vacuumlazy.c</code> with its entry point in
+            <code>commands/vacuum.c</code>, the buffer cache in
+            <code>storage/buffer/bufmgr.c</code>, and the WAL machinery in
+            <code>access/transam/xlog.c</code>. A good first exercise is to
+            take one query, read its <code>EXPLAIN</code> output, and find the
+            executor node file that implements each plan node, since the names
+            match almost exactly.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> PostgreSQL is a small number of old,
+            sound decisions compounding for decades: version rows instead of
+            locking them and pay for it with vacuum, log every change once and
+            derive recovery and replication from that log, isolate connections
+            in processes, and keep the system's own behavior in catalogs so
+            extensions can teach an ancient codebase new tricks.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+  </body>
+</html>
