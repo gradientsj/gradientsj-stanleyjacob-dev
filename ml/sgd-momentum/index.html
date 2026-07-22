@@ -1,0 +1,623 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SGD and momentum · Stanley Jacob</title>
+    <meta name="description" content="Stochastic gradient descent and heavy-ball momentum from first principles: the condition-number convergence rate on quadratics, gradient noise as both obstacle and regularizer, momentum derived two ways, Nesterov's lookahead, and from-scratch optimizers verified against torch.optim.SGD and optax.sgd." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" integrity="sha384-eFTL69TLRZTkNfYZOLM+G04821K1qZao/4QLJbet1pP4tcF+fdXq/9CdqAbWRl/L" crossorigin="anonymous" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml" class="active">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/ml">Machine learning</a></div>
+        <h1>SGD and momentum</h1>
+        <p class="lead">
+          Stochastic gradient descent is the algorithm every other optimizer is
+          measured against, and momentum is the one modification that survived
+          sixty years of alternatives. This page derives why plain gradient
+          descent slows to a crawl on ill-conditioned problems, why minibatch
+          noise is both the price of scale and a quiet regularizer, and what the
+          momentum buffer actually does, seen once as an exponential average of
+          gradients and once as physics. Then it builds the optimizer from
+          scratch in PyTorch and JAX and verifies both, step for step, against
+          torch.optim.SGD and optax.sgd.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>What it is and when you reach for it</h2>
+          <p>
+            SGD updates parameters by stepping against a gradient estimated on a
+            random minibatch: θ ← θ − η·g, where g averages the per-example
+            gradients of the loss. Add a momentum buffer that accumulates
+            gradients across steps and you have the optimizer that trained
+            AlexNet, every ResNet, and most of computer vision since. It sits at
+            the base of the optimizer family tree: <a href="/ml/adam">Adam</a>
+            is SGD with per-coordinate step sizes bolted on, and every schedule
+            trick on the <a href="/ml/lr-schedules">learning-rate schedules
+            page</a> modulates the same η that appears here. You reach for
+            SGD with momentum when you want the fewest moving parts, when the
+            problem is a convnet where it is still the strongest known recipe,
+            or when you need a baseline whose behavior you can actually reason
+            about. You reach past it, usually to Adam, when gradients across
+            parameters differ in scale by orders of magnitude, which is the
+            situation in transformers.
+          </p>
+
+          <h2>The math</h2>
+          <h3>Gradient descent on a quadratic, and the condition number</h3>
+          <p>
+            The clean setting is the quadratic f(x) = ½·x<sup>T</sup>Ax with A
+            symmetric positive definite, because near any minimum every smooth
+            loss looks like this with A the Hessian. The gradient is Ax, so
+            gradient descent iterates x<sub>t+1</sub> = (I − ηA)x<sub>t</sub>.
+            Decompose x along the eigenvectors of A: the component along the
+            eigenvector with eigenvalue λ<sub>i</sub> is multiplied by
+            (1 − ηλ<sub>i</sub>) every step. Convergence therefore requires
+            |1 − ηλ<sub>i</sub>| &lt; 1 for every eigenvalue, which pins
+            η &lt; 2/λ<sub>max</sub>, and the overall rate is set by whichever
+            direction contracts slowest. The best single η balances the two
+            extremes, η* = 2/(λ<sub>min</sub> + λ<sub>max</sub>), and gives the
+            worst-direction contraction factor
+          </p>
+          <p>
+            rate = (κ − 1)/(κ + 1), where κ = λ<sub>max</sub>/λ<sub>min</sub>
+            is the condition number.
+          </p>
+          <p>
+            A small worked example makes the pain concrete. Take
+            A = diag(1, 100), so κ = 100. The optimal step is
+            η* = 2/101 ≈ 0.0198 and both directions contract by exactly
+            0.9802 per step. Halving the error takes ln 2 / ln(1/0.9802) ≈ 35
+            steps; reaching 10<sup>−6</sup> of the initial error takes about
+            690. The steep direction is not the problem, it would converge in a
+            handful of steps on its own; <mark>the problem is that the steep
+            direction caps the step size while the shallow direction sets the
+            distance, and one η must serve both.</mark> Deep-network Hessians
+            have condition numbers far beyond 100, which is why plain gradient
+            descent is never used bare.
+          </p>
+
+          <h3>Stochasticity: noise as tax and as regularizer</h3>
+          <p>
+            The minibatch gradient is an unbiased estimate of the full gradient,
+            with covariance shrinking like Σ/B for batch size B. This costs
+            something and buys something. The cost: near a minimum the updates
+            no longer converge but bounce inside a noise ball whose radius grows
+            with η and with the noise scale, roughly η·Σ/B for SGD on a
+            quadratic. That is the fundamental reason the learning rate must
+            decay over training, which is the subject of the
+            <a href="/ml/lr-schedules">schedules page</a>, and it is why
+            training runs like <a href="/oss/nanogpt">nanoGPT</a>'s end at a
+            small fraction of their peak learning rate rather than at the peak. The benefit is
+            subtler and partly empirical: the noise acts like a temperature that
+            helps trajectories leave sharp, narrow basins and settle in flat
+            ones, and flat minima correlate with better generalization in
+            practice. Keskar et al. observed that very large batches (less
+            noise) tend toward sharper minima and worse test accuracy, and Goyal
+            et al.'s linear scaling rule, multiply η by k when you multiply B by
+            k, can be read as keeping the noise scale η/B roughly constant.
+            These are careful empirical regularities, not theorems, and both
+            have documented exceptions at extreme scales, but the working
+            intuition holds up well: <mark>minibatch noise is not merely
+            tolerated, part of SGD's generalization behavior appears to depend
+            on it.</mark>
+          </p>
+
+          <h3>Heavy-ball momentum, derived twice</h3>
+          <p>
+            Momentum replaces the raw gradient with a buffer that remembers
+            past gradients:
+          </p>
+          <pre><code>v<sub>t</sub> = μ·v<sub>t−1</sub> + g<sub>t</sub>          (buffer, μ ≈ 0.9)
+x<sub>t+1</sub> = x<sub>t</sub> − η·v<sub>t</sub></code></pre>
+          <p>
+            The first view is the averaging view. Unrolling the recursion,
+            v<sub>t</sub> = g<sub>t</sub> + μ·g<sub>t−1</sub> +
+            μ<sup>2</sup>·g<sub>t−2</sub> + …, a geometrically weighted sum of
+            the gradient history with an effective memory of about 1/(1 − μ)
+            steps. Along a direction where consecutive gradients agree, the
+            geometric series compounds: with a constant gradient g the buffer
+            converges to g/(1 − μ), so at μ = 0.9 the steady-state step is ten
+            times the plain-SGD step. Along a direction where the iterate
+            overshoots and the gradient flips sign every step, the terms cancel
+            and the buffer stays small. That single mechanism is the whole
+            trick: <mark>momentum amplifies persistent gradient directions by
+            up to 1/(1 − μ) and damps oscillating ones, which is exactly the
+            medicine the ill-conditioned quadratic needs.</mark> On the
+            quadratic, tuned heavy ball (Polyak, 1964) achieves rate
+            (√κ − 1)/(√κ + 1) with μ* set to the square of that quantity. For
+            the κ = 100 example the rate improves from 0.980 to 9/11 ≈ 0.818:
+            error halves in about 3.5 steps instead of 35, and 10<sup>−6</sup>
+            arrives in roughly 70 steps instead of 690. The square root of the
+            condition number is the entire headline.
+          </p>
+          <p>
+            The second view is physical. Rewrite the update by eliminating v:
+            x<sub>t+1</sub> = x<sub>t</sub> + μ·(x<sub>t</sub> − x<sub>t−1</sub>)
+            − η·∇f(x<sub>t</sub>). This is a discretization of a ball with mass
+            rolling on the loss surface with friction, m·ẍ + c·ẋ = −∇f(x),
+            where μ plays the role of (1 − friction). A frictionless ball
+            oscillates forever; an overdamped one is plain gradient descent; the
+            useful regime is in between, where inertia carries the iterate
+            through narrow ravines and shallow noise without stalling. The
+            physical picture also predicts the failure mode: too much mass
+            (μ too close to 1) and the ball orbits the minimum instead of
+            settling, which is exactly the ringing you see on loss curves when
+            momentum is set too high for the learning rate.
+          </p>
+
+          <h3>Nesterov's lookahead</h3>
+          <p>
+            Nesterov's variant evaluates the gradient not at the current point
+            but at the point the momentum is about to carry you to:
+            v<sub>t</sub> = μ·v<sub>t−1</sub> +
+            ∇f(x<sub>t</sub> − η·μ·v<sub>t−1</sub>). If the buffer is about to
+            overshoot, the lookahead gradient already points back, so the
+            correction arrives one step earlier than heavy ball's. On smooth
+            convex problems this is the accelerated method with the optimal
+            O(1/t<sup>2</sup>) rate, versus O(1/t) for gradient descent. Deep
+            learning frameworks implement the Sutskever et al. rearrangement,
+            which keeps the parameters at the lookahead point implicitly and
+            applies the update g<sub>t</sub> + μ·v<sub>t</sub> instead of
+            v<sub>t</sub>; it is equivalent up to a reparameterization of what
+            "the parameters" means and is what the <code>nesterov=True</code>
+            flag toggles below. In stochastic, non-convex practice the gap
+            between Nesterov and heavy ball is small; it is worth a try, not a
+            reorganization of your life.
+          </p>
+
+          <h3>The momentum and learning-rate interaction</h3>
+          <p>
+            Because the buffer steady-states at g/(1 − μ), the quantity a run
+            actually experiences is the effective learning rate
+            η<sub>eff</sub> = η/(1 − μ). Move μ from 0.9 to 0.99 at fixed η and
+            you have silently multiplied the effective step by ten; most
+            "momentum 0.99 diverged" reports are really "effective learning
+            rate 10× diverged". When sweeping momentum, hold η/(1 − μ) constant
+            so you are comparing the averaging horizon, not the step size.
+            There is a second, sneakier interaction with schedules: PyTorch
+            multiplies η into the update at the end (the buffer stores
+            gradients), while the Sutskever formulation folds η into the buffer
+            itself (v = μv − η·g). At constant η they coincide; under a decaying
+            schedule they do not, because the PyTorch form rescales the entire
+            accumulated history by today's η while the folded form lets old
+            steps keep the η they were taken with. The difference is usually
+            small but it is real, and it is one reason optimizer trajectories
+            from different frameworks drift apart under aggressive schedules.
+          </p>
+
+          <h2>Implementation, twice</h2>
+          <p>
+            The PyTorch version mirrors <code>torch.optim.SGD</code>'s
+            documented algorithm exactly, including the two easy-to-miss
+            details: the first momentum step initializes the buffer to the raw
+            gradient (not (1 − dampening)·g), and weight decay is added to the
+            gradient before the buffer update, so decay rides the momentum too.
+            The JAX version is a pure init/update pair over pytrees in the
+            optax style; note that optax's <code>trace</code> transform has no
+            dampening knob, its buffer is the plain accumulator, so the two
+            libraries agree exactly when dampening is zero.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import torch
+
+class SGD:
+    """From-scratch mirror of torch.optim.SGD.
+
+    Per parameter, per step:
+        g = grad + weight_decay * p
+        if momentum != 0:
+            buf = g                                (first step)
+            buf = momentum * buf + (1-dampening)*g (afterwards)
+            g = g + momentum * buf   if nesterov else buf
+        p -= lr * g
+    """
+
+    def __init__(self, params, lr, momentum=0.0, dampening=0.0,
+                 weight_decay=0.0, nesterov=False):
+        if nesterov and (momentum &lt;= 0 or dampening != 0):
+            raise ValueError("nesterov requires momentum &gt; 0 and dampening = 0")
+        self.param_groups = [dict(params=list(params), lr=lr,
+                                  momentum=momentum, dampening=dampening,
+                                  weight_decay=weight_decay,
+                                  nesterov=nesterov)]
+        self.state = {}  # param -&gt; momentum buffer
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            mu, tau = group["momentum"], group["dampening"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad
+                if group["weight_decay"] != 0:
+                    # decay enters BEFORE the buffer: it gets momentum too
+                    g = g.add(p, alpha=group["weight_decay"])
+                if mu != 0:
+                    buf = self.state.get(p)
+                    if buf is None:
+                        # torch initializes buf = g, not (1-tau)*g
+                        buf = self.state[p] = g.clone().detach()
+                    else:
+                        buf.mul_(mu).add_(g, alpha=1.0 - tau)
+                    g = g.add(buf, alpha=mu) if group["nesterov"] else buf
+                p.add_(g, alpha=-group["lr"])
+
+    def zero_grad(self):
+        for group in self.param_groups:
+            for p in group["params"]:
+                p.grad = None</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">from typing import Any, NamedTuple
+
+import jax
+import jax.numpy as jnp
+
+
+class SGDState(NamedTuple):
+    trace: Any  # pytree of momentum buffers, mirrors params
+
+
+def sgd(lr, momentum=0.0, nesterov=False, weight_decay=0.0):
+    """Pure init/update pair in the optax GradientTransformation style.
+
+    Matches optax.sgd (= torch.optim.SGD with dampening=0):
+    the trace is an accumulator, t &lt;- g + momentum * t.
+    Zero-init makes the first step's trace equal g, same as torch.
+    """
+
+    def init(params):
+        return SGDState(trace=jax.tree_util.tree_map(jnp.zeros_like, params))
+
+    def update(grads, state, params=None):
+        if weight_decay:
+            grads = jax.tree_util.tree_map(
+                lambda g, p: g + weight_decay * p, grads, params)
+        new_trace = jax.tree_util.tree_map(
+            lambda g, t: g + momentum * t, grads, state.trace)
+        if nesterov:
+            direction = jax.tree_util.tree_map(
+                lambda g, t: g + momentum * t, grads, new_trace)
+        else:
+            direction = new_trace
+        updates = jax.tree_util.tree_map(lambda d: -lr * d, direction)
+        return updates, SGDState(trace=new_trace)
+
+    return init, update
+
+
+def apply_updates(params, updates):
+    return jax.tree_util.tree_map(lambda p, u: p + u, params, updates)</code></pre>
+          </div>
+          <p>
+            The verification harness runs both against the reference optimizers
+            on the Rosenbrock function, a classic curved valley that punishes
+            any disagreement in the update rule within a few dozen steps. The
+            whole parameter trajectory is compared, not just the endpoint, so a
+            first-step initialization bug or a misplaced dampening factor
+            cannot hide.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import torch
+
+def rosenbrock(p):
+    x, y = p
+    return (1 - x) ** 2 + 100 * (y - x ** 2) ** 2
+
+def trajectory(opt_cls, steps=300, **kw):
+    p = torch.tensor([-1.5, 2.0], requires_grad=True)
+    opt = opt_cls([p], **kw)
+    out = []
+    for _ in range(steps):
+        opt.zero_grad()
+        rosenbrock(p).backward()
+        opt.step()
+        out.append(p.detach().clone())
+    return torch.stack(out)
+
+configs = [
+    dict(lr=1e-3),
+    dict(lr=1e-3, momentum=0.9),
+    dict(lr=1e-3, momentum=0.9, nesterov=True),
+    dict(lr=1e-3, momentum=0.9, dampening=0.5),
+    dict(lr=1e-3, momentum=0.9, weight_decay=1e-2),
+]
+for kw in configs:
+    ours = trajectory(SGD, **kw)
+    ref = trajectory(torch.optim.SGD, **kw)
+    assert torch.allclose(ours, ref, atol=1e-7), kw
+print("all 5 trajectories match torch.optim.SGD exactly")</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">import jax
+import jax.numpy as jnp
+import optax
+
+def rosenbrock(p):
+    x, y = p
+    return (1 - x) ** 2 + 100 * (y - x ** 2) ** 2
+
+def trajectory(init_fn, update_fn, steps=300):
+    params = jnp.array([-1.5, 2.0])
+    state = init_fn(params)
+
+    def step(carry, _):
+        params, state = carry
+        grads = jax.grad(rosenbrock)(params)
+        updates, state = update_fn(grads, state, params)
+        params = optax.apply_updates(params, updates)
+        return (params, state), params
+
+    _, traj = jax.lax.scan(step, (params, state), None, length=steps)
+    return traj
+
+for kw in [dict(momentum=0.0), dict(momentum=0.9),
+           dict(momentum=0.9, nesterov=True)]:
+    init, update = sgd(lr=1e-3, **kw)
+    ref = optax.sgd(1e-3, momentum=kw.get("momentum") or None,
+                    nesterov=kw.get("nesterov", False))
+    ours = trajectory(init, update)
+    theirs = trajectory(ref.init, ref.update)
+    assert jnp.allclose(ours, theirs, atol=1e-7), kw
+print("all trajectories match optax.sgd exactly")</code></pre>
+          </div>
+
+          <h2>Using it on a real shape of problem</h2>
+          <p>
+            The two-parameter valley proves correctness; a small classifier
+            shows the optimizer in its natural habitat. The loop below trains a
+            784→256→10 MLP, the standard MNIST shape covered in more depth on
+            the <a href="/ml/neural-network">neural network page</a>, on
+            synthetic data with the same dimensions. With lr = 0.1 and
+            momentum = 0.9, expect cross-entropy to fall from about ln 10 ≈ 2.30
+            to well under 0.1 within a few hundred steps on separable synthetic
+            clusters; exact curves are machine and seed dependent. Rerun with
+            momentum = 0 at the same lr and the early descent is visibly
+            slower; rerun with momentum = 0.99 at the same lr and it will
+            oscillate or diverge, which is the effective-learning-rate
+            interaction from the math section showing up on schedule.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import torch
+
+torch.manual_seed(0)
+X = torch.randn(4096, 784)
+y = (X[:, :10].argmax(dim=1))          # synthetic 10-class labels
+
+model = torch.nn.Sequential(
+    torch.nn.Linear(784, 256), torch.nn.ReLU(),
+    torch.nn.Linear(256, 10),
+)
+opt = SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=1e-4)
+
+for step in range(500):
+    idx = torch.randint(0, 4096, (128,))
+    loss = torch.nn.functional.cross_entropy(model(X[idx]), y[idx])
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+    if step % 100 == 0:
+        print(step, round(loss.item(), 3))
+# expect ~2.3 at step 0, falling below ~0.3 by step 500 (machine-dependent)</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">import jax
+import jax.numpy as jnp
+import optax
+
+key = jax.random.PRNGKey(0)
+kx, k1, k2 = jax.random.split(key, 3)
+X = jax.random.normal(kx, (4096, 784))
+y = X[:, :10].argmax(axis=1)           # synthetic 10-class labels
+
+params = {
+    "w1": jax.random.normal(k1, (784, 256)) * (2.0 / 784) ** 0.5,
+    "b1": jnp.zeros(256),
+    "w2": jax.random.normal(k2, (256, 10)) * (2.0 / 256) ** 0.5,
+    "b2": jnp.zeros(10),
+}
+
+def loss_fn(params, xb, yb):
+    h = jax.nn.relu(xb @ params["w1"] + params["b1"])
+    logits = h @ params["w2"] + params["b2"]
+    return optax.softmax_cross_entropy_with_integer_labels(logits, yb).mean()
+
+init, update = sgd(lr=0.1, momentum=0.9, weight_decay=1e-4)
+state = init(params)
+
+@jax.jit
+def train_step(params, state, xb, yb):
+    loss, grads = jax.value_and_grad(loss_fn)(params, xb, yb)
+    updates, state = update(grads, state, params)
+    return optax.apply_updates(params, updates), state, loss
+
+for step in range(500):
+    key, sub = jax.random.split(key)
+    idx = jax.random.randint(sub, (128,), 0, 4096)
+    params, state, loss = train_step(params, state, X[idx], y[idx])
+    if step % 100 == 0:
+        print(step, round(float(loss), 3))
+# expect loss ~2-3 at step 0, well below 0.3 by step 500 (machine-dependent)</code></pre>
+          </div>
+
+          <h2>Applications</h2>
+          <p>
+            SGD with momentum is still the reference recipe for convolutional
+            networks. The original ResNet training used SGD with momentum 0.9,
+            weight decay 10<sup>−4</sup>, and lr 0.1 divided by 10 on a step
+            schedule, and the modern torchvision and timm ImageNet recipes are
+            refinements of the same core (cosine decay, label smoothing, longer
+            training) rather than replacements of the optimizer. Detection and
+            segmentation stacks built on those backbones, Detectron2 and
+            YOLO-family trainers among them, default to SGD with momentum for
+            the same reason. The generalization folklore deserves a careful
+            statement: Wilson et al. (2017) reported that adaptive methods can
+            generalize worse than tuned SGD on vision benchmarks, and that
+            observation shaped practice for years, but later work showed much
+            of the gap closes when Adam's hyperparameters, especially ε and
+            weight decay, are tuned as aggressively as SGD's. The honest
+            summary is that <mark>on convnets, SGD with momentum remains at
+            least as good as anything else while being simpler, whereas on
+            transformers Adam-family optimizers win clearly,</mark> plausibly
+            because attention and layer-norm gradients are badly scaled across
+            parameters in a way per-coordinate adaptation fixes and a single
+            global η cannot. Beyond vision, SGD variants train large-scale
+            recommendation models, and SGD itself is the backbone of federated
+            learning (local SGD steps averaged across devices) and of most
+            convergence theory: when a paper proves something about neural
+            network training, the object of proof is almost always SGD.
+          </p>
+
+          <h2>Against the real libraries</h2>
+          <p>
+            The production implementations to compare against are
+            <a href="https://github.com/pytorch/pytorch" target="_blank" rel="noreferrer">torch.optim.SGD</a>
+            and
+            <a href="https://github.com/google-deepmind/optax" target="_blank" rel="noreferrer">optax.sgd</a>.
+            Mathematically they compute exactly what the from-scratch versions
+            above compute, which is the point of the trajectory test. What they
+            add is engineering. PyTorch ships three execution paths for the
+            same update: a per-parameter loop, a <code>foreach</code> path that
+            batches the arithmetic across all parameters into a few large
+            multi-tensor kernels, and a <code>fused</code> path that does the
+            whole update in one kernel per dtype and device; on a model with
+            hundreds of parameter tensors the difference is a meaningful slice
+            of step time. It also handles the bookkeeping this page ignores:
+            parameter groups with per-group hyperparameters,
+            <code>state_dict</code> save and restore for resumable training,
+            sparse gradients, a <code>maximize</code> flag, a
+            <code>capturable</code> mode for CUDA graphs, and a
+            <code>differentiable</code> mode that lets you backprop through the
+            optimizer itself for meta-learning. Optax's added value is
+            compositionality: <code>optax.sgd</code> is literally
+            <code>chain(trace(momentum), scale(-lr))</code>, and the same
+            chaining gives you gradient clipping, schedules, and weight decay
+            as independent, testable transforms, a design the
+            <a href="/ml/lr-schedules">schedules page</a> leans on heavily. The
+            from-scratch version is genuinely enough for research code with a
+            single parameter group and no checkpointing, and writing it is the
+            fastest way to stop treating optimizers as black boxes. The
+            verification recipe is the one shown above and it generalizes:
+            fixed seed, identical initial parameters, run both optimizers for a
+            few hundred steps, and assert the full trajectories agree to
+            float32 tolerance across every flag combination you claim to
+            support.
+          </p>
+
+          <h2>Traps and misconceptions</h2>
+          <p>
+            <strong>"Momentum is just a bigger learning rate."</strong> No. The
+            steady-state amplification 1/(1 − μ) applies only along directions
+            where gradients persist; along oscillating directions momentum
+            shrinks the step. A bigger η scales both. That asymmetry is why
+            momentum helps on ill-conditioned losses where a bigger η alone
+            diverges.
+          </p>
+          <p>
+            <strong>Sweeping momentum without rescaling η.</strong> Because the
+            realized step scales like η/(1 − μ), comparing μ = 0.9 against
+            μ = 0.99 at fixed η is really comparing two effective learning
+            rates an order of magnitude apart. Hold η/(1 − μ) constant when you
+            change μ, or the sweep measures nothing.
+          </p>
+          <p>
+            <strong>Assuming all frameworks compute the same momentum.</strong>
+            PyTorch keeps gradients in the buffer and multiplies η at the end;
+            the Sutskever formulation folds η into the buffer. Identical at
+            constant η, different under a schedule, since PyTorch rescales the
+            whole accumulated history by the current η. Also, PyTorch's first
+            momentum step sets buf = g while some texts write
+            buf = (1 − μ)·g; and its <code>dampening</code> is a separate knob
+            that optax does not have at all. Trajectory-level tests catch every
+            one of these.
+          </p>
+          <p>
+            <strong>Weight decay here is not the decoupled kind.</strong> In
+            torch.optim.SGD (and the mirror above), decay is added to the
+            gradient before the momentum update, so the decay term is itself
+            momentum-smoothed and scaled by any schedule. That is L2
+            regularization, not the decoupled weight decay of AdamW; the
+            distinction matters more for Adam and is treated on the
+            <a href="/ml/adam">Adam page</a>, but do not assume
+            <code>weight_decay=</code> means the same thing across optimizers.
+          </p>
+          <p>
+            <strong>Expecting Nesterov to look like the textbook.</strong>
+            Frameworks do not evaluate the gradient at a lookahead point; they
+            use the Sutskever rearrangement g + μ·v, which is the same method
+            expressed at shifted coordinates. If you diff a framework's update
+            against the textbook two-point form and see disagreement, that is
+            the reparameterization, not a bug, and PyTorch additionally
+            requires dampening = 0 when nesterov is on.
+          </p>
+
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> gradient descent's speed limit is
+            the condition number, and momentum's entire job is to take the
+            square root of it: the buffer geometrically averages gradients,
+            amplifying directions that persist by up to 1/(1 − μ) and
+            cancelling directions that oscillate. Everything practical follows
+            from that one identity, including why η and μ are one knob wearing
+            two hats, and the way to trust any optimizer you write is to match
+            a reference implementation trajectory for trajectory, flag for
+            flag.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/code-tabs.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (!window.hljs) return;
+        hljs.configure({ languages: ["python", "bash", "c", "cpp", "rust", "go", "typescript", "swift", "sql", "json", "yaml", "plaintext"] });
+        hljs.highlightAll();
+      });
+    </script>
+  </body>
+</html>

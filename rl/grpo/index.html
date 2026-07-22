@@ -1,0 +1,692 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Group Relative Policy Optimization · Stanley Jacob</title>
+    <meta name="description" content="GRPO from DeepSeekMath derived against the PPO baseline: group-normalized advantages instead of a value network, the clipped ratio, the k3 KL estimator to the reference policy, a worked numeric example, verifiable rewards, the DeepSeek-R1 story, and the known length and difficulty biases, implemented in PyTorch and JAX." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" integrity="sha512-0aPQyyeZrWj9sCA46UlmWgKOP0mUipLQ6OZXu8l4IcAmD2u31EPEy9VcIMvl7SoAaKe8bLXZhYoMaE/in+gcgA==" crossorigin="anonymous" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl" class="active">RL</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/rl">Reinforcement learning</a></div>
+        <h1>Group relative policy optimization</h1>
+        <p class="lead">
+          GRPO is PPO with the value network amputated. Instead of training a
+          second model to predict how good a completion should be, it samples a
+          group of completions for the same prompt, scores them all, and uses
+          each completion's standing relative to its own group as the
+          advantage. That one substitution halved the memory bill of RL
+          fine-tuning, made rule-checkable rewards the natural fuel, and became
+          the training loop behind DeepSeek-R1. This page derives it from the
+          PPO baseline, works the numbers on a four-completion group, and
+          builds the loss in PyTorch and JAX.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>What it is and when you reach for it</h2>
+          <p>
+            Group Relative Policy Optimization is a policy-gradient algorithm
+            for fine-tuning language models with reinforcement learning,
+            introduced in the DeepSeekMath paper (Shao et al., 2024). It keeps
+            the two ideas that made <a href="/rl/ppo">PPO</a> the workhorse of
+            RLHF, the clipped importance ratio that limits how far one update
+            can move the policy and the KL leash that keeps the policy near a
+            trusted reference, and deletes the most expensive part: the learned
+            value function that PPO uses as a baseline. In its place, GRPO
+            samples a group of G completions for every prompt, scores each one
+            with a reward, and normalizes the rewards within the group. A
+            completion that beat its siblings gets a positive advantage; one
+            that lost to them gets a negative advantage; every token of the
+            completion inherits that single number. The group is the baseline.
+          </p>
+          <p>
+            You reach for GRPO when your reward arrives once per completion
+            rather than per step, which is exactly the shape of language-model
+            training: a math answer is right or wrong at the end, a program
+            passes its tests or does not. In that regime a per-token value
+            function is both hard to learn and expensive to host, and replacing
+            it with a handful of extra samples from the policy you are already
+            running is a genuinely good trade, because sampling is cheap
+            relative to training a second full-size network. Its neighbors:
+            <a href="/rl/ppo">PPO</a> is what GRPO simplifies, and
+            <a href="/rl/dpo">DPO</a> is the offline alternative that skips
+            rollouts entirely and learns directly from preference pairs. GRPO
+            sits in the online camp with PPO: it needs to generate fresh
+            completions from the current policy every step, which is where most
+            of the wall-clock time of a real run goes.
+          </p>
+
+          <h2>The math</h2>
+          <h3>The PPO baseline and what it costs</h3>
+          <p>
+            RLHF with PPO maximizes expected reward while penalizing drift from
+            a reference policy π<sub>ref</sub>, usually the SFT model. The
+            policy π<sub>θ</sub> generates a completion o for prompt q, a
+            reward model (or a checker) scores it, and PPO updates θ with the
+            clipped surrogate objective on per-token importance ratios
+            ρ<sub>t</sub> = π<sub>θ</sub>(o<sub>t</sub> | q, o<sub>&lt;t</sub>)
+            / π<sub>θ<sub>old</sub></sub>(o<sub>t</sub> | q, o<sub>&lt;t</sub>):
+          </p>
+          <p>
+            J<sub>PPO</sub>(θ) = E[ min( ρ<sub>t</sub> Â<sub>t</sub>,
+            clip(ρ<sub>t</sub>, 1−ε, 1+ε) Â<sub>t</sub> ) ].
+          </p>
+          <p>
+            The load-bearing symbol is Â<sub>t</sub>, the advantage: how much
+            better this token's outcome was than expected. PPO estimates it
+            with GAE, which requires a value function V(q, o<sub>&lt;t</sub>)
+            predicting expected future reward at every prefix, and that value
+            function is a separate trained network, in practice initialized
+            from a model comparable in size to the policy. The full PPO-RLHF
+            rig therefore holds four models: the policy being trained, the
+            frozen reference, the reward model, and the value model, two of
+            which need optimizer state and gradients. On top of the memory,
+            there is a learning problem: with a single sparse reward at the
+            final token, the value network must apportion credit across
+            thousands of prefix states from very little signal, and DeepSeekMath
+            notes it is typically trained per-token while the reward only
+            exists per-completion. The value model is the most fragile and the
+            most expensive part of the pipeline, and GRPO's entire pitch is
+            that for language-model workloads you can replace it with
+            statistics of a group of samples.
+          </p>
+
+          <h3>The GRPO move: the group is the baseline</h3>
+          <p>
+            For each prompt q, sample G completions {o<sub>1</sub>, ...,
+            o<sub>G</sub>} from the behavior policy π<sub>θ<sub>old</sub></sub>
+            and score each with a scalar reward r<sub>i</sub>. Normalize within
+            the group:
+          </p>
+          <p>
+            Â<sub>i</sub> = ( r<sub>i</sub> − mean(r<sub>1</sub>, ..., r<sub>G</sub>) )
+            / std(r<sub>1</sub>, ..., r<sub>G</sub>),
+          </p>
+          <p>
+            and assign this one number as the advantage of <em>every token</em>
+            of completion i: Â<sub>i,t</sub> = Â<sub>i</sub> for all t. This is
+            the whole trick.
+          </p>
+          <pre class="flow">prompt q ──► π_old ──► o_1 ──► reward r_1 ─┐
+              (sample   o_2 ──► reward r_2 ─┤   Â_i = (r_i − mean r) / std r
+               G times) o_3 ──► reward r_3 ─┼─►
+                        o_4 ──► reward r_4 ─┘   every token of o_i gets Â_i
+                                                (no value network anywhere)</pre>
+          <p> The group mean plays the role of the value
+            baseline (what reward should a completion of this prompt expect?),
+            estimated by Monte Carlo from siblings instead of by a neural
+            network. Subtracting a baseline that does not depend on the action
+            leaves the policy gradient unbiased in expectation, which is the
+            same argument that justifies baselines in REINFORCE; dividing by
+            the standard deviation rescales updates so easy and hard prompts
+            contribute comparable gradient magnitudes (a choice with a known
+            side effect, discussed below). The objective keeps PPO's clipped
+            ratio per token and adds an explicit KL penalty to the reference
+            policy, written as a term in the loss rather than folded into the
+            reward:
+          </p>
+          <p>
+            J<sub>GRPO</sub>(θ) = E [ (1/G) Σ<sub>i=1</sub><sup>G</sup>
+            (1/|o<sub>i</sub>|) Σ<sub>t=1</sub><sup>|o<sub>i</sub>|</sup>
+            ( min( ρ<sub>i,t</sub> Â<sub>i</sub>,
+            clip(ρ<sub>i,t</sub>, 1−ε, 1+ε) Â<sub>i</sub> )
+            − β D<sub>KL</sub>[π<sub>θ</sub> ‖ π<sub>ref</sub>]<sub>i,t</sub> ) ],
+          </p>
+          <p>
+            with ρ<sub>i,t</sub> = π<sub>θ</sub>(o<sub>i,t</sub> | q,
+            o<sub>i,&lt;t</sub>) / π<sub>θ<sub>old</sub></sub>(o<sub>i,t</sub> |
+            q, o<sub>i,&lt;t</sub>). The min-with-clip has PPO's usual
+            pessimistic reading: when the advantage is positive, the ratio is
+            capped at 1+ε so no single lucky completion can drag the policy
+            arbitrarily far; when it is negative, the objective takes the worse
+            of the two terms, so moving probability away from a bad completion
+            is also bounded. <mark>No value network appears anywhere: the only
+            trained model is the policy, and the only other forward passes are
+            the frozen reference and whatever scores the rewards.</mark>
+          </p>
+          <p>
+            The KL term uses a specific per-token estimator that DeepSeekMath
+            chose for being unbiased and guaranteed nonnegative, the k3
+            estimator in John Schulman's taxonomy of KL approximations:
+          </p>
+          <p>
+            D̂<sub>KL,i,t</sub> =
+            π<sub>ref</sub>(o<sub>i,t</sub> | q, o<sub>i,&lt;t</sub>) /
+            π<sub>θ</sub>(o<sub>i,t</sub> | q, o<sub>i,&lt;t</sub>) −
+            log ( π<sub>ref</sub>(o<sub>i,t</sub> | q, o<sub>i,&lt;t</sub>) /
+            π<sub>θ</sub>(o<sub>i,t</sub> | q, o<sub>i,&lt;t</sub>) ) − 1.
+          </p>
+          <p>
+            Writing u = π<sub>ref</sub>/π<sub>θ</sub> for the ratio at the
+            sampled token, this is u − log u − 1, which is zero at u = 1 and
+            positive everywhere else (it is the first-order Taylor remainder of
+            log at 1). Its expectation under π<sub>θ</sub> equals the true
+            KL(π<sub>θ</sub> ‖ π<sub>ref</sub>) because E[u] = 1, and unlike
+            the naive estimator −log u it never goes negative on a single
+            sample, so the penalty cannot accidentally reward drift. It needs
+            only the log-probabilities of the tokens actually sampled, not the
+            full vocabulary distribution, which is what makes it practical.
+          </p>
+
+          <h3>A worked group: rewards 1, 0, 0, 1</h3>
+          <p>
+            Take one prompt, G = 4 completions, and a binary checker that
+            scored them r = (1, 0, 0, 1): completions 1 and 4 correct, 2 and 3
+            wrong. The group mean is 0.5, the deviations are (0.5, −0.5, −0.5,
+            0.5), and the population standard deviation is
+            √((0.25·4)/4) = 0.5. So the advantages are
+          </p>
+          <p>
+            Â = ( (1−0.5)/0.5, (0−0.5)/0.5, (0−0.5)/0.5, (1−0.5)/0.5 )
+            = (+1, −1, −1, +1).
+          </p>
+          <p>
+            Every token of completions 1 and 4 gets advantage +1: the update
+            raises the probability of each of their tokens, bounded by the
+            clip. Every token of completions 2 and 3 gets −1 and is pushed
+            down. Notice the advantages sum to zero: a group teaches the model
+            nothing about how good the prompt is overall, only which of its own
+            answers were better than which. If all four completions had been
+            correct (r = 1, 1, 1, 1) the deviations would all be zero, the
+            advantages zero, and the group would contribute no policy gradient
+            at all; a prompt the model has fully mastered, or completely
+            failed, is dead weight in a GRPO batch, which is why practical
+            recipes curate prompt difficulty and implementations put an ε in
+            the denominator to survive std = 0. One bookkeeping footnote worth
+            knowing when comparing implementations: with Bessel's correction
+            (dividing by G−1 instead of G) the std here is √(1/3) ≈ 0.577 and
+            the advantages become ±0.866; PyTorch's <code>std()</code> applies
+            the correction by default while NumPy's and JAX's do not. Signs and
+            ordering never change, only the scale.
+          </p>
+          <p>
+            To see the clip act, suppose after one gradient step a token of
+            completion 1 has ratio ρ = 1.3 with ε = 0.2. Unclipped the term is
+            1.3·(+1) = 1.3; clipped it is 1.2·(+1) = 1.2; the min takes 1.2,
+            and since 1.2 is a constant with respect to θ at that point, the
+            gradient through this token is zero. The token has already moved as
+            far as this batch is allowed to move it. And to see the KL term:
+            if at some token π<sub>ref</sub>/π<sub>θ</sub> = 1.2, the penalty
+            is 1.2 − log(1.2) − 1 ≈ 0.0177, small, positive, and growing the
+            further the policy strays.
+          </p>
+
+          <h3>Where the rewards come from: checkers versus reward models</h3>
+          <p>
+            GRPO is agnostic about r, but its rise is tied to
+            <mark>reinforcement learning with verifiable rewards (RLVR):
+            rewards computed by a program, not predicted by a model.</mark>
+            For math, extract the final boxed answer and string-match or
+            symbolically compare it against ground truth; for code, run the
+            unit tests in a sandbox and reward pass rate; formatting rewards
+            check that reasoning stays inside designated tags. Verifiable
+            rewards are exactly the sparse, end-of-episode signal that made
+            value functions awkward, so they pair naturally with a
+            group-relative baseline, and they cannot be reward-hacked in the
+            way a learned reward model can: a reward model is a neural network
+            with adversarial examples, and a policy optimized against it long
+            enough will find completions that score high while being worse,
+            the over-optimization failure mode that forces early stopping and
+            KL tightening in classic RLHF. A checker has no such soft spots,
+            though it has its own failure modes: it only covers tasks with
+            checkable answers, and a sloppy checker (weak test suites, brittle
+            answer extraction) is itself a hackable reward. DeepSeekMath used
+            a reward model over math completions; DeepSeek-R1-Zero moved to
+            purely rule-based accuracy and format rewards, explicitly avoiding
+            neural reward models because of hacking risk. Both fit the same
+            GRPO loss unchanged.
+          </p>
+
+          <h3>Known subtleties: length bias and the Dr. GRPO discussion</h3>
+          <p>
+            The 1/|o<sub>i</sub>| in the objective, averaging the per-token
+            terms over each completion's own length, looks innocuous and has
+            become the most discussed line of the algorithm. "Understanding
+            R1-Zero-Like Training" (Liu et al., 2025), the Dr. GRPO paper,
+            argues that this normalization biases the gradient with respect to
+            length: for a completion with negative advantage, doubling its
+            length halves the per-token penalty, so among wrong answers the
+            longer ones are punished less per token, and the policy can drift
+            toward longer and longer incorrect responses without those
+            responses getting better. The authors point to this as one
+            contributor to the growing response lengths observed in
+            R1-Zero-style runs, alongside any genuine gains from longer
+            reasoning; how much of the observed length growth each cause
+            explains is still debated, and lengthening also happens for
+            benign reasons, so treat this as a documented bias rather than a
+            full explanation. Their second objection targets the std division:
+            prompts where the group's rewards barely vary (very easy or very
+            hard prompts, where std is small) get their advantages inflated by
+            the small denominator, so the difficulty distribution of your
+            prompt set silently reweights the gradient. Dr. GRPO ("GRPO Done
+            Right") removes both terms: divide by a constant rather than
+            |o<sub>i</sub>|, and use r<sub>i</sub> − mean(r) without the std,
+            recovering an unbiased Monte Carlo baseline. Reported results show
+            similar reasoning performance with noticeably shorter outputs.
+            The community has not fully converged: the original form remains
+            widely used, TRL exposes both as loss variants, and follow-up work
+            continues to trade off the variants' stability. The
+            implementations below use the original DeepSeekMath form and mark
+            the two contested lines so you can see exactly what Dr. GRPO
+            deletes.
+          </p>
+
+          <h2>Implementation, twice</h2>
+          <p>
+            The loss is a pure function of things you can hand it as tensors:
+            per-token log-probabilities of the sampled completion tokens under
+            the current policy, the behavior policy that generated them, and
+            the frozen reference, plus one reward per completion and a mask
+            marking real completion tokens. Batch layout: B = n_prompts × G
+            rows, with the G completions of each prompt contiguous. Everything
+            is vectorized; no loops over completions.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import torch
+
+def group_advantages(rewards, group_size, eps=1e-4):
+    """rewards: (B,) with B = n_prompts * group_size; the G completions
+    of each prompt are contiguous rows. Returns (B,) advantages,
+    constant across all tokens of a completion."""
+    r = rewards.view(-1, group_size)          # (n_prompts, G)
+    mean = r.mean(dim=1, keepdim=True)
+    std = r.std(dim=1, keepdim=True)          # note: Bessel-corrected (G-1)
+    adv = (r - mean) / (std + eps)            # Dr. GRPO drops the std here
+    return adv.view(-1)                       # (B,)
+
+def grpo_loss(logp_new, logp_old, logp_ref, rewards, mask,
+              group_size, clip_eps=0.2, kl_coef=0.04):
+    """logp_new/old/ref: (B, T) log-probs of the sampled completion
+    tokens under current / behavior / reference policies. mask: (B, T),
+    1.0 on completion tokens, 0.0 on padding. rewards: (B,).
+    Returns scalar loss (negated DeepSeekMath objective)."""
+    adv = group_advantages(rewards, group_size).unsqueeze(1)   # (B, 1)
+
+    ratio = torch.exp(logp_new - logp_old)                     # (B, T)
+    unclipped = ratio * adv
+    clipped = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * adv
+    pg = -torch.min(unclipped, clipped)                        # (B, T)
+
+    # k3 KL estimator: u - log u - 1 with u = pi_ref / pi_theta.
+    # Zero iff u == 1, always &gt;= 0, unbiased for KL(pi_theta || pi_ref).
+    log_u = logp_ref - logp_new                                # (B, T)
+    kl = torch.exp(log_u) - log_u - 1.0                        # (B, T)
+
+    per_token = pg + kl_coef * kl                              # (B, T)
+    # Mean over each completion's own tokens (the 1/|o_i| term that
+    # Dr. GRPO replaces with a constant), then mean over completions.
+    per_seq = (per_token * mask).sum(1) / mask.sum(1).clamp(min=1)
+    return per_seq.mean()</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">import jax
+import jax.numpy as jnp
+
+def group_advantages(rewards, group_size, eps=1e-4):
+    """rewards: (B,) with B = n_prompts * group_size; the G completions
+    of each prompt are contiguous rows. Returns (B,) advantages."""
+    r = rewards.reshape(-1, group_size)       # (n_prompts, G)
+    mean = r.mean(axis=1, keepdims=True)
+    std = r.std(axis=1, keepdims=True, ddof=1)  # ddof=1 matches torch.std
+    adv = (r - mean) / (std + eps)            # Dr. GRPO drops the std here
+    return adv.reshape(-1)                    # (B,)
+
+def grpo_loss(logp_new, logp_old, logp_ref, rewards, mask,
+              group_size, clip_eps=0.2, kl_coef=0.04):
+    """logp_new/old/ref: (B, T); mask: (B, T); rewards: (B,).
+    Returns scalar loss (negated DeepSeekMath objective)."""
+    adv = group_advantages(rewards, group_size)[:, None]       # (B, 1)
+
+    ratio = jnp.exp(logp_new - logp_old)                       # (B, T)
+    unclipped = ratio * adv
+    clipped = jnp.clip(ratio, 1 - clip_eps, 1 + clip_eps) * adv
+    pg = -jnp.minimum(unclipped, clipped)                      # (B, T)
+
+    # k3 KL estimator: u - log u - 1 with u = pi_ref / pi_theta.
+    log_u = logp_ref - logp_new
+    kl = jnp.exp(log_u) - log_u - 1.0                          # (B, T)
+
+    per_token = pg + kl_coef * kl                              # (B, T)
+    # Token-average per completion (the 1/|o_i| term), then batch mean.
+    per_seq = (per_token * mask).sum(1) / jnp.maximum(mask.sum(1), 1.0)
+    return per_seq.mean()</code></pre>
+          </div>
+          <p>
+            One step of training wires the loss to a policy. To keep this page
+            runnable on synthetic tensors, the "policy" below is a tiny
+            embedding-plus-head language model and the "rollouts" are random
+            token ids with random binary rewards; the shapes and the gradient
+            flow are exactly those of the real thing. Be clear about what this
+            omits: <mark>in production the completions come from a serving
+            engine (vLLM or SGLang) running alongside training, with policy
+            weights re-synced into it every step, and that generation loop,
+            not the loss, is where the engineering lives.</mark> That is the
+            problem verl and TRL exist to solve; the loss they apply afterward
+            is the function above.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import copy
+import torch.nn as nn
+import torch.nn.functional as F
+
+class TinyLM(nn.Module):
+    """Stand-in for a causal LM: token embedding -&gt; GRU-free mixing
+    (a linear over the embedding) -&gt; vocab logits. Enough structure
+    to make the GRPO loss differentiable end to end."""
+    def __init__(self, vocab=256, dim=64):
+        super().__init__()
+        self.emb = nn.Embedding(vocab, dim)
+        self.head = nn.Linear(dim, vocab)
+
+    def token_logprobs(self, tokens):
+        """tokens: (B, T+1) ids. Returns (B, T): log p(tokens[:, 1:])
+        with position t predicted from the embedding at position t."""
+        logits = self.head(self.emb(tokens[:, :-1]))   # (B, T, V)
+        logp = F.log_softmax(logits, dim=-1)
+        return logp.gather(-1, tokens[:, 1:].unsqueeze(-1)).squeeze(-1)
+
+torch.manual_seed(0)
+n_prompts, G, T, vocab = 4, 8, 128, 256
+B = n_prompts * G
+
+policy = TinyLM(vocab)
+ref = copy.deepcopy(policy).requires_grad_(False)   # frozen reference
+opt = torch.optim.AdamW(policy.parameters(), lr=1e-4)
+
+# --- rollout phase (synthetic; really: vLLM/SGLang generation) ---
+tokens = torch.randint(vocab, (B, T + 1))           # sampled completions
+mask = torch.ones(B, T)                             # all tokens real here
+rewards = torch.randint(0, 2, (B,)).float()         # checker output per row
+with torch.no_grad():
+    logp_old = policy.token_logprobs(tokens)        # behavior policy snapshot
+    logp_ref = ref.token_logprobs(tokens)
+
+# --- update phase ---
+logp_new = policy.token_logprobs(tokens)            # grads flow through this
+loss = grpo_loss(logp_new, logp_old, logp_ref, rewards, mask, G)
+opt.zero_grad(); loss.backward(); opt.step()
+print(float(loss))   # ~0.0 on the first step: see next section</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">def init_lm(key, vocab=256, dim=64):
+    ke, kh = jax.random.split(key)
+    return {'emb': jax.random.normal(ke, (vocab, dim)) * 0.02,
+            'w': jax.random.normal(kh, (dim, vocab)) * 0.02,
+            'b': jnp.zeros(vocab)}
+
+def token_logprobs(params, tokens):
+    """tokens: (B, T+1) ids -&gt; (B, T) log p(tokens[:, 1:])."""
+    h = params['emb'][tokens[:, :-1]]                  # (B, T, dim)
+    logits = h @ params['w'] + params['b']             # (B, T, V)
+    logp = jax.nn.log_softmax(logits, axis=-1)
+    return jnp.take_along_axis(
+        logp, tokens[:, 1:, None], axis=-1)[..., 0]    # (B, T)
+
+key = jax.random.PRNGKey(0)
+n_prompts, G, T, vocab = 4, 8, 128, 256
+B = n_prompts * G
+
+k1, k2, k3 = jax.random.split(key, 3)
+params = init_lm(k1, vocab)
+ref_params = jax.tree_util.tree_map(jnp.copy, params)  # frozen reference
+
+# --- rollout phase (synthetic; really: vLLM/SGLang generation) ---
+tokens = jax.random.randint(k2, (B, T + 1), 0, vocab)
+mask = jnp.ones((B, T))
+rewards = jax.random.bernoulli(k3, 0.5, (B,)).astype(jnp.float32)
+logp_old = token_logprobs(params, tokens)              # snapshot, no grads
+logp_ref = token_logprobs(ref_params, tokens)
+
+@jax.jit
+def train_step(params, tokens, logp_old, logp_ref, rewards, mask, lr=1e-4):
+    def loss_fn(p):
+        logp_new = token_logprobs(p, tokens)
+        return grpo_loss(logp_new, logp_old, logp_ref, rewards, mask, G)
+    loss, grads = jax.value_and_grad(loss_fn)(params)
+    params = jax.tree_util.tree_map(lambda p, g: p - lr * g, params, grads)
+    return params, loss
+
+params, loss = train_step(params, tokens, logp_old, logp_ref, rewards, mask)
+print(float(loss))   # ~0.0 on the first step: see next section</code></pre>
+          </div>
+
+          <h2>Using it on a real shape of problem</h2>
+          <p>
+            Realistic shapes for a small reasoning run: 32 to 512 prompts per
+            batch, G = 8 to 16 completions each (TRL's docs suggest at least 8
+            for stable group statistics), and completion lengths from a few
+            hundred tokens to tens of thousands for long-chain reasoning, so
+            the log-prob tensors above become (256, 4096) and larger and the
+            rollout phase dominates wall clock. The synthetic run above prints
+            a first-step loss of approximately zero, and it is worth
+            understanding why that is correct rather than a bug. On the first
+            update, the policy has not moved since the rollout, so
+            logp_new = logp_old, every ratio is exactly 1, and the
+            policy-gradient term of each completion reduces to −Â<sub>i</sub>;
+            averaged over a group whose advantages are centered, that is zero.
+            The KL term is also zero because the policy still equals the
+            reference. <mark>A zero loss with a nonzero gradient is the
+            expected signature of a fresh GRPO step; the number to watch is
+            not the loss but the reward mean, the KL, and the completion
+            length.</mark> Over a healthy run you should see mean reward on
+            held-out prompts climb, KL grow slowly and roughly monotonically
+            (if it spikes, β is too small or the learning rate too high), and
+            length drift that you should track deliberately given the biases
+            discussed above. Exact numbers are machine- and task-dependent;
+            the qualitative curves are not.
+          </p>
+
+          <h2>Applications</h2>
+          <p>
+            GRPO's headline application is reasoning models. DeepSeek-R1-Zero
+            took the DeepSeek-V3 base model, no SFT at all, and ran GRPO
+            against rule-based rewards (answer accuracy plus a format reward
+            keeping deliberation inside think tags) until long chain-of-thought
+            reasoning, self-checking, and backtracking emerged on their own;
+            DeepSeek-R1 wrapped that recipe with a small cold-start SFT stage
+            and further rounds to get a usable assistant, and the R1 paper made
+            GRPO the default vocabulary word for this whole training style.
+            The pattern generalized quickly: open reasoning efforts across the
+            ecosystem (the open R1 reproductions, Qwen-style reasoning
+            pipelines, and a long tail of academic RLVR papers) train with
+            GRPO or one of its descendants (DAPO, Dr. GRPO, GSPO and friends)
+            on math datasets with symbolic answer checkers and code datasets
+            with unit-test rewards. Beyond pure reasoning, the same loop
+            trains agents and tool users, where the verifiable reward is task
+            completion (the patch passes the test suite, the SQL query returns
+            the right table), and it slots into standard RLHF stacks as a
+            cheaper PPO wherever a reward model already exists. Allen AI's
+            Tülu 3 pipeline is a clean public example of where this sits in a
+            modern post-training stack: SFT, then <a href="/rl/dpo">DPO</a> on
+            preferences, then online RL with verifiable rewards as the final
+            stage. When a lab says "we did RL on verifiable rewards", GRPO or
+            a close variant is usually the loss underneath.
+          </p>
+
+          <h2>Against the real libraries</h2>
+          <p>
+            The loss on this page is complete, but a GRPO run is mostly not
+            the loss: it is generating millions of tokens per step from a
+            model that changes every step. Production frameworks earn their
+            keep in that gap.
+          </p>
+          <p>
+            <a href="https://github.com/volcengine/verl" target="_blank" rel="noreferrer">verl</a>
+            (my notes at <a href="/rl/verl">/rl/verl</a>) is the open-source
+            implementation of the HybridFlow paper and the closest thing to a
+            standard for serious RL post-training. Its hybrid-controller
+            design lets one script orchestrate a training backend (PyTorch
+            FSDP or Megatron-LM) and a rollout backend (vLLM or SGLang) on the
+            same GPUs, with weight resharding between them each step; it
+            ships PPO, GRPO, DAPO, Dr. GRPO, RLOO, REINFORCE++ and more as
+            configuration choices over the same dataflow, supports both
+            reward-model and function-based verifiable rewards, and scales to
+            very large models across hundreds of GPUs. What it adds over this
+            page is exactly the part this page declared out of scope: the
+            rollout engine, the weight sync, the placement of four model roles
+            onto hardware.
+          </p>
+          <p>
+            <a href="https://huggingface.co/docs/trl/grpo_trainer" target="_blank" rel="noreferrer">TRL's GRPOTrainer</a>
+            (notes at <a href="/rl/trl">/rl/trl</a>) is the most accessible
+            entry point: you pass a model name, a prompt dataset, and reward
+            functions as plain Python callables, and the trainer handles
+            generation, grouping, and the update. It exposes the contested
+            design choices as configuration, <code>loss_type</code> selects
+            among the DeepSeekMath form, Dr. GRPO, DAPO and successors, and
+            <code>num_generations</code> is G, and it can drive vLLM either as
+            a separate server process or colocated with training. Reading its
+            <code>grpo_trainer.py</code> against the loss above is a good
+            exercise: the same ratio, clip, k3 and masking lines are all
+            there, surrounded by a few thousand lines of distributed
+            generation plumbing.
+            <a href="https://github.com/OpenRLHF/OpenRLHF" target="_blank" rel="noreferrer">OpenRLHF</a>
+            is the third mature option, a Ray-based framework with vLLM
+            rollouts that grew up around PPO-style RLHF and added GRPO and
+            REINFORCE-family baselines; it popularized several of the
+            efficiency tricks (packed samples, colocated vLLM) the others also
+            use.
+          </p>
+          <p>
+            The from-scratch version is enough when the model is small enough
+            to generate from directly inside the training process, which is
+            true for toy tasks, unit tests, and algorithm research on the loss
+            itself. To verify it against a real implementation, exploit the
+            identities the math gives you: on any inputs, the advantages must
+            be zero-mean within each group; the k3 term must be everywhere
+            nonnegative and exactly zero when <code>logp_ref == logp_new</code>;
+            with <code>logp_new == logp_old</code> the loss must equal
+            <code>kl_coef</code> times the masked-mean KL (zero if the
+            reference also matches); and perturbing <code>logp_new</code> so
+            some ratio exceeds 1+ε with positive advantage must leave the
+            gradient of those tokens exactly zero. All four are two-line
+            asserts on the synthetic tensors above, and the same asserts hold
+            against TRL's internals on identical inputs with
+            <code>loss_type="grpo"</code> and matching ε, β, and std handling.
+          </p>
+
+          <h2>Traps and misconceptions</h2>
+          <p>
+            <strong>Treating the advantage as per-token credit.</strong>
+            GRPO assigns one advantage to every token of a completion; there
+            is no discounting, no GAE, no notion that the tokens near the
+            correct answer mattered more. That is a modeling choice, not an
+            approximation of PPO: with a single terminal reward there is
+            nothing per-token to estimate without a value function. If you
+            find yourself broadcasting different advantages across time from a
+            scalar reward, you have reinvented the value model GRPO deleted.
+          </p>
+          <p>
+            <strong>Degenerate groups silently do nothing.</strong> A group
+            where every completion got the same reward has zero advantage
+            everywhere and contributes only KL gradient. On easy or saturated
+            prompt sets, most of your batch can be dead weight while the loss
+            looks perfectly normal. Track the fraction of all-same-reward
+            groups; curating prompts to keep pass rates away from 0 and 1 is
+            part of the algorithm in practice, not an optional nicety. The
+            std + ε denominator also lives here: without the ε, an all-equal
+            group divides by zero.
+          </p>
+          <p>
+            <strong>Expecting the clip to act on the first inner step.</strong>
+            When the policy has not moved since generation, all ratios are 1
+            and both clip branches agree; with a single gradient step per
+            batch of rollouts (a common configuration) the clip is nearly
+            inactive the entire run and the KL term does the real restraining.
+            The clip earns its keep only when you take multiple optimization
+            epochs over the same rollouts, which is also when
+            <code>logp_old</code> genuinely differs from
+            <code>logp_new</code> and must be a stored snapshot, not
+            recomputed.
+          </p>
+          <p>
+            <strong>Confusing the KL placement with PPO's.</strong> Classic
+            RLHF subtracts a KL penalty inside the reward before advantages
+            are computed, so the penalty is shaped by the baseline and
+            clipped with everything else. GRPO adds the KL directly to the
+            loss, outside the advantage normalization, with its own
+            coefficient and the k3 estimator. Implementations that mix the
+            two conventions, or that use the naive −log u estimator where
+            k3 is expected, will disagree with reference implementations in
+            ways that look like tuning problems rather than bugs.
+          </p>
+          <p>
+            <strong>Assuming the published objective is settled.</strong> The
+            token-averaging and std lines carry documented biases (length and
+            difficulty reweighting), the Dr. GRPO variant deletes them, DAPO
+            decouples the clip bounds, and frameworks ship all of these as
+            flags precisely because the community has not crowned a winner.
+            Results that hinge on response-length behavior deserve special
+            skepticism: the loss itself can push length around independently
+            of quality.
+          </p>
+
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> GRPO is the observation that for
+            one-reward-per-completion problems, a group of samples is a good
+            enough baseline that the value network can go. Normalize each
+            completion's reward against its group's mean and std, give every
+            token that advantage, keep PPO's clipped ratio, and hold the
+            policy near the reference with the nonnegative k3 KL estimator.
+            The loss fits on a slide; the cost moved into generating the
+            groups, which is why the real engineering lives in rollout
+            engines like verl and TRL's vLLM integration, and the open
+            questions live in two innocent-looking normalizations that the
+            Dr. GRPO line of work put under the microscope.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/code-tabs.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" integrity="sha512-D9gUyxqja7hBtkWpPWGt9wfbfaMGVt9gnyCvYa+jojwwPHLCzUm5i8rpk7vD7wNee9bA35eYIjobYPaQuKS1MQ==" crossorigin="anonymous"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (!window.hljs) return;
+        hljs.configure({ languages: ["python", "bash", "c", "cpp", "rust", "go", "typescript", "swift", "sql", "json", "yaml", "plaintext"] });
+        hljs.highlightAll();
+      });
+    </script>
+  </body>
+</html>

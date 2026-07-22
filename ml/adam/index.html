@@ -1,0 +1,693 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Adam and AdamW · Stanley Jacob</title>
+    <meta name="description" content="Adam and AdamW from first principles: the Adagrad-to-RMSProp-to-Adam lineage, bias correction derived, the epsilon placement subtlety, why L2 in the gradient is not weight decay, and from-scratch PyTorch and JAX implementations verified step for step against torch.optim.AdamW and optax.adamw." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" integrity="sha384-eFTL69TLRZTkNfYZOLM+G04821K1qZao/4QLJbet1pP4tcF+fdXq/9CdqAbWRl/L" crossorigin="anonymous" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml" class="active">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/ml">Machine learning</a></div>
+        <h1>Adam and AdamW</h1>
+        <p class="lead">
+          Adam is two exponential moving averages and a correction factor, and
+          AdamW is Adam with one term moved outside the adaptive machinery.
+          That is the entire content of the optimizer that trains essentially
+          every transformer in production today. This page derives it honestly:
+          the Adagrad-to-RMSProp lineage, why the bias correction has the exact
+          form 1&nbsp;&minus;&nbsp;&beta;<sup>t</sup>, where epsilon goes and
+          why it matters, and the Loshchilov-Hutter argument for why L2
+          regularization inside the gradient is not weight decay once the
+          denominator adapts. Then it implements both from scratch in PyTorch
+          and JAX and verifies them step for step against
+          <code>torch.optim.AdamW</code> and <code>optax.adamw</code>.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>What it is and when you reach for it</h2>
+          <p>
+            Adam (adaptive moment estimation) is a first-order stochastic
+            optimizer that keeps, per parameter, an exponential moving average
+            of the gradient (the first moment) and of the squared gradient (the
+            second moment), and takes steps proportional to the ratio of the
+            two. The ratio makes the update roughly unit-scale regardless of
+            how large or small the raw gradients are, which is why one learning
+            rate works across layers whose gradient magnitudes differ by orders
+            of magnitude. AdamW is the variant you should almost always use: it
+            applies weight decay directly to the parameters instead of folding
+            an L2 penalty into the gradient, which under Adam's adaptive
+            denominator turns out to be a genuinely different algorithm. Reach
+            for AdamW whenever you are training a deep network with
+            heterogeneous gradient scales: transformers, diffusion models, and
+            most modern architectures use it by default. Plain SGD with
+            momentum still competes on convolutional vision models and is
+            cheaper in memory, but for attention-based models AdamW is not just
+            the default, it is close to load-bearing: transformer training with
+            vanilla SGD is markedly less stable and slower to converge at any
+            practical learning rate.
+          </p>
+
+          <h2>The math, from Adagrad to Adam</h2>
+          <h3>Adagrad: per-parameter learning rates</h3>
+          <p>
+            SGD moves every parameter with the same step size &eta;:
+            &theta; &larr; &theta; &minus; &eta;g. But gradient magnitudes are
+            wildly non-uniform across a deep network, and a single &eta; must
+            be small enough for the largest-gradient parameter, starving all
+            the others.
+            <a href="https://jmlr.org/papers/v12/duchi11a.html" target="_blank" rel="noreferrer">Adagrad</a>
+            (Duchi, Hazan, Singer, 2011) fixed this by accumulating the sum of
+            squared gradients per parameter, G<sub>t</sub> =
+            &Sigma;<sub>i&le;t</sub> g<sub>i</sub><sup>2</sup>, and dividing:
+            &theta; &larr; &theta; &minus; &eta; g<sub>t</sub> /
+            (&radic;G<sub>t</sub> + &epsilon;). Parameters that have seen large
+            gradients get small steps, rarely-updated parameters get large
+            ones, which is exactly what sparse features want. The flaw is that
+            G<sub>t</sub> only grows: the effective learning rate decays
+            monotonically toward zero whether or not the loss landscape asks
+            for it, and training stalls.
+          </p>
+          <h3>RMSProp: forgetting the past</h3>
+          <p>
+            RMSProp (Hinton, in a
+            <a href="https://www.cs.toronto.edu/~tijmen/csc321/slides/lecture_slides_lec6.pdf" target="_blank" rel="noreferrer">lecture slide</a>,
+            never formally published) replaces the growing sum with an
+            exponential moving average: v<sub>t</sub> = &rho;v<sub>t-1</sub> +
+            (1&nbsp;&minus;&nbsp;&rho;)g<sub>t</sub><sup>2</sup>. Now the
+            denominator tracks the <em>recent</em> root-mean-square gradient
+            rather than the whole history, so the effective step size can
+            recover when gradients shrink. What RMSProp lacks is momentum on
+            the numerator and any account of the EMA's startup transient.
+          </p>
+          <h3>Adam: two moments</h3>
+          <p>
+            <a href="https://arxiv.org/abs/1412.6980" target="_blank" rel="noreferrer">Adam</a>
+            (Kingma and Ba, 2014) keeps EMAs of both moments:
+          </p>
+          <pre class="flow">m_t = beta1 * m_{t-1} + (1 - beta1) * g_t        first moment  (mean of g)
+v_t = beta2 * v_{t-1} + (1 - beta2) * g_t^2      second moment (mean of g^2)
+
+m_hat = m_t / (1 - beta1^t)                       bias correction
+v_hat = v_t / (1 - beta2^t)
+
+theta = theta - lr * m_hat / (sqrt(v_hat) + eps)</pre>
+          <p>
+            The numerator is momentum: averaging gradients over roughly
+            1/(1&nbsp;&minus;&nbsp;&beta;<sub>1</sub>) &asymp; 10 recent steps
+            smooths minibatch noise. The denominator is RMSProp: dividing by
+            the recent RMS gradient normalizes the step per coordinate. If the
+            gradient of one coordinate is consistently around some magnitude
+            c, then m&#770; &asymp; c and &radic;v&#770; &asymp; c, so the
+            update is about &eta; in size no matter what c is.
+            <mark>Adam's step size is controlled by the signal-to-noise ratio
+            of the gradient, not by its magnitude, and is soft-bounded by the
+            learning rate itself.</mark> That invariance to gradient scale is
+            what makes one learning rate portable across layers, and largely
+            across model widths.
+          </p>
+          <h3>Bias correction, derived</h3>
+          <p>
+            Both EMAs start at zero, so early estimates are biased toward zero.
+            The correction term is not a heuristic, it falls straight out of
+            unrolling the recursion. With m<sub>0</sub> = 0:
+          </p>
+          <p>
+            m<sub>t</sub> = (1&nbsp;&minus;&nbsp;&beta;<sub>1</sub>)
+            &Sigma;<sub>i=1..t</sub> &beta;<sub>1</sub><sup>t&minus;i</sup>
+            g<sub>i</sub>.
+          </p>
+          <p>
+            Take expectations and suppose the gradient is roughly stationary
+            over the window, E[g<sub>i</sub>] &asymp; E[g]. The geometric sum
+            &Sigma;<sub>i=1..t</sub> &beta;<sub>1</sub><sup>t&minus;i</sup> =
+            (1&nbsp;&minus;&nbsp;&beta;<sub>1</sub><sup>t</sup>) /
+            (1&nbsp;&minus;&nbsp;&beta;<sub>1</sub>), so
+          </p>
+          <p>
+            E[m<sub>t</sub>] &asymp; E[g] &middot;
+            (1&nbsp;&minus;&nbsp;&beta;<sub>1</sub><sup>t</sup>).
+          </p>
+          <p>
+            The EMA underestimates the true mean by exactly the factor
+            1&nbsp;&minus;&nbsp;&beta;<sub>1</sub><sup>t</sup>: this is where
+            &beta;<sup>t</sup> comes from. Dividing by it makes the estimator
+            unbiased at every t, and the factor decays to 1, so correction only
+            matters early. The same algebra with &beta;<sub>2</sub> gives
+            v&#770;. The reason you cannot skip it: v is corrected by
+            1&nbsp;&minus;&nbsp;&beta;<sub>2</sub><sup>t</sup>, which at t = 1
+            with &beta;<sub>2</sub> = 0.999 is 0.001, a thousandfold
+            underestimate sitting under a square root in the denominator.
+          </p>
+          <h3>A worked step</h3>
+          <p>
+            One parameter, constant gradient g = 0.5, defaults
+            &beta;<sub>1</sub> = 0.9, &beta;<sub>2</sub> = 0.999, at t = 1:
+            m<sub>1</sub> = 0.1 &times; 0.5 = 0.05 and v<sub>1</sub> = 0.001
+            &times; 0.25 = 0.00025. Without correction the ratio is
+            0.05/&radic;0.00025 = 0.05/0.0158 &asymp; 3.16, so the very first
+            step is 3.16 times the learning rate: the second moment is far more
+            underestimated than the first, and the square root amplifies the
+            mismatch. With correction, m&#770; = 0.05/0.1 = 0.5 and v&#770; =
+            0.00025/0.001 = 0.25, giving 0.5/&radic;0.25 = 1.0 exactly: a step
+            of precisely one learning rate. At t = 2 the corrected estimates
+            are again exactly 0.5 and 0.25. For a constant gradient the
+            corrected ratio is identically 1, which is the cleanest way to see
+            that the correction recovers the intended semantics from step one
+            instead of after a thousand steps of warm-up.
+          </p>
+          <h3>Where epsilon goes</h3>
+          <p>
+            The paper writes the update as m&#770; / (&radic;v&#770; +
+            &epsilon;), with &epsilon; <em>outside</em> the square root, and
+            that is what PyTorch implements. The other placement, m&#770; /
+            &radic;(v&#770; + &epsilon;), looks interchangeable and is not:
+            when v&#770; is tiny the first form bounds the step by
+            m&#770;/&epsilon; while the second bounds it by
+            m&#770;/&radic;&epsilon;, a factor of 10<sup>4</sup> apart at
+            &epsilon; = 10<sup>-8</sup>. Optax exposes both knobs separately
+            (<code>eps</code> outside, <code>eps_root</code> inside, default
+            0), and TensorFlow's historical RMSProp put it inside, which is one
+            reason naive hyperparameter ports across frameworks silently change
+            the optimizer. &epsilon; is also not just overflow armor: for
+            coordinates whose gradients are smaller than about &epsilon;, the
+            denominator saturates and Adam degrades gracefully toward plain
+            momentum SGD. Some training recipes deliberately raise &epsilon;
+            to 10<sup>-6</sup> or 10<sup>-5</sup> to damp the adaptivity, and
+            in low-precision training a larger &epsilon; guards against v
+            underflowing to zero. Treat it as a real hyperparameter with a
+            placement convention, not as a numerical footnote.
+          </p>
+          <h3>AdamW: why L2 in the gradient is not weight decay</h3>
+          <p>
+            Classical weight decay multiplies weights toward zero each step:
+            &theta; &larr; (1&nbsp;&minus;&nbsp;&eta;&lambda;)&theta; &minus;
+            &eta;g. Classical L2 regularization adds
+            &lambda;&theta; to the gradient of the loss. Under plain SGD these
+            are the same operation, since &theta; &minus; &eta;(g +
+            &lambda;&theta;) = (1&nbsp;&minus;&nbsp;&eta;&lambda;)&theta;
+            &minus; &eta;g, and that identity is why the two names were used
+            interchangeably for decades. <a href="https://arxiv.org/abs/1711.05101" target="_blank" rel="noreferrer">Loshchilov and Hutter (2017)</a>
+            pointed out that the identity dies the moment the update is
+            preconditioned. Feed g + &lambda;&theta; into Adam and the decay
+            term travels through both EMAs and gets divided by
+            &radic;v&#770;:
+          </p>
+          <pre class="flow">L2 inside the gradient:   theta -= lr * (m_hat(g + lambda*theta)) / (sqrt(v_hat) + eps)
+                                       ^ decay is rescaled per-coordinate by 1/sqrt(v_hat)
+
+Decoupled weight decay:   theta -= lr * m_hat(g) / (sqrt(v_hat) + eps)  +  lr * lambda * theta
+                                       ^ decay is applied at full strength, uniformly</pre>
+          <p>
+            The consequence is backwards from what regularization intends:
+            parameters with historically large gradients have large
+            &radic;v&#770;, so their decay term is shrunk the most, while
+            rarely-updated parameters are decayed hardest. Worse, since the
+            decay contribution to the update is normalized by the same RMS
+            machinery as the gradient, its effective strength stops scaling
+            with &lambda; in any clean way, and the optimal &lambda; becomes
+            entangled with the learning rate. <mark>AdamW moves the decay out
+            of the gradient entirely, multiplying &theta; by
+            (1&nbsp;&minus;&nbsp;&eta;&lambda;) as a separate step, so the
+            adaptive machinery only ever sees the loss gradient.</mark> The
+            paper's experiments show the decoupled version generalizes better
+            and, usefully in practice, makes learning rate and weight decay
+            close to independently tunable. This is why
+            <code>torch.optim.Adam(weight_decay=...)</code> and
+            <code>torch.optim.AdamW(weight_decay=...)</code> are different
+            optimizers, not one optimizer with a renamed argument: the former
+            adds &lambda;&theta; to the gradient, the latter decays the
+            parameter directly.
+          </p>
+
+          <h2>Implementation, twice</h2>
+          <p>
+            The PyTorch version mirrors <code>torch.optim.AdamW</code>'s exact
+            update order: decay the parameter first, update the moments, then
+            take the bias-corrected step, with the corrections folded into
+            scalars so the stored m and v remain the raw EMAs. The JAX version
+            follows optax's convention: a pair of pure functions,
+            <code>init(params)</code> producing the state and
+            <code>update(grads, state, params)</code> producing updates to be
+            added to the parameters. Optax applies decoupled decay by adding
+            &lambda;&theta; to the scaled update rather than pre-multiplying
+            the parameter; expanding both shows they compute the same
+            (1&nbsp;&minus;&nbsp;&eta;&lambda;)&theta; &minus;
+            &eta;&middot;adam_step, differing only in floating point rounding
+            order.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import math
+import torch
+
+class AdamW(torch.optim.Optimizer):
+    """From-scratch AdamW matching torch.optim.AdamW's update order:
+    decay first, then moments, then the bias-corrected step.
+    decoupled=False turns it into torch.optim.Adam's L2 coupling,
+    which is the two-line difference the whole AdamW paper is about.
+    """
+
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999),
+                 eps=1e-8, weight_decay=1e-2, decoupled=True):
+        super().__init__(params, dict(lr=lr, betas=betas, eps=eps,
+                                      weight_decay=weight_decay,
+                                      decoupled=decoupled))
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            lr, (b1, b2) = group["lr"], group["betas"]
+            eps, wd = group["eps"], group["weight_decay"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad
+                state = self.state[p]
+                if not state:
+                    state["step"] = 0
+                    state["m"] = torch.zeros_like(p)
+                    state["v"] = torch.zeros_like(p)
+                m, v = state["m"], state["v"]
+                state["step"] += 1
+                t = state["step"]
+
+                if wd != 0.0:
+                    if group["decoupled"]:
+                        p.mul_(1 - lr * wd)        # AdamW: shrink the weight itself
+                    else:
+                        g = g.add(p, alpha=wd)     # Adam+L2: decay rides the gradient
+
+                # Moment EMAs. lerp_(g, 1-b1) is b1*m + (1-b1)*g in one
+                # fused op, exactly as in PyTorch's implementation.
+                m.lerp_(g, 1 - b1)
+                v.mul_(b2).addcmul_(g, g, value=1 - b2)
+
+                # Bias correction folded into scalars: the stored m, v stay
+                # uncorrected, so state memory holds the plain EMAs.
+                step_size = lr / (1 - b1 ** t)
+                denom = (v.sqrt() / math.sqrt(1 - b2 ** t)).add_(eps)
+                p.addcdiv_(m, denom, value=-step_size)</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">import jax
+import jax.numpy as jnp
+
+def adamw(lr, b1=0.9, b2=0.999, eps=1e-8, weight_decay=1e-2):
+    """optax-style transformation: init(params) -&gt; state,
+    update(grads, state, params) -&gt; (updates, state).
+    Apply with params + updates (optax.apply_updates convention).
+    """
+
+    def init(params):
+        return dict(mu=jax.tree.map(jnp.zeros_like, params),
+                    nu=jax.tree.map(jnp.zeros_like, params),
+                    count=jnp.zeros([], jnp.int32))
+
+    def update(grads, state, params):
+        count = state["count"] + 1
+        mu = jax.tree.map(lambda m, g: b1 * m + (1 - b1) * g,
+                          state["mu"], grads)
+        nu = jax.tree.map(lambda v, g: b2 * v + (1 - b2) * g * g,
+                          state["nu"], grads)
+        # Bias correction as scalars; mu/nu stay uncorrected in the state.
+        c1 = 1 - b1 ** count.astype(jnp.float32)
+        c2 = 1 - b2 ** count.astype(jnp.float32)
+
+        def one(m, v, p):
+            adam_step = (m / c1) / (jnp.sqrt(v / c2) + eps)
+            # Decoupled decay added to the update, as optax.adamw does;
+            # algebraically identical to PyTorch's p *= 1 - lr*wd.
+            return -lr * (adam_step + weight_decay * p)
+
+        updates = jax.tree.map(one, mu, nu, params)
+        return updates, dict(mu=mu, nu=nu, count=count)
+
+    return init, update</code></pre>
+          </div>
+          <p>
+            Both versions are step-for-step checkable against the production
+            optimizers on a fixed seed, which is the single best debugging tool
+            an optimizer implementation has: any divergence at step k with
+            identical inputs is a wrong line, not noise.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import copy
+import torch
+import torch.nn as nn
+
+torch.manual_seed(0)
+net_ref = nn.Sequential(nn.Linear(64, 128), nn.Tanh(), nn.Linear(128, 10))
+net_mine = copy.deepcopy(net_ref)
+
+opt_ref = torch.optim.AdamW(net_ref.parameters(), lr=1e-3,
+                            betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01)
+opt_mine = AdamW(net_mine.parameters(), lr=1e-3,
+                 betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01)
+
+for step in range(100):
+    x = torch.randn(32, 64)               # same batch feeds both copies
+    for net, opt in ((net_ref, opt_ref), (net_mine, opt_mine)):
+        opt.zero_grad(set_to_none=True)
+        net(x).pow(2).mean().backward()
+        opt.step()
+
+for a, b in zip(net_ref.parameters(), net_mine.parameters()):
+    # Same op order means this is typically bitwise-equal on CPU;
+    # the tolerance covers fused/foreach paths that reorder arithmetic.
+    assert torch.allclose(a, b, rtol=0, atol=1e-7)
+print("matches torch.optim.AdamW for 100 steps")</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">import jax
+import jax.numpy as jnp
+import optax
+
+key = jax.random.PRNGKey(0)
+params = {"w": jax.random.normal(key, (64, 10)) * 0.1,
+          "b": jnp.zeros(10)}
+
+def loss_fn(p, x):
+    return jnp.mean((x @ p["w"] + p["b"]) ** 2)
+
+ref = optax.adamw(1e-3, b1=0.9, b2=0.999, eps=1e-8, weight_decay=0.01)
+init, update = adamw(1e-3, weight_decay=0.01)
+
+p_ref, p_mine = params, params
+s_ref, s_mine = ref.init(params), init(params)
+
+for step in range(100):
+    x = jax.random.normal(jax.random.fold_in(key, step), (32, 64))
+    g_ref = jax.grad(loss_fn)(p_ref, x)
+    u_ref, s_ref = ref.update(g_ref, s_ref, p_ref)
+    p_ref = optax.apply_updates(p_ref, u_ref)
+
+    g_mine = jax.grad(loss_fn)(p_mine, x)
+    u_mine, s_mine = update(g_mine, s_mine, p_mine)
+    p_mine = optax.apply_updates(p_mine, u_mine)
+
+worst = jax.tree.map(lambda a, b: jnp.abs(a - b).max(), p_ref, p_mine)
+print(worst)   # every entry at float32 rounding level, ~1e-7 or below</code></pre>
+          </div>
+
+          <h2>Using it on a real shape of problem</h2>
+          <p>
+            Real training runs never hand every parameter the same decay. The
+            near-universal transformer recipe puts weight matrices in a decayed
+            group and biases, LayerNorm gains, and usually embeddings in a
+            zero-decay group, then wraps the learning rate in warmup plus
+            cosine decay. On a 10M-parameter transformer language model with lr
+            3&times;10<sup>-4</sup>, warmup over the first few hundred steps,
+            and weight decay 0.1, expect the loss to fall fast through the
+            warmup, then descend smoothly; a loss that spikes and recovers
+            repeatedly usually means &beta;<sub>2</sub> is too slow for your
+            gradient noise (see the next section) or the warmup is too short.
+            Exact numbers are model- and machine-dependent, but the shape of
+            the curve is not.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import torch
+
+# Two param groups: ndim &gt;= 2 tensors (matmul weights, embeddings) decay,
+# 1-D tensors (biases, norm gains) do not. This is the nanoGPT/minGPT split.
+decay, no_decay = [], []
+for name, p in model.named_parameters():
+    if not p.requires_grad:
+        continue
+    (decay if p.ndim &gt;= 2 else no_decay).append(p)
+
+opt = torch.optim.AdamW(
+    [{"params": decay, "weight_decay": 0.1},
+     {"params": no_decay, "weight_decay": 0.0}],
+    lr=3e-4, betas=(0.9, 0.95), eps=1e-8, fused=True)  # LLM-style beta2
+
+sched = torch.optim.lr_scheduler.SequentialLR(
+    opt,
+    [torch.optim.lr_scheduler.LinearLR(opt, 0.01, 1.0, total_iters=500),
+     torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=9500)],
+    milestones=[500])
+
+for step, (x, y) in enumerate(loader):
+    loss = model(x, y)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    opt.step(); sched.step()
+    opt.zero_grad(set_to_none=True)</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">import jax
+import optax
+
+# Same split, optax-style: a mask pytree routes decay to ndim &gt;= 2 leaves.
+decay_mask = jax.tree.map(lambda p: p.ndim &gt;= 2, params)
+
+sched = optax.warmup_cosine_decay_schedule(
+    init_value=0.0, peak_value=3e-4,
+    warmup_steps=500, decay_steps=10_000, end_value=3e-5)
+
+opt = optax.chain(
+    optax.clip_by_global_norm(1.0),
+    optax.adamw(sched, b1=0.9, b2=0.95, eps=1e-8,
+                weight_decay=0.1, mask=decay_mask))
+opt_state = opt.init(params)
+
+@jax.jit
+def train_step(params, opt_state, batch):
+    loss, grads = jax.value_and_grad(loss_fn)(params, batch)
+    updates, opt_state = opt.update(grads, opt_state, params)
+    return optax.apply_updates(params, updates), opt_state, loss</code></pre>
+          </div>
+
+          <h2>Applications</h2>
+          <h3>The default for transformers, and the hyperparameters that ship</h3>
+          <p>
+            AdamW trains GPT-style language models, BERT-style encoders, ViTs,
+            diffusion models, and nearly everything with attention in it. The
+            hyperparameters are remarkably stable across the field: lr around
+            10<sup>-4</sup> to 6&times;10<sup>-4</sup> for pretraining with
+            warmup and cosine or linear decay, &beta;<sub>1</sub> = 0.9,
+            weight decay 0.1 on matrices, gradient clipping at norm 1.0. The
+            interesting deviation is &beta;<sub>2</sub>. The library default is
+            0.999, an averaging window of roughly a thousand steps, but GPT-3,
+            LLaMA, and most large-model reports since use
+            <mark>&beta;<sub>2</sub> = 0.95, a window of about twenty steps.
+            The reason is stability under heavy-tailed gradient noise: with a
+            thousand-step memory, a sudden gradient spike is divided by a
+            stale, small &radic;v&#770; and produces a huge parameter jump,
+            the classic loss-spike signature of large-batch LLM training. A
+            twenty-step memory lets the denominator react to the spike within
+            a few steps and absorb it.</mark> The cost is noisier adaptation
+            on small models, where 0.999 remains fine. When you see a
+            training-instability postmortem that ends with "we lowered beta2",
+            this is the mechanism.
+          </p>
+          <h3>The memory bill, and what people do about it</h3>
+          <p>
+            Adam's price is state: two fp32 tensors the size of the model, 8
+            bytes per parameter, on top of the parameters and gradients. In the
+            standard mixed-precision recipe (half-precision weights and grads,
+            fp32 master weights, fp32 m and v) the optimizer-adjacent
+            state comes to 16 bytes per parameter, the arithmetic at the heart
+            of the ZeRO paper: a 7B-parameter model carries about 56 GB of
+            optimizer state before a single activation is stored. That bill
+            motivates three lines of engineering. Sharding: FSDP and
+            ZeRO partition m, v, and master weights across data-parallel ranks,
+            which is exactly what <a href="/oss/torchtitan">torchtitan</a>
+            does for Llama-style pretraining. Quantized state:
+            <a href="https://github.com/bitsandbytes-foundation/bitsandbytes" target="_blank" rel="noreferrer">bitsandbytes</a>
+             8-bit Adam stores m and v as 8-bit values with block-wise scaling
+            constants (
+            <a href="https://arxiv.org/abs/2110.02861" target="_blank" rel="noreferrer">Dettmers et al., 2021</a>),
+            cutting state memory roughly 4x with matching accuracy on the
+            benchmarks in the paper. And kernel fusion: the update touches
+            every parameter with a handful of flops, so it is bandwidth-bound
+            and dominated by kernel-launch overhead when run tensor-by-tensor;
+            <code>foreach</code> batches tensors per kernel and
+            <code>fused=True</code> in <code>torch.optim.AdamW</code> performs
+            the whole update in a single multi-tensor kernel. Because the
+            moments live in fp32 while compute runs in bf16 or fp16, the
+            optimizer step is also where mixed-precision training pays its
+            precision debts; the companion page on
+            <a href="/ml/mixed-precision">mixed precision and loss scaling</a>
+            covers why the master copy must stay fp32 and why fp16 gradients
+            must be unscaled before this update runs.
+          </p>
+          <h3>Beyond Adam: second-order-lite research</h3>
+          <p>
+            Adam's preconditioner is diagonal: each coordinate is scaled
+            independently. Current research reintroduces cross-coordinate
+            structure without full second-order cost.
+            <a href="https://arxiv.org/abs/1802.09568" target="_blank" rel="noreferrer">Shampoo</a>
+            preconditions each weight matrix with Kronecker-factored statistics
+            (one small matrix per dimension), and a distributed implementation
+            won the external tuning track of the 2024 AlgoPerf optimizer
+            benchmark.
+            <a href="https://kellerjordan.github.io/posts/muon/" target="_blank" rel="noreferrer">Muon</a>
+            replaces the second moment entirely for 2-D weights: it
+            orthogonalizes the momentum matrix with a few Newton-Schulz
+            iterations, so every direction in the update has comparable
+            magnitude, while embeddings, norms, and scalars stay on AdamW. It
+            set the <a href="/oss/nanogpt">nanoGPT</a> speedrun records and has
+            since been scaled to multi-billion-parameter pretraining runs.
+            Both are best understood as answers to the same question Adam
+            answers diagonally: how should the raw gradient be reshaped before
+            it becomes a step. AdamW remains the production default, but it is
+            no longer obviously the end of the story.
+          </p>
+
+          <h2>Against the real libraries</h2>
+          <p>
+            <a href="https://github.com/pytorch/pytorch" target="_blank" rel="noreferrer">torch.optim</a>
+            adds, over the reference implementation above: the
+            <code>foreach</code> and <code>fused</code> execution paths
+            (multi-tensor and single-kernel updates), a <code>capturable</code>
+            mode that keeps the step count on-device so the optimizer can be
+            captured into CUDA graphs, <code>amsgrad</code>, differentiable
+            optimizer steps for meta-learning, and battle-tested state-dict
+            save/load including cross-device restore. The scheduler ecosystem
+            hangs off it.
+            <a href="https://github.com/google-deepmind/optax" target="_blank" rel="noreferrer">optax</a>
+            adds composability as the core design: <code>adamw</code> is
+            literally <code>chain(scale_by_adam, add_decayed_weights,
+            scale_by_learning_rate)</code>, and the same combinators give you
+            clipping, schedules, gradient accumulation
+            (<code>MultiSteps</code>), and per-subtree masking without touching
+            optimizer internals; everything is a pure function, so the whole
+            update jits and shards.
+            <a href="https://github.com/bitsandbytes-foundation/bitsandbytes" target="_blank" rel="noreferrer">bitsandbytes</a>
+            adds the 8-bit state representation with block-wise quantization,
+            stable-embedding handling, and paged optimizer variants that spill
+            state to CPU memory under pressure, the difference between fitting
+            and not fitting a fine-tune on a single consumer GPU.
+          </p>
+          <p>
+            The from-scratch version is genuinely enough when you are doing
+            optimizer research (you need to modify the update anyway), when the
+            model is small enough that state memory and launch overhead are
+            irrelevant, and as executable documentation. Verification against
+            the libraries is the check shown above: identical parameters,
+            identical data, fixed seed, run both optimizers side by side and
+            assert per-parameter agreement to float32 rounding after 100 steps.
+            Since the update order here mirrors the library exactly, agreement
+            on CPU is typically bitwise; any looser tolerance you find yourself
+            needing is a discrepancy worth explaining before trusting the
+            implementation.
+          </p>
+
+          <h2>Traps and misconceptions</h2>
+          <p>
+            <strong>"weight_decay in torch.optim.Adam is weight decay."</strong>
+            It is L2-in-the-gradient, the exact coupling the AdamW paper shows
+            to be a different and worse regularizer under adaptive scaling. If
+            you mean weight decay, use <code>AdamW</code>. The two differ
+            precisely when &radic;v&#770; varies across parameters, which is
+            always.
+          </p>
+          <p>
+            <strong>"Decay everything uniformly."</strong> Decaying LayerNorm
+            gains and biases toward zero fights their function (a norm gain of
+            zero kills the channel), and most recipes exempt them along with,
+            usually, embeddings. The two-param-group split by
+            <code>ndim</code> is the standard fix; forgetting it typically
+            costs a little accuracy quietly rather than failing loudly.
+          </p>
+          <p>
+            <strong>"Bias correction is startup bookkeeping you can drop."</strong>
+            Dropping it inflates the first step to
+            (1&minus;&beta;<sub>1</sub>)/&radic;(1&minus;&beta;<sub>2</sub>)
+            &asymp; 3.16x the learning rate at the defaults, as the worked
+            example shows, exactly when the model is at its most fragile
+            initialization. Implementations that
+            skip it compensate with longer warmup, which is solving a problem
+            you created.
+          </p>
+          <p>
+            <strong>"Epsilon is a numerical detail, any small value works."</strong>
+            Placement (inside vs outside the square root) changes the
+            small-gradient behavior by orders of magnitude, frameworks disagree
+            on the convention, and several published models tune &epsilon;
+            deliberately. Porting a recipe across frameworks without checking
+            the epsilon convention is a classic source of silent divergence.
+          </p>
+          <p>
+            <strong>"Adam is scale-invariant, so gradient scaling never
+            matters."</strong> The invariance is asymptotic and per-coordinate.
+            A constant scale factor does cancel in m&#770;/&radic;v&#770;
+            eventually, but &epsilon; breaks the invariance for small
+            gradients, and in fp16 training the scale factor must still be
+            removed before the update because otherwise &epsilon; and weight
+            decay act on the wrong scale, and because scaled gradients can
+            overflow the fp16 range on the way to the optimizer. Details in
+            the <a href="/ml/mixed-precision">mixed precision</a> page.
+          </p>
+
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> Adam is two exponential moving
+            averages, one over gradients and one over their squares, with the
+            startup bias divided out by the exactly-derived factor
+            1&minus;&beta;<sup>t</sup>, stepping each coordinate by roughly one
+            learning rate regardless of gradient scale. AdamW is the
+            recognition that weight decay must bypass that adaptive machinery
+            to remain regularization. Everything else, epsilon placement,
+            &beta;<sub>2</sub> = 0.95, 8-bit state, fused kernels, is
+            engineering around those two EMAs, and because the update order is
+            fully specified you can, and should, verify an implementation
+            against torch.optim.AdamW or optax.adamw step for step.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/code-tabs.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (!window.hljs) return;
+        hljs.configure({ languages: ["python", "bash", "c", "cpp", "rust", "go", "typescript", "swift", "sql", "json", "yaml", "plaintext"] });
+        hljs.highlightAll();
+      });
+    </script>
+  </body>
+</html>

@@ -1,0 +1,719 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Attention Variants: MQA, GQA &amp; MLA · Stanley Jacob</title>
+    <meta name="description" content="The KV-efficiency family of attention variants: the KV cache size formula worked for a 7B model, multi-query attention, grouped-query attention as used by Llama and Mistral, and DeepSeek's multi-head latent attention, with a single configurable PyTorch and JAX module that interpolates from MHA to MQA." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" integrity="sha384-eFTL69TLRZTkNfYZOLM+G04821K1qZao/4QLJbet1pP4tcF+fdXq/9CdqAbWRl/L" crossorigin="anonymous" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml" class="active">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/ml">Machine learning</a></div>
+        <h1>Attention variants: MQA, GQA, and MLA</h1>
+        <p class="lead">
+          Multi-head attention is priced twice: once in FLOPs during training,
+          and once in memory bandwidth during decoding, where every new token
+          must re-read every cached key and value. The variants on this page,
+          multi-query attention, grouped-query attention, and multi-head
+          latent attention, all attack the second bill. They keep the query
+          side fully multi-headed and shrink only what has to be cached. This
+          page works the KV cache arithmetic for a real 7B model, derives each
+          variant, and builds one configurable module in PyTorch and JAX that
+          slides from MHA to GQA to MQA with a single integer.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>What it is and when you reach for it</h2>
+          <p>
+            The <a href="/ml/attention">attention page</a> derives scaled
+            dot-product attention and multi-head attention (MHA), where every
+            head owns its own query, key, and value projections. That design
+            is symmetric, and the symmetry turns out to be wasteful in exactly
+            one place: autoregressive decoding. When a language model
+            generates token by token, it caches the keys and values of every
+            past position so it never recomputes them, and each new token's
+            query must be scored against that entire cache. The cache grows
+            linearly with context, is duplicated per head and per layer, and
+            must be streamed from GPU memory once per generated token. On
+            modern hardware the matrix multiplies are cheap and the memory
+            traffic is not, so <mark>decoding speed is set less by FLOPs than
+            by how many bytes of KV cache each step has to read, and the
+            variant family exists to shrink those bytes</mark>. Multi-query
+            attention (MQA) shares a single K and V head across all query
+            heads. Grouped-query attention (GQA) interpolates, sharing each
+            KV head across a group of query heads. Multi-head latent
+            attention (MLA) compresses keys and values into one small latent
+            vector per token and caches only that. You reach for this family
+            whenever you are building or serving a decoder model at real
+            context lengths; every prominent open-weights LLM since 2023
+            ships one of these, not vanilla MHA. Sparse and linear-time
+            attention methods, which shrink the other cost (the quadratic
+            score matrix), live on the
+            <a href="/ml/efficient-attention">efficient attention page</a>;
+            the two families are orthogonal and are often combined.
+          </p>
+
+          <h2>The math</h2>
+          <h3>The KV cache bill, worked numerically</h3>
+          <p>
+            The cache stores two tensors per layer, K and V, each of shape
+            (batch, kv_heads, seq, head_dim). Its size in bytes is
+          </p>
+          <p>
+            cache = 2 · n<sub>layers</sub> · n<sub>kv_heads</sub> · d<sub>head</sub> · T · b,
+          </p>
+          <p>
+            where the leading 2 counts K and V, T is the sequence length, and
+            b is bytes per element (2 for fp16 or bf16), all times the batch
+            size. Take a Llama-2-7B-shaped model, which uses plain MHA: 32
+            layers, 32 heads, head dimension 128, context 4096, fp16. Per
+            token, the cache costs 2 · 32 · 32 · 128 · 2 = 524,288 bytes,
+            exactly 512 KiB. At the full 4096-token context that is
+            512 KiB · 4096 = 2 GiB for a single sequence. Now serve a batch:
+            32 concurrent 4k-context requests need 64 GiB of cache on top of
+            the 14 GB of fp16 weights, which has already overflowed an 80 GB
+            A100. And size is only half the problem. Every decode step must
+            read the whole cache once; at 2 GiB per sequence and roughly
+            2 TB/s of HBM bandwidth, cache traffic alone caps a single
+            sequence's contribution and, across a large batch, becomes the
+            dominant cost per token. Shrinking n<sub>kv_heads</sub> divides
+            both the residency and the traffic by the same factor, which is
+            why it is the highest-leverage knob in the formula: the other
+            terms (layers, head_dim, context) are fixed by the model and the
+            workload.
+          </p>
+
+          <h3>MQA: one KV head for everyone</h3>
+          <p>
+            Multi-query attention, proposed by Shazeer in 2019 in "Fast
+            Transformer Decoding: One Write-Head is All You Need", keeps h
+            query heads but computes a single key head and a single value
+            head:
+          </p>
+          <p>
+            head<sub>i</sub> = softmax(Q<sub>i</sub>K<sup>T</sup>/√d<sub>head</sub>) V,&nbsp;&nbsp; i = 1..h,
+          </p>
+          <p>
+            with one shared K = XW<sub>K</sub> and V = XW<sub>V</sub> of head
+            dimension d<sub>head</sub>, instead of per-head
+            K<sub>i</sub>, V<sub>i</sub>. Each query head still asks its own
+            question; all heads now consult the same directory. The cache
+            shrinks by a factor of h (32× in the model above, from 512 KiB to
+            16 KiB per token), and the FLOP count barely moves because the
+            score and value matmuls are unchanged, only the K and V
+            projections got narrower. The cost is expressiveness on the
+            memory side: the model loses the ability to organize different
+            keys and values for different heads, and in practice MQA trained
+            from scratch gives up a measurable slice of quality on some tasks
+            and can be less stable in training. PaLM, Falcon-7B, and
+            StarCoder shipped MQA; it is the aggressive end of the family.
+          </p>
+
+          <h3>GQA: interpolating with groups</h3>
+          <p>
+            Grouped-query attention (Ainslie et al., 2023) is the obvious
+            middle point once you see MHA and MQA as endpoints. Choose
+            g = n<sub>kv_heads</sub> with 1 ≤ g ≤ h and h divisible by g;
+            partition the h query heads into g groups of h/g; give each group
+            one shared K and V head:
+          </p>
+          <p>
+            head<sub>i</sub> = softmax(Q<sub>i</sub>K<sub>⌈i·g/h⌉</sub><sup>T</sup>/√d<sub>head</sub>) V<sub>⌈i·g/h⌉</sub>.
+          </p>
+          <p>
+            g = h recovers MHA exactly and g = 1 recovers MQA exactly, so a
+            single implementation parameterized by g covers the whole family,
+            which is what the code below does. The empirical finding that made
+            GQA the default is that quality degrades very slowly as g drops
+            until it gets close to 1: with g = 8 the cache shrinks 4 to 8×
+            while benchmark quality stays essentially at MHA level, and the
+            GQA paper further showed that an existing MHA checkpoint can be
+            converted by mean-pooling each group's K and V heads and then
+            uptrained for a small fraction of the original compute. The
+            adoption list is the argument: <mark>Llama 2 70B and every Llama
+            3 model use GQA with 8 KV heads, and Mistral 7B uses 8 KV heads
+            against 32 query heads</mark>; Falcon-40B, Qwen 2 and later, and
+            most 2024-onward open models made the same choice. Eight groups
+            appears to be a sweet spot for another reason: it matches
+            8-way tensor parallelism, so each GPU shard holds exactly one KV
+            head and no KV replication is needed across shards.
+          </p>
+
+          <h3>MLA: cache a latent, not the keys and values</h3>
+          <p>
+            Multi-head latent attention, introduced with DeepSeek-V2 and
+            carried into V3 and R1, takes a different route: instead of
+            sharing full-width KV heads, compress. A learned down-projection
+            squeezes each token's hidden state x<sub>t</sub> into a small
+            latent
+          </p>
+          <p>
+            c<sub>t</sub> = x<sub>t</sub> W<sub>DKV</sub>,&nbsp;&nbsp; W<sub>DKV</sub> ∈ ℝ<sup>d_model × d_c</sup>,
+          </p>
+          <p>
+            with d<sub>c</sub> much smaller than what MHA caches (DeepSeek-V2
+            uses d<sub>c</sub> = 512 against 128 heads of dimension 128, so
+            the latent is 64× smaller than the 2 · 128 · 128 = 32,768 numbers
+            per token that full MHA would store). Per-head keys and values
+            are reconstructed by up-projections
+            k<sub>t</sub><sup>(i)</sup> = c<sub>t</sub> W<sub>UK</sub><sup>(i)</sup>
+            and
+            v<sub>t</sub><sup>(i)</sup> = c<sub>t</sub> W<sub>UV</sub><sup>(i)</sup>.
+            Written naively that looks like you must decompress the whole
+            cache every step, but the up-projections are linear, and linear
+            maps can be moved across the dot product. The score for head i is
+          </p>
+          <p>
+            q<sub>t</sub><sup>(i)</sup> · k<sub>s</sub><sup>(i)</sup>
+            = q<sub>t</sub><sup>(i)</sup> · (c<sub>s</sub> W<sub>UK</sub><sup>(i)</sup>)
+            = (q<sub>t</sub><sup>(i)</sup> W<sub>UK</sub><sup>(i)T</sup>) · c<sub>s</sub>,
+          </p>
+          <p>
+            so <mark>W<sub>UK</sub> is absorbed into the query path: each head
+            projects its query once into latent space and scores directly
+            against the cached latents</mark>. Symmetrically, the output
+            Σ<sub>s</sub> w<sub>s</sub> v<sub>s</sub><sup>(i)</sup> =
+            (Σ<sub>s</sub> w<sub>s</sub> c<sub>s</sub>) W<sub>UV</sub><sup>(i)</sup>,
+            so attention averages latents and W<sub>UV</sub> is applied once
+            per query, where it can be folded into the output projection
+            W<sub>O</sub>. After absorption, decoding is structurally MQA
+            with one shared "KV head" of width d<sub>c</sub> whose keys and
+            values are the same vector, yet each head still has its own
+            learned view of that latent through its absorbed projections.
+            That is the trick MQA cannot do: per-head diversity survives
+            because it lives in the projections, not in the cache. Two real
+            complications are worth naming honestly. RoPE positional
+            rotations do not commute with the absorption (the rotation sits
+            between q and k and depends on position), so DeepSeek adds a
+            small decoupled rotary key of dimension d<sub>r</sub> = 64 per
+            token, cached alongside the latent; and queries get their own
+            low-rank compression to save activation memory during training.
+            With both, the cache per token per layer is
+            d<sub>c</sub> + d<sub>r</sub> = 576 elements, and the paper
+            reports a 93.3% KV cache reduction versus its MHA equivalent,
+            comparable in size to GQA with about 2.25 groups, while
+            reporting quality above the MHA baseline at their scale.
+          </p>
+
+          <h2>Implementation, twice</h2>
+          <p>
+            One module covers MHA, GQA, and MQA, because they are one
+            algorithm: <code>n_kv_heads = n_heads</code> is MHA,
+            <code>1 &lt; n_kv_heads &lt; n_heads</code> is GQA, and
+            <code>n_kv_heads = 1</code> is MQA. The only new mechanics
+            relative to the <a href="/ml/attention">baseline module</a> are
+            narrower K and V projections and a broadcast of each KV head
+            across its group of query heads, done here with
+            <code>repeat_interleave</code> in PyTorch and
+            <code>jnp.repeat</code> in JAX. This mirrors exactly how
+            huggingface/transformers implements Llama's
+            <code>repeat_kv</code>.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class KVEfficientAttention(nn.Module):
+    """Causal self-attention with a configurable KV head count.
+
+    n_kv_heads == n_heads          -&gt; MHA (baseline)
+    1 &lt; n_kv_heads &lt; n_heads       -&gt; GQA (e.g. Llama 3: 32 q, 8 kv)
+    n_kv_heads == 1                -&gt; MQA
+    """
+
+    def __init__(self, n_embd, n_heads, n_kv_heads):
+        super().__init__()
+        assert n_embd % n_heads == 0
+        assert n_heads % n_kv_heads == 0
+        self.n_heads, self.n_kv_heads = n_heads, n_kv_heads
+        self.head_dim = n_embd // n_heads
+        # Only K and V get narrower; Q and O are full width, so the
+        # model keeps h independent questions per position.
+        self.q_proj = nn.Linear(n_embd, n_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(n_embd, n_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(n_embd, n_kv_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(n_heads * self.head_dim, n_embd, bias=False)
+
+    def forward(self, x):                                  # x: (B, T, C)
+        B, T, C = x.shape
+        q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        # Broadcast each KV head to its group of query heads.
+        # Pedagogical: production kernels index into the small KV
+        # instead of materializing the repeat (that would forfeit
+        # the bandwidth win the variant exists to buy).
+        g = self.n_heads // self.n_kv_heads
+        k = k.repeat_interleave(g, dim=1)                  # (B, Hq, T, d)
+        v = v.repeat_interleave(g, dim=1)
+        scores = q @ k.transpose(-2, -1) / math.sqrt(self.head_dim)
+        future = torch.triu(torch.ones(T, T, dtype=torch.bool,
+                                       device=x.device), diagonal=1)
+        scores = scores.masked_fill(future, float('-inf'))
+        w = F.softmax(scores, dim=-1)
+        y = (w @ v).transpose(1, 2).contiguous().view(B, T, C)
+        return self.o_proj(y)
+
+def kv_cache_bytes(n_layers, n_kv_heads, head_dim, seq_len,
+                   batch=1, bytes_per_elem=2):
+    """K and V, each (batch, n_kv_heads, seq_len, head_dim), per layer."""
+    return 2 * n_layers * n_kv_heads * head_dim * seq_len * batch * bytes_per_elem</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">import jax
+import jax.numpy as jnp
+
+def init_kv_efficient_attention(key, n_embd, n_heads, n_kv_heads):
+    assert n_embd % n_heads == 0 and n_heads % n_kv_heads == 0
+    head_dim = n_embd // n_heads
+    kq, kk, kv, ko = jax.random.split(key, 4)
+    s = 1.0 / jnp.sqrt(n_embd)
+    # Only K and V get narrower; Q and O stay full width.
+    return {
+        'w_q': jax.random.normal(kq, (n_embd, n_heads * head_dim)) * s,
+        'w_k': jax.random.normal(kk, (n_embd, n_kv_heads * head_dim)) * s,
+        'w_v': jax.random.normal(kv, (n_embd, n_kv_heads * head_dim)) * s,
+        'w_o': jax.random.normal(ko, (n_heads * head_dim, n_embd)) * s,
+    }
+
+def kv_efficient_attention(params, x, n_heads, n_kv_heads):
+    """n_kv_heads == n_heads is MHA, 1 is MQA, in between is GQA."""
+    B, T, C = x.shape
+    head_dim = C // n_heads
+    q = (x @ params['w_q']).reshape(B, T, n_heads, head_dim).swapaxes(1, 2)
+    k = (x @ params['w_k']).reshape(B, T, n_kv_heads, head_dim).swapaxes(1, 2)
+    v = (x @ params['w_v']).reshape(B, T, n_kv_heads, head_dim).swapaxes(1, 2)
+    # Broadcast each KV head across its query group. Pedagogical:
+    # fused kernels index the small KV rather than materialize this.
+    g = n_heads // n_kv_heads
+    k = jnp.repeat(k, g, axis=1)                       # (B, Hq, T, d)
+    v = jnp.repeat(v, g, axis=1)
+    scores = jnp.einsum('bhqd,bhkd-&gt;bhqk', q, k) / jnp.sqrt(head_dim)
+    visible = jnp.tril(jnp.ones((T, T), dtype=bool))
+    scores = jnp.where(visible, scores, -jnp.inf)
+    w = jax.nn.softmax(scores, axis=-1)
+    y = jnp.einsum('bhqk,bhkd-&gt;bhqd', w, v)
+    y = y.swapaxes(1, 2).reshape(B, T, C)
+    return y @ params['w_o']
+
+def kv_cache_bytes(n_layers, n_kv_heads, head_dim, seq_len,
+                   batch=1, bytes_per_elem=2):
+    """K and V, each (batch, n_kv_heads, seq_len, head_dim), per layer."""
+    return 2 * n_layers * n_kv_heads * head_dim * seq_len * batch * bytes_per_elem</code></pre>
+          </div>
+          <p>
+            MLA deserves code too, but with its scope stated plainly. The
+            version below shows the load-bearing mechanics, compressing to a
+            latent, caching only the latent, and absorbing the K
+            up-projection into the query path and the V up-projection into
+            the output path, and it runs. What it omits is exactly what makes
+            DeepSeek's production version subtle: the decoupled RoPE key that
+            restores position information (rotations do not commute with the
+            absorption), the query-side low-rank compression, and the fused
+            kernels. Treat it as pseudocode that happens to execute, not as a
+            faithful DeepSeek reimplementation, and do not benchmark quality
+            conclusions off it.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">class MLADecodeSimplified(nn.Module):
+    """Multi-head latent attention, decode step, simplified.
+
+    Omits DeepSeek's decoupled RoPE keys and query compression.
+    The point being demonstrated: the cache holds ONE d_latent
+    vector per token, shared by all heads, yet every head keeps
+    its own learned view of it via absorbed projections.
+    """
+
+    def __init__(self, d_model, n_heads, head_dim, d_latent):
+        super().__init__()
+        self.n_heads, self.head_dim = n_heads, head_dim
+        self.w_dkv = nn.Linear(d_model, d_latent, bias=False)   # compress
+        self.w_q = nn.Linear(d_model, n_heads * head_dim, bias=False)
+        # Per-head up-projections kept explicit so absorption is visible.
+        self.w_uk = nn.Parameter(torch.randn(n_heads, d_latent, head_dim)
+                                 / math.sqrt(d_latent))
+        self.w_uv = nn.Parameter(torch.randn(n_heads, d_latent, head_dim)
+                                 / math.sqrt(d_latent))
+        self.w_o = nn.Linear(n_heads * head_dim, d_model, bias=False)
+
+    def forward(self, x, latent_cache):
+        # x: (B, 1, d_model) newest token
+        # latent_cache: (B, T_past, d_latent), the ONLY cached state
+        B = x.size(0)
+        c_new = self.w_dkv(x)                          # (B, 1, d_latent)
+        cache = torch.cat([latent_cache, c_new], dim=1)  # (B, T, d_latent)
+        q = self.w_q(x).view(B, self.n_heads, self.head_dim)
+        # Absorb W_uk into the query: score against latents directly.
+        q_lat = torch.einsum('bhd,hcd-&gt;bhc', q, self.w_uk)   # (B, H, d_latent)
+        s = torch.einsum('bhc,btc-&gt;bht', q_lat, cache)
+        s = s / math.sqrt(self.head_dim)
+        w = F.softmax(s, dim=-1)                       # (B, H, T)
+        o_lat = torch.einsum('bht,btc-&gt;bhc', w, cache)  # attend over latents
+        o = torch.einsum('bhc,hcd-&gt;bhd', o_lat, self.w_uv)  # absorb W_uv
+        return self.w_o(o.reshape(B, 1, -1)), cache</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">def init_mla(key, d_model, n_heads, head_dim, d_latent):
+    k1, k2, k3, k4, k5 = jax.random.split(key, 5)
+    return {
+        'w_dkv': jax.random.normal(k1, (d_model, d_latent)) / jnp.sqrt(d_model),
+        'w_q': jax.random.normal(k2, (d_model, n_heads * head_dim))
+               / jnp.sqrt(d_model),
+        # Per-head up-projections kept explicit so absorption is visible.
+        'w_uk': jax.random.normal(k3, (n_heads, d_latent, head_dim))
+                / jnp.sqrt(d_latent),
+        'w_uv': jax.random.normal(k4, (n_heads, d_latent, head_dim))
+                / jnp.sqrt(d_latent),
+        'w_o': jax.random.normal(k5, (n_heads * head_dim, d_model))
+               / jnp.sqrt(n_heads * head_dim),
+    }
+
+def mla_decode_step(params, x, latent_cache, n_heads, head_dim):
+    """Simplified MLA decode: no decoupled RoPE keys, no query
+    compression. The cache holds ONE d_latent vector per token."""
+    B = x.shape[0]                                 # x: (B, 1, d_model)
+    c_new = x @ params['w_dkv']                    # (B, 1, d_latent)
+    cache = jnp.concatenate([latent_cache, c_new], axis=1)  # (B, T, d_c)
+    q = (x @ params['w_q']).reshape(B, n_heads, head_dim)
+    # Absorb W_uk into the query: score against latents directly.
+    q_lat = jnp.einsum('bhd,hcd-&gt;bhc', q, params['w_uk'])
+    s = jnp.einsum('bhc,btc-&gt;bht', q_lat, cache) / jnp.sqrt(head_dim)
+    w = jax.nn.softmax(s, axis=-1)                 # (B, H, T)
+    o_lat = jnp.einsum('bht,btc-&gt;bhc', w, cache)   # attend over latents
+    o = jnp.einsum('bhc,hcd-&gt;bhd', o_lat, params['w_uv'])
+    return o.reshape(B, 1, -1) @ params['w_o'], cache</code></pre>
+          </div>
+
+          <h2>Using it on a real shape of problem</h2>
+          <p>
+            Two things are worth actually running: the module at the three
+            settings, to see that the interface and output shape never
+            change, and the cache calculator at Llama-2-7B dimensions, to
+            see what the family buys. The parameter count also drops as
+            n_kv_heads falls (the K and V projections narrow), which is a
+            side benefit, not the point.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">torch.manual_seed(0)
+x = torch.randn(2, 256, 4096)          # (B, T, C) at 7B width
+
+for n_kv in (32, 8, 1):                # MHA, GQA-8 (Llama 3), MQA
+    attn = KVEfficientAttention(n_embd=4096, n_heads=32, n_kv_heads=n_kv)
+    y = attn(x)
+    n_params = sum(p.numel() for p in attn.parameters())
+    print(n_kv, y.shape, f"{n_params/1e6:.1f}M params")
+# 32 torch.Size([2, 256, 4096]) 67.1M params   (full MHA layer)
+#  8 torch.Size([2, 256, 4096]) 41.9M params
+#  1 torch.Size([2, 256, 4096]) 34.6M params
+
+# The cache bill at Llama-2-7B shape: 32 layers, head_dim 128,
+# context 4096, fp16, one sequence.
+for n_kv in (32, 8, 1):
+    gib = kv_cache_bytes(32, n_kv, 128, 4096) / 2**30
+    print(f"n_kv_heads={n_kv:2d}: {gib:.3f} GiB")
+# n_kv_heads=32: 2.000 GiB    (MHA: the 7B baseline)
+# n_kv_heads= 8: 0.500 GiB    (GQA-8: 4x smaller)
+# n_kv_heads= 1: 0.062 GiB    (MQA: 32x smaller)</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">key = jax.random.PRNGKey(0)
+x = jax.random.normal(key, (2, 256, 4096))   # (B, T, C) at 7B width
+
+for n_kv in (32, 8, 1):                      # MHA, GQA-8, MQA
+    params = init_kv_efficient_attention(key, 4096, 32, n_kv)
+    apply = jax.jit(lambda p, x, n=n_kv: kv_efficient_attention(p, x, 32, n))
+    y = apply(params, x)
+    n_params = sum(p.size for p in jax.tree_util.tree_leaves(params))
+    print(n_kv, y.shape, f"{n_params/1e6:.1f}M params")
+# 32 (2, 256, 4096) 67.1M params   (full MHA layer)
+#  8 (2, 256, 4096) 41.9M params
+#  1 (2, 256, 4096) 34.6M params
+
+# The cache bill at Llama-2-7B shape: 32 layers, head_dim 128,
+# context 4096, fp16, one sequence.
+for n_kv in (32, 8, 1):
+    gib = kv_cache_bytes(32, n_kv, 128, 4096) / 2**30
+    print(f"n_kv_heads={n_kv:2d}: {gib:.3f} GiB")
+# n_kv_heads=32: 2.000 GiB    (MHA: the 7B baseline)
+# n_kv_heads= 8: 0.500 GiB    (GQA-8: 4x smaller)
+# n_kv_heads= 1: 0.062 GiB    (MQA: 32x smaller)</code></pre>
+          </div>
+          <p>
+            The numbers to internalize are the cache ones. GQA-8 turns the
+            2 GiB per-sequence cache into 512 MiB, which quadruples how many
+            concurrent sequences fit in the same memory and cuts per-token
+            cache reads by the same factor. Training-time forward FLOPs, by
+            contrast, are nearly identical across the three settings, which
+            is why <mark>you will not see the win in a training-shaped
+            benchmark; the variant family pays off at decode, where the
+            workload is one query token against a long cache</mark>. Exact
+            speedups are machine- and batch-dependent, but the direction is
+            robust: throughput at large batch scales roughly with how much
+            cache traffic you removed.
+          </p>
+
+          <h2>Applications</h2>
+          <p>
+            This family is why long-context serving is economical at all.
+            Concretely: Llama 2 70B, Llama 3 (8B and 70B), Mistral 7B,
+            Mixtral, Falcon-40B, and Qwen 2 and later all ship GQA with 8 KV
+            heads against 32 to 64 query heads; PaLM, Falcon-7B, and
+            StarCoder shipped MQA; DeepSeek-V2, V3, and R1 ship MLA. The
+            practical consequences show up in three places. First, batch
+            size: a serving engine's throughput at fixed hardware is largely
+            a function of how many requests' caches fit in HBM, so a 4×
+            smaller cache is roughly 4× more concurrency, which is a direct
+            cost-per-token reduction. Second, context length: 128k-token
+            contexts at MHA cache rates would be tens of GiB per sequence;
+            GQA and MLA are what make the long-context tiers of commercial
+            APIs feasible. Third, on-device inference: llama.cpp-style local
+            deployment on a laptop or phone lives inside a few GiB, and a
+            GQA model leaves that budget to weights instead of cache. MLA's
+            extra credit is that DeepSeek paired the 90%+ cache reduction
+            with quality their paper reports as above the MHA baseline,
+            which turned "compression as a necessary evil" into
+            "compression as a free lunch" and is a large part of why
+            DeepSeek-V3-class models serve cheaply at scale. When you read a
+            model card, num_kv_heads is one of the first numbers to check:
+            it tells you the serving economics before you run anything.
+          </p>
+
+          <h2>Against the real libraries</h2>
+          <p>
+            <a href="https://github.com/huggingface/transformers" target="_blank" rel="noreferrer">huggingface/transformers</a>
+            (my codebase notes are at <a href="/oss/transformers">/oss/transformers</a>)
+            exposes the whole family through one config field:
+            <code>num_key_value_heads</code>. Set it equal to
+            <code>num_attention_heads</code> and the model is MHA, set it to
+            1 for MQA, anything between for GQA; <code>LlamaConfig</code>,
+            <code>MistralConfig</code>, and most modern architectures carry
+            it. Inside the modeling code the broadcast is the same
+            <code>repeat_kv</code> expand you saw above when running the
+            eager path, but with <code>attn_implementation="flash_attention_2"</code>
+            or <code>"sdpa"</code> the repeat never materializes. What the
+            library adds over this page is everything around the module:
+            RoPE application, cache management classes, quantized caches,
+            and per-model wiring, all selected by config rather than code.
+          </p>
+          <p>
+            <a href="https://github.com/Dao-AILab/flash-attention" target="_blank" rel="noreferrer">flash-attention</a>
+            (walkthrough at <a href="/oss/flash-attention">/oss/flash-attention</a>)
+            supports MQA and GQA natively: pass q with h heads and k, v with
+            fewer heads, and as long as the query head count is divisible by
+            the KV head count, the kernel indexes each query head into its
+            group's KV tile inside SRAM, so the bandwidth saving is realized
+            rather than simulated. PyTorch's
+            <code>F.scaled_dot_product_attention</code> grew the same
+            ability behind an <code>enable_gqa=True</code> flag (added
+            around PyTorch 2.5; check your version), which lets you delete
+            the <code>repeat_interleave</code> entirely.
+          </p>
+          <p>
+            Serving engines are where the variants cash out.
+            <a href="https://github.com/vllm-project/vllm" target="_blank" rel="noreferrer">vLLM</a>
+            (notes at <a href="/oss/vllm">/oss/vllm</a>) manages the KV cache
+            in fixed-size pages with PagedAttention, so cache memory is
+            allocated like virtual memory and shared across sequences with
+            common prefixes; a GQA model needs 4 to 8× fewer pages per
+            request, which multiplies directly into batch capacity. vLLM and
+            <a href="https://github.com/sgl-project/sglang" target="_blank" rel="noreferrer">SGLang</a>
+            (notes at <a href="/oss/sglang">/oss/sglang</a>) both added
+            dedicated MLA paths for the DeepSeek models, including kernels
+            in the lineage of DeepSeek's own open-sourced
+            <a href="https://github.com/deepseek-ai/FlashMLA" target="_blank" rel="noreferrer">FlashMLA</a>,
+            because absorbed-MLA decode is a different kernel shape (one
+            wide shared latent instead of many narrow heads) than GQA.
+          </p>
+          <p>
+            The from-scratch version is enough for architecture experiments,
+            ablations at research scale, and any setting where you want the
+            attention weights inspectable. The correctness check has two
+            layers. First, internal consistency: with
+            <code>n_kv_heads = n_heads</code> the module must match the
+            baseline MHA module from the <a href="/ml/attention">attention
+            page</a> given identical weights. Second, against the library
+            kernel:
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">torch.manual_seed(0)
+B, Hq, Hkv, T, d = 2, 8, 2, 64, 32
+q = torch.randn(B, Hq, T, d, dtype=torch.float64)
+k = torch.randn(B, Hkv, T, d, dtype=torch.float64)
+v = torch.randn(B, Hkv, T, d, dtype=torch.float64)
+
+# Ours: materialize the repeat, then plain causal attention.
+kk = k.repeat_interleave(Hq // Hkv, dim=1)
+vv = v.repeat_interleave(Hq // Hkv, dim=1)
+scores = q @ kk.transpose(-2, -1) / math.sqrt(d)
+scores = scores.masked_fill(
+    torch.triu(torch.ones(T, T, dtype=torch.bool), 1), float('-inf'))
+ours = F.softmax(scores, dim=-1) @ vv
+
+# Reference: SDPA's native GQA path (PyTorch &gt;= 2.5).
+ref = F.scaled_dot_product_attention(q, k, v, is_causal=True,
+                                     enable_gqa=True)
+print((ref - ours).abs().max())        # ~1e-16 in float64
+assert torch.allclose(ref, ours, atol=1e-12)</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">key = jax.random.PRNGKey(0)
+kq, kk_, kv_ = jax.random.split(key, 3)
+B, Hq, Hkv, T, d = 2, 8, 2, 64, 32
+# jax.nn.dot_product_attention uses (B, T, H, d) layout and
+# supports GQA when Hq is a multiple of Hkv.
+q = jax.random.normal(kq, (B, T, Hq, d))
+k = jax.random.normal(kk_, (B, T, Hkv, d))
+v = jax.random.normal(kv_, (B, T, Hkv, d))
+
+ref = jax.nn.dot_product_attention(q, k, v, is_causal=True)
+
+# Ours: repeat KV heads, then plain causal attention in (B,H,T,d).
+g = Hq // Hkv
+qh = q.swapaxes(1, 2)
+kh = jnp.repeat(k.swapaxes(1, 2), g, axis=1)
+vh = jnp.repeat(v.swapaxes(1, 2), g, axis=1)
+scores = jnp.einsum('bhqd,bhkd-&gt;bhqk', qh, kh) / jnp.sqrt(d)
+visible = jnp.tril(jnp.ones((T, T), dtype=bool))
+scores = jnp.where(visible, scores, -jnp.inf)
+ours = jnp.einsum('bhqk,bhkd-&gt;bhqd',
+                  jax.nn.softmax(scores, axis=-1), vh).swapaxes(1, 2)
+
+print(jnp.abs(ref - ours).max())       # ~1e-6 in float32
+assert jnp.allclose(ref, ours, atol=1e-4)</code></pre>
+          </div>
+
+          <h2>Traps and misconceptions</h2>
+          <p>
+            <strong>"GQA makes training faster."</strong> Mostly it does
+            not, and measuring the wrong phase is the classic mistake. In a
+            training step the sequence is processed in parallel and the
+            dominant costs (score matmul, value matmul, MLP) are untouched
+            by shrinking KV heads; only the K and V projections narrow. The
+            win is at autoregressive decode, where each step is one query
+            against a long cache and the cache read is the bottleneck.
+            Benchmark decode throughput at realistic batch and context, or
+            you will conclude the variant does nothing.
+          </p>
+          <p>
+            <strong>Materializing the repeat in production.</strong>
+            <code>repeat_interleave</code> on K and V recreates full-size
+            tensors and, if done on the cache itself, forfeits the entire
+            bandwidth saving. It is the right teaching implementation and
+            an acceptable eager fallback, but the deployed path must index
+            heads into groups inside the kernel, which is what
+            flash-attention's GQA support, SDPA's <code>enable_gqa</code>,
+            and every serving engine actually do. Related bug: computing
+            the cache, then repeating, then caching the repeated tensors,
+            which silently restores MHA-size memory.
+          </p>
+          <p>
+            <strong>"MQA/GQA shrink the score matrix."</strong> No. Every
+            query head still scores against every position, so the
+            attention matrix is exactly as large and exactly as quadratic
+            as MHA's; only the number of distinct K and V tensors changed.
+            Quadratic-cost reduction is a different axis, covered on the
+            <a href="/ml/efficient-attention">efficient attention page</a>,
+            and models like Mistral combine both (GQA plus sliding-window
+            attention) precisely because they are independent.
+          </p>
+          <p>
+            <strong>Treating head-count changes as checkpoint-compatible.</strong>
+            You cannot flip <code>num_key_value_heads</code> on trained MHA
+            weights and expect a working model: the K and V projection
+            shapes change. The GQA paper's recipe is mean-pooling the heads
+            within each group and then uptraining for a small fraction of
+            the original tokens; skipping the uptraining step gives a
+            visibly damaged model. Conversely MLA cannot be obtained by
+            surgery on an MHA checkpoint at all in the general case; it is
+            an architectural commitment made before pretraining, with
+            recent research exploring conversions as an open problem.
+          </p>
+          <p>
+            <strong>"MLA is just GQA with extra steps."</strong> The cache
+            sizes can look similar, but the mechanism differs where it
+            matters: GQA forces groups of query heads to share literal keys
+            and values, while MLA gives every head its own learned
+            projection of a shared compressed latent, so per-head diversity
+            survives compression. That is why DeepSeek could report
+            quality above their MHA baseline at a cache size GQA only
+            reaches by giving up head diversity. The price is real
+            complexity: absorption changes the decode kernel, and RoPE
+            requires a decoupled positional key path.
+          </p>
+
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> the KV cache costs
+            2 · layers · kv_heads · head_dim · seq · bytes, about 2 GiB per
+            4k-context sequence for a 7B MHA model, and it is read once per
+            generated token, so it, not FLOPs, prices decoding. MQA shares
+            one KV head (32× smaller, some quality risk), GQA shares one
+            per group (Llama and Mistral ship 8 groups: 4× smaller,
+            quality holds), and MLA caches a single low-rank latent per
+            token with the up-projections absorbed into the query and
+            output paths (90%+ smaller, per-head diversity preserved). One
+            module with an n_kv_heads knob covers MHA to MQA; the serving
+            stack (flash-attention, vLLM, SGLang) realizes the saving by
+            indexing instead of repeating.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/code-tabs.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (!window.hljs) return;
+        hljs.configure({ languages: ["python", "bash", "c", "cpp", "rust", "go", "typescript", "swift", "sql", "json", "yaml", "plaintext"] });
+        hljs.highlightAll();
+      });
+    </script>
+  </body>
+</html>

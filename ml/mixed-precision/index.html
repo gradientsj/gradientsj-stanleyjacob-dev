@@ -1,0 +1,587 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Mixed precision · Stanley Jacob</title>
+    <meta name="description" content="Mixed precision training from the bit layouts up: why fp16 underflows gradients and bf16 does not, loss scaling derived with the dynamic overflow-backoff loop, fp32 master weights, which ops must stay in fp32, and manual plus idiomatic implementations in PyTorch and JAX." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" integrity="sha384-eFTL69TLRZTkNfYZOLM+G04821K1qZao/4QLJbet1pP4tcF+fdXq/9CdqAbWRl/L" crossorigin="anonymous" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml" class="active">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/ml">Machine learning</a></div>
+        <h1>Mixed precision and loss scaling</h1>
+        <p class="lead">
+          Mixed precision training is a bet about where a neural network can
+          tolerate error: run the matmuls in 16-bit floats for speed and
+          memory, keep a 32-bit master copy of the weights for correctness,
+          and, if the 16-bit format is fp16, multiply the loss by a large
+          constant so gradients survive the trip through the narrow exponent
+          range. This page works up from the bit layouts of fp32, fp16, and
+          bf16 to exactly why fp16 underflows gradients and bf16 does not,
+          derives static and dynamic loss scaling including the
+          overflow-backoff loop, then builds a mixed-precision training step by
+          hand in PyTorch and JAX before showing what
+          <code>torch.autocast</code> and <code>GradScaler</code> were doing
+          all along.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>What it is and when you reach for it</h2>
+          <p>
+            Mixed precision training runs the compute-heavy operations of a
+            network, mostly matrix multiplies and convolutions, in a 16-bit
+            floating point format while keeping a 32-bit copy of the weights
+            for the optimizer to update. The wins are concrete: half the bytes
+            per activation and gradient means roughly double the effective
+            memory and memory bandwidth, and on every GPU since Volta the
+            tensor cores execute half-precision matmuls at several times the
+            fp32 rate. The technique was formalized by
+            <a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noreferrer">Micikevicius et al. (2017)</a>
+            with three ingredients: half-precision compute, an fp32 master copy
+            of the weights, and loss scaling to keep fp16 gradients from
+            flushing to zero. The arrival of bfloat16 on TPUs and on NVIDIA
+            GPUs from Ampere onward made the third ingredient optional, and the
+            modern default for large-model training is bf16 compute with fp32
+            master state and no loss scaler at all. You reach for mixed
+            precision whenever you train anything nontrivial on modern
+            hardware, which is to say always; the only real decisions left are
+            fp16-plus-scaler versus bf16, and which operations to hold back in
+            fp32.
+          </p>
+
+          <h2>The math</h2>
+          <h3>Three bit layouts</h3>
+          <p>
+            A binary float is a sign bit, an exponent field, and a mantissa
+            (fraction) field, encoding &plusmn;1.mantissa &times;
+            2<sup>exponent&minus;bias</sup>. The three formats that matter
+            split their bits like this:
+          </p>
+          <pre class="flow">        sign  exponent      mantissa            range (normal)     rel. precision
+fp32    s     eeeeeeee      mmmmmmmmmmmmmmmmmmmmmmm
+        1     8 bits        23 bits             ~1.2e-38..3.4e38   2^-24 ~ 6e-8
+
+fp16    s     eeeee         mmmmmmmmmm
+        1     5 bits        10 bits             ~6.1e-5..65504     2^-11 ~ 4.9e-4
+
+bf16    s     eeeeeeee      mmmmmmm
+        1     8 bits        7 bits              ~1.2e-38..3.4e38   2^-8  ~ 3.9e-3</pre>
+          <p>
+            The exponent field sets dynamic range: how far from 1.0 a value can
+            wander before it overflows to infinity or underflows to zero. The
+            mantissa sets precision: how many significant bits each value
+            carries. fp16 spent its bits on precision (10 mantissa bits, about
+            3 decimal digits) and starves the exponent: the largest finite
+            fp16 is 65504, the smallest normal is about 6.1&times;10<sup>-5</sup>,
+            and with subnormals the absolute floor is 2<sup>-24</sup> &asymp;
+            6&times;10<sup>-8</sup>. bfloat16 is simply fp32 with the bottom
+            16 mantissa bits sliced off: it keeps the full 8-bit exponent and
+            therefore fp32's entire range, at the cost of 7 mantissa bits,
+            about 2 to 3 decimal digits. <mark>bf16 trades precision for
+            range; fp16 traded range for precision, and range is the thing
+            deep learning actually needs.</mark>
+          </p>
+          <h3>Why fp16 underflows gradients and bf16 does not</h3>
+          <p>
+            Weights and activations in a trained network cluster within a few
+            orders of magnitude of 1, comfortably inside any of these formats.
+            Gradients do not. Backpropagated activation gradients shrink as
+            they pass through layers scaled by small weights and saturating
+            nonlinearities, and the mixed-precision paper's measurements show
+            large fractions of gradient values with magnitudes below
+            2<sup>-24</sup>, fp16's absolute floor. Every one of those becomes
+            exactly zero when stored in fp16: not imprecise, gone. The model
+            keeps training but the small-gradient parameters silently stop
+            learning, and the loss curve degrades or diverges from the fp32
+            baseline. bf16 has no such cliff: its floor is fp32's
+            ~10<sup>-38</sup>, some thirty orders of magnitude of headroom
+            below any gradient a sane model produces. What bf16 gives up
+            instead is resolution: 1.0 + 0.003 rounds back to 1.0 in bf16,
+            since the next representable value above 1 is 1 + 2<sup>-7</sup>
+            &asymp; 1.0078. Networks are robust to that kind of rounding in
+            the forward and backward compute; they are not robust to entire
+            gradient populations flushing to zero. This asymmetry is the whole
+            reason bf16 training needs no loss scaling and fp16 training does.
+          </p>
+          <h3>Loss scaling, derived</h3>
+          <p>
+            Backpropagation is linear in the output gradient: every chain-rule
+            product that produces &part;L/&part;&theta; starts from
+            &part;L/&part;L = 1, so training on S&middot;L instead of L
+            multiplies every intermediate and final gradient by exactly S.
+            That gives a free translation knob in log space:
+          </p>
+          <pre class="flow">grad(S * L) = S * grad(L)          exact, by linearity of backprop
+
+fp16 exponent axis (powers of 2):
+  -24        -14                 0                +15
+   |----------|------------------|-----------------|
+   ^ subnormal floor                       65504 ^
+      [ gradient histogram ]  --- multiply by S=2^16 --&gt;  [ shifted histogram ]
+      (partly below floor,                                (fully inside range)
+       flushes to zero)</pre>
+          <p>
+            Choose S so the gradient histogram slides up out of the underflow
+            region without its largest values crossing 65504, compute the
+            backward pass in fp16, then divide the gradients by S in fp32
+            before they touch gradient clipping or the optimizer. The unscale
+            must happen in fp32: dividing by S in fp16 would re-underflow
+            exactly the values the scale was protecting.
+          </p>
+          <p>
+            Static scaling picks a constant, typically 2<sup>15</sup> or
+            2<sup>16</sup>, and works when you know the gradient range.
+            Dynamic scaling removes the tuning with a bang-bang control loop.
+            Start high, S = 2<sup>16</sup>. After each backward pass, check
+            the gradients for inf or NaN. If any appear, the scale pushed some
+            gradient past 65504: skip the optimizer step entirely (the
+            gradients are garbage) and halve S. If a run of N consecutive
+            steps (2000 in <code>torch.amp.GradScaler</code>'s defaults)
+            completes cleanly, double S. The loop hunts for the largest scale
+            that does not overflow and tracks it as gradient magnitudes drift
+            during training; the occasional skipped step and halving is the
+            deliberate cost of probing the ceiling. This is why fp16 training
+            logs show the scale sawtoothing, and why a scale that halves
+            repeatedly without recovering signals real divergence rather than
+            scaler mischief.
+          </p>
+          <h3>Master weights in fp32</h3>
+          <p>
+            Floating point addition loses the smaller addend once the
+            magnitude gap exceeds the mantissa width: in fp16, x + &delta;
+            returns x whenever |&delta;| &lt; |x| &middot; 2<sup>-11</sup>.
+            Optimizer updates are exactly this shape. A typical weight is
+            ~10<sup>-1</sup>; a typical per-step update with a small learning
+            rate is 10<sup>-5</sup> or below; the ratio 10<sup>-4</sup> sits
+            under fp16's 2<sup>-11</sup> &asymp; 4.9&times;10<sup>-4</sup>
+            threshold, so applying the update to an fp16 weight does nothing
+            at all. Training proceeds, loss plateaus, nothing is NaN, and the
+            weights simply are not moving. The fix is to keep the
+            authoritative copy of every weight in fp32, whose 2<sup>-24</sup>
+            threshold gives eleven more bits of headroom, apply updates there,
+            and cast fresh 16-bit copies for each forward pass. In bf16 the
+            problem is even more acute (2<sup>-8</sup> threshold), which is
+            why <mark>the bf16 recipe still keeps fp32 master weights: bf16
+            removes the need for loss scaling, not the need for fp32
+            accumulation of small updates.</mark> The same logic keeps
+            <a href="/ml/adam">Adam's</a> moment EMAs in fp32: they too are
+            long-running accumulations of small increments.
+          </p>
+          <h3>Which ops stay in fp32, and why</h3>
+          <p>
+            Autocast is not "run everything in 16 bits"; it is a per-op
+            policy. Matmuls and convolutions go to 16-bit inputs because
+            tensor cores accumulate their dot products in fp32 internally, so
+            the cheap format costs little accuracy where the flops are.
+            Everything whose failure mode is a bad reduction stays in fp32:
+            sums and means over many elements (a sum of 4096 squared
+            activations around 10 reaches ~409,600, already past fp16's
+            65504), variance computations inside LayerNorm and BatchNorm
+            (cancellation between large nearly-equal terms), softmax (exp has
+            a brutal dynamic range; see the
+            <a href="/ml/softmax">softmax page</a> for the subtract-max
+            machinery), log, pow, and the loss itself. This is precisely the
+            split <code>torch.autocast</code> hardcodes in its op lists, and
+            the reason a manual implementation must cast the loss computation
+            back up. Even inside fused fp16 attention kernels the softmax
+            statistics and accumulators are carried in fp32.
+          </p>
+          <h3>fp8, briefly</h3>
+          <p>
+            The same trade pushed further gives fp8, in two flavors: e4m3
+            (4 exponent bits, 3 mantissa bits, more precision) for weights and
+            activations, and e5m2 (more range) for gradients. Eight bits is
+            too narrow for a single global loss scale, so fp8 training keeps
+            per-tensor scaling factors updated from a rolling history of each
+            tensor's observed maximum, which is the delayed-scaling machinery
+            NVIDIA's Transformer Engine implements on Hopper and Blackwell.
+            Conceptually it is loss scaling gone local: one scale per tensor
+            instead of one for the whole backward pass. The inference-side
+            story, fp8 KV caches and quantized serving, is covered in the
+            <a href="/oss/tensorrt-llm">TensorRT-LLM chapter</a>.
+          </p>
+
+          <h2>Implementation, twice</h2>
+          <p>
+            First the manual version: a two-layer MLP written so every cast is
+            visible. The PyTorch tab is a faithful expansion of what
+            <code>torch.autocast</code> plus <code>GradScaler</code> do: fp16
+            compute copies of fp32 master weights, fp32 loss, scaled backward,
+            inf/NaN check, unscale, conditional step, and the grow/backoff
+            loop with PyTorch's default constants. The JAX tab is the bf16
+            policy written as explicit dtype discipline on a params pytree:
+            params fp32, compute bf16, output and loss fp32; since the casts
+            are part of the traced graph, gradients arrive in fp32
+            automatically, and no scaler is needed because the format is bf16.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import torch
+
+torch.manual_seed(0)
+dev = "cuda"
+
+# fp32 master weights: the only copy the optimizer ever touches.
+w1 = (torch.randn(4096, 1024, device=dev) * 0.02).requires_grad_()
+w2 = (torch.randn(1024, 4096, device=dev) * 0.02).requires_grad_()
+opt = torch.optim.AdamW([w1, w2], lr=3e-4)   # states in fp32 too
+
+scale, good_steps = 2.0 ** 16, 0             # GradScaler's defaults
+GROWTH_INTERVAL = 2000
+
+for step in range(1000):
+    x = torch.randn(32, 1024, device=dev)
+    y = torch.randn(32, 1024, device=dev)
+
+    # Forward in fp16 compute copies. The .half() casts are inside the
+    # graph, so autograd casts gradients back to the fp32 leaves.
+    h = torch.relu(x.half() @ w1.half().t())
+    pred = h @ w2.half().t()
+    loss = (pred.float() - y).pow(2).mean()  # loss math in fp32 (a reduction)
+
+    (loss * scale).backward()                # every grad now carries factor S
+
+    with torch.no_grad():
+        grads = [w1.grad, w2.grad]
+        if any(not g.isfinite().all() for g in grads):
+            scale, good_steps = scale * 0.5, 0   # overflow: back off, skip step
+        else:
+            for g in grads:
+                g.div_(scale)                # unscale in fp32, never in fp16
+            opt.step()                       # fp32 update on master weights
+            good_steps += 1
+            if good_steps == GROWTH_INTERVAL:
+                scale, good_steps = scale * 2.0, 0   # probe a higher ceiling
+    opt.zero_grad(set_to_none=True)</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">import jax
+import jax.numpy as jnp
+import optax
+
+key = jax.random.PRNGKey(0)
+k1, k2 = jax.random.split(key)
+
+# fp32 params pytree: the master copy, owned by the optimizer.
+params = {"w1": jax.random.normal(k1, (1024, 4096)) * 0.02,
+          "w2": jax.random.normal(k2, (4096, 1024)) * 0.02}
+
+def forward(params, x):
+    # Explicit dtype policy, jmp's "params=float32,compute=bfloat16,
+    # output=float32" spelled out: cast down at the boundary, compute
+    # in bf16, cast the output back up.
+    p = jax.tree.map(lambda t: t.astype(jnp.bfloat16), params)
+    h = jax.nn.relu(x.astype(jnp.bfloat16) @ p["w1"])
+    return (h @ p["w2"]).astype(jnp.float32)
+
+def loss_fn(params, x, y):
+    return jnp.mean((forward(params, x) - y) ** 2)   # reduction in fp32
+
+opt = optax.adamw(3e-4)
+opt_state = opt.init(params)   # moment EMAs in fp32, like the params
+
+@jax.jit
+def train_step(params, opt_state, x, y):
+    # The astype calls are traced ops, so their cotangents cast back up:
+    # grads arrive as an fp32 pytree matching params. bf16 has fp32's
+    # exponent range, so no loss scaling is required anywhere.
+    loss, grads = jax.value_and_grad(loss_fn)(params, x, y)
+    updates, opt_state = opt.update(grads, opt_state, params)
+    return optax.apply_updates(params, updates), opt_state, loss</code></pre>
+          </div>
+          <p>
+            Then the idiomatic version. In PyTorch, <code>torch.autocast</code>
+            replaces the hand-placed casts with the per-op policy and
+            <code>torch.amp.GradScaler</code> owns the scale, the inf check,
+            the conditional step, and the growth loop; switching the dtype to
+            bf16 makes the scaler unnecessary (it is a no-op when disabled, so
+            the code can stay shape-identical). In JAX,
+            <a href="https://github.com/google-deepmind/jmp" target="_blank" rel="noreferrer">jmp</a>
+            packages the same discipline as a declarative policy object plus a
+            loss-scale type for the fp16 case.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import torch
+
+use_bf16 = torch.cuda.is_bf16_supported()      # Ampere and newer
+amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
+# GradScaler is a transparent no-op when disabled, so one loop serves both.
+scaler = torch.amp.GradScaler("cuda", enabled=not use_bf16)
+
+for x, y in loader:
+    with torch.autocast("cuda", dtype=amp_dtype):
+        pred = model(x)                # matmuls in 16-bit per the op policy
+        loss = loss_fn(pred, y)        # reductions autocast keeps in fp32
+    scaler.scale(loss).backward()
+
+    scaler.unscale_(opt)               # expose true grads BEFORE clipping
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+    scaler.step(opt)                   # skips the step if inf/NaN was found
+    scaler.update()                    # backoff on overflow, growth after 2000
+    opt.zero_grad(set_to_none=True)</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">import jax
+import jax.numpy as jnp
+import jmp
+
+policy = jmp.get_policy("params=float32,compute=bfloat16,output=float32")
+
+def forward(params, x):
+    params, x = policy.cast_to_compute((params, x))
+    h = jax.nn.relu(x @ params["w1"])
+    return policy.cast_to_output(h @ params["w2"])
+
+# fp16 on older accelerators: jmp adds the scaler side as a pytree value
+# threaded through the step, mirroring GradScaler's skip/adjust loop.
+loss_scale = jmp.DynamicLossScale(jnp.float32(2 ** 15))
+
+def train_step(params, opt_state, loss_scale, x, y):
+    def scaled_loss(p):
+        return loss_scale.scale(loss_fn(p, x, y))
+    grads = jax.grad(scaled_loss)(params)
+    grads = loss_scale.unscale(grads)
+
+    finite = jmp.all_finite(grads)              # the inf/NaN check
+    loss_scale = loss_scale.adjust(finite)      # halve or grow the scale
+    updates, new_opt_state = opt.update(grads, opt_state, params)
+    new_params = optax.apply_updates(params, updates)
+    # Commit the step only if grads were finite, else keep the old trees.
+    params, opt_state = jmp.select_tree(
+        finite, (new_params, new_opt_state), (params, opt_state))
+    return params, opt_state, loss_scale</code></pre>
+          </div>
+
+          <h2>Using it on a real shape of problem</h2>
+          <p>
+            On a transformer block of model dimension 1024 with batch 32 and
+            sequence length 512, switching the forward and backward compute
+            from fp32 to bf16 roughly halves activation memory and, on an
+            Ampere-or-newer GPU, speeds the matmul-bound steps by anywhere
+            from 1.5x to 3x depending on how memory-bound the model is; exact
+            numbers are hardware-dependent and worth measuring on your own
+            stack rather than assuming. The functional check matters more than
+            the speed check: run a few hundred steps in full fp32 and in mixed
+            precision from the same seed and overlay the loss curves. They
+            will not match step for step (different rounding), but they should
+            track within noise; a mixed-precision curve that detaches from the
+            fp32 curve is the signal to hunt for an op that needed fp32, a
+            missing master copy, or, in fp16, a scale stuck at a low value. In
+            fp16 runs, also log <code>scaler.get_scale()</code>: healthy
+            training shows it climbing to a plateau and sawtoothing gently,
+            with a handful of skipped steps early on.
+          </p>
+
+          <h2>Applications</h2>
+          <h3>The standard bf16 LLM recipe</h3>
+          <p>
+            Every major LLM pretraining stack today runs the same
+            configuration: bf16 compute for the model, fp32 master weights and
+            optimizer state, fp32 for gradient all-reduce across data-parallel
+            ranks, no loss scaler. That last choice, reducing in fp32, exists
+            because summing gradients over hundreds of ranks is one more long
+            accumulation with the same failure mode as everything else in this
+            page. This is literally
+            <a href="/oss/torchtitan">torchtitan</a>'s mixed-precision policy:
+            FSDP's <code>MixedPrecisionPolicy(param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32)</code>, sharded bf16 parameters for
+            compute with fp32 communication and fp32 sharded optimizer state.
+            At the small end, <a href="/oss/nanogpt">nanoGPT</a> is a clean
+            single-file example of the autocast idiom above: one
+            <code>torch.autocast</code> context with bf16 where supported and
+            a GradScaler that is enabled only in the fp16 fallback.
+            <a href="/ml/adam">AdamW</a> sits inside all of these recipes as
+            the fp32 half of the bargain: the moments and master weights it
+            keeps are the reason the 16-bit rounding never compounds across
+            steps.
+          </p>
+          <h3>When fp16 plus a scaler is still the answer</h3>
+          <p>
+            bf16 arithmetic requires Ampere (A100, RTX 30-series) or newer on
+            NVIDIA, so the fp16-plus-GradScaler path remains the working
+            recipe on V100s, T4s, GTX 10/16 and RTX 20 series cards, which is
+            a large fraction of cloud spot capacity, Colab-class free tiers,
+            and installed research hardware. fp16 also retains a genuine edge
+            in inference and in some fine-tuning regimes: its 10 mantissa
+            bits are three more than bf16's, so when the value range is
+            controlled, fp16 is the more accurate 16-bit format, which is why
+            inference engines often prefer it even on hardware with bf16.
+          </p>
+          <h3>Debugging NaNs</h3>
+          <p>
+            Mixed precision changes the meaning of a NaN. In fp16 training,
+            first look at the scale: infs in the scaled gradients are the
+            scaler's normal probing behavior, handled by the skip-and-halve
+            loop, and are only pathological when the scale collapses
+            repeatedly toward 1. A genuine fp16 overflow in the forward pass
+            (attention logits are the classic site, which is one reason
+            attention softmax runs in fp32) shows up as NaN in the loss
+            itself, before the scaler is involved. In bf16, precision almost
+            never produces NaNs; a bf16 NaN is nearly always real mathematics,
+            a log of zero, a division by zero, an exploding update, and should
+            be debugged as such, with
+            <code>torch.autograd.set_detect_anomaly(True)</code> to find the
+            producing op on a small repro. The most common false accusation in
+            both regimes is blaming the format for a learning rate or
+            initialization problem that fp32 would have exposed a few hundred
+            steps later.
+          </p>
+
+          <h2>Against the real libraries</h2>
+          <p>
+            <a href="https://github.com/pytorch/pytorch" target="_blank" rel="noreferrer">torch.amp</a>
+            adds, over the manual loop above: per-op cast policies covering
+            the whole operator surface (including ops this page never
+            mentioned, with a cache so each weight is cast once per step),
+            nesting and disabling of autocast regions, CPU and other-backend
+            autocast, a GradScaler that handles multiple optimizers and
+            gradient accumulation correctly, and state-dict serialization of
+            the scale so training resumes cleanly. The manual version breaks
+            in exactly the places these features cover: forget one cast, or
+            unscale twice, and you get silent wrongness rather than an error.
+            <a href="https://github.com/google-deepmind/jmp" target="_blank" rel="noreferrer">jmp</a>
+            packages the JAX discipline: <code>Policy</code> objects parsed
+            from strings, <code>cast_to_compute</code> /
+            <code>cast_to_param</code> / <code>cast_to_output</code> applied
+            to whole pytrees, and <code>NoOpLossScale</code> /
+            <code>StaticLossScale</code> / <code>DynamicLossScale</code> types
+            that make the fp16 machinery a swappable value instead of control
+            flow.
+            <a href="https://github.com/NVIDIA/TransformerEngine" target="_blank" rel="noreferrer">NVIDIA Transformer Engine</a>
+            operates a level below both: fused transformer layers whose
+            internals pick fp8/fp16/bf16 per tensor, with the per-tensor
+            delayed-scaling recipes fp8 needs, integrated into Megatron, JAX,
+            and PyTorch stacks.
+          </p>
+          <p>
+            The from-scratch loop is enough when you control the whole model
+            and want the casts auditable, in teaching and research code, and
+            when debugging what autocast is actually doing to a misbehaving
+            op. Verification is direct: run the manual fp16 loop and the
+            autocast/GradScaler loop on the same model, seed, and data, and
+            compare per-step losses and the evolution of the scale; the
+            trajectories should agree closely at the start (divergence grows
+            with steps as rounding compounds), and the scaler's
+            skip-and-halve events should occur at the same steps if the
+            manual inf check is placed correctly.
+          </p>
+
+          <h2>Traps and misconceptions</h2>
+          <p>
+            <strong>"Just call model.half()."</strong> Converting every
+            parameter and buffer to fp16 is not mixed precision, it is low
+            precision: no fp32 master copy, so small updates vanish into the
+            2<sup>-11</sup> rounding threshold, and norms and losses compute
+            their reductions in fp16. It can appear to work for a while, which
+            makes it worse. Mixed precision is defined by what it keeps in
+            fp32, not by what it casts down.
+          </p>
+          <p>
+            <strong>"Loss scaling fixes overflow."</strong> Backwards: scaling
+            multiplies gradients up and can only cause overflow, which the
+            dynamic loop then detects and backs off from. What scaling fixes
+            is underflow. If your forward pass overflows fp16 (activations or
+            attention logits past 65504), no scale value helps, because the
+            damage happens before the loss exists; the fixes are fp32 islands
+            for the offending ops, or bf16.
+          </p>
+          <p>
+            <strong>"Clip gradients, then unscale."</strong> Clipping scaled
+            gradients compares them against a threshold that is effectively
+            max_norm &times; S with S changing over training: a random,
+            drifting clip. The correct order is
+            <code>scaler.unscale_(opt)</code> first, clip second,
+            <code>scaler.step</code> third, and the scaler guards against
+            double-unscaling for exactly this workflow.
+          </p>
+          <p>
+            <strong>"bf16 is just a safer fp32."</strong> bf16 matches fp32's
+            range, not its precision: 2 to 3 significant decimal digits. Long
+            accumulations, EMAs, and anything else that adds many small
+            numbers into a large one must still be carried in fp32, which is
+            why optimizer state, gradient reductions, and softmax accumulators
+            stay there even in all-bf16-compute stacks. Pure-bf16 experiments
+            that skip fp32 accumulation typically show slow, quiet convergence
+            degradation rather than dramatic failure.
+          </p>
+          <p>
+            <strong>"Autocast converted my model."</strong> Autocast is a
+            context, not a conversion: weights remain fp32, and ops are cast
+            at call time inside the region only. Computing the loss outside
+            the region, calling explicit <code>.half()</code> inside it, or
+            running custom ops that lack autocast rules all silently sidestep
+            the policy. The symptom is usually dtype-mismatch errors at best
+            and quiet fp32 fallback (no speedup) at worst; when in doubt,
+            print dtypes at the boundaries.
+          </p>
+
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> mixed precision is one principle
+            applied three ways: floating point fails at the edges of its
+            exponent range and mantissa, so put the 16-bit formats where the
+            flops are and fp32 where the accumulations are. fp16's narrow
+            exponent makes gradients underflow, and loss scaling is the exact,
+            linearity-of-backprop trick that slides them back into range, with
+            a bang-bang loop to track the largest safe scale; bf16 keeps
+            fp32's exponent and dissolves that entire problem, which is why
+            the modern recipe is bf16 compute, fp32 masters and reductions,
+            and no scaler. The master copy is not optional in either format:
+            updates smaller than a weight times 2<sup>-mantissa</sup> simply
+            do not happen.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/code-tabs.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (!window.hljs) return;
+        hljs.configure({ languages: ["python", "bash", "c", "cpp", "rust", "go", "typescript", "swift", "sql", "json", "yaml", "plaintext"] });
+        hljs.highlightAll();
+      });
+    </script>
+  </body>
+</html>

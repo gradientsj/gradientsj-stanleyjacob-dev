@@ -1,0 +1,645 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Cross-Attention &amp; Conditioning · Stanley Jacob</title>
+    <meta name="description" content="Cross-attention derived as learned retrieval from a second sequence: queries from N positions, keys and values from M context positions, the encoder-decoder original, Stable Diffusion's text conditioning, Perceiver latent bottlenecks, and a minimal encoder-decoder block in PyTorch and JAX with every shape written out." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" integrity="sha384-eFTL69TLRZTkNfYZOLM+G04821K1qZao/4QLJbet1pP4tcF+fdXq/9CdqAbWRl/L" crossorigin="anonymous" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml" class="active">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/ml">Machine learning</a></div>
+        <h1>Cross-attention and conditioning</h1>
+        <p class="lead">
+          Self-attention lets a sequence talk to itself. Cross-attention lets
+          one sequence read from another: queries come from the sequence you
+          are building, keys and values come from the thing you are
+          conditioning on, a source sentence, a text prompt, an audio
+          spectrogram, an image. It is the same scaled dot-product machinery
+          as self-attention with one index changed, and that one change is
+          how a diffusion model obeys a prompt, how a translator reads its
+          source, and how a multimodal model looks at pictures. This page
+          derives it, builds it in PyTorch and JAX with every shape written
+          out, and maps it onto the systems that run on it.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>What it is and when you reach for it</h2>
+          <p>
+            The <a href="/ml/attention">attention page</a> builds
+            self-attention, where q, k, and v are all projections of the same
+            sequence. Cross-attention makes one substitution: queries are
+            projected from a sequence X of N positions, while keys and values
+            are projected from a different sequence Z of M positions.
+            Position i of X asks "what in Z is relevant to me right now?",
+            scores every element of Z, and pulls back a weighted blend of Z's
+            values. Nothing about the mechanism changes, only the provenance
+            of the tensors, but the role changes completely:
+            <mark>self-attention is a sequence organizing its own
+            information; cross-attention is a learned, differentiable
+            retrieval system from one representation into another</mark>. You
+            reach for it whenever generation or prediction must be steered by
+            something outside the sequence itself: a decoder reading an
+            encoded source sentence, image features reading a text prompt, a
+            small set of latent vectors reading a huge pixel array, a
+            language model reading vision features. The output always lives
+            on the query side, one vector per query position, while the
+            context sequence is read-only: nothing is written back into Z.
+            That asymmetry is the design tool. Whichever side you want
+            outputs for supplies the queries; whatever you want to condition
+            on supplies keys and values. It also means the two sequences can
+            have wildly different lengths, modalities, and even dimensions,
+            since W<sub>K</sub> and W<sub>V</sub> can project from a
+            different width than W<sub>Q</sub>.
+          </p>
+
+          <h2>The math</h2>
+          <h3>Two sequences, one lookup</h3>
+          <p>
+            Let X ∈ ℝ<sup>N×d</sup> be the query-side sequence and
+            Z ∈ ℝ<sup>M×d<sub>ctx</sub></sup> be the context. Project
+            Q = XW<sub>Q</sub>, K = ZW<sub>K</sub>, V = ZW<sub>V</sub>, with
+            W<sub>Q</sub> ∈ ℝ<sup>d×d<sub>k</sub></sup> and
+            W<sub>K</sub>, W<sub>V</sub> ∈ ℝ<sup>d<sub>ctx</sub>×d<sub>k</sub></sup>
+            bridging any width mismatch. Then
+          </p>
+          <p>
+            CrossAttn(X, Z) = softmax(QK<sup>T</sup>/√d<sub>k</sub>) V.
+          </p>
+          <p>
+            The score matrix QK<sup>T</sup> is N×M, not N×N: each of the N
+            rows is a distribution over the M context positions, and the
+            output is N×d<sub>k</sub>, one vector per query. Three structural
+            consequences follow. First, cost is O(N·M), so a short context
+            makes cross-attention cheap even when the query side is long,
+            which the Stable Diffusion numbers below make concrete. Second,
+            there is normally no causal mask: the context is fully known
+            before generation starts, so every query may see all of it
+            (causality applies to the decoder's self-attention over its own
+            partial output, not to its reading of the source). Third, at
+            decode time K and V depend only on Z, so they are computed once
+            when the context is encoded and reused for every generated
+            token; the cross-attention "KV cache" is fixed-size and never
+            grows, unlike the self-attention cache dissected on the
+            <a href="/ml/attention-variants">attention variants page</a>.
+          </p>
+          <p>
+            A worked example with N = 1 query, M = 3 context positions, and
+            d<sub>k</sub> = 2. Let q = [1, 0], and the context produce keys
+            k<sub>1</sub> = [1, 0], k<sub>2</sub> = [0, 1],
+            k<sub>3</sub> = [−1, 0] with values v<sub>1</sub> = [1, 0],
+            v<sub>2</sub> = [0, 1], v<sub>3</sub> = [1, 1]. Scores are
+            q·k = [1, 0, −1], scaled by 1/√2 to [0.707, 0, −0.707].
+            Softmax gives [e<sup>0.707</sup>, 1, e<sup>−0.707</sup>] /
+            (e<sup>0.707</sup> + 1 + e<sup>−0.707</sup>) =
+            [2.028, 1, 0.493] / 3.521 ≈ [0.576, 0.284, 0.140], and the
+            output is 0.576·v<sub>1</sub> + 0.284·v<sub>2</sub> +
+            0.140·v<sub>3</sub> ≈ [0.716, 0.424]. The query retrieved mostly
+            from the context element whose key matched it, exactly a soft
+            database lookup where the database is the other sequence.
+          </p>
+
+          <h3>Multi-head cross-attention and the fixed KV</h3>
+          <p>
+            Heads work exactly as in self-attention: split
+            d<sub>model</sub> into h subspaces, run h independent N×M
+            lookups, concatenate, and mix with W<sub>O</sub>. The payoff is
+            the same as on the query-key-value analysis of the
+            <a href="/ml/attention">attention page</a>, h simultaneous
+            retrieval patterns instead of one, and in conditioning it is
+            visibly useful: in a text-to-image model one head can track
+            object nouns while another tracks style adjectives, because
+            each head scores the same 77 tokens through its own learned
+            projections. The scaling analysis carries over unchanged too,
+            since q·k is still a sum of d<sub>k</sub> roughly unit-variance
+            terms, so the √d<sub>k</sub> divisor is identical.
+          </p>
+          <p>
+            The inference-time structure deserves emphasis because it is
+            the mirror image of the self-attention cache problem. In
+            autoregressive decoding with cross-attention, the context Z is
+            encoded once, K = ZW<sub>K</sub> and V = ZW<sub>V</sub> are
+            computed once per layer, and then every generated token reuses
+            them untouched: the per-step cost of consulting the source is
+            one query row against a fixed M×d<sub>k</sub> table. Nothing
+            accumulates. All of the growth, and therefore all of the
+            KV-cache economics that motivate MQA, GQA, and MLA on the
+            <a href="/ml/attention-variants">attention variants page</a>,
+            lives in the decoder's self-attention over its own output. A
+            useful way to say it: cross-attention reads a static database,
+            self-attention reads an append-only log, and only the log has
+            a storage problem.
+          </p>
+
+          <h3>The encoder-decoder original</h3>
+          <p>
+            Cross-attention predates the transformer. Bahdanau, Cho, and
+            Bengio's 2014 neural machine translation model attached an
+            attention mechanism to an RNN decoder so that each output word
+            could look back over all encoded source words instead of relying
+            on a single fixed context vector, which was the bottleneck that
+            capped earlier sequence-to-sequence models on long sentences.
+            The 2017 transformer kept that wiring and made it pure
+            attention: an encoder runs bidirectional self-attention over the
+            source to build Z, and each decoder block runs three sublayers,
+            causal self-attention over the partial output, cross-attention
+            from the output positions into Z, and an MLP:
+          </p>
+          <pre class="flow">source ─► [ encoder: self-attn + MLP, stacked ] ─► Z (M, d)   built once
+                                                    │
+target so far ─► causal self-attn ─► cross-attn(Q from target, K,V from Z)
+                                        │
+                                       MLP ─► next-token logits</pre>
+          <p>
+            The division of labor is clean: self-attention organizes what
+            has been generated so far, cross-attention consults the source,
+            and the MLP computes on the gathered result. Every decoder
+            layer gets its own cross-attention read of the same Z, so
+            deeper layers can consult the source about increasingly
+            abstract questions.
+          </p>
+
+          <h3>Conditioning as learned retrieval</h3>
+          <p>
+            The modern reading generalizes translation: cross-attention is
+            the standard way to make a generative model obey side
+            information of variable size. Alternatives exist and define the
+            trade-off. You can concatenate conditioning tokens into the
+            sequence and use plain self-attention (prefix conditioning, the
+            LLaVA route), which is simple but makes the conditioning pay
+            self-attention cost at every layer and mix into the sequence's
+            own representation. You can add a pooled conditioning vector to
+            activations (the timestep embedding route in
+            <a href="/ml/diffusion">diffusion models</a>), which is cheap
+            but fixed-size: a single vector cannot say "put the red cube
+            left of the sphere". Cross-attention sits between:
+            <mark>the conditioning stays a set of M vectors, each query
+            position retrieves from it independently, and gradients flow
+            back into the encoder that produced it</mark>, so the model
+            learns simultaneously how to describe the condition (the K, V
+            side) and how to consult it (the Q side). When people say a
+            diffusion model "attends to the prompt", this is the precise
+            mechanism they mean.
+          </p>
+
+          <h2>Implementation, twice</h2>
+          <p>
+            The module below is multi-head cross-attention with the two
+            sequence lengths kept scrupulously distinct: N for queries, M
+            for context. Note the two width parameters as well; the context
+            may live in a different embedding space (768-dim CLIP text
+            states feeding a 320-channel U-Net level is the canonical
+            example). Setting <code>ctx = x</code> recovers self-attention
+            exactly, which is also the correctness check.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class CrossAttention(nn.Module):
+    """Multi-head cross-attention.
+
+    Queries come from x (the sequence being built), keys and values
+    from ctx (the thing being conditioned on). ctx is read-only:
+    the output lives entirely on the query side.
+    """
+
+    def __init__(self, d_model, d_ctx, n_heads):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        # K and V project FROM the context width INTO d_model,
+        # bridging any dimension mismatch between the two spaces.
+        self.k_proj = nn.Linear(d_ctx, d_model, bias=False)
+        self.v_proj = nn.Linear(d_ctx, d_model, bias=False)
+        self.o_proj = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(self, x, ctx, ctx_mask=None):
+        # x:   (B, N, d_model)   N query positions
+        # ctx: (B, M, d_ctx)     M context positions
+        B, N, _ = x.shape
+        M = ctx.size(1)
+        H, d = self.n_heads, self.head_dim
+        q = self.q_proj(x).view(B, N, H, d).transpose(1, 2)    # (B, H, N, d)
+        k = self.k_proj(ctx).view(B, M, H, d).transpose(1, 2)  # (B, H, M, d)
+        v = self.v_proj(ctx).view(B, M, H, d).transpose(1, 2)  # (B, H, M, d)
+        scores = q @ k.transpose(-2, -1) / math.sqrt(d)        # (B, H, N, M)
+        if ctx_mask is not None:
+            # ctx_mask: (B, M) True where context is real, False at padding.
+            # No causal mask: the context is fully known, so no future to hide.
+            scores = scores.masked_fill(
+                ~ctx_mask[:, None, None, :], float('-inf'))
+        w = F.softmax(scores, dim=-1)      # each query: a distribution over M
+        y = (w @ v).transpose(1, 2).reshape(B, N, H * d)       # (B, N, d_model)
+        return self.o_proj(y)</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">import jax
+import jax.numpy as jnp
+
+def init_cross_attention(key, d_model, d_ctx, n_heads):
+    assert d_model % n_heads == 0
+    kq, kk, kv, ko = jax.random.split(key, 4)
+    return {
+        'w_q': jax.random.normal(kq, (d_model, d_model)) / jnp.sqrt(d_model),
+        # K and V project FROM the context width INTO d_model,
+        # bridging any dimension mismatch between the two spaces.
+        'w_k': jax.random.normal(kk, (d_ctx, d_model)) / jnp.sqrt(d_ctx),
+        'w_v': jax.random.normal(kv, (d_ctx, d_model)) / jnp.sqrt(d_ctx),
+        'w_o': jax.random.normal(ko, (d_model, d_model)) / jnp.sqrt(d_model),
+    }
+
+def cross_attention(params, x, ctx, n_heads, ctx_mask=None):
+    # x:   (B, N, d_model)   N query positions
+    # ctx: (B, M, d_ctx)     M context positions
+    B, N, d_model = x.shape
+    M = ctx.shape[1]
+    d = d_model // n_heads
+    q = (x @ params['w_q']).reshape(B, N, n_heads, d).swapaxes(1, 2)
+    k = (ctx @ params['w_k']).reshape(B, M, n_heads, d).swapaxes(1, 2)
+    v = (ctx @ params['w_v']).reshape(B, M, n_heads, d).swapaxes(1, 2)
+    scores = jnp.einsum('bhnd,bhmd-&gt;bhnm', q, k) / jnp.sqrt(d)  # (B,H,N,M)
+    if ctx_mask is not None:
+        # ctx_mask: (B, M) True where context is real, False at padding.
+        # No causal mask: the context is fully known, no future to hide.
+        scores = jnp.where(ctx_mask[:, None, None, :], scores, -jnp.inf)
+    w = jax.nn.softmax(scores, axis=-1)   # each query: a distribution over M
+    y = jnp.einsum('bhnm,bhmd-&gt;bhnd', w, v)
+    y = y.swapaxes(1, 2).reshape(B, N, d_model)
+    return y @ params['w_o']</code></pre>
+          </div>
+          <p>
+            A minimal transformer decoder block shows where cross-attention
+            sits: after causal self-attention, before the MLP, each sublayer
+            pre-LN with a residual, matching the layout on the
+            <a href="/ml/attention">attention page</a>. The
+            <code>CausalSelfAttention</code> module is the one built there.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">class DecoderBlock(nn.Module):
+    """Pre-LN decoder block: organize the output so far (causal
+    self-attn), consult the source (cross-attn), compute (MLP)."""
+
+    def __init__(self, d_model, d_ctx, n_heads):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(d_model)
+        self.self_attn = CausalSelfAttention(d_model, n_heads)  # /ml/attention
+        self.ln_2 = nn.LayerNorm(d_model)
+        self.cross_attn = CrossAttention(d_model, d_ctx, n_heads)
+        self.ln_3 = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model), nn.GELU(),
+            nn.Linear(4 * d_model, d_model))
+
+    def forward(self, x, ctx, ctx_mask=None):
+        x = x + self.self_attn(self.ln_1(x))                # within target
+        x = x + self.cross_attn(self.ln_2(x), ctx, ctx_mask)  # read source
+        x = x + self.mlp(self.ln_3(x))                      # per position
+        return x</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">def init_decoder_block(key, d_model, d_ctx, n_heads):
+    ks, kc, k1, k2 = jax.random.split(key, 4)
+    s = 1.0 / jnp.sqrt(d_model)
+    return {
+        'self_attn': init_attention(ks, d_model),   # from /ml/attention
+        'cross_attn': init_cross_attention(kc, d_model, d_ctx, n_heads),
+        'ln1': (jnp.ones(d_model), jnp.zeros(d_model)),
+        'ln2': (jnp.ones(d_model), jnp.zeros(d_model)),
+        'ln3': (jnp.ones(d_model), jnp.zeros(d_model)),
+        'w_fc': jax.random.normal(k1, (d_model, 4 * d_model)) * s,
+        'b_fc': jnp.zeros(4 * d_model),
+        'w_proj': jax.random.normal(k2, (4 * d_model, d_model)) * s,
+        'b_proj': jnp.zeros(d_model),
+    }
+
+def decoder_block(params, x, ctx, n_heads, ctx_mask=None):
+    """Pre-LN: organize the output so far (causal self-attn),
+    consult the source (cross-attn), compute (MLP)."""
+    x = x + causal_self_attention(                       # within target
+        params['self_attn'], layer_norm(x, *params['ln1']), n_heads)
+    x = x + cross_attention(                             # read source
+        params['cross_attn'], layer_norm(x, *params['ln2']),
+        ctx, n_heads, ctx_mask)
+    h = layer_norm(x, *params['ln3'])
+    h = jax.nn.gelu(h @ params['w_fc'] + params['b_fc'])
+    return x + h @ params['w_proj'] + params['b_proj']   # per position</code></pre>
+          </div>
+
+          <h2>Using it on a real shape of problem</h2>
+          <p>
+            The most instructive real shape is Stable Diffusion's: at the
+            U-Net's 64×64 latent resolution there are N = 4096 image-patch
+            queries attending to M = 77 CLIP text tokens of width 768. The
+            asymmetry N ≫ M is the norm in conditioning, and it is why
+            cross-attention is cheap there: the score matrix is 4096×77,
+            about 315k entries per head, versus 16.8M for 4096×4096
+            self-attention at the same resolution.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">torch.manual_seed(0)
+B = 4
+img = torch.randn(B, 4096, 320)      # 64x64 latent grid, U-Net width 320
+txt = torch.randn(B, 77, 768)        # CLIP text states: 77 tokens, 768-dim
+mask = torch.ones(B, 77, dtype=torch.bool)
+mask[:, 60:] = False                 # pretend prompts end at token 60
+
+xattn = CrossAttention(d_model=320, d_ctx=768, n_heads=8)
+y = xattn(img, txt, ctx_mask=mask)
+print(y.shape)                       # torch.Size([4, 4096, 320])
+# Output length follows the QUERY side (4096), never the context (77).
+
+# Score matrix per head: 4096 x 77 = 315k entries, vs 16.8M for
+# self-attention over the same 4096 positions. Conditioning is cheap.</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">key = jax.random.PRNGKey(0)
+ki, kt = jax.random.split(key)
+B = 4
+img = jax.random.normal(ki, (B, 4096, 320))  # 64x64 latents, width 320
+txt = jax.random.normal(kt, (B, 77, 768))    # CLIP text: 77 tokens, 768-dim
+mask = jnp.arange(77)[None, :] &lt; 60          # prompts end at token 60
+mask = jnp.broadcast_to(mask, (B, 77))
+
+params = init_cross_attention(key, d_model=320, d_ctx=768, n_heads=8)
+apply = jax.jit(lambda p, a, b, m: cross_attention(p, a, b, 8, m))
+y = apply(params, img, txt, mask)
+print(y.shape)                               # (4, 4096, 320)
+# Output length follows the QUERY side (4096), never the context (77).
+
+# Score matrix per head: 4096 x 77 = 315k entries, vs 16.8M for
+# self-attention over the same 4096 positions. Conditioning is cheap.</code></pre>
+          </div>
+          <p>
+            Two behaviors to check when you run this. Masked context
+            positions receive exactly zero weight (probe by making a padding
+            token huge and observing the output does not move), and the
+            output is permutation-covariant on the query side: shuffling the
+            4096 queries shuffles the outputs identically, because each
+            query's retrieval is independent. In a real training run you
+            would watch the cross-attention maps sharpen from near-uniform
+            to token-specific as the model learns which prompt words govern
+            which spatial regions; expect exact values to be seed- and
+            machine-dependent.
+          </p>
+
+          <h2>Applications</h2>
+          <p>
+            Machine translation is the heritage and still the cleanest
+            mental model: T5, BART, Marian, and every classic
+            encoder-decoder LLM generate each target token while
+            cross-attending into the encoded source, and Whisper is the same
+            architecture with the encoder run over audio spectrogram frames,
+            so transcription is literally translation from sound. What made
+            cross-attention ubiquitous, though, is image generation. In
+            Stable Diffusion, the denoising <a href="/ml/unet">U-Net</a>
+            interleaves ResNet blocks with transformer blocks at several
+            resolutions, and each of those blocks contains a self-attention
+            over image positions followed by a cross-attention whose keys
+            and values come from the frozen CLIP text encoder's 77 token
+            states; that cross-attention is the only place the prompt
+            touches the image, which is why prompt-editing techniques and
+            attention-map visualizations of "which word painted which
+            region" all operate on those layers, and the
+            <a href="/ml/diffusion">diffusion page</a> covers how the
+            denoising objective wraps around it. Perceiver and Perceiver IO
+            invert the usual asymmetry to solve scale: a small learned
+            latent array of a few hundred vectors queries a giant input (50k
+            pixels, video, audio, point clouds) via cross-attention, so cost
+            is latents × inputs rather than inputs², and all the deep
+            self-attention happens among the cheap latents; the same
+            latent-bottleneck pattern reappears as the resampler in many
+            multimodal systems. Multimodal LLM bridging splits into two
+            camps worth keeping straight at concept level: Flamingo
+            interleaves gated cross-attention layers into a frozen language
+            model so text queries retrieve from vision features, with a tanh
+            gate initialized at zero so the pretrained LM starts unperturbed
+            and BLIP-2's Q-Former uses learned queries cross-attending into
+            image features, while LLaVA-style models skip cross-attention
+            entirely and project vision features into the LM's input
+            sequence as prefix tokens, trading mechanism simplicity for
+            longer sequences. Retrieval-augmented generation has a
+            cross-attention lineage too: DeepMind's RETRO cross-attends
+            from the generating sequence into encoded retrieved chunks
+            rather than stuffing them in the prompt, and the idea of
+            reading external memory through attention rather than
+            concatenation keeps resurfacing whenever prompt budgets bind.
+          </p>
+
+          <h2>Against the real libraries</h2>
+          <p>
+            <a href="https://github.com/huggingface/diffusers" target="_blank" rel="noreferrer">huggingface/diffusers</a>
+            is where cross-attention conditioning ships at industrial scale.
+            <code>UNet2DConditionModel</code>'s forward signature says it
+            all: <code>unet(sample, timestep, encoder_hidden_states)</code>,
+            where <code>encoder_hidden_states</code> is exactly the
+            <code>ctx</code> of the module above (CLIP text states of shape
+            (B, 77, 768) for SD 1.x, larger for SDXL). Inside, each
+            <code>BasicTransformerBlock</code> holds <code>attn1</code>
+            (self-attention over image tokens) and <code>attn2</code>
+            (cross-attention into the text states), with the context width
+            configured by <code>cross_attention_dim</code>, matching the
+            <code>d_ctx</code> parameter here. What the library adds over
+            this page: a processor abstraction that swaps attention backends
+            without touching model code, fused kernels, classifier-free
+            guidance plumbing, and IP-Adapter-style hooks that inject extra
+            image conditioning through additional cross-attention.
+          </p>
+          <p>
+            <a href="https://github.com/huggingface/transformers" target="_blank" rel="noreferrer">huggingface/transformers</a>
+            (notes at <a href="/oss/transformers">/oss/transformers</a>)
+            carries the encoder-decoder tradition: T5, BART, Marian, and
+            Whisper models all contain a per-decoder-layer cross-attention
+            reading <code>encoder_hidden_states</code>, and generation
+            precomputes the cross KV once per input and reuses it every
+            step (visible as the cross-attention entries in
+            <code>past_key_values</code>). The generic
+            <code>EncoderDecoderModel</code> class will even weld a BERT
+            encoder to a GPT-2 decoder by inserting randomly initialized
+            cross-attention layers, which then must be trained; the class
+            exists precisely because cross-attention is the only missing
+            piece between two pretrained single-stack models.
+          </p>
+          <p>
+            At the kernel level nothing special is needed, which is a
+            feature: <code>F.scaled_dot_product_attention</code> and
+            <a href="https://github.com/Dao-AILab/flash-attention" target="_blank" rel="noreferrer">flash-attention</a>
+            (walkthrough at <a href="/oss/flash-attention">/oss/flash-attention</a>)
+            accept different query and key lengths natively, so the fused
+            speedups from the <a href="/ml/attention">attention page</a> and
+            the memory tricks from the
+            <a href="/ml/efficient-attention">efficient attention page</a>
+            apply unchanged; xFormers' memory-efficient attention filled
+            this role for Stable Diffusion before FlashAttention was
+            everywhere. The from-scratch module is genuinely enough for
+            research-scale conditioning experiments and for any work where
+            you want the N×M attention maps as inspectable tensors, which
+            fused kernels never materialize. The correctness check: with
+            <code>ctx = x</code>, d_ctx = d_model, and shared weights,
+            cross-attention must reproduce non-causal self-attention, and
+            against the fused kernel it must match with distinct lengths:
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">torch.manual_seed(0)
+B, H, N, M, d = 2, 4, 128, 77, 64      # note N != M on purpose
+q = torch.randn(B, H, N, d, dtype=torch.float64)
+k = torch.randn(B, H, M, d, dtype=torch.float64)
+v = torch.randn(B, H, M, d, dtype=torch.float64)
+
+ref = F.scaled_dot_product_attention(q, k, v)   # no causal mask
+ours = F.softmax(q @ k.transpose(-2, -1) / math.sqrt(d), dim=-1) @ v
+
+print((ref - ours).abs().max())   # ~1e-16 in float64
+assert torch.allclose(ref, ours, atol=1e-12)
+# Same check in float32 lands near 1e-6: identical math,
+# different accumulation order.</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">key = jax.random.PRNGKey(0)
+kq, kk_, kv_ = jax.random.split(key, 3)
+B, H, N, M, d = 2, 4, 128, 77, 64      # note N != M on purpose
+# jax.nn.dot_product_attention uses (B, T, H, d) layout.
+q = jax.random.normal(kq, (B, N, H, d))
+k = jax.random.normal(kk_, (B, M, H, d))
+v = jax.random.normal(kv_, (B, M, H, d))
+
+ref = jax.nn.dot_product_attention(q, k, v)     # no causal mask
+scores = jnp.einsum('bnhd,bmhd-&gt;bhnm', q, k) / jnp.sqrt(d)
+ours = jnp.einsum('bhnm,bmhd-&gt;bnhd',
+                  jax.nn.softmax(scores, axis=-1), v)
+
+print(jnp.abs(ref - ours).max())  # ~1e-6 in float32
+assert jnp.allclose(ref, ours, atol=1e-4)</code></pre>
+          </div>
+
+          <h2>Traps and misconceptions</h2>
+          <p>
+            <strong>Swapping the query and context sides.</strong> The
+            output has one vector per query, so queries must come from the
+            side you want outputs for. Wire a translator with queries from
+            the source and you get one vector per source token, useless
+            for generating the target. The mnemonic: the conditioned
+            sequence asks, the conditioning sequence answers. Perceiver is
+            not a counterexample but the rule applied deliberately: it
+            wants outputs on the small latent side, so the latents ask.
+          </p>
+          <p>
+            <strong>Causally masking the context.</strong> The context is
+            fully known before generation begins, so hiding "future"
+            context positions is a bug that starves early queries of
+            information. Causality belongs only in the decoder's
+            self-attention over its own partial output. The mask that does
+            belong in cross-attention is the padding mask on the context
+            side, and forgetting it means real queries spend probability
+            mass retrieving from padding embeddings, a quiet quality
+            degradation that batch-size-1 unit tests never catch.
+          </p>
+          <p>
+            <strong>"The cross-attention KV cache grows during
+            decoding."</strong> It does not: K and V depend only on the
+            encoder output, so they are computed once per input and stay
+            fixed for every decoding step, unlike the self-attention cache
+            that grows per token and drives the economics on the
+            <a href="/ml/attention-variants">attention variants page</a>.
+            Recomputing the cross KV every step is a common performance
+            bug in hand-rolled decoders; it silently multiplies decode
+            cost without changing outputs.
+          </p>
+          <p>
+            <strong>Assuming both sequences must share a width.</strong>
+            W<sub>K</sub> and W<sub>V</sub> project from the context's
+            dimension and W<sub>Q</sub> from the query side's, so nothing
+            requires d_ctx = d_model; Stable Diffusion feeds 768- or
+            1024-dim text states into U-Net levels of width 320 to 1280.
+            Hand-rolled implementations that hardcode one width discover
+            this the day they attach a different text encoder.
+          </p>
+          <p>
+            <strong>Reading cross-attention maps as faithful
+            grounding.</strong> The N×M maps are more interpretable than
+            most attention (query positions against nameable things like
+            prompt tokens), and prompt-to-image editing exploits them, but
+            they remain one head in one layer before output mixing.
+            Perturbation studies in both translation and diffusion show
+            maps can shift substantially with modest output change, so
+            treat "token 7 painted this region" as a hypothesis to test by
+            intervention, not as evidence by inspection.
+          </p>
+
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> cross-attention is scaled
+            dot-product attention with queries from the sequence you are
+            building (N positions) and keys and values from the sequence
+            you are conditioning on (M positions): an N×M score matrix, an
+            output on the query side, no causal mask, a padding mask on
+            the context, and a fixed KV that is encoded once and read at
+            every step. That one re-wiring of self-attention is the
+            conditioning mechanism behind translation, Whisper, Stable
+            Diffusion's prompt control, Perceiver's latent bottleneck, and
+            Flamingo-style multimodal bridging; the libraries differ only
+            in plumbing around the identical lookup.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/code-tabs.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (!window.hljs) return;
+        hljs.configure({ languages: ["python", "bash", "c", "cpp", "rust", "go", "typescript", "swift", "sql", "json", "yaml", "plaintext"] });
+        hljs.highlightAll();
+      });
+    </script>
+  </body>
+</html>

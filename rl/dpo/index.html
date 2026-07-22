@@ -1,0 +1,625 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Direct Preference Optimization · Stanley Jacob</title>
+    <meta name="description" content="DPO derived step by step: the KL-constrained RLHF objective, its closed-form optimal policy, the substitution that turns the Bradley-Terry preference likelihood into a simple classification loss on log-ratios, the implicit-reward reading, what offline preference tuning can and cannot do, and the loss implemented in PyTorch and JAX." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" integrity="sha512-0aPQyyeZrWj9sCA46UlmWgKOP0mUipLQ6OZXu8l4IcAmD2u31EPEy9VcIMvl7SoAaKe8bLXZhYoMaE/in+gcgA==" crossorigin="anonymous" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl" class="active">RL</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/rl">Reinforcement learning</a></div>
+        <h1>Direct preference optimization</h1>
+        <p class="lead">
+          RLHF trains a reward model on human preferences and then runs
+          reinforcement learning against it. DPO's insight is that for the
+          KL-constrained objective everyone actually uses, the optimal policy
+          can be written in closed form as a function of the reward, which
+          means the reward can be written as a function of the policy, which
+          means the preference data can train the policy directly. No reward
+          model, no rollouts, no RL loop: one classification-shaped loss on
+          pairs of responses. This page walks the derivation honestly, because
+          the derivation is the whole algorithm, then builds the loss in
+          PyTorch and JAX.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>What it is and when you reach for it</h2>
+          <p>
+            Direct Preference Optimization (Rafailov et al., 2023) is an
+            offline method for tuning a language model on human preference
+            data. The data is the same as classic RLHF's: triples of a prompt
+            x, a preferred response y<sub>w</sub>, and a rejected response
+            y<sub>l</sub>, gathered by showing annotators (or a judge model)
+            two candidate responses and asking which is better. Classic RLHF
+            spends that data in two stages: fit a reward model to the
+            preferences, then optimize the policy against it with
+            <a href="/rl/ppo">PPO</a> or a cousin like
+            <a href="/rl/grpo">GRPO</a>, generating fresh samples the whole
+            way. DPO collapses the two stages into one supervised-looking
+            step: a loss computed from four log-probabilities per pair (the
+            policy and a frozen reference, each evaluated on the chosen and
+            rejected responses), trained with ordinary gradient descent on a
+            fixed dataset. Its title says the thesis out loud: your language
+            model is secretly a reward model.
+          </p>
+          <p>
+            You reach for DPO when you have preference pairs and want the
+            improvement without standing up an RL system: no reward-model
+            training run, no generation engine in the training loop, no
+            value network, no KL controller. The cost profile is that of
+            fine-tuning with a second frozen model in memory, and the whole
+            thing fits in a few dozen lines. What you give up is everything
+            online RL buys: the model never generates during training, so it
+            never explores beyond the dataset and never gets feedback on its
+            own current behavior. That trade, cheap and stable but strictly
+            offline, is why DPO settled into a specific slot in modern
+            pipelines, after SFT and often before online RL, rather than
+            replacing RL outright.
+          </p>
+
+          <h2>The math</h2>
+          <h3>The objective DPO inherits</h3>
+          <p>
+            Everything starts from the standard KL-constrained RLHF objective.
+            Given a reward function r(x, y) and a reference policy
+            π<sub>ref</sub> (in practice the SFT model), find
+          </p>
+          <p>
+            max<sub>π</sub> E<sub>x ~ D, y ~ π(·|x)</sub>[ r(x, y) ]
+            − β D<sub>KL</sub>[ π(·|x) ‖ π<sub>ref</sub>(·|x) ].
+          </p>
+          <p>
+            The KL term is not decoration. The reward model is only trustworthy
+            near the distribution it was trained on, and unconstrained reward
+            maximization walks straight out of that region into degenerate
+            high-reward text; β prices how much probability mass the policy may
+            move away from the reference. Every serious RLHF system optimizes
+            some version of this penalized objective, which is exactly what
+            makes the next step more than a textbook exercise: DPO solves the
+            objective people actually use, not a simplified stand-in.
+          </p>
+
+          <h3>Step 1: the optimal policy in closed form</h3>
+          <p>
+            Fix one prompt x and expand the KL as an expectation under π:
+          </p>
+          <p>
+            max<sub>π</sub> E<sub>y ~ π</sub>[ r(x, y) −
+            β log ( π(y|x) / π<sub>ref</sub>(y|x) ) ].
+          </p>
+          <p>
+            Divide by −β (flipping max to min) and fold r inside the log:
+          </p>
+          <p>
+            min<sub>π</sub> E<sub>y ~ π</sub>[ log ( π(y|x) /
+            ( π<sub>ref</sub>(y|x) e<sup>r(x,y)/β</sup> ) ) ].
+          </p>
+          <p>
+            The denominator is almost a probability distribution; it just is
+            not normalized. Define the partition function
+            Z(x) = Σ<sub>y</sub> π<sub>ref</sub>(y|x) e<sup>r(x,y)/β</sup>
+            and the distribution
+          </p>
+          <p>
+            π<sup>*</sup>(y|x) = (1/Z(x)) π<sub>ref</sub>(y|x)
+            e<sup>r(x,y)/β</sup>.
+          </p>
+          <p>
+            Multiplying and dividing by Z(x) inside the log splits the
+            objective into
+            min<sub>π</sub> D<sub>KL</sub>[ π(·|x) ‖ π<sup>*</sup>(·|x) ]
+            − log Z(x). The second term does not depend on π, and a KL
+            divergence is minimized, at zero, exactly when the two
+            distributions are equal. So the optimum of the RLHF objective is
+            π<sup>*</sup>: <mark>the optimal policy is the reference policy
+            reweighted by exponentiated reward, softened by β.</mark> Small β
+            sharpens toward pure reward maximization; large β stays glued to
+            the reference. Nothing about neural networks was used; this holds
+            for any r and any β &gt; 0.
+          </p>
+
+          <h3>Step 2: invert it, so the policy defines a reward</h3>
+          <p>
+            Take logs of the closed form and solve for the reward:
+          </p>
+          <p>
+            r(x, y) = β log ( π<sup>*</sup>(y|x) / π<sub>ref</sub>(y|x) )
+            + β log Z(x).
+          </p>
+          <p>
+            This is the pivot of the whole paper. Every reward function
+            corresponds to an optimal policy, and reading the equation
+            backward, every policy can be interpreted as optimal for
+            <em>some</em> reward, namely β times the log-ratio of that policy
+            to the reference, up to a per-prompt constant β log Z(x). The
+            constant looks like an obstruction, Z(x) is a sum over all
+            possible responses and is hopeless to compute, but the next step
+            makes it vanish.
+          </p>
+
+          <h3>Step 3: the Bradley-Terry likelihood eats the partition function</h3>
+          <p>
+            Preference data does not label absolute rewards; it labels
+            comparisons. The standard model for turning latent scores into
+            choice probabilities is Bradley-Terry:
+          </p>
+          <p>
+            p(y<sub>w</sub> ≻ y<sub>l</sub> | x) =
+            σ( r(x, y<sub>w</sub>) − r(x, y<sub>l</sub>) ),
+          </p>
+          <p>
+            with σ the logistic function; this is exactly the model RLHF's
+            reward-model stage fits by maximum likelihood. Substitute the
+            inverted reward from step 2 for both responses. They share the
+            same prompt, so both carry the identical β log Z(x) term, and
+            <mark>the difference of rewards cancels the intractable partition
+            function exactly</mark>:
+          </p>
+          <p>
+            p(y<sub>w</sub> ≻ y<sub>l</sub> | x) =
+            σ( β log ( π<sup>*</sup>(y<sub>w</sub>|x) /
+            π<sub>ref</sub>(y<sub>w</sub>|x) )
+            − β log ( π<sup>*</sup>(y<sub>l</sub>|x) /
+            π<sub>ref</sub>(y<sub>l</sub>|x) ) ).
+          </p>
+          <p>
+            The preference probability now involves only the optimal policy
+            and the reference, both of which assign computable probabilities
+            to any given text (sum the per-token log-probs). Replace the
+            unknown π<sup>*</sup> with a parameterized π<sub>θ</sub> and fit
+            it by maximum likelihood on the preference dataset, and you get
+            the DPO loss:
+          </p>
+          <p>
+            L<sub>DPO</sub>(θ) = −E<sub>(x, y<sub>w</sub>, y<sub>l</sub>) ~ D</sub>
+            [ log σ( β log ( π<sub>θ</sub>(y<sub>w</sub>|x) /
+            π<sub>ref</sub>(y<sub>w</sub>|x) )
+            − β log ( π<sub>θ</sub>(y<sub>l</sub>|x) /
+            π<sub>ref</sub>(y<sub>l</sub>|x) ) ) ].
+          </p>
+          <p>
+            This is logistic regression where the logit is a difference of
+            log-probability ratios. The quantity
+            r̂<sub>θ</sub>(x, y) = β log ( π<sub>θ</sub>(y|x) /
+            π<sub>ref</sub>(y|x) ) is called the implicit reward: DPO is
+            literally training the reward model of classic RLHF, except the
+            reward model is parameterized through the policy itself, so that
+            when the likelihood is maximized the policy is already the
+            KL-constrained optimum for the reward it learned. The two RLHF
+            stages did not get skipped; they got composed into one loss.
+          </p>
+          <p>
+            The gradient makes the mechanics concrete. Differentiating gives,
+            per example,
+          </p>
+          <p>
+            ∇<sub>θ</sub>L = −β ·
+            σ( r̂<sub>θ</sub>(x, y<sub>l</sub>) − r̂<sub>θ</sub>(x, y<sub>w</sub>) )
+            · [ ∇<sub>θ</sub> log π<sub>θ</sub>(y<sub>w</sub>|x)
+            − ∇<sub>θ</sub> log π<sub>θ</sub>(y<sub>l</sub>|x) ].
+          </p>
+          <p>
+            Push up the chosen response's log-probability, push down the
+            rejected one's, scaled by how wrong the implicit reward currently
+            ranks the pair: examples the model already orders correctly
+            contribute almost nothing, examples it orders backward dominate.
+            That adaptive weighting is what a naive "maximize chosen minus
+            rejected likelihood" loss lacks, and the paper shows it falls out
+            of the RLHF objective rather than being a heuristic.
+          </p>
+          <h3>A worked pair</h3>
+          <p>
+            Let β = 0.1. Suppose the summed token log-probs are: policy on
+            chosen −10, reference on chosen −12, policy on rejected −20,
+            reference on rejected −18. Implicit rewards:
+            r̂<sub>w</sub> = 0.1 · (−10 − (−12)) = +0.2 and
+            r̂<sub>l</sub> = 0.1 · (−20 − (−18)) = −0.2. The margin is
+            0.2 − (−0.2) = 0.4, the modeled preference probability is
+            σ(0.4) ≈ 0.599, and the loss is −log 0.599 ≈ 0.513. If instead
+            the policy still equaled the reference everywhere, both implicit
+            rewards would be 0, the margin 0, σ(0) = 0.5, and the loss
+            log 2 ≈ 0.693: <mark>every DPO run starts at 0.693 by
+            construction, and a first-batch loss that is not ≈ log 2 means
+            the policy and reference disagree before training, usually a
+            checkpoint or tokenization bug.</mark> Note also what the margin
+            does not say: it compares ratios, not raw likelihoods, so it can
+            grow while both responses' absolute probabilities fall, a real
+            phenomenon discussed under traps.
+          </p>
+
+          <h3>What it is not, and the variant landscape</h3>
+          <p>
+            DPO is offline. The model never samples during training, so
+            there is no exploration: it can only reshuffle probability among
+            behaviors the dataset exhibits, not discover a better answer no
+            annotator wrote down. And the guarantee it inherits is
+            conditional: the derivation says the optimum of the DPO loss is
+            the RLHF optimum <em>for preferences distributed like the
+            training pairs</em>. As the policy moves, the responses it would
+            actually generate drift away from the fixed dataset, and the loss
+            keeps grinding on stale comparisons; online methods refresh their
+            data every step precisely to avoid this. Empirically, papers and
+            practitioner reports find well-tuned online RL (PPO/GRPO with a
+            reward signal) tends to outperform pure DPO at the top end,
+            while DPO wins decisively on cost and simplicity; both findings
+            come with task and tuning caveats and the gap is an active
+            research topic rather than a settled constant.
+          </p>
+          <p>
+            The loss also spawned a family. IPO (Azar et al.) replaces the
+            log-sigmoid with a squared loss pulling the margin toward a fixed
+            target, addressing DPO's tendency to grow margins without bound
+            and overfit when preferences are near-deterministic. KTO
+            (Ethayarajh et al.) drops the need for pairs entirely, learning
+            from unpaired thumbs-up/thumbs-down examples with an asymmetric,
+            prospect-theory-inspired weighting. SimPO (Meng et al.) removes
+            the reference model, using the policy's length-normalized average
+            log-probability as the implicit reward plus a target margin,
+            cheaper and reportedly strong, at the price of losing the KL
+            anchor. TRL implements these as one-flag variants of the same
+            trainer, which tells you how much machinery they share.
+          </p>
+
+          <h2>Implementation, twice</h2>
+          <p>
+            The core loss needs exactly four vectors, the summed response
+            log-probs for chosen and rejected under policy and reference, and
+            β. A helper reduces per-token logits to those sums; the mask is
+            what restricts the sum to response tokens only, excluding the
+            prompt, which is a correctness requirement, not a convention.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import torch
+import torch.nn.functional as F
+
+def sequence_logprob(logits, tokens, mask):
+    """logits: (B, T, V) next-token logits; tokens: (B, T) realized ids;
+    mask: (B, T), 1.0 on response tokens, 0.0 on prompt and padding.
+    Returns (B,) summed log-prob of each response given its prompt."""
+    logp = F.log_softmax(logits, dim=-1)                       # (B, T, V)
+    tok = logp.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)    # (B, T)
+    return (tok * mask).sum(-1)                                # (B,)
+
+def dpo_loss(policy_chosen_logp, policy_rejected_logp,
+             ref_chosen_logp, ref_rejected_logp, beta=0.1):
+    """All inputs (B,): summed response log-probs. Returns
+    (scalar loss, chosen implicit rewards, rejected implicit rewards)."""
+    chosen_rw = beta * (policy_chosen_logp - ref_chosen_logp)      # (B,)
+    rejected_rw = beta * (policy_rejected_logp - ref_rejected_logp)
+    margin = chosen_rw - rejected_rw                               # (B,)
+    # -log sigmoid(margin): logistic regression on the reward margin.
+    loss = -F.logsigmoid(margin).mean()
+    return loss, chosen_rw.detach(), rejected_rw.detach()</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">import jax
+import jax.numpy as jnp
+
+def sequence_logprob(logits, tokens, mask):
+    """logits: (B, T, V) next-token logits; tokens: (B, T) realized ids;
+    mask: (B, T), 1.0 on response tokens, 0.0 on prompt and padding.
+    Returns (B,) summed log-prob of each response given its prompt."""
+    logp = jax.nn.log_softmax(logits, axis=-1)                 # (B, T, V)
+    tok = jnp.take_along_axis(
+        logp, tokens[..., None], axis=-1)[..., 0]              # (B, T)
+    return (tok * mask).sum(-1)                                # (B,)
+
+def dpo_loss(policy_chosen_logp, policy_rejected_logp,
+             ref_chosen_logp, ref_rejected_logp, beta=0.1):
+    """All inputs (B,): summed response log-probs. Returns
+    (scalar loss, chosen implicit rewards, rejected implicit rewards)."""
+    chosen_rw = beta * (policy_chosen_logp - ref_chosen_logp)      # (B,)
+    rejected_rw = beta * (policy_rejected_logp - ref_rejected_logp)
+    margin = chosen_rw - rejected_rw                               # (B,)
+    loss = -jax.nn.log_sigmoid(margin).mean()
+    return loss, jax.lax.stop_gradient(chosen_rw), \
+           jax.lax.stop_gradient(rejected_rw)</code></pre>
+          </div>
+          <p>
+            The training step wires two models, the trainable policy and a
+            frozen copy as reference, to that loss. A tiny embedding-and-head
+            language model stands in for the LLM so the whole thing runs on
+            synthetic tensors, but the data flow, two forward passes per model
+            per batch (chosen and rejected) with gradients only through the
+            policy, is exactly production's. There are no rollouts anywhere:
+            this is the entire loop.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import copy
+import torch.nn as nn
+
+class TinyLM(nn.Module):
+    """Stand-in for a causal LM: embedding -&gt; linear -&gt; vocab logits."""
+    def __init__(self, vocab=256, dim=64):
+        super().__init__()
+        self.emb = nn.Embedding(vocab, dim)
+        self.head = nn.Linear(dim, vocab)
+
+    def forward(self, tokens):            # (B, T) -&gt; (B, T, V)
+        return self.head(self.emb(tokens))
+
+torch.manual_seed(0)
+B, T, vocab = 8, 128, 256
+
+policy = TinyLM(vocab)
+ref = copy.deepcopy(policy).requires_grad_(False)   # frozen reference
+opt = torch.optim.AdamW(policy.parameters(), lr=5e-5)
+
+# Synthetic preference batch: ids and response masks for both sides.
+chosen = torch.randint(vocab, (B, T))
+rejected = torch.randint(vocab, (B, T))
+c_mask = (torch.arange(T) &gt;= 32).float().expand(B, T)  # prompt = 32 tokens
+r_mask = c_mask.clone()
+
+with torch.no_grad():                    # reference is inference-only
+    ref_c = sequence_logprob(ref(chosen), chosen, c_mask)
+    ref_r = sequence_logprob(ref(rejected), rejected, r_mask)
+
+pol_c = sequence_logprob(policy(chosen), chosen, c_mask)
+pol_r = sequence_logprob(policy(rejected), rejected, r_mask)
+
+loss, rw_c, rw_r = dpo_loss(pol_c, pol_r, ref_c, ref_r, beta=0.1)
+opt.zero_grad(); loss.backward(); opt.step()
+
+print(float(loss))                       # 0.6931...: policy == ref
+print(float((rw_c &gt; rw_r).float().mean()))  # "reward accuracy" metric</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">def init_lm(key, vocab=256, dim=64):
+    ke, kh = jax.random.split(key)
+    return {'emb': jax.random.normal(ke, (vocab, dim)) * 0.02,
+            'w': jax.random.normal(kh, (dim, vocab)) * 0.02,
+            'b': jnp.zeros(vocab)}
+
+def forward(params, tokens):              # (B, T) -&gt; (B, T, V)
+    return params['emb'][tokens] @ params['w'] + params['b']
+
+key = jax.random.PRNGKey(0)
+B, T, vocab = 8, 128, 256
+k1, k2, k3 = jax.random.split(key, 3)
+
+params = init_lm(k1, vocab)
+ref_params = jax.tree_util.tree_map(jnp.copy, params)   # frozen reference
+
+chosen = jax.random.randint(k2, (B, T), 0, vocab)
+rejected = jax.random.randint(k3, (B, T), 0, vocab)
+c_mask = jnp.broadcast_to(
+    (jnp.arange(T) &gt;= 32).astype(jnp.float32), (B, T))  # prompt = 32 tokens
+r_mask = c_mask
+
+ref_c = sequence_logprob(forward(ref_params, chosen), chosen, c_mask)
+ref_r = sequence_logprob(forward(ref_params, rejected), rejected, r_mask)
+
+@jax.jit
+def train_step(params, lr=5e-5):
+    def loss_fn(p):
+        pol_c = sequence_logprob(forward(p, chosen), chosen, c_mask)
+        pol_r = sequence_logprob(forward(p, rejected), rejected, r_mask)
+        loss, _, _ = dpo_loss(pol_c, pol_r, ref_c, ref_r, beta=0.1)
+        return loss
+    loss, grads = jax.value_and_grad(loss_fn)(params)
+    params = jax.tree_util.tree_map(lambda p, g: p - lr * g, params, grads)
+    return params, loss
+
+params, loss = train_step(params)
+print(float(loss))                        # 0.6931...: policy == ref</code></pre>
+          </div>
+
+          <h2>Using it on a real shape of problem</h2>
+          <p>
+            A realistic DPO batch on a 7B model looks like B = 8 to 64 pairs
+            of sequences of 512 to 4096 tokens over a ~32k to 128k vocabulary,
+            which means the (B, T, V) logits, computed four times per step
+            (policy and reference, chosen and rejected), dominate memory; this
+            is why implementations concatenate chosen and rejected into one
+            forward pass and why TRL offers precomputing all reference
+            log-probs once up front so the reference model can be dropped
+            from memory entirely. Run the synthetic loop above for a few
+            hundred steps with made-up "preferences" and you will see the
+            three numbers every real run is judged by: the loss falling from
+            0.693, the reward accuracy (fraction of pairs where the implicit
+            chosen reward exceeds the rejected one) climbing from 0.5 toward
+            the ceiling the data admits, and the reward margin growing. On
+            real runs, expect epochs to matter a lot (1 to 3 is typical, more
+            overfits visibly), expect β in the 0.05 to 0.5 range with 0.1 the
+            common default, and expect the margins to keep growing long after
+            actual output quality has plateaued, which is why held-out
+            win-rate judged by humans or a strong model, not the training
+            metrics, is the acceptance test. Exact curves are dataset- and
+            hardware-dependent; the directions are not.
+          </p>
+
+          <h2>Applications</h2>
+          <p>
+            DPO's slot in production pipelines is the middle of post-training.
+            The canonical public recipe is Zephyr-7B from Hugging Face's H4
+            team: SFT on strong instruction data, then DPO on
+            judge-model-ranked preference pairs (UltraFeedback), which at the
+            time beat much larger chat models and made "SFT then DPO" the
+            default open-source alignment recipe. Meta's Llama 3 post-training
+            ran iterative rounds of SFT plus DPO on preference data at
+            frontier scale, an existence proof that the method holds up far
+            beyond 7B. Allen AI's Tülu 3 is the clearest published version of
+            the full modern staircase: SFT, then DPO, then online RL with
+            verifiable rewards as a final stage. The logic of that ordering
+            is cost-shaped: SFT teaches format and competence cheaply, DPO
+            spends a fixed preference dataset to fix style, helpfulness, and
+            refusal behavior without any generation infrastructure, and the
+            expensive online RL budget (<a href="/rl/ppo">PPO</a> or
+            <a href="/rl/grpo">GRPO</a> with rollouts) is saved for the last
+            stretch where exploration and fresh feedback actually pay,
+            reasoning accuracy and reward signals a static dataset cannot
+            express. Beyond chat alignment, the same loss tunes models from
+            AI-generated feedback (RLAIF-style pairs ranked by a judge model),
+            and diffusion variants apply the identical math to image models,
+            but text preference tuning remains the home turf.
+          </p>
+
+          <h2>Against the real libraries</h2>
+          <p>
+            <a href="https://huggingface.co/docs/trl/dpo_trainer" target="_blank" rel="noreferrer">TRL's DPOTrainer</a>
+            (my notes on the library at <a href="/rl/trl">/rl/trl</a>) is the
+            standard implementation, and the distance between it and this
+            page is instructive. The loss line is the same; around it TRL
+            adds the things a real run needs: correct chat-template
+            tokenization of prompt/chosen/rejected with the loss masked to
+            response tokens, automatic creation of the frozen reference (or
+            PEFT-based training where the reference is just the adapter
+            turned off, halving memory), optional one-time precomputation of
+            reference log-probs, distributed training, and logged
+            reward-margin and reward-accuracy metrics. Its
+            <code>loss_type</code> flag is a tour of the variant literature:
+            <code>"sigmoid"</code> is the DPO loss above, <code>"ipo"</code>
+            the squared-loss variant, plus hinge, robust, and a dozen
+            research losses, with β reinterpreted per variant as documented.
+            The second reference point is
+            <a href="https://github.com/eric-mitchell/direct-preference-optimization" target="_blank" rel="noreferrer">eric-mitchell/direct-preference-optimization</a>,
+            the original authors' repo: less production machinery, but the
+            cleanest statement of the loss in the wild (its
+            <code>preference_loss</code> function is essentially the PyTorch
+            function above) and the code against which the paper's results
+            were produced, which makes it the right cross-check for research
+            forks.
+          </p>
+          <p>
+            The from-scratch version is genuinely enough when you control
+            tokenization and just need the loss inside an existing training
+            loop, which is why so many labs' internal trainers contain a
+            twenty-line DPO rather than a TRL dependency. Verification is
+            pleasantly deterministic because everything is offline: feed the
+            same four log-prob tensors to your <code>dpo_loss</code> and to
+            TRL's loss computation with <code>loss_type="sigmoid"</code> and
+            the same β, and the scalars must agree to float tolerance
+            (~1e-6); independently, assert the closed-form anchors, loss
+            exactly log 2 and zero margins when policy equals reference, and
+            loss decreasing when you add any positive constant to the chosen
+            log-probs. If those pass and a real run still misbehaves, the bug
+            is almost always in masking or tokenization, not the loss.
+          </p>
+
+          <h2>Traps and misconceptions</h2>
+          <p>
+            <strong>"DPO has no reward model."</strong> It has one; you just
+            do not train it separately. The implicit reward
+            β log(π<sub>θ</sub>/π<sub>ref</sub>) is a real reward model,
+            fit by the same Bradley-Terry likelihood as RLHF's, and it
+            inherits the same failure modes: it can overfit annotator quirks,
+            it can be probed and gamed, and its margins are trustworthy only
+            near the training distribution. The saved cost is infrastructural,
+            not epistemic.
+          </p>
+          <p>
+            <strong>Summing versus masking log-probs.</strong> The loss needs
+            the log-probability of the response given the prompt. Including
+            prompt tokens in the sum, or forgetting to mask padding, silently
+            changes every margin, and because chosen and rejected prompts are
+            identical the bug partially cancels, making it look like a
+            hyperparameter problem instead of a correctness one. The
+            first-batch loss ≈ log 2 check catches many of these; length
+            statistics of chosen versus rejected catch the rest.
+          </p>
+          <p>
+            <strong>Reading β backwards.</strong> β multiplies the log-ratio,
+            but its role comes from the RLHF objective: it is the KL price.
+            Small β means weak anchoring, large policy drift, and sharper
+            fitting of the preferences; large β keeps the model close to the
+            reference and mutes the update. People routinely assume the
+            opposite because β "scales the reward". When outputs degrade into
+            repetitive or unnatural text, the usual fix is a larger β or
+            fewer epochs, not more data.
+          </p>
+          <p>
+            <strong>Margins up, likelihoods down.</strong> The loss only
+            constrains the difference of ratios, so a well-documented
+            training dynamic is both chosen and rejected log-probabilities
+            falling while the margin grows, with probability mass leaking to
+            sequences that appear in no pairs. Some of that is benign
+            reallocation; enough of it degrades generation. This is a real
+            limitation of the offline objective, it motivated variants like
+            IPO and auxiliary SFT-loss terms, and it is why generation-based
+            evaluation is mandatory even though training never generates.
+          </p>
+          <p>
+            <strong>Treating DPO as a drop-in replacement for online RL.</strong>
+            The derivation's optimum coincides with RLHF's only under the
+            training distribution of pairs; nothing corrects the policy on
+            the distribution it actually induces after moving. For verifiable
+            objectives (math, code) where rewards can be checked on fresh
+            samples, online methods like <a href="/rl/grpo">GRPO</a> exploit
+            information DPO structurally cannot see. The mature reading of
+            the evidence is placement, not ranking: DPO where a fixed
+            preference set is the resource, online RL where rollouts and a
+            checkable reward are.
+          </p>
+
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> DPO is one algebraic observation
+            carried to its conclusion: the KL-constrained RLHF objective has
+            the closed-form optimum π<sub>ref</sub> · e<sup>r/β</sup> / Z,
+            so the reward is β times a log-ratio plus a constant, the
+            constant cancels inside the Bradley-Terry comparison, and the
+            preference likelihood becomes a logistic loss on
+            β log(π<sub>θ</sub>/π<sub>ref</sub>) margins that trains the
+            policy directly. You get preference alignment for the price of
+            fine-tuning, at the cost of being offline: no exploration, no
+            feedback on the model's own outputs, and margins that can outrun
+            quality. That is exactly why pipelines run SFT, then DPO, then
+            hand the finish to online RL.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/code-tabs.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" integrity="sha512-D9gUyxqja7hBtkWpPWGt9wfbfaMGVt9gnyCvYa+jojwwPHLCzUm5i8rpk7vD7wNee9bA35eYIjobYPaQuKS1MQ==" crossorigin="anonymous"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (!window.hljs) return;
+        hljs.configure({ languages: ["python", "bash", "c", "cpp", "rust", "go", "typescript", "swift", "sql", "json", "yaml", "plaintext"] });
+        hljs.highlightAll();
+      });
+    </script>
+  </body>
+</html>

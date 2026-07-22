@@ -1,0 +1,949 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Efficient Attention: Long Context &amp; Sub-Quadratic Variants · Stanley Jacob</title>
+    <meta name="description" content="Why attention is quadratic and what to do about it: sliding-window and local attention, sparse patterns from Sparse Transformers and BigBird, linear attention and the kernel reassociation trick, and FlashAttention as exact attention made fast by IO-awareness. Sliding-window and linear attention implemented in PyTorch and JAX." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" integrity="sha384-eFTL69TLRZTkNfYZOLM+G04821K1qZao/4QLJbet1pP4tcF+fdXq/9CdqAbWRl/L" crossorigin="anonymous" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml" class="active">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/ml">Machine learning</a></div>
+        <h1>Efficient attention: long context and sub-quadratic variants</h1>
+        <p class="lead">
+          Scaled dot-product attention compares every position with every
+          other position, and that all-pairs comparison is both its power and
+          its bill: quadratic time and quadratic memory in sequence length.
+          This page states that bill concretely at 128k tokens, then walks
+          the three families of answers: restrict which pairs get compared
+          (sliding windows and sparse patterns), change the math so the
+          pairwise matrix never exists (linear attention and its kernel
+          trick), or keep the math exact and fix the memory traffic instead
+          (FlashAttention). Sliding-window and linear attention are built
+          from scratch in PyTorch and JAX, and each variant gets an honest
+          assessment of what it actually buys you and who ships it.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>What it is and when you reach for it</h2>
+          <p>
+            The <a href="/ml/attention">attention page</a> derives the core
+            mechanism: out = softmax(QK<sup>T</sup>/√d)V, a differentiable
+            dictionary lookup in which every query scores every key. That
+            "every query, every key" is an N×N score matrix for a sequence
+            of length N, and nothing about the transformer block bounds N.
+            The moment you want a model to read a book, a codebase, an hour
+            of audio, or a genome, the quadratic term stops being a footnote
+            and becomes the dominant cost of the whole network. Efficient
+            attention is the family of responses. You reach for this
+            material in two situations. The first is architectural: you are
+            choosing or designing a model that must handle long inputs, and
+            you need to know which of the published tricks change the model
+            (windows, sparsity, kernels) versus which merely change the
+            implementation (FlashAttention, paged KV caches), because the
+            first kind trades quality for cost and the second kind is free.
+            The second is diagnostic: your model or serving stack is falling
+            over at long context and you need to know whether the wall you
+            hit is FLOPs, activation memory, or KV-cache memory, because the
+            three walls have three different fixes. This page sits between
+            <a href="/ml/attention">core attention</a>, which derives the
+            mechanism these variants modify, and
+            <a href="/ml/attention-variants">attention variants</a>, which
+            covers the head-structure axis (multi-query and grouped-query
+            attention, positional encodings); here the axis is sequence
+            length.
+          </p>
+
+          <h2>The math</h2>
+          <h3>The quadratic wall, stated concretely</h3>
+          <p>
+            Fix realistic numbers: context length N = 131,072 (the "128k"
+            of model cards), head dimension d = 128, and 32 heads, roughly a
+            7B-class dense model. The score matrix QK<sup>T</sup> has
+            N<sup>2</sup> ≈ 1.7×10<sup>10</sup> entries per head. Stored in
+            float16 at 2 bytes each, that is about 34 GB for one head of
+            one sequence, and about 1.1 TB across 32 heads, for a single
+            layer's forward pass. No GPU holds that; an 80 GB H100 cannot
+            hold even three heads' worth. The FLOP count is quadratic too:
+            forming QK<sup>T</sup> costs about 2N<sup>2</sup>d multiply-adds
+            per head and applying the weights to V costs the same again,
+            about 8.8×10<sup>12</sup> FLOPs per head, so roughly
+            2.8×10<sup>14</sup> FLOPs per layer across 32 heads. Repeat over
+            a few dozen layers and a single 128k forward pass spends on the
+            order of 10<sup>16</sup> FLOPs on attention alone, several
+            seconds of an H100's peak throughput before the MLPs do any
+            work. And there is a third, sneakier wall: even if you never
+            materialize the score matrix, autoregressive decoding must keep
+            every past key and value around. For a 7B-class model without
+            grouped-query attention that KV cache runs about 0.5 MB per
+            token, so a single 128k conversation pins around 64 GB of GPU
+            memory doing nothing but remembering.
+            <mark>Three distinct resources blow up at long context, score
+            memory, score FLOPs, and KV-cache memory, and every technique
+            on this page attacks a specific subset of the three.</mark>
+          </p>
+
+          <h3>Sliding-window and local attention</h3>
+          <p>
+            The oldest observation about attention maps is that most heads
+            attend locally most of the time: language is largely a
+            short-range phenomenon punctuated by occasional long-range
+            references. Sliding-window attention takes that as a design
+            constraint. Each query i attends only to keys j with
+            i − w &lt; j ≤ i for a window size w (in the causal case), so
+            each row of the score matrix has at most w nonzero entries and
+            the total cost falls from O(N<sup>2</sup>) to O(N·w), linear in
+            N for fixed w. At N = 131,072 with w = 4,096 that is a 32×
+            reduction in scores computed, and, more importantly, the cost
+            of adding a token stops depending on how long the sequence
+            already is. The KV cache benefits identically: a strict
+            sliding window only ever needs the last w keys and values, so
+            decoding memory is capped at w tokens instead of growing
+            without bound, a rolling buffer rather than an archive.
+          </p>
+          <p>
+            The obvious objection is that a window kills long-range
+            information, and the standard answer is the receptive-field
+            argument, the same one used for stacked convolutions. A token
+            at layer 1 sees w tokens back. But those tokens were computed
+            at layer 0 from their own windows, so at layer 2 the
+            information reachable from position i extends 2w back, and
+            after L layers the theoretical receptive field is L·w tokens:
+          </p>
+          <pre class="flow">layer 3   [◄──────────── 3w reachable ────────────] i
+layer 2        [◄───────── 2w reachable ────────] i
+layer 1             [◄────── w visible ─────────] i
+tokens    ... t-3w ......... t-2w ......... t-w ... t</pre>
+          <p>
+            Mistral 7B made exactly this bet: a 4,096-token window over 32
+            layers gives a theoretical reach of about 131k tokens while
+            paying local-attention prices everywhere. The honest caveat is
+            that "theoretical reach" means information can be relayed
+            hop by hop through intermediate representations, not that it
+            survives the trip; each hop is a lossy compression into a
+            fixed-width residual stream, so precise recall of a fact
+            exactly L·w tokens back is far harder than the diagram
+            suggests, and empirically long-range recall in pure
+            sliding-window models degrades well before the theoretical
+            horizon. Longformer's refinement, aimed at document tasks,
+            was local-plus-global: a window (512 tokens in the paper) for
+            almost every position, plus a handful of designated global
+            tokens, the classification token, question tokens, that attend
+            to everything and are attended to by everything. Global tokens
+            act as a shared scratchpad, one hop from anywhere to anywhere,
+            for O(N·w + g·N) cost with g global tokens. The modern
+            production form of the local idea is interleaving: Gemma 2 and
+            Gemma 3 alternate sliding-window layers with full-attention
+            layers (Gemma 3 at a 5:1 local-to-global ratio), so most
+            layers pay O(N·w) and the occasional global layer restores
+            exact long-range access, and GPT-OSS ships the same
+            alternating pattern. What windows are genuinely useful for:
+            streams where recency dominates (chat, code completion, audio),
+            capping KV-cache growth, and cutting prefill cost. What they
+            are not: a free replacement for full attention on tasks that
+            need exact retrieval of arbitrary distant tokens.
+          </p>
+
+          <h3>Sparse patterns: strided, fixed, and BigBird's recipe</h3>
+          <p>
+            Sliding windows are one sparsity pattern; the Sparse
+            Transformer (Child et al., 2019) asked the general question:
+            which subsets of the N<sup>2</sup> pairs preserve modeling
+            power at sub-quadratic cost? Their two patterns are best
+            pictured on the score matrix. The <em>strided</em> pattern
+            gives each position a local band plus every k-th position
+            before it (stride k ≈ √N), so any pair of positions is
+            connected in two hops, one along the stride, one within a
+            band, for O(N√N) total cost; it suits data with periodic
+            structure like images flattened row by row, where the stride
+            aligns with the row length. The <em>fixed</em> pattern
+            designates anchor columns, every position attends to its own
+            block plus a set of fixed anchor positions that summarize
+            earlier blocks, which suits text, where no natural period
+            exists. The lasting insight is that
+            <mark>full connectivity per layer is unnecessary as long as
+            the pattern's transitive closure across a few layers connects
+            everything</mark>, the same receptive-field argument again,
+            engineered deliberately.
+          </p>
+          <p>
+            BigBird (Zaheer et al., 2020) assembled the now-canonical
+            three-part recipe: a sliding window for local structure, a few
+            global tokens for one-hop shortcuts, and, the novel part,
+            random connections, each query attends to r randomly chosen
+            keys. The random links are borrowed from expander-graph
+            theory: a sparse graph with random edges has short paths
+            between all pairs with high probability, so information mixes
+            in O(log N) hops even without global tokens. The paper backed
+            the construction with theory, sparse attention of this shape
+            is a universal approximator of sequence functions and remains
+            Turing complete, and with strong results on long-document QA
+            and summarization and on genomics data, at O(N) cost for
+            fixed window, global, and random budgets. The honest
+            assessment: BigBird and Longformer earned real adoption in
+            long-document NLP in the BERT era, and the window+global
+            ingredients live on in modern LLMs, but the random component
+            never transferred to production autoregressive models, partly
+            because random gathers are hostile to GPU memory coalescing,
+            and partly because FlashAttention made exact attention cheap
+            enough that block-sparse patterns lost their urgency at the
+            lengths people actually train. Sparse patterns today are
+            mostly an architectural idea you inherit through windows and
+            a few global layers rather than a thing you configure
+            directly.
+          </p>
+
+          <h3>Linear attention: the reassociation trick</h3>
+          <p>
+            The sparse family keeps the softmax and drops pairs. Linear
+            attention keeps all pairs and drops the softmax. Write
+            unnormalized attention with a general similarity function
+            sim(q, k) ≥ 0:
+          </p>
+          <p>
+            out<sub>i</sub> = Σ<sub>j</sub> sim(q<sub>i</sub>, k<sub>j</sub>) v<sub>j</sub> / Σ<sub>j</sub> sim(q<sub>i</sub>, k<sub>j</sub>).
+          </p>
+          <p>
+            Softmax attention is the special case sim(q, k) =
+            exp(q·k/√d). Now suppose the similarity factorizes through a
+            feature map φ: sim(q, k) = φ(q)·φ(k) for some elementwise
+            nonnegative φ. Then the numerator becomes
+            Σ<sub>j</sub> φ(q<sub>i</sub>)<sup>T</sup>φ(k<sub>j</sub>) v<sub>j</sub> =
+            φ(q<sub>i</sub>)<sup>T</sup> (Σ<sub>j</sub> φ(k<sub>j</sub>) v<sub>j</sub><sup>T</sup>),
+            and in matrix form the whole layer is
+            (φ(Q)φ(K)<sup>T</sup>)V = φ(Q)(φ(K)<sup>T</sup>V). That is
+            just associativity of matrix multiplication, but the two
+            parenthesizations have wildly different costs.
+            (φ(Q)φ(K)<sup>T</sup>)V forms an N×N matrix first: O(N<sup>2</sup>d)
+            time, O(N<sup>2</sup>) memory. φ(Q)(φ(K)<sup>T</sup>V) forms a
+            d×d<sub>v</sub> matrix first: O(N·d·d<sub>v</sub>) time,
+            O(d·d<sub>v</sub>) extra memory, linear in sequence length
+            because the sum over positions happens inside the small
+            matrix. <mark>The complexity class of attention is not a
+            property of the math; it is a property of where you put the
+            parentheses, and the softmax is what forbids moving
+            them</mark>, because exp(q·k) does not factorize into a
+            finite-dimensional φ(q)·φ(k).
+          </p>
+          <p>
+            A worked example with N = 2 positions and one-dimensional
+            features. Let φ(q) take the values [2, 1] at the two
+            positions, φ(k) the values [3, 1], and v the values [5, 7].
+            The quadratic route forms the 2×2 similarity matrix
+            [[2·3, 2·1], [1·3, 1·1]] = [[6, 2], [3, 1]], multiplies by v
+            to get [6·5 + 2·7, 3·5 + 1·7] = [44, 22], and divides by the
+            row sums [8, 4] to get outputs [5.5, 5.5]. The linear route
+            never builds the matrix: it computes the summaries
+            S = Σ φ(k<sub>j</sub>)v<sub>j</sub> = 3·5 + 1·7 = 22 and
+            z = Σ φ(k<sub>j</sub>) = 4 once, then each output is
+            φ(q<sub>i</sub>)·S / (φ(q<sub>i</sub>)·z): 2·22/(2·4) = 5.5
+            and 1·22/(1·4) = 5.5. Identical answers; the left route
+            touched N<sup>2</sup> = 4 similarity terms, the right touched
+            N = 2. At N = 131,072 with d = d<sub>v</sub> = 128, the
+            running state S is a 128×128 matrix, 16,384 numbers,
+            regardless of context length.
+          </p>
+          <p>
+            The causal case reveals something deeper. With a mask, the
+            sums become prefix sums,
+            S<sub>t</sub> = S<sub>t−1</sub> + φ(k<sub>t</sub>)v<sub>t</sub><sup>T</sup>
+            and z<sub>t</sub> = z<sub>t−1</sub> + φ(k<sub>t</sub>), and
+            out<sub>t</sub> = φ(q<sub>t</sub>)<sup>T</sup>S<sub>t</sub> / φ(q<sub>t</sub>)<sup>T</sup>z<sub>t</sub>.
+            That is a recurrent network: a fixed-size state updated once
+            per token, with O(1) memory and O(d·d<sub>v</sub>) work per
+            decoding step, no KV cache at all. This is the observation of
+            Katharopoulos et al. (2020), whose "transformers are RNNs"
+            framing used the simple feature map φ(x) = elu(x) + 1
+            (positivity keeps the normalizer positive). Performer
+            (Choromanski et al., 2020) went further and chose φ to be a
+            randomized map, positive random features built from
+            exp(w·x) with Gaussian-sampled w, whose inner products are an
+            unbiased estimate of the softmax kernel itself, so in
+            expectation Performer computes real softmax attention in
+            linear time, with accuracy controlled by the number of random
+            features.
+          </p>
+          <p>
+            Now the honest note, because this family has the largest gap
+            between headline and practice. Trained head-to-head at equal
+            parameter count, classic linear attention consistently trails
+            softmax attention on language modeling, and the gap
+            concentrates exactly where you would predict from the math:
+            recall. Softmax attention with a KV cache is a lossless
+            archive, any query can sharply retrieve any stored token,
+            while linear attention compresses the entire past into a
+            d×d<sub>v</sub> state, so distinct keys interfere and precise
+            needle-in-a-haystack retrieval degrades as context grows.
+            Performer's unbiased softmax estimate helps less than hoped
+            because the variance of the estimate is largest precisely for
+            the sharp, high-score lookups that matter most. That is why
+            the 2020-era linear transformers did not take over. The
+            revival came from the state-space direction: modern recurrent
+            architectures, RWKV in its later matrix-valued-state
+            versions, RetNet, Gated Linear Attention, and Mamba-2, whose
+            state-space duality result makes the connection explicit, are
+            all linear attention wearing decay gates and better
+            parameterizations, trained with hardware-aware chunked-scan
+            kernels. And the form that actually ships is the hybrid:
+            Jamba interleaves Mamba layers with a few full-attention
+            layers, Griffin and RecurrentGemma interleave gated linear
+            recurrences with local attention, on the theory that a few
+            exact-attention layers supply the recall that the linear
+            layers cannot, while the linear layers carry the bulk of the
+            sequence cheaply. What linear attention is genuinely useful
+            for: constant-memory streaming inference, extreme lengths
+            where even O(N·w) is too much, and as the cheap component of
+            a hybrid. What it is not: a drop-in replacement where exact
+            long-range retrieval is the product.
+          </p>
+
+          <h3>FlashAttention: exact attention, IO-aware</h3>
+          <p>
+            Everything above changes the model. FlashAttention (Dao et
+            al., 2022) changes nothing about the model:
+            <mark>it computes bit-for-bit the same softmax attention as
+            the naive code, and its entire contribution is refusing to
+            write the N×N matrix to GPU main memory.</mark> The insight is
+            that attention at these sizes is bound by memory traffic, not
+            arithmetic: reading and writing an N×N score matrix through
+            HBM costs far more time than the multiplies. FlashAttention
+            tiles Q, K, and V into blocks sized for on-chip SRAM,
+            computes each score tile there, and folds it immediately into
+            the running output using the online-softmax identity, a
+            softmax can be computed in one streaming pass carrying only a
+            running (max, sum) pair and rescaling past contributions when
+            the max updates. I derive that identity on the
+            <a href="/ml/softmax">softmax page</a>, and my step-by-step
+            kernel reconstruction lives at
+            <a href="/oss/flash-attention">/oss/flash-attention</a>. The
+            result is O(N) memory instead of O(N<sup>2</sup>) and a large
+            constant-factor speedup, while the FLOP count stays
+            quadratic. That last clause is the key contrast with every
+            approximation above: FlashAttention moves the wall, from
+            memory at a few thousand tokens to FLOPs at hundreds of
+            thousands, rather than removing it. In practice that trade
+            won: exact attention at 128k became affordable, and the
+            frontier long-context models are generally understood to run
+            exact attention on FlashAttention-class kernels rather than
+            any approximation.
+          </p>
+          <p>
+            The serving-time sibling is PagedAttention, the idea vLLM is
+            built around (my notes: <a href="/oss/vllm">/oss/vllm</a>).
+            It attacks the third wall, KV-cache memory, again without
+            approximating anything: instead of reserving one contiguous
+            max-length buffer per sequence, which fragments memory and
+            strands most of it, the KV cache is stored in fixed-size
+            pages with a per-sequence page table, exactly like OS virtual
+            memory. Attention kernels gather K and V through the page
+            table, sequences share pages for shared prefixes, and cache
+            utilization goes from a reported minority of allocated memory
+            to near-total, which translates directly into batch size and
+            throughput. Paged KV plus flash-style kernels is the default
+            production serving stack; the approximations earlier on this
+            page only enter when even exact-but-fast is too expensive.
+          </p>
+
+          <h2>Implementation, twice</h2>
+          <p>
+            Two reference implementations. First, sliding-window
+            attention built from the same core as the
+            <a href="/ml/attention">attention page</a>: the core function
+            gains a mask argument, and the window is nothing but a mask
+            construction. This reference still materializes the full
+            score matrix, so it demonstrates the pattern, not the
+            savings; the savings require a kernel that skips masked tiles
+            entirely, which is exactly what the production
+            implementations in the library section do.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+def masked_attention(q, k, v, allowed):
+    """Core attention with an arbitrary boolean visibility mask.
+
+    q, k: (..., T, d); v: (..., T, dv); allowed: (T, T) bool,
+    True where query row i may see key column j. Returns (..., T, dv).
+    """
+    d = q.size(-1)
+    scores = q @ k.transpose(-2, -1) / math.sqrt(d)   # (..., T, T)
+    # -inf BEFORE softmax: masked entries become exactly 0 weight
+    # and each row renormalizes over its visible set.
+    scores = scores.masked_fill(~allowed, float('-inf'))
+    return F.softmax(scores, dim=-1) @ v
+
+def sliding_window_mask(T, window, device=None):
+    """(T, T) bool: causal AND local. Row i sees columns j with
+    i - window &lt; j &lt;= i, i.e. at most `window` nonzeros per row."""
+    i = torch.arange(T, device=device).unsqueeze(1)   # (T, 1)
+    j = torch.arange(T, device=device).unsqueeze(0)   # (1, T)
+    return (j &lt;= i) &amp; (j &gt; i - window)
+
+class SlidingWindowSelfAttention(nn.Module):
+    """Multi-head causal self-attention restricted to a local window.
+
+    Identical to full causal attention except for the mask; with
+    window &gt;= T it IS full causal attention, which is also the
+    correctness check used later on this page.
+    """
+
+    def __init__(self, n_embd, n_head, window):
+        super().__init__()
+        assert n_embd % n_head == 0
+        self.n_head, self.window = n_head, window
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd)   # fused q, k, v
+        self.c_proj = nn.Linear(n_embd, n_embd)
+
+    def forward(self, x):                              # x: (B, T, C)
+        B, T, C = x.shape
+        q, k, v = self.c_attn(x).split(C, dim=2)       # each (B, T, C)
+        # (B, T, C) -&gt; (B, H, T, C // H): head axis becomes batch
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        allowed = sliding_window_mask(T, self.window, x.device)
+        y = masked_attention(q, k, v, allowed)         # (B, H, T, C//H)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        return self.c_proj(y)</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">import jax
+import jax.numpy as jnp
+
+def masked_attention(q, k, v, allowed):
+    """Core attention with an arbitrary boolean visibility mask.
+
+    q, k: (..., T, d); v: (..., T, dv); allowed: (T, T) bool,
+    True where query row i may see key column j. Returns (..., T, dv).
+    """
+    d = q.shape[-1]
+    scores = jnp.einsum('...qd,...kd-&gt;...qk', q, k) / jnp.sqrt(d)
+    # -inf BEFORE softmax: masked weights are exactly zero and each
+    # row renormalizes over its visible set.
+    scores = jnp.where(allowed, scores, -jnp.inf)
+    w = jax.nn.softmax(scores, axis=-1)
+    return jnp.einsum('...qk,...kv-&gt;...qv', w, v)
+
+def sliding_window_mask(T, window):
+    """(T, T) bool: causal AND local. Row i sees columns j with
+    i - window &lt; j &lt;= i, i.e. at most `window` nonzeros per row."""
+    i = jnp.arange(T)[:, None]                        # (T, 1)
+    j = jnp.arange(T)[None, :]                        # (1, T)
+    return (j &lt;= i) &amp; (j &gt; i - window)
+
+def init_swa(key, n_embd):
+    k1, k2 = jax.random.split(key)
+    s = 1.0 / jnp.sqrt(n_embd)
+    return {
+        'w_qkv': jax.random.normal(k1, (n_embd, 3 * n_embd)) * s,
+        'b_qkv': jnp.zeros(3 * n_embd),
+        'w_out': jax.random.normal(k2, (n_embd, n_embd)) * s,
+        'b_out': jnp.zeros(n_embd),
+    }
+
+def sliding_window_self_attention(params, x, n_head, window):
+    B, T, C = x.shape                                 # (batch, time, dim)
+    qkv = x @ params['w_qkv'] + params['b_qkv']       # (B, T, 3C)
+    q, k, v = jnp.split(qkv, 3, axis=-1)              # each (B, T, C)
+
+    def heads(t):                        # (B, T, C) -&gt; (B, H, T, C//H)
+        return t.reshape(B, T, n_head, C // n_head).swapaxes(1, 2)
+
+    allowed = sliding_window_mask(T, window)
+    y = masked_attention(heads(q), heads(k), heads(v), allowed)
+    y = y.swapaxes(1, 2).reshape(B, T, C)             # concat heads
+    return y @ params['w_out'] + params['b_out']</code></pre>
+          </div>
+          <p>
+            Second, a minimal linear-attention layer. Both versions show
+            the reassociation in its two guises: the non-causal function
+            is the three-line parenthesization change,
+            φ(Q)(φ(K)<sup>T</sup>V), and the causal version is the
+            prefix-sum form that makes the RNN structure visible. The
+            PyTorch causal path uses a cumulative sum over outer
+            products, clear but memory-hungry, materializing
+            (B, H, T, d, d<sub>v</sub>); production kernels process time
+            in chunks instead. The JAX causal path uses
+            <code>lax.scan</code>, which is the honest shape of the
+            computation: a fixed-size state carried token to token.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">def feature_map(x):
+    # phi(x) = elu(x) + 1 &gt; 0 (Katharopoulos et al. 2020):
+    # positive features keep the normalizer strictly positive.
+    return F.elu(x) + 1.0
+
+def linear_attention(q, k, v):
+    """Non-causal linear attention: the reassociation in one line.
+
+    q, k: (B, H, T, d); v: (B, H, T, dv). Returns (B, H, T, dv).
+    phi(K)^T V is (d, dv): the T-length axis is summed away BEFORE
+    any query touches it, so nothing of size T x T ever exists.
+    """
+    q, k = feature_map(q), feature_map(k)
+    kv = k.transpose(-2, -1) @ v                # (B, H, d, dv)  O(T d dv)
+    z = k.sum(dim=-2)                           # (B, H, d)
+    num = q @ kv                                # (B, H, T, dv)  O(T d dv)
+    den = (q * z.unsqueeze(-2)).sum(-1, keepdim=True)   # (B, H, T, 1)
+    return num / den.clamp_min(1e-6)
+
+class CausalLinearAttention(nn.Module):
+    """Causal linear attention via prefix sums: an RNN in disguise.
+
+    State per head: S_t = sum_{j&lt;=t} phi(k_j) v_j^T   (d, dv)
+                    z_t = sum_{j&lt;=t} phi(k_j)          (d,)
+    out_t = phi(q_t)^T S_t / phi(q_t)^T z_t. Decoding needs only
+    (S, z), constant memory, no KV cache.
+    """
+
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        assert n_embd % n_head == 0
+        self.n_head = n_head
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd)
+        self.c_proj = nn.Linear(n_embd, n_embd)
+
+    def forward(self, x):                              # x: (B, T, C)
+        B, T, C = x.shape
+        q, k, v = self.c_attn(x).split(C, dim=2)
+        h, dh = self.n_head, C // self.n_head
+        q = feature_map(q.view(B, T, h, dh).transpose(1, 2))  # (B,H,T,d)
+        k = feature_map(k.view(B, T, h, dh).transpose(1, 2))
+        v = v.view(B, T, h, dh).transpose(1, 2)               # (B,H,T,dv)
+        # Outer products phi(k_t) v_t^T, prefix-summed over time.
+        # (B, H, T, d, dv): fine as a reference, chunked in production.
+        S = torch.einsum('bhtd,bhte-&gt;bhtde', k, v).cumsum(dim=2)
+        z = k.cumsum(dim=2)                                   # (B,H,T,d)
+        num = torch.einsum('bhtd,bhtde-&gt;bhte', q, S)          # (B,H,T,dv)
+        den = torch.einsum('bhtd,bhtd-&gt;bht', q, z)            # (B,H,T)
+        y = num / den.clamp_min(1e-6).unsqueeze(-1)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        return self.c_proj(y)</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">def feature_map(x):
+    # phi(x) = elu(x) + 1 &gt; 0 (Katharopoulos et al. 2020):
+    # positive features keep the normalizer strictly positive.
+    return jax.nn.elu(x) + 1.0
+
+def linear_attention(q, k, v):
+    """Non-causal linear attention: the reassociation in one line.
+
+    q, k: (B, H, T, d); v: (B, H, T, dv). Returns (B, H, T, dv).
+    phi(K)^T V is (d, dv): the T axis is summed away BEFORE any
+    query touches it, so nothing of size T x T ever exists.
+    """
+    q, k = feature_map(q), feature_map(k)
+    kv = jnp.einsum('...td,...te-&gt;...de', k, v)   # (B, H, d, dv)
+    z = k.sum(axis=-2)                            # (B, H, d)
+    num = jnp.einsum('...td,...de-&gt;...te', q, kv) # (B, H, T, dv)
+    den = jnp.einsum('...td,...d-&gt;...t', q, z)    # (B, H, T)
+    return num / jnp.maximum(den, 1e-6)[..., None]
+
+def causal_linear_attention(q, k, v):
+    """Causal linear attention as an explicit recurrence (lax.scan).
+
+    q, k: (B, H, T, d); v: (B, H, T, dv). State per head is
+    (S, z) with S: (d, dv), z: (d,), constant in T: this scan IS
+    the constant-memory decoding loop, not a simulation of it.
+    """
+    q, k = feature_map(q), feature_map(k)
+
+    def one_head(qh, kh, vh):            # (T, d), (T, d), (T, dv)
+        d, dv = qh.shape[-1], vh.shape[-1]
+
+        def step(carry, qkv_t):
+            S, z = carry                 # (d, dv), (d,)
+            q_t, k_t, v_t = qkv_t
+            S = S + jnp.outer(k_t, v_t)  # accumulate phi(k) v^T
+            z = z + k_t
+            out = (q_t @ S) / jnp.maximum(q_t @ z, 1e-6)
+            return (S, z), out           # out: (dv,)
+
+        init = (jnp.zeros((d, dv)), jnp.zeros(d))
+        _, out = jax.lax.scan(step, init, (qh, kh, vh))
+        return out                       # (T, dv)
+
+    # vmap over batch, then heads: scan stays per-sequence.
+    return jax.vmap(jax.vmap(one_head))(q, k, v)</code></pre>
+          </div>
+
+          <h2>Using it on a real shape of problem</h2>
+          <p>
+            Two checks worth actually running. The first exploits the
+            fact that sliding-window attention with window ≥ T is exactly
+            full causal attention, so the reference module can be
+            verified against the fused production kernel. The second
+            verifies the reassociation itself: the quadratic
+            parenthesization and the linear one must agree to floating
+            point noise, and the causal scan must agree with a masked
+            quadratic computation using the same feature map. Note what
+            is being tested in each case: the first test checks our code
+            against someone else's exact kernel; the second checks two of
+            our own parenthesizations against each other, because there
+            is no exact softmax reference for linear attention to match,
+            it is a different model.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">torch.manual_seed(0)
+B, H, T, d = 2, 8, 2048, 64
+q, k, v = torch.randn(3, B, H, T, d, dtype=torch.float64).unbind(0)
+
+# 1) window &gt;= T degenerates to full causal attention: compare
+#    against the fused kernel with the same window mask.
+full = masked_attention(q, k, v, sliding_window_mask(T, T))
+ref = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+print((full - ref).abs().max())          # ~1e-16 in float64
+
+# ...and a real window is just a different mask fed to SDPA.
+win = masked_attention(q, k, v, sliding_window_mask(T, 256))
+ref_w = F.scaled_dot_product_attention(
+    q, k, v, attn_mask=sliding_window_mask(T, 256))
+print((win - ref_w).abs().max())         # ~1e-16 in float64
+
+# 2) reassociation: quadratic vs linear parenthesization agree.
+fq, fk = feature_map(q), feature_map(k)
+quad = (fq @ fk.transpose(-2, -1)) @ v          # O(T^2) route
+quad = quad / (fq @ fk.transpose(-2, -1)).sum(-1, keepdim=True)
+lin = linear_attention(q, k, v)                 # O(T) route
+print((quad - lin).abs().max())          # ~1e-15: same math, new parens</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">key = jax.random.PRNGKey(0)
+kq, kk, kv = jax.random.split(key, 3)
+B, H, T, d = 2, 8, 2048, 64
+q = jax.random.normal(kq, (B, H, T, d))
+k = jax.random.normal(kk, (B, H, T, d))
+v = jax.random.normal(kv, (B, H, T, d))
+
+# 1) window &gt;= T degenerates to full causal attention.
+full = masked_attention(q, k, v, sliding_window_mask(T, T))
+causal = masked_attention(q, k, v, sliding_window_mask(T, T + 1))
+print(jnp.abs(full - causal).max())      # 0.0: identical masks
+
+# 2) reassociation: quadratic vs linear parenthesization agree.
+fq, fk = feature_map(q), feature_map(k)
+sim = jnp.einsum('...td,...sd-&gt;...ts', fq, fk)     # O(T^2) route
+quad = (sim @ v) / sim.sum(-1, keepdims=True)
+lin = linear_attention(q, k, v)                    # O(T) route
+print(jnp.abs(quad - lin).max())         # ~1e-6 in float32
+
+# 3) the causal scan matches a causally-masked quadratic version.
+mask = jnp.tril(jnp.ones((T, T), dtype=bool))
+sim_c = jnp.where(mask, sim, 0.0)
+quad_c = (sim_c @ v) / sim_c.sum(-1, keepdims=True)
+scan_c = causal_linear_attention(q, k, v)
+print(jnp.abs(quad_c - scan_c).max())    # ~1e-6 in float32</code></pre>
+          </div>
+          <p>
+            Exact tolerances are machine-dependent; the float64 PyTorch
+            checks should sit near 1e-15, and the float32 JAX checks
+            near 1e-6, since the two parenthesizations accumulate in
+            different orders. The instructive experiment beyond
+            correctness is to time the two linear-attention routes as T
+            grows with d fixed at 64: the quadratic route's time and
+            memory grow with T<sup>2</sup> and it dies of out-of-memory
+            first, while the linear route grows linearly and is bound by
+            the (B, H, T, d, d<sub>v</sub>) cumsum in the PyTorch causal
+            case, which is exactly why real linear-attention kernels
+            (and Mamba-style scans) process time in chunks: a chunk of
+            quadratic attention inside, state passed between chunks.
+          </p>
+
+          <h2>Applications</h2>
+          <p>
+            The variants sort cleanly by which wall they attack and what
+            they sacrifice, so the comparison table is the honest summary
+            of the field:
+          </p>
+          <table>
+            <thead>
+              <tr>
+                <th>Variant</th>
+                <th>Time / memory</th>
+                <th>Exact?</th>
+                <th>Genuinely useful for</th>
+                <th>Who ships it</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Full softmax (naive)</td>
+                <td>O(N<sup>2</sup>) / O(N<sup>2</sup>)</td>
+                <td>Yes</td>
+                <td>Short context, interpretability work that needs the weight matrix</td>
+                <td>Reference code, teaching, model surgery</td>
+              </tr>
+              <tr>
+                <td>FlashAttention</td>
+                <td>O(N<sup>2</sup>) / O(N)</td>
+                <td>Yes, bit-for-bit the same model</td>
+                <td>The default; exact attention to ~100k+ tokens</td>
+                <td>flash-attn, PyTorch SDPA, cuDNN, every major LLM stack</td>
+              </tr>
+              <tr>
+                <td>Sliding window / local</td>
+                <td>O(N·w) / O(N·w)</td>
+                <td>Exact compute of a restricted model</td>
+                <td>Streams where recency dominates; capping KV cache; cheap layers in interleaved stacks</td>
+                <td>Mistral 7B, Gemma 2/3, GPT-OSS, Longformer</td>
+              </tr>
+              <tr>
+                <td>Sparse (strided, BigBird)</td>
+                <td>O(N√N) or O(N)</td>
+                <td>Exact compute of a restricted model</td>
+                <td>Long-document encoders; historically images/audio</td>
+                <td>Sparse Transformer, BigBird, Longformer (window+global survives; random links did not)</td>
+              </tr>
+              <tr>
+                <td>Linear / kernel attention</td>
+                <td>O(N·d·d<sub>v</sub>) / O(d·d<sub>v</sub>) state</td>
+                <td>No: different model (Performer: unbiased softmax estimate)</td>
+                <td>Constant-memory streaming; extreme lengths; the cheap half of hybrids</td>
+                <td>RWKV, RetNet, GLA, Mamba-2; hybrids: Jamba, Griffin/RecurrentGemma</td>
+              </tr>
+              <tr>
+                <td>PagedAttention</td>
+                <td>Exact attention; paged KV memory</td>
+                <td>Yes, serving-side memory management</td>
+                <td>Throughput serving: batching, prefix sharing</td>
+                <td>vLLM, SGLang, TensorRT-LLM (paged KV variants)</td>
+              </tr>
+            </tbody>
+          </table>
+          <p>
+            In deployment terms: production LLM serving is
+            FlashAttention-class exact kernels plus paged KV management,
+            full stop, with sliding-window layers appearing inside open
+            models (Mistral, the Gemma line, GPT-OSS) as a training-time
+            architecture choice that also caps serving memory. The
+            document-NLP world still runs Longformer and BigBird
+            checkpoints for long-input classification and QA where an
+            encoder over 4k to 16k tokens is the whole job. Linear
+            attention's production presence is through the recurrent
+            model families, RWKV models have shipped on consumer and
+            edge hardware precisely because decoding needs constant
+            memory, and through hybrids like Jamba and RecurrentGemma
+            that put a small number of exact-attention layers where
+            recall lives. And the ideas compose rather than compete: a
+            Gemma 3 style stack runs flash kernels inside its local
+            layers and its global layers, serves through a paged KV
+            cache, and caps the local layers' cache at the window size,
+            three sections of this page in one model.
+          </p>
+
+          <h2>Against the real libraries</h2>
+          <p>
+            <a href="https://github.com/Dao-AILab/flash-attention" target="_blank" rel="noreferrer">flash-attn</a>
+            is the reference production kernel line (FlashAttention-2 and
+            -3). Beyond the tiled exact algorithm, the repo ships the
+            features this page's reference code quietly lacks: a
+            <code>window_size</code> argument that implements
+            sliding-window attention by skipping out-of-window tiles
+            entirely, which is the real O(N·w), unlike our masked dense
+            reference; causal masking fused into tile iteration bounds;
+            paged KV-cache support; and a recompute-based backward pass.
+            When people say Mistral's window is "supported in flash-attn",
+            they mean that argument.
+          </p>
+          <p>
+            <a href="https://github.com/facebookresearch/xformers" target="_blank" rel="noreferrer">xformers</a>
+            provides <code>memory_efficient_attention</code>, the other
+            widely deployed exact kernel family, along with an
+            <code>attn_bias</code> zoo (<code>BlockDiagonalMask</code>,
+            <code>LowerTriangularMask</code>, local attention biases)
+            that lets structured masks reach the kernel as iteration
+            bounds rather than materialized tensors. It was the standard
+            way to make Stable Diffusion fit in consumer VRAM before the
+            fused kernels went upstream, and much of it did go upstream:
+            <a href="https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html" target="_blank" rel="noreferrer">torch.nn.functional.scaled_dot_product_attention</a>
+            dispatches among a FlashAttention-2 backend, a
+            memory-efficient backend from the xformers line, a cuDNN
+            backend, and a naive math fallback, selectable via the
+            <code>torch.nn.attention.sdpa_kernel</code> context manager.
+            For patterned masks, PyTorch's newer FlexAttention API
+            compiles a user-written score-modification function (sliding
+            windows included) into a fused kernel, which is the clean
+            path from this page's mask-based reference to production
+            speed without writing CUDA.
+          </p>
+          <p>
+            One level up,
+            <a href="https://github.com/huggingface/transformers" target="_blank" rel="noreferrer">huggingface/transformers</a>
+            (notes at <a href="/oss/transformers">/oss/transformers</a>)
+            exposes the whole choice as a single
+            <code>attn_implementation</code> flag on
+            <code>from_pretrained</code>: <code>"eager"</code> is
+            essentially this page's naive reference, <code>"sdpa"</code>
+            is the PyTorch dispatcher, and
+            <code>"flash_attention_2"</code> calls flash-attn directly,
+            with model configs carrying window sizes (Mistral's
+            <code>sliding_window</code>) down into whichever backend is
+            active. On the serving side,
+            <a href="https://github.com/vllm-project/vllm" target="_blank" rel="noreferrer">vllm</a>
+            (<a href="/oss/vllm">/oss/vllm</a>) owns the paged KV design
+            described above. What all of these add over the reference
+            code here is not different math but kernels that turn mask
+            structure into skipped work, plus dtype coverage, GQA
+            support, and backward passes; the reference is genuinely
+            enough for research on short contexts, for interpretability
+            work that needs inspectable weights, and for prototyping new
+            mask patterns before compiling them.
+          </p>
+          <p>
+            Verification against the libraries is concrete on the exact
+            side: the usage section already checks the sliding-window
+            module against <code>F.scaled_dot_product_attention</code>
+            with the identical boolean mask, at float64 tolerance so
+            failures mean logic, not accumulation order; the same check
+            against <code>xformers.ops.memory_efficient_attention</code>
+            with a local-attention bias should agree to float32
+            tolerance. On the linear side there is deliberately no
+            softmax reference to match; the right checks are internal
+            consistency (both parenthesizations, and scan versus masked
+            quadratic) plus, if you want an external anchor, the
+            <a href="https://github.com/fla-org/flash-linear-attention" target="_blank" rel="noreferrer">flash-linear-attention</a>
+            repo, which maintains chunked Triton kernels for the
+            GLA/RetNet/Mamba-2 family that our scan version should
+            match at reference precision.
+          </p>
+
+          <h2>Traps and misconceptions</h2>
+          <p>
+            <strong>"FlashAttention is an approximation."</strong> It is
+            the opposite: exact softmax attention with the memory
+            traffic reorganized. The FLOP count is still quadratic; only
+            the O(N<sup>2</sup>) memory and the HBM round-trips are
+            gone. Conflating it with the approximating families leads to
+            both wrong worries (no, it does not change your loss) and
+            wrong hopes (no, it does not make 10M-token contexts free;
+            the quadratic FLOPs eventually reassert themselves).
+          </p>
+          <p>
+            <strong>Masking a dense matrix and calling it sparse
+            attention.</strong> The reference sliding-window code on
+            this page computes every score and throws most away; its
+            cost is identical to full attention. The asymptotic win only
+            materializes in a kernel whose loop bounds skip the masked
+            tiles (flash-attn's <code>window_size</code>, xformers
+            attn_bias, FlexAttention). If you benchmark a masked dense
+            implementation and conclude sliding windows do not help,
+            you have measured the mask, not the method.
+          </p>
+          <p>
+            <strong>"A window of w means the model cannot use anything
+            older than w tokens."</strong> Receptive field compounds
+            through depth: L layers of window w reach L·w tokens back in
+            principle, which is how Mistral's 4k window can touch 131k
+            of context across 32 layers. But the converse trap is just
+            as real: theoretical reach is relayed through lossy
+            intermediate states, so treating L·w as an effective context
+            length overstates what the model can precisely recall.
+            Both halves of this are tested trivially with
+            needle-in-a-haystack probes at varying depths.
+          </p>
+          <p>
+            <strong>"Linear attention is fast softmax
+            attention."</strong> With the standard feature maps it is a
+            different model, not an approximation of softmax; only
+            Performer-style random features even target the softmax
+            kernel, unbiasedly but with variance concentrated on the
+            sharp lookups that matter most. The fixed d×d<sub>v</sub>
+            state is a compressed memory, and precise long-range
+            retrieval is exactly what compression sacrifices, which is
+            why the successful modern deployments are hybrids that keep
+            a few exact-attention layers for recall.
+          </p>
+          <p>
+            <strong>Reading big-O as a benchmark.</strong> O(N) with
+            poor hardware utilization loses to a well-tiled
+            O(N<sup>2</sup>) kernel at every length people commonly
+            train, because the quadratic term's constant is tiny (dense
+            matmuls at full tensor-core throughput) and the linear
+            methods' constants historically were not (random gathers,
+            sequential scans). FlashAttention beat most published
+            sub-quadratic methods at 4k to 16k context while doing
+            strictly more arithmetic. The crossover exists, but it is
+            further out than the complexity class suggests, and it moved
+            further out every time the exact kernels improved.
+          </p>
+
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> attention's quadratic cost
+            comes from insisting that every query score every key, and
+            the escape routes are exactly three: compare fewer pairs
+            (windows and sparse patterns, exact computation of a
+            deliberately restricted model, made deep enough to reconnect
+            everything through receptive fields), change the similarity
+            so the parentheses can move (linear attention, where
+            φ(Q)(φ(K)<sup>T</sup>V) turns the sequence dimension into a
+            fixed-size running state and attention into an RNN), or keep
+            the model identical and fix the memory traffic
+            (FlashAttention, exact to the bit, plus paged KV for
+            serving). Production stacks answer in that order of
+            preference: exact and IO-aware first, windowed layers where
+            the architecture allows, linear recurrence only where
+            constant-memory streaming is the requirement, and hybrids
+            when you want the last two with recall retained.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/code-tabs.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (!window.hljs) return;
+        hljs.configure({ languages: ["python", "bash", "c", "cpp", "rust", "go", "typescript", "swift", "sql", "json", "yaml", "plaintext"] });
+        hljs.highlightAll();
+      });
+    </script>
+  </body>
+</html>

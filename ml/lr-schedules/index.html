@@ -1,0 +1,639 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Learning-rate schedules · Stanley Jacob</title>
+    <meta name="description" content="Warmup, cosine and linear decay, step schedules, one-cycle, warmup-stable-decay, and inverse-sqrt, with the math of why warmup exists and how global-norm gradient clipping rescales; pure schedule functions in PyTorch and JAX verified against torch.optim.lr_scheduler, optax, and torch.nn.utils.clip_grad_norm_." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" integrity="sha384-eFTL69TLRZTkNfYZOLM+G04821K1qZao/4QLJbet1pP4tcF+fdXq/9CdqAbWRl/L" crossorigin="anonymous" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml" class="active">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/ml">Machine learning</a></div>
+        <h1>Learning-rate schedules, warmup, and clipping</h1>
+        <p class="lead">
+          The learning rate is the one hyperparameter that matters at every
+          step, and a schedule is the admission that no single value serves
+          the whole run. This page derives why warmup exists, walks the shapes
+          that survived (cosine, linear, step, one-cycle, inverse-sqrt, and the
+          warmup-stable-decay shape recent LLMs use), and works out global-norm
+          gradient clipping down to the rescale arithmetic. Then it builds a
+          pure schedule library and a clipper in PyTorch and JAX and verifies
+          them against torch.optim.lr_scheduler, optax, and
+          torch.nn.utils.clip_grad_norm_.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>What it is and when you reach for it</h2>
+          <p>
+            A learning-rate schedule is nothing more than a function
+            η(t) evaluated once per optimizer step, and gradient clipping is a
+            guard applied to the gradient just before the optimizer sees it.
+            Together they form the stability layer that sits between the loss
+            and the optimizer, whether that optimizer is
+            <a href="/ml/sgd-momentum">SGD with momentum</a> or
+            <a href="/ml/adam">Adam</a>. You reach for a schedule the moment a
+            run is longer than a few thousand steps, because the step size that
+            makes early progress is too noisy to converge with, and the step
+            size that converges is too timid to start with. You reach for
+            warmup whenever the optimizer is adaptive or the batch is large,
+            and for clipping whenever a single bad batch can produce a gradient
+            large enough to undo hours of training, which in practice means
+            always for language models and recurrent networks.
+          </p>
+
+          <h2>The math</h2>
+          <h3>Why the learning rate must move at all</h3>
+          <p>
+            SGD with a constant η does not converge to a minimum; it converges
+            to a noise ball around it. On a quadratic with gradient noise, the
+            steady-state error is proportional to η times the noise scale, so
+            progress stalls at a plateau set by the learning rate. Halve η and
+            the plateau drops, but so does the speed of travel between
+            plateaus. A schedule resolves the tension by spending a large η
+            while the signal-to-noise ratio of the gradient is high and paying
+            it down as the iterate approaches regions where noise dominates.
+            Classical theory wants η<sub>t</sub> ~ 1/t for convergence
+            guarantees; deep learning practice found that gentler decays to a
+            small floor work better with momentum and finite budgets, which is
+            why the shapes below all end low but rarely at zero.
+          </p>
+
+          <h3>Why warmup exists</h3>
+          <p>
+            Warmup, running the first hundreds or thousands of steps at a
+            learning rate ramping up from near zero, earns its place twice
+            over. The first reason is Adam's early variance. Adam divides each
+            gradient coordinate by √v̂, where v̂ is an exponential average of
+            squared gradients with decay β<sub>2</sub> = 0.999. In the first
+            steps that average has seen only a handful of samples, so it is a
+            terrible estimate of the true second moment; bias correction fixes
+            its mean but not its variance, and the RAdam analysis (Liu et al.)
+            makes this precise: the variance of the adaptive step is enormous,
+            in the limit unbounded, early in training. A too-large step taken
+            through a badly estimated preconditioner can throw the parameters
+            into a bad region the run never fully recovers from.
+            <mark>Warmup keeps the step size small until v̂ has accumulated
+            enough history, on the order of 1/(1 − β<sub>2</sub>) steps, to be
+            trustworthy.</mark> The second reason is large-batch stability.
+            Goyal et al.'s linear scaling rule multiplies η with the batch
+            size, but the rule's justification assumes the gradient changes
+            slowly along the trajectory, and that assumption is at its worst in
+            the first epochs when weights move fastest; their fix was exactly a
+            gradual warmup. Both arguments predict the same knob: ramp
+            linearly from 0 (or a small fraction of peak) to η<sub>peak</sub>
+            over T<sub>w</sub> steps, η(t) = η<sub>peak</sub>·t/T<sub>w</sub>.
+          </p>
+
+          <h3>The shapes that survived</h3>
+          <p>
+            After warmup, the decay shape takes over. The ones worth knowing,
+            oldest heritage first. The <strong>inverse-sqrt</strong> schedule
+            comes from the original transformer paper: η(t) =
+            d<sub>model</sub><sup>−0.5</sup>·min(t<sup>−0.5</sup>,
+            t·T<sub>w</sub><sup>−1.5</sup>), which is a linear warmup to a peak
+            at t = T<sub>w</sub> followed by 1/√t decay. Its virtue is that it
+            never needs to know the total budget; its vice is that it decays
+            fast early and slow late, and it has largely been displaced.
+            <strong>Step schedules</strong> hold η constant and divide by 10 at
+            fixed milestones, the classic ImageNet recipe being epochs 30, 60,
+            90; simple, effective, and the visible loss-curve cliffs at each
+            drop are a signature every practitioner has seen.
+            <strong>Cosine decay</strong>, popularized by Loshchilov and
+            Hutter's SGDR (whose warm restarts were mostly dropped while the
+            half-cosine stayed), interpolates smoothly:
+          </p>
+          <p>
+            η(t) = η<sub>min</sub> + ½·(η<sub>peak</sub> −
+            η<sub>min</sub>)·(1 + cos(π·t/T))
+          </p>
+          <p>
+            with t counted from the end of warmup and T the remaining budget.
+            It spends most of its time near the ends, easing out of the peak
+            and easing into the floor. Worked numbers, using the LLM-typical
+            recipe of η<sub>peak</sub> = 3·10<sup>−4</sup>, floor at 10% so
+            η<sub>min</sub> = 3·10<sup>−5</sup>, warmup 2,000 of 100,000 steps:
+            at step 1,000 warmup gives 1.5·10<sup>−4</sup>; at step 51,000 the
+            cosine argument is π·(49,000/98,000) = π/2, cos = 0, so η =
+            3·10<sup>−5</sup> + ½·2.7·10<sup>−4</sup> = 1.65·10<sup>−4</sup>;
+            at step 100,000, cos(π) = −1 and η lands exactly on the
+            3·10<sup>−5</sup> floor. <strong>Linear decay</strong> is the
+            straight-line version of the same idea, standard for fine-tuning
+            since BERT. <strong>One-cycle</strong> (Leslie Smith) is a single
+            up-then-down cycle, roughly 30% of steps rising to a peak above the
+            "safe" rate and 70% annealing far below it, with momentum cycled
+            inversely; it produced the superconvergence results and remains a
+            strong default for short vision runs. Finally the
+            <strong>warmup-stable-decay (WSD)</strong> shape used by recent
+            LLMs (MiniCPM described it, and trapezoidal variants have been
+            analyzed since): warmup, then a long flat plateau at
+            η<sub>peak</sub>, then a short sharp decay, 10 to 20% of the
+            budget, to near zero. Its selling point is operational:
+            <mark>because the plateau is horizon-free, you can branch a decay
+            leg off any checkpoint and get a fully converged model, without
+            having committed to a total step count the way cosine forces you
+            to.</mark> That property is why continual-pretraining pipelines
+            favor it.
+          </p>
+
+          <h3>Gradient clipping by global norm</h3>
+          <p>
+            Clipping by global norm treats the entire gradient, every tensor of
+            every layer, as one long vector g and rescales it if it is too
+            long:
+          </p>
+          <p>
+            g ← g · min(1, c / ‖g‖<sub>2</sub>), with
+            ‖g‖<sub>2</sub> = √(Σ<sub>params</sub> Σ<sub>elements</sub>
+            g<sub>i</sub><sup>2</sup>)
+          </p>
+          <p>
+            The min with 1 means gradients already inside the ball pass
+            untouched; clipping never scales up. Because every element is
+            multiplied by the same scalar, the direction of the update is
+            exactly preserved, only its length is capped, which is what
+            distinguishes norm clipping from per-element value clamping (that
+            one changes direction). A worked example: two parameter tensors
+            with gradient norms 3 and 4 give a global norm of
+            √(9 + 16) = 5; with the standard threshold c = 1 the coefficient is
+            1/5, every gradient element is multiplied by 0.2, and the clipped
+            global norm is exactly 1. Had the global norm been 0.8, the
+            coefficient 1.25 would be clamped to 1 and nothing would change.
+            The practical effect is a hard bound on the step: for SGD the
+            parameter displacement per step is at most η·c no matter what the
+            batch produced, which is precisely the insurance you want against
+            the rare pathological minibatch. PyTorch's implementation adds an
+            ε = 10<sup>−6</sup> to the denominator; optax's does not, a
+            difference of one part in a million that only matters to tests.
+          </p>
+
+          <h2>Implementation, twice</h2>
+          <p>
+            Schedules deserve to be pure functions of the step number: trivial
+            to plot, trivial to test, trivial to resume (the step count is the
+            only state). The PyTorch tab writes them as multipliers and wires
+            them in with <code>LambdaLR</code>, which multiplies the base lr by
+            the function's value each step; the JAX tab writes the same shapes
+            as jnp-traceable functions and shows the idiomatic optax
+            equivalents, which optimizers accept directly in place of a
+            constant learning rate.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import math
+import torch
+
+# Pure schedule(step) functions returning a multiplier in [0, 1].
+# Peak lr lives in the optimizer; the schedule only shapes it.
+
+def warmup_cosine(step, *, warmup, total, final_frac=0.10):
+    """The LLM default: linear warmup, cosine to final_frac of peak."""
+    if step &lt; warmup:
+        return (step + 1) / warmup
+    t = (step - warmup) / max(1, total - warmup)      # 0 -&gt; 1
+    return final_frac + 0.5 * (1 - final_frac) * (1 + math.cos(math.pi * t))
+
+def warmup_stable_decay(step, *, warmup, stable, decay, final_frac=0.0):
+    """WSD: warmup, flat plateau, short linear cooldown."""
+    if step &lt; warmup:
+        return (step + 1) / warmup
+    if step &lt; warmup + stable:
+        return 1.0
+    t = min(1.0, (step - warmup - stable) / max(1, decay))
+    return final_frac + (1 - final_frac) * (1 - t)
+
+def step_decay(step, *, milestones=(30_000, 60_000, 90_000), gamma=0.1):
+    return gamma ** sum(step &gt;= m for m in milestones)
+
+def inverse_sqrt(step, *, warmup):
+    s = step + 1
+    return s / warmup if s &lt; warmup else (warmup / s) ** 0.5
+
+# Wiring: LambdaLR multiplies the optimizer's base lr by our multiplier.
+model = torch.nn.Linear(768, 768)
+opt = torch.optim.AdamW(model.parameters(), lr=3e-4)   # base lr = peak
+sched = torch.optim.lr_scheduler.LambdaLR(
+    opt, lambda s: warmup_cosine(s, warmup=2_000, total=100_000))
+
+def train_step(batch):
+    loss = model(batch).square().mean()
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    opt.step()
+    opt.zero_grad()
+    sched.step()      # once per optimizer step, AFTER opt.step()
+    return loss</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">import jax.numpy as jnp
+import optax
+
+# Pure schedule(step) functions returning the lr itself.
+# jnp.where instead of if: traceable under jit, step can be a tracer.
+
+def warmup_cosine(step, *, peak, warmup, total, final_frac=0.10):
+    warm = peak * (step + 1) / warmup
+    t = jnp.clip((step - warmup) / jnp.maximum(1, total - warmup), 0.0, 1.0)
+    floor = final_frac * peak
+    cos = floor + 0.5 * (peak - floor) * (1 + jnp.cos(jnp.pi * t))
+    return jnp.where(step &lt; warmup, warm, cos)
+
+def warmup_stable_decay(step, *, peak, warmup, stable, decay,
+                        final_frac=0.0):
+    warm = peak * (step + 1) / warmup
+    t = jnp.clip((step - warmup - stable) / jnp.maximum(1, decay), 0.0, 1.0)
+    tail = peak * (final_frac + (1 - final_frac) * (1 - t))
+    return jnp.where(step &lt; warmup, warm,
+                     jnp.where(step &lt; warmup + stable, peak, tail))
+
+# The idiomatic versions ship with optax; decay_steps counts the
+# WHOLE schedule length, warmup included.
+cosine = optax.warmup_cosine_decay_schedule(
+    init_value=0.0, peak_value=3e-4,
+    warmup_steps=2_000, decay_steps=100_000, end_value=3e-5)
+
+wsd = optax.join_schedules(
+    schedules=[
+        optax.linear_schedule(0.0, 3e-4, 2_000),     # warmup
+        optax.constant_schedule(3e-4),               # stable plateau
+        optax.linear_schedule(3e-4, 0.0, 10_000),    # cooldown
+    ],
+    boundaries=[2_000, 90_000])
+
+# Wiring: optax optimizers accept the schedule wherever a constant
+# lr would go, and clipping is just another link in the chain.
+tx = optax.chain(
+    optax.clip_by_global_norm(1.0),
+    optax.adamw(learning_rate=cosine, weight_decay=0.1),
+)</code></pre>
+          </div>
+          <p>
+            The shapes, drawn over one training run:
+          </p>
+          <pre class="flow">warmup + cosine (LLM default)          warmup-stable-decay (WSD)
+peak |    .--..                        peak |   .-------------.
+     |   /     `--.                         |  /               \
+     |  /          `--.                     | /                 \
+ 10% | /               `---__           ~0% |/                   \_
+     +------------------------              +-----------------------
+      warmup    cosine to 10%                wu     stable     decay
+
+step decay (ImageNet classic)          one-cycle (short vision runs)
+peak |-------.                         peak |       .-``-.
+ /10 |       `------.                       |     /       \
+/100 |              `------.                |   /           \
+     |                     `----        &lt;&lt;pk|__/              `--..__
+     +------------------------              +-----------------------
+       ep30     ep60    ep90                 ~30% up      ~70% down</pre>
+          <p>
+            Clipping is short enough to write and verify in one sitting, and
+            worth it: the verification pins down both the returned norm and
+            every clipped element against the reference implementations.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import torch
+
+def clip_grads_(grads, max_norm, eps=1e-6):
+    """In-place global-norm clip; returns the PRE-clip total norm.
+
+    Mirrors torch.nn.utils.clip_grad_norm_: coefficient
+    max_norm / (norm + eps), clamped at 1.0 so gradients already
+    inside the ball are never scaled up.
+    """
+    total = torch.linalg.vector_norm(
+        torch.stack([torch.linalg.vector_norm(g) for g in grads]))
+    coef = (max_norm / (total + eps)).clamp(max=1.0)
+    for g in grads:
+        g.mul_(coef)
+    return total
+
+# Verify against the reference on a real backward pass.
+torch.manual_seed(0)
+model = torch.nn.Sequential(torch.nn.Linear(64, 64), torch.nn.ReLU(),
+                            torch.nn.Linear(64, 10))
+model(torch.randn(32, 64)).square().sum().backward()
+
+copies = [p.grad.clone() for p in model.parameters()]
+norm_ref = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+norm_ours = clip_grads_(copies, 1.0)
+
+assert torch.allclose(norm_ours, norm_ref)
+for ours, p in zip(copies, model.parameters()):
+    assert torch.allclose(ours, p.grad)
+print(f"pre-clip norm {norm_ref:.4f}; norms and clipped grads agree")</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">import jax
+import jax.numpy as jnp
+import optax
+
+def global_norm(tree):
+    return jnp.sqrt(sum(jnp.sum(jnp.square(g))
+                        for g in jax.tree_util.tree_leaves(tree)))
+
+def clip_by_global_norm(grads, max_norm):
+    """Returns (clipped pytree, pre-clip norm). No epsilon: this
+    matches optax exactly; torch adds 1e-6 in the denominator."""
+    norm = global_norm(grads)
+    scale = jnp.minimum(1.0, max_norm / norm)
+    return jax.tree_util.tree_map(lambda g: g * scale, grads), norm
+
+# Verify against optax on a pytree standing in for gradients.
+k1, k2 = jax.random.split(jax.random.PRNGKey(0))
+grads = {"w": 3.0 * jax.random.normal(k1, (64, 64)),
+         "b": jax.random.normal(k2, (64,))}
+
+ours, norm = clip_by_global_norm(grads, 1.0)
+tx = optax.clip_by_global_norm(1.0)
+theirs, _ = tx.update(grads, tx.init(grads))
+
+for a, b in zip(jax.tree_util.tree_leaves(ours),
+                jax.tree_util.tree_leaves(theirs)):
+    assert jnp.allclose(a, b, atol=1e-7)
+print(f"pre-clip norm {norm:.2f}; matches optax.clip_by_global_norm")</code></pre>
+          </div>
+
+          <h2>Using it on a real shape of problem</h2>
+          <p>
+            The pieces assemble into the loop below: AdamW at a
+            3·10<sup>−4</sup> peak, 200 warmup steps of a 5,000-step budget,
+            cosine to 10%, clip at global norm 1.0, on a transformer-width
+            regression problem (batch 32, width 768). The skeleton is the same
+            training loop as every page in this section, the
+            <a href="/ml/neural-network">neural network page</a> builds it
+            from scratch, with the stability layer threaded through it. Two things are worth
+            watching. The learning-rate trace is deterministic and should
+            reproduce the worked numbers from the math section scaled to this
+            budget; printing it at steps 0, 100, 2,600, and 4,999 is a free
+            correctness check. The loss curve is machine and seed dependent,
+            but the characteristic signatures are not: gradient norms exceed
+            the clip threshold most often in the first tens of steps (so
+            clipping is active exactly when warmup is also protecting you),
+            and if you re-run with <code>warmup=1</code> you will often see
+            the first-step loss jump that warmup exists to prevent, though on
+            a problem this small Adam frequently survives it; at billion-scale
+            it frequently does not.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import torch
+
+torch.manual_seed(0)
+X = torch.randn(4096, 768)
+W_true = torch.randn(768, 1) / 768 ** 0.5
+Y = X @ W_true + 0.01 * torch.randn(4096, 1)
+
+model = torch.nn.Sequential(torch.nn.Linear(768, 768), torch.nn.GELU(),
+                            torch.nn.Linear(768, 1))
+opt = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.1)
+sched = torch.optim.lr_scheduler.LambdaLR(
+    opt, lambda s: warmup_cosine(s, warmup=200, total=5_000))
+
+for step in range(5_000):
+    idx = torch.randint(0, 4096, (32,))
+    loss = (model(X[idx]) - Y[idx]).square().mean()
+    loss.backward()
+    gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    opt.step(); opt.zero_grad(); sched.step()
+    if step in (0, 100, 2_600, 4_999):
+        print(step, f"lr={opt.param_groups[0]['lr']:.2e}",
+              f"loss={loss.item():.4f}", f"gnorm={gnorm:.2f}")
+# lr trace is exact: warmup at 100, ~half-decayed at 2600, floor at 4999.
+# loss should fall steadily; gnorm &gt; 1 mostly in the earliest steps.</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">import jax
+import jax.numpy as jnp
+import optax
+
+key = jax.random.PRNGKey(0)
+kx, kw, km = jax.random.split(key, 3)
+X = jax.random.normal(kx, (4096, 768))
+Y = X @ (jax.random.normal(kw, (768, 1)) / 768 ** 0.5)
+
+def net(params, x):
+    h = jax.nn.gelu(x @ params["w1"] + params["b1"])
+    return h @ params["w2"] + params["b2"]
+
+k1, k2 = jax.random.split(km)
+params = {"w1": jax.random.normal(k1, (768, 768)) / 768 ** 0.5,
+          "b1": jnp.zeros(768),
+          "w2": jax.random.normal(k2, (768, 1)) / 768 ** 0.5,
+          "b2": jnp.zeros(1)}
+
+schedule = optax.warmup_cosine_decay_schedule(
+    init_value=0.0, peak_value=3e-4,
+    warmup_steps=200, decay_steps=5_000, end_value=3e-5)
+tx = optax.chain(optax.clip_by_global_norm(1.0),
+                 optax.adamw(learning_rate=schedule, weight_decay=0.1))
+state = tx.init(params)
+
+@jax.jit
+def train_step(params, state, xb, yb):
+    def loss_fn(p):
+        return jnp.mean((net(p, xb) - yb) ** 2)
+    loss, grads = jax.value_and_grad(loss_fn)(params)
+    updates, state = tx.update(grads, state, params)
+    return optax.apply_updates(params, updates), state, loss
+
+for step in range(5_000):
+    key, sub = jax.random.split(key)
+    idx = jax.random.randint(sub, (32,), 0, 4096)
+    params, state, loss = train_step(params, state, X[idx], Y[idx])
+    if step in (0, 100, 2_600, 4_999):
+        print(step, f"lr={schedule(step):.2e}", f"loss={float(loss):.4f}")
+# schedule(step) is a plain function: plotting or asserting its
+# values needs no optimizer at all.</code></pre>
+          </div>
+
+          <h2>Applications</h2>
+          <p>
+            The standard LLM pretraining recipe is warmup plus cosine to 10% of
+            peak, and it has been remarkably stable across generations. GPT-3
+            warmed up over the first 375 million tokens and cosine-decayed to
+            10% of peak over 260 billion; LLaMA used 2,000 warmup steps and
+            cosine to 10%; Chinchilla's ablations kept the same family and
+            mostly tuned how the horizon matches the token budget. The
+            <a href="/oss/nanogpt">nanoGPT</a> page walks a readable
+            implementation of exactly this shape, a hand-rolled
+            warmup-then-cosine function with a min lr of one tenth the peak,
+            applied per step outside any scheduler class, which is a strong
+            endorsement of the pure-function style. Global-norm clipping at
+            1.0 is part of the same recipe nearly universally. The WSD shape
+            is the emerging alternative where the total budget is not known in
+            advance: MiniCPM used it to reuse plateau checkpoints across
+            scales, and continual-pretraining pipelines branch cooldowns off a
+            long-running plateau. Fine-tuning flips most defaults:
+            <mark>pretraining schedules are shaped around a fixed, enormous
+            budget and a high peak; fine-tuning schedules are short, low, and
+            end near zero.</mark> BERT-style fine-tuning established linear
+            decay with roughly 10% warmup at peaks around 2·10<sup>−5</sup>,
+            two orders of magnitude below pretraining peaks, and
+            instruction-tuning recipes typically use cosine with a small
+            warmup ratio around 3%. In vision, the step schedule trained the
+            ResNet era, cosine is the modern default in timm recipes, and
+            one-cycle remains popular for short runs where its aggressive peak
+            pays off.
+          </p>
+
+          <h2>Against the real libraries</h2>
+          <p>
+            Three libraries own this space.
+            <a href="https://github.com/pytorch/pytorch" target="_blank" rel="noreferrer">torch.optim.lr_scheduler</a>
+            provides the class-based versions: <code>LambdaLR</code> (the
+            idiomatic host for pure functions like the ones above),
+            <code>CosineAnnealingLR</code>, <code>StepLR</code> and
+            <code>MultiStepLR</code>, <code>LinearLR</code>,
+            <code>OneCycleLR</code> (which also cycles momentum, the part of
+            one-cycle everyone forgets), <code>SequentialLR</code> for
+            stitching warmup onto a decay, and <code>ReduceLROnPlateau</code>,
+            the one schedule that reads the loss instead of the clock. What
+            the classes add over a bare function is state management:
+            <code>state_dict</code> save and restore so a resumed run continues
+            the schedule where it left off, per-parameter-group scaling so
+            layer-wise lr multipliers keep working, and edge-case behavior
+            (step-zero initialization, the call-order warning) that has been
+            litigated in years of issues.
+            <a href="https://github.com/google-deepmind/optax" target="_blank" rel="noreferrer">optax</a>
+            takes the opposite stance and won the argument for JAX: schedules
+            are pure functions, <code>warmup_cosine_decay_schedule</code>,
+            <code>cosine_decay_schedule</code>, <code>linear_schedule</code>,
+            <code>piecewise_constant_schedule</code>, and
+            <code>join_schedules</code> to compose them (the WSD build above is
+            three joins), and any optimizer accepts a schedule wherever it
+            accepts a constant;
+            <code>optax.clip_by_global_norm</code> composes into the same
+            chain. <a href="https://github.com/huggingface/transformers" target="_blank" rel="noreferrer">HF Transformers</a>
+            wraps the common shapes behind <code>get_scheduler(name, ...)</code>
+            with string names ("linear", "cosine", "inverse_sqrt",
+            "warmup_stable_decay", and others) plus explicit constructors like
+            <code>get_cosine_schedule_with_warmup</code> and
+            <code>get_wsd_schedule</code> (warmup, stable, and decay step
+            counts with a <code>min_lr_ratio</code>), which is what the
+            Trainer drives; its value is that a config file fully specifies
+            the schedule. The from-scratch version is genuinely enough
+            surprisingly often, and the pure-function style is arguably the
+            better engineering: it is what nanoGPT and most large training
+            codebases do internally. Verification is mercifully deterministic:
+            evaluate your schedule and the library's at a grid of steps
+            (include 0, the warmup boundary, and the final step, where the
+            off-by-one bugs live) and assert agreement to float64 precision;
+            for clipping, the paired-gradient test in the implementation
+            section pins both the returned norm and every element.
+          </p>
+
+          <h2>Traps and misconceptions</h2>
+          <p>
+            <strong>Stepping the scheduler at the wrong cadence.</strong>
+            PyTorch schedulers were historically stepped per epoch, and
+            <code>OneCycleLR</code> and every warmup-bearing schedule must be
+            stepped per optimizer step; mixing the two conventions silently
+            compresses your schedule 500-fold. Related: call
+            <code>opt.step()</code> before <code>sched.step()</code>; PyTorch
+            warns about the reversed order because it skips the first lr
+            value. Under gradient accumulation, one "step" of the schedule is
+            one optimizer step, not one microbatch.
+          </p>
+          <p>
+            <strong>LambdaLR takes a multiplier, not a learning rate.</strong>
+            The lambda's return value is multiplied by the base lr stored in
+            the optimizer. Return absolute lr values from it and your run
+            trains at lr² scale. If you want the function to own the absolute
+            value, set the optimizer's lr to 1.0 and document it loudly.
+          </p>
+          <p>
+            <strong>Warmup is not a license for a bad peak.</strong> Warmup
+            prevents the specific early-training failure of adaptive
+            optimizers and large batches; it does not make an intrinsically
+            unstable peak lr stable. If loss spikes at step 20,000, long after
+            warmup ended, the peak is too high (or clipping is missing), and
+            lengthening warmup will only delay the evidence.
+          </p>
+          <p>
+            <strong>Clipping confusions.</strong> Global-norm clipping is not
+            <code>clip_grad_value_</code>: value clamping changes the
+            gradient's direction, norm clipping only its length. With mixed
+            precision, clip after <code>GradScaler.unscale_()</code> or you
+            are clipping scaled gradients against an unscaled threshold. With
+            gradient accumulation, clip once on the accumulated gradient, not
+            per microbatch. And a clip that fires every step is not stability,
+            it is a schedule you did not choose: the effective update becomes
+            η·c·g/‖g‖, a normalized-gradient method at a rate you never
+            picked; monitor the clip fraction, and if it stays near 1.0, lower
+            the peak lr instead.
+          </p>
+          <p>
+            <strong>"Cosine" does not name one function.</strong> HF's cosine
+            decays to zero; nanoGPT's decays to 10% of peak; optax's takes an
+            explicit <code>end_value</code>; CosineAnnealingLR takes
+            <code>eta_min</code> defaulting to 0. A floor of 0 versus 10%
+            changes how much learning happens in the final third of training,
+            and a resumed or reproduced run that silently swaps floors will
+            not match. Always state the floor as part of the recipe.
+          </p>
+
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> a schedule is just a pure function
+            of the step count, and the whole modern recipe is three commitments
+            wide: ramp up while the optimizer's statistics are untrustworthy,
+            decay toward a stated floor as gradient noise takes over, and cap
+            the global gradient norm so no single batch can move the
+            parameters further than η·c. Write the function, plot it, assert
+            its values at the boundaries against the library, and the most
+            temperamental part of training becomes the most deterministic.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/code-tabs.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (!window.hljs) return;
+        hljs.configure({ languages: ["python", "bash", "c", "cpp", "rust", "go", "typescript", "swift", "sql", "json", "yaml", "plaintext"] });
+        hljs.highlightAll();
+      });
+    </script>
+  </body>
+</html>

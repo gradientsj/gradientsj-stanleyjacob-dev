@@ -1,0 +1,774 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Proximal Policy Optimization · Stanley Jacob</title>
+    <meta name="description" content="PPO derived from the trust-region problem it approximates: the importance-sampling ratio, the clipped surrogate objective worked numerically, value loss and entropy bonus, the full rollout/GAE/minibatch recipe, and complete implementations on CartPole in PyTorch and JAX, plus the RLHF adaptation." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" integrity="sha384-eFTL69TLRZTkNfYZOLM+G04821K1qZao/4QLJbet1pP4tcF+fdXq/9CdqAbWRl/L" crossorigin="anonymous" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl" class="active">RL</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/rl">Reinforcement learning</a></div>
+        <h1>Proximal policy optimization</h1>
+        <p class="lead">
+          On-policy data is expensive and a policy gradient step can only
+          legally use it once. PPO's answer is a clipped objective that lets
+          you take several optimization epochs on each batch while refusing
+          to let the policy move far from the one that collected the data.
+          It is the workhorse of modern RL, from simulated robots to the
+          RLHF stage of language model training, and its reputation for
+          "just working" hides a list of implementation details that matter
+          as much as the equation. This page derives the objective, works
+          the clipping cases numerically, and builds a complete PPO on
+          CartPole in PyTorch and JAX.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>What it is and when you reach for it</h2>
+          <p>
+            PPO (<a href="https://arxiv.org/abs/1707.06347" target="_blank" rel="noreferrer">Schulman et al., 2017</a>)
+            is an on-policy actor-critic algorithm whose one new idea sits in
+            the policy loss. Everything else it needs is inherited from the
+            template on the <a href="/rl/actor-critic">actor-critic page</a>:
+            a policy head and a value head, rollouts collected with the
+            current policy, advantages estimated with GAE, an entropy bonus.
+            What it adds is a way to reuse each rollout for multiple gradient
+            steps without destroying the policy in the process, which makes
+            it several times more sample-efficient than A2C at nearly zero
+            implementation cost over it. You reach for PPO as the default
+            first serious algorithm on almost any problem with a simulator
+            or a cheap environment: it is forgiving of hyperparameters by
+            RL's dismal standards, needs no replay buffer or target
+            networks, parallelizes cleanly across vectorized environments,
+            and scales from CartPole to systems with billions of parameters.
+            When compute per sample is the bottleneck rather than samples
+            themselves, off-policy methods can beat it; when you are
+            fine-tuning a language model against a learned reward, PPO,
+            lightly adapted, was for several years the entire game, and its
+            critic-free descendant on the <a href="/rl/grpo">GRPO page</a>
+            is best read as a reaction to PPO's memory bill.
+          </p>
+
+          <h2>The math</h2>
+          <h3>Why naive policy gradient steps destroy the policy</h3>
+          <p>
+            The <a href="/rl/policy-gradients">policy gradient</a>
+            ∇<sub>θ</sub>J = E[∇ log π<sub>θ</sub>(a|s) Â]
+            is a local statement: it is the gradient of expected return
+            under the distribution of states and actions the current policy
+            visits. Take one small step and the estimate is valid. Take a
+            large step, or several steps on the same batch, and two things
+            go wrong at once. First, the data is now off-policy: the batch
+            was sampled from the old policy, but you are updating a new one,
+            and the gradient estimate silently loses its meaning. Second,
+            and worse, the state distribution shifts: a policy that changed
+            a lot visits different states, and the batch says nothing about
+            those. The failure mode is empirical and vicious: one oversized
+            update makes the policy worse, the worse policy collects worse
+            data, and the run collapses in a way later updates cannot repair,
+            because on-policy methods have no memory of the good data. The
+            principled fix is a trust region: maximize the improvement
+            objective subject to a bound on how far the new policy may move
+            from the old, measured in KL divergence. TRPO
+            (<a href="https://arxiv.org/abs/1502.05477" target="_blank" rel="noreferrer">Schulman et al., 2015</a>)
+            solves exactly that constrained problem with a second-order
+            method, and its theory supplies the justification: the expected
+            return of a nearby policy can be lower-bounded by a surrogate
+            built from old-policy data minus a penalty growing with the KL
+            between the policies, so keeping KL small keeps improvement
+            guaranteed. TRPO's conjugate-gradient machinery is heavy.
+            <mark>PPO is the observation that a crude, first-order proxy for
+            the trust region, clipping the objective rather than
+            constraining the step, captures most of the benefit at a
+            fraction of the complexity.</mark>
+          </p>
+
+          <h3>The importance-sampling ratio</h3>
+          <p>
+            To even write an objective that stays meaningful over several
+            epochs on one batch, correct for the distribution mismatch with
+            importance sampling. For each stored transition, define
+          </p>
+          <p>
+            r<sub>t</sub>(θ) = π<sub>θ</sub>(a<sub>t</sub>|s<sub>t</sub>) / π<sub>θ<sub>old</sub></sub>(a<sub>t</sub>|s<sub>t</sub>),
+          </p>
+          <p>
+            the ratio of the new policy's probability of the stored action
+            to the old policy's, computed in practice as
+            exp(log π<sub>θ</sub> − log π<sub>old</sub>) from stored log
+            probabilities. The surrogate objective
+            L<sup>IS</sup>(θ) = E[ r<sub>t</sub>(θ) Â<sub>t</sub> ]
+            has the right gradient at θ = θ<sub>old</sub> (where every ratio
+            is 1 it reduces to the vanilla policy gradient) and remains a
+            valid estimate of relative performance as θ moves, per-action
+            distribution shift corrected by the ratio. What it does not
+            correct is the state distribution, and it has no brake: if some
+            Â<sub>t</sub> is positive, the objective is maximized by pushing
+            r<sub>t</sub> toward infinity, which is exactly the destructive
+            overcommitment the trust region exists to prevent.
+          </p>
+
+          <h3>The clipped surrogate objective</h3>
+          <p>
+            PPO installs the brake inside the loss:
+          </p>
+          <p>
+            L<sup>CLIP</sup>(θ) = E[ min( r<sub>t</sub>(θ) Â<sub>t</sub>,&nbsp; clip(r<sub>t</sub>(θ), 1 − ε, 1 + ε) Â<sub>t</sub> ) ],
+          </p>
+          <p>
+            with ε typically 0.2. Read it in two moves. The clip freezes the
+            ratio once it leaves [1 − ε, 1 + ε], so beyond that band the
+            clipped term contributes zero gradient: no further reward for
+            pushing a good action's probability higher than 1 + ε times its
+            old value, no further reward for crushing a bad action below
+            1 − ε. The min then takes the more pessimistic of the clipped
+            and unclipped terms, and this asymmetry is the subtle part:
+            <mark>clipping only ever disables the gradient in the direction
+            that would move the policy further away; a step that made the
+            objective worse (a good action's ratio pushed below 1, a bad
+            action's pushed above 1) stays unclipped, so the gradient can
+            always pull the policy back toward the data.</mark> The
+            pessimistic bound is what makes several epochs on one batch
+            safe-ish: each sample can contribute at most a bounded
+            improvement to the surrogate, so the incentive to sprint away
+            from θ<sub>old</sub> is capped sample by sample.
+          </p>
+          <p>
+            Worked numerically with ε = 0.2, so the band is [0.8, 1.2].
+            Take an advantage of +2 or −2 and a ratio of 0.7 or 1.3, the
+            four ways a sample can sit relative to the band:
+          </p>
+          <table>
+            <thead>
+              <tr>
+                <th>Â</th>
+                <th>r(θ)</th>
+                <th>r·Â</th>
+                <th>clip(r)·Â</th>
+                <th>min (the loss uses this)</th>
+                <th>gradient?</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td>+2</td><td>1.3</td><td>2.6</td><td>1.2 · 2 = 2.4</td><td>2.4 (clipped)</td><td>none: already moved far enough toward this action</td></tr>
+              <tr><td>+2</td><td>0.7</td><td>1.4</td><td>0.8 · 2 = 1.6</td><td>1.4 (unclipped)</td><td>yes: pulls the good action's probability back up</td></tr>
+              <tr><td>−2</td><td>0.7</td><td>−1.4</td><td>0.8 · (−2) = −1.6</td><td>−1.6 (clipped)</td><td>none: already moved far enough away from this action</td></tr>
+              <tr><td>−2</td><td>1.3</td><td>−2.6</td><td>1.2 · (−2) = −2.4</td><td>−2.6 (unclipped)</td><td>yes: pushes the bad action's probability back down</td></tr>
+            </tbody>
+          </table>
+          <p>
+            Rows one and three are the brake: the policy already moved ε far
+            in the profitable direction and gets no incentive to continue.
+            Rows two and four are the recovery path: whenever earlier
+            minibatches (or noise) pushed a sample the wrong way, the
+            gradient is live and corrective. Note what clipping is not: it
+            is not a constraint on the ratio itself, which can end up far
+            outside [0.8, 1.2] after many minibatches; it only zeroes the
+            local incentive to go further. PPO approximates a trust region
+            behaviorally, not by guarantee, a point the traps section
+            returns to.
+          </p>
+
+          <h3>Value loss and entropy bonus</h3>
+          <p>
+            The full loss adds the same two terms A2C uses. The critic is
+            regressed onto the GAE value targets
+            R<sub>t</sub> = Â<sub>t</sub> + V<sub>old</sub>(s<sub>t</sub>)
+            with an MSE loss weighted by c<sub>v</sub> ≈ 0.5, and an entropy
+            bonus weighted by c<sub>e</sub> ≈ 0.01 resists premature
+            determinism:
+          </p>
+          <p>
+            L = −L<sup>CLIP</sup> + c<sub>v</sub> (V<sub>φ</sub>(s<sub>t</sub>) − R<sub>t</sub>)<sup>2</sup> − c<sub>e</sub> H(π<sub>θ</sub>(·|s<sub>t</sub>)),
+          </p>
+          <p>
+            minimized jointly, with one optimizer over the actor's and
+            critic's parameters. Some implementations also clip the value
+            function's update around its old predictions, mirroring the
+            policy clip; that detail is contentious and covered below.
+          </p>
+
+          <h3>The full recipe, and the details that actually matter</h3>
+          <p>
+            The algorithm is a loop of three phases. Collect: step the
+            environment (or n vectorized copies) for T steps with the
+            current policy, storing observations, actions, rewards, dones,
+            values, and log probabilities. Estimate: compute GAE advantages
+            and value targets with one backward pass over the rollout,
+            exactly as derived on the
+            <a href="/rl/actor-critic">actor-critic page</a>. Update: for K
+            epochs (typically 3 to 10), shuffle the rollout into minibatches
+            and take a gradient step on the clipped loss for each. Then
+            discard the data and repeat. The stored log probabilities are
+            frozen at collection time; only the numerator of the ratio is
+            recomputed during updates.
+          </p>
+          <p>
+            PPO's reputation was built as much by its implementation details
+            as by its objective; studies that ablate them
+            (<a href="https://arxiv.org/abs/2005.12729" target="_blank" rel="noreferrer">Engstrom et al., 2020</a>,
+            and the 37-detail reproduction study behind CleanRL's
+            benchmarks) find several worth more than the clip itself.
+            <strong>Advantage normalization</strong>: standardize advantages
+            to zero mean and unit variance, conventionally per minibatch,
+            before the loss. It stabilizes the effective step size across
+            the run at the cost of making each update relative ("better
+            than this minibatch's average") rather than absolute.
+            <strong>Value clipping</strong>: clipping the value loss around
+            old predictions is in most reference code, yet the ablation
+            evidence says it is neutral to mildly harmful; it survives
+            because reproducing published baselines means reproducing their
+            details. <strong>KL early stopping</strong>: track the
+            approximate KL between old and new policies during the update
+            epochs, and stop the epochs early when it exceeds a target
+            (0.015 to 0.03 is common), a cheap restoration of the trust
+            region the clip only imitates. The stable estimator is
+            E[(r − 1) − log r], which is non-negative and low-variance,
+            rather than E[−log r]. Beyond these three: orthogonal weight
+            initialization with a small-gain policy head, gradient clipping
+            at global norm 0.5, learning-rate annealing to zero, and
+            reward normalization on environments with wild reward scales
+            each move benchmarks by more than most algorithmic
+            substitutions.
+          </p>
+
+          <h2>Implementation, twice</h2>
+          <p>
+            A complete but compact PPO on CartPole, structured as the three
+            phases: collect, compute GAE, update in minibatch epochs. The
+            GAE recursion is identical to the
+            <a href="/rl/actor-critic">actor-critic page</a>, restated here
+            so each file runs standalone; the new material is the update
+            phase. One deliberate architectural difference from that page:
+            actor and critic are separate networks rather than two heads on
+            a shared trunk, following CleanRL's <code>ppo.py</code>. On
+            CartPole the discounted value targets grow toward
+            1/(1 − γ) = 100 as the policy improves, and in my own runs of
+            this exact file the shared-trunk variant plateaued around a
+            return of 150 while the separate-network version solved the
+            task, because the large-magnitude value regression monopolizes
+            shared features. The JAX version keeps environment stepping in
+            Python (gymnasium is host-side, stateful code) and jits the GAE
+            scan and the minibatch update, which is where the arithmetic
+            lives.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import gymnasium as gym
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+GAMMA, LAM, CLIP_EPS = 0.99, 0.95, 0.2
+ROLLOUT, EPOCHS, MINIBATCH = 2048, 4, 64
+LR, ENT_COEF, VF_COEF = 3e-4, 0.01, 0.5
+TARGET_KL = 0.03
+TOTAL_STEPS = 100_000
+
+class ActorCritic(nn.Module):
+    """Separate actor and critic networks, as in CleanRL's ppo.py.
+    CartPole value targets grow to ~100; with a shared trunk that
+    regression's gradients drown the policy's (see traps)."""
+    def __init__(self, obs_dim, n_actions, hidden=128):
+        super().__init__()
+        self.actor = nn.Sequential(
+            nn.Linear(obs_dim, hidden), nn.Tanh(),
+            nn.Linear(hidden, hidden), nn.Tanh(),
+            nn.Linear(hidden, n_actions))
+        self.critic = nn.Sequential(
+            nn.Linear(obs_dim, hidden), nn.Tanh(),
+            nn.Linear(hidden, hidden), nn.Tanh(),
+            nn.Linear(hidden, 1))
+
+    def forward(self, x):
+        return self.actor(x), self.critic(x).squeeze(-1)
+
+def gae(rewards, values, dones, last_value):
+    adv = torch.zeros_like(rewards)
+    a, next_v = 0.0, last_value
+    for t in reversed(range(len(rewards))):
+        mask = 1.0 - dones[t]
+        delta = rewards[t] + GAMMA * next_v * mask - values[t]
+        a = delta + GAMMA * LAM * mask * a
+        adv[t] = a
+        next_v = values[t]
+    return adv, adv + values
+
+env = gym.make("CartPole-v1")
+net = ActorCritic(env.observation_space.shape[0], env.action_space.n)
+opt = torch.optim.Adam(net.parameters(), lr=LR)
+
+obs, _ = env.reset(seed=0)
+ep_ret, recent = 0.0, []
+for it in range(TOTAL_STEPS // ROLLOUT):
+    # ---- phase 1: collect a rollout with the current (soon "old") policy
+    obs_b, act_b, logp_b, rew_b, done_b, val_b = [], [], [], [], [], []
+    for _ in range(ROLLOUT):
+        with torch.no_grad():
+            logits, value = net(torch.as_tensor(obs, dtype=torch.float32))
+        dist = torch.distributions.Categorical(logits=logits)
+        action = dist.sample()
+        next_obs, r, terminated, truncated, _ = env.step(action.item())
+        obs_b.append(obs); act_b.append(action)
+        logp_b.append(dist.log_prob(action))   # frozen: denominator of the ratio
+        rew_b.append(r); val_b.append(value)
+        done_b.append(float(terminated or truncated))
+        ep_ret += r
+        obs = next_obs
+        if terminated or truncated:
+            recent.append(ep_ret); ep_ret = 0.0
+            obs, _ = env.reset()
+    with torch.no_grad():
+        _, last_value = net(torch.as_tensor(obs, dtype=torch.float32))
+
+    # ---- phase 2: GAE over the whole rollout, once
+    obs_t = torch.as_tensor(np.array(obs_b), dtype=torch.float32)
+    act_t = torch.stack(act_b)
+    logp_t = torch.stack(logp_b)
+    adv, ret = gae(torch.as_tensor(rew_b, dtype=torch.float32),
+                   torch.stack(val_b),
+                   torch.as_tensor(done_b), last_value)
+
+    # ---- phase 3: K epochs of minibatch updates on the clipped loss
+    for epoch in range(EPOCHS):
+        stop = False
+        for start in torch.randperm(ROLLOUT).split(MINIBATCH):
+            mb = start
+            logits, value = net(obs_t[mb])
+            dist = torch.distributions.Categorical(logits=logits)
+            new_logp = dist.log_prob(act_t[mb])
+            logratio = new_logp - logp_t[mb]
+            ratio = logratio.exp()
+
+            with torch.no_grad():      # stable low-variance KL estimate
+                approx_kl = ((ratio - 1.0) - logratio).mean()
+            if approx_kl &gt; TARGET_KL:
+                stop = True            # trust region breached: stop updating
+                break
+
+            mb_adv = (adv[mb] - adv[mb].mean()) / (adv[mb].std() + 1e-8)
+            # min of (unclipped, clipped), written as max of negations
+            pg1 = -mb_adv * ratio
+            pg2 = -mb_adv * torch.clamp(ratio, 1 - CLIP_EPS, 1 + CLIP_EPS)
+            pg_loss = torch.max(pg1, pg2).mean()
+            v_loss = F.mse_loss(value, ret[mb])
+            entropy = dist.entropy().mean()
+            loss = pg_loss + VF_COEF * v_loss - ENT_COEF * entropy
+
+            opt.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+            opt.step()
+        if stop:
+            break
+
+    if recent:
+        print(f"step {(it + 1) * ROLLOUT:&gt;7}  "
+              f"mean return {np.mean(recent[-20:]):.1f}")</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">import gymnasium as gym
+import numpy as np
+import jax
+import jax.numpy as jnp
+import optax
+
+GAMMA, LAM, CLIP_EPS = 0.99, 0.95, 0.2
+ROLLOUT, EPOCHS, MINIBATCH = 2048, 4, 64
+LR, ENT_COEF, VF_COEF = 3e-4, 0.01, 0.5
+TOTAL_STEPS = 100_000
+
+def dense(key, n_in, n_out):
+    scale = jnp.sqrt(2.0 / n_in)
+    return {'w': jax.random.normal(key, (n_in, n_out)) * scale,
+            'b': jnp.zeros(n_out)}
+
+def mlp_init(key, sizes):
+    keys = jax.random.split(key, len(sizes) - 1)
+    return [dense(k, n_in, n_out)
+            for k, n_in, n_out in zip(keys, sizes[:-1], sizes[1:])]
+
+def mlp(layers, x):
+    for layer in layers[:-1]:
+        x = jnp.tanh(x @ layer['w'] + layer['b'])
+    return x @ layers[-1]['w'] + layers[-1]['b']
+
+def init_params(key, obs_dim, n_actions, hidden=128):
+    ka, kc = jax.random.split(key)
+    # Separate actor and critic, as in CleanRL's ppo.py: CartPole value
+    # targets grow to ~100, and with a shared trunk that regression's
+    # gradients drown the policy's (see traps).
+    return {'actor': mlp_init(ka, (obs_dim, hidden, hidden, n_actions)),
+            'critic': mlp_init(kc, (obs_dim, hidden, hidden, 1))}
+
+def forward(params, x):
+    logits = mlp(params['actor'], x)
+    value = mlp(params['critic'], x).squeeze(-1)
+    return logits, value
+
+@jax.jit
+def gae(rewards, values, dones, last_value):
+    """Backward linear recurrence as a reversed lax.scan (see /rl/actor-critic)."""
+    def step(carry, x):
+        a, next_v = carry
+        r, v, d = x
+        mask = 1.0 - d
+        delta = r + GAMMA * next_v * mask - v
+        a = delta + GAMMA * LAM * mask * a
+        return (a, v), a
+    _, adv = jax.lax.scan(step, (jnp.float32(0.0), last_value),
+                          (rewards, values, dones), reverse=True)
+    return adv, adv + values
+
+optimizer = optax.chain(optax.clip_by_global_norm(0.5), optax.adam(LR))
+
+def ppo_loss(params, obs, actions, old_logp, adv, returns):
+    logits, values = forward(params, obs)
+    logp_all = jax.nn.log_softmax(logits)
+    new_logp = jnp.take_along_axis(logp_all, actions[:, None], axis=1).squeeze(1)
+    logratio = new_logp - old_logp
+    ratio = jnp.exp(logratio)
+
+    adv = (adv - adv.mean()) / (adv.std() + 1e-8)   # per-minibatch normalization
+    pg1 = -adv * ratio
+    pg2 = -adv * jnp.clip(ratio, 1 - CLIP_EPS, 1 + CLIP_EPS)
+    pg_loss = jnp.maximum(pg1, pg2).mean()          # pessimistic bound
+
+    v_loss = jnp.mean((values - returns) ** 2)
+    entropy = -jnp.sum(jnp.exp(logp_all) * logp_all, axis=1).mean()
+    loss = pg_loss + VF_COEF * v_loss - ENT_COEF * entropy
+    approx_kl = ((ratio - 1.0) - logratio).mean()   # reported, not differentiated
+    return loss, approx_kl
+
+@jax.jit
+def minibatch_step(params, opt_state, obs, actions, old_logp, adv, returns):
+    (_, approx_kl), grads = jax.value_and_grad(ppo_loss, has_aux=True)(
+        params, obs, actions, old_logp, adv, returns)
+    updates, opt_state = optimizer.update(grads, opt_state, params)
+    return optax.apply_updates(params, updates), opt_state, approx_kl
+
+@jax.jit
+def act(params, obs, key):
+    logits, value = forward(params, obs)
+    action = jax.random.categorical(key, logits)
+    logp = jax.nn.log_softmax(logits)[action]
+    return action, logp, value
+
+env = gym.make("CartPole-v1")
+key = jax.random.PRNGKey(0)
+params = init_params(key, env.observation_space.shape[0], env.action_space.n)
+opt_state = optimizer.init(params)
+
+obs, _ = env.reset(seed=0)
+ep_ret, recent = 0.0, []
+rng = np.random.default_rng(0)
+for it in range(TOTAL_STEPS // ROLLOUT):
+    # ---- phase 1: collect
+    obs_b, act_b, logp_b, rew_b, done_b, val_b = [], [], [], [], [], []
+    for _ in range(ROLLOUT):
+        key, k = jax.random.split(key)
+        action, logp, value = act(params, jnp.asarray(obs), k)
+        next_obs, r, terminated, truncated, _ = env.step(int(action))
+        obs_b.append(obs); act_b.append(int(action))
+        logp_b.append(float(logp)); rew_b.append(r); val_b.append(float(value))
+        done_b.append(float(terminated or truncated))
+        ep_ret += r
+        obs = next_obs
+        if terminated or truncated:
+            recent.append(ep_ret); ep_ret = 0.0
+            obs, _ = env.reset()
+    _, last_value = forward(params, jnp.asarray(obs))
+
+    # ---- phase 2: GAE once over the rollout
+    obs_t = jnp.asarray(np.array(obs_b), dtype=jnp.float32)
+    act_t = jnp.asarray(act_b)
+    logp_t = jnp.asarray(logp_b, dtype=jnp.float32)
+    adv, ret = gae(jnp.asarray(rew_b, dtype=jnp.float32),
+                   jnp.asarray(val_b, dtype=jnp.float32),
+                   jnp.asarray(done_b, dtype=jnp.float32), last_value)
+
+    # ---- phase 3: K epochs of shuffled minibatches
+    for epoch in range(EPOCHS):
+        perm = rng.permutation(ROLLOUT)
+        for s in range(0, ROLLOUT, MINIBATCH):
+            mb = perm[s:s + MINIBATCH]
+            params, opt_state, approx_kl = minibatch_step(
+                params, opt_state, obs_t[mb], act_t[mb],
+                logp_t[mb], adv[mb], ret[mb])
+
+    if recent:
+        print(f"step {(it + 1) * ROLLOUT:&gt;7}  "
+              f"mean return {np.mean(recent[-20:]):.1f}")</code></pre>
+          </div>
+          <p>
+            Points of contact with the math. The stored
+            <code>logp</code> values are the frozen denominator of the
+            ratio; only the numerator is recomputed, minibatch by
+            minibatch, so the ratio genuinely measures drift from the
+            collecting policy. The loss writes min(unclipped, clipped) as
+            max of negated terms because the code minimizes. Advantage
+            normalization happens per minibatch, matching the common
+            reference choice. The PyTorch version implements KL early
+            stopping and breaks out of the epoch loop when the estimate
+            exceeds the target; the JAX version computes the same estimate
+            and returns it from the jitted step (a host-side check against
+            a threshold works identically there, at the cost of a device
+            sync per minibatch, which is why some JAX implementations log
+            it but do not branch on it). Value clipping is deliberately
+            omitted, per the evidence discussed above; adding it is six
+            lines if a baseline you are reproducing used it.
+          </p>
+
+          <h2>Using it on a real shape of problem</h2>
+          <p>
+            Run either file as-is. With a 2048-step rollout and 4 epochs of
+            64-sample minibatches, each iteration performs 128 gradient
+            steps on data A2C would have spent in one, and the effect is
+            visible in sample count: in my run of the PyTorch file, seed 0,
+            mean return first crossed 400 around 35k environment steps,
+            dipped and recovered (a collapse to 277 near 50k), and sat
+            pinned at 495 to 500 from about 85k on, where the A2C on the
+            <a href="/rl/actor-critic">actor-critic page</a> needed most of
+            a 200k budget to reach the same neighborhood. Treat those
+            numbers as one seed on one machine, not a benchmark; on-policy
+            RL on a single environment is noisy by nature, and part of the
+            gap here comes from the separate-network architecture as well
+            as the multi-epoch reuse. Useful gauges while it runs: the KL estimate should sit
+            comfortably below 0.03 most of the time, spiking early in
+            training when advantages are large; the fraction of clipped
+            samples (add <code>(ratio - 1).abs() &gt; CLIP_EPS</code> to the
+            logging) typically runs 5 to 25 percent, and a sustained value
+            near zero means the learning rate is too small or the epochs
+            too few for the clip to be doing anything; entropy should decay
+            from ln 2 ≈ 0.693 gradually, not cliff-dive in the first
+            iterations.
+          </p>
+
+          <h2>Applications</h2>
+          <p>
+            PPO earned its default status in simulation-heavy RL. OpenAI
+            Five played Dota 2 at professional level on a scaled-up PPO,
+            and the same lineage trained the dexterous hand that
+            manipulated a Rubik's cube; DeepMind and academic labs use it
+            as the standard baseline for locomotion and manipulation in
+            MuJoCo and Isaac Gym, where thousands of GPU-parallel
+            environments feed exactly the rollout/GAE/minibatch loop above;
+            game studios and the procedural-generation research line
+            (Procgen, NetHack) default to it; and it is the standard
+            control-policy trainer for sim-to-real robotics.
+          </p>
+          <p>
+            The second life is RLHF. InstructGPT and the original ChatGPT
+            alignment stage used PPO to fine-tune the language model
+            against a reward model trained from human preference
+            comparisons, and the adaptation is worth understanding at
+            concept level because it is the bridge to
+            <a href="/rl/grpo">GRPO</a>. The policy is the LLM; an "action"
+            is emitting one token, so a completion is a trajectory and the
+            per-token log probabilities play exactly the role of
+            π(a<sub>t</sub>|s<sub>t</sub>) above. The reward model scores
+            only the finished completion, so the environment reward is
+            sparse: zero at every token, the scalar preference score at the
+            end. Two structural changes follow. A per-token KL penalty
+            against a frozen reference policy (the model before RL) is
+            subtracted from the reward, r<sub>t</sub> = −β·KL<sub>t</sub>
+            plus the final score at the last token: this is a second trust
+            region, not against the rollout policy but against the
+            pre-training distribution, and it is what stops the model from
+            collapsing into reward-hacking gibberish that the reward model
+            happens to score well. And the critic becomes a value head on
+            the LLM estimating expected final reward from each prefix,
+            which means RLHF-PPO holds a policy, a reference model, a
+            reward model, and a critic in memory at once, roughly four
+            model-sized objects. That memory bill, plus the awkwardness of
+            training a good token-level critic on sparse terminal rewards,
+            is precisely what GRPO attacks by replacing the critic with a
+            group-relative baseline. Rollout generation is its own systems
+            problem at LLM scale, since every PPO iteration needs thousands
+            of sampled completions; that is where fast inference engines
+            enter the loop, covered from the systems side in my
+            <a href="/oss/vllm">vLLM notes</a>.
+          </p>
+
+          <h2>Against the real libraries</h2>
+          <p>
+            <a href="https://github.com/DLR-RM/stable-baselines3" target="_blank" rel="noreferrer">stable-baselines3</a>'s
+            <code>PPO</code> is the batteries-included version of this
+            page: vectorized environments, correct truncation
+            bootstrapping, <code>VecNormalize</code> for observation and
+            reward normalization, orthogonal initialization, learning-rate
+            and clip-range schedules, optional value clipping
+            (<code>clip_range_vf</code>), and a <code>target_kl</code>
+            early stop, all behind
+            <code>PPO("MlpPolicy", "CartPole-v1").learn(100_000)</code>.
+            It is the right tool when you want results on a standard
+            environment rather than an inspectable algorithm.
+          </p>
+          <p>
+            <a href="https://github.com/vwxyzjn/cleanrl" target="_blank" rel="noreferrer">CleanRL</a>'s
+            <code>ppo.py</code> deserves its status as the canonical
+            single-file reference: every one of the implementation details
+            above is present, named, and toggleable in one readable file,
+            the companion blog post documents 37 of them with ablations,
+            and every benchmark run is tracked and reproducible with exact
+            commands. When your PPO misbehaves, diffing your code against
+            <code>ppo.py</code> detail by detail is the single most
+            effective debugging procedure I know of in RL. CleanRL also
+            ships JAX variants whose GAE and update structure match the JAX
+            implementation above. For the RLHF variant,
+            <a href="https://github.com/huggingface/trl" target="_blank" rel="noreferrer">TRL</a>'s
+            <code>PPOTrainer</code> implements the language-model
+            adaptation: value head on the policy, frozen reference model,
+            per-token KL penalty, and generation-based rollouts, so the
+            concepts in the previous section map one-to-one onto its
+            configuration options.
+          </p>
+          <p>
+            The from-scratch version is enough for single-environment
+            control problems, for research that modifies the objective
+            itself (new clip shapes, different KL controls), and for
+            actually understanding what you are running. Verification is
+            two-layered. Algebraically, check the loss against hand
+            arithmetic: feed the four (Â, r) cases from the table above
+            through your policy-loss code as fixed tensors and assert it
+            returns the min column's mean (negated). End-to-end, run SB3's
+            PPO and yours on CartPole with matched hyperparameters and a
+            few seeds each; the learning curves should overlap within
+            seed noise, and a persistent gap means a detail differs, most
+            often advantage normalization placement, truncation handling,
+            or initialization.
+          </p>
+
+          <h2>Traps and misconceptions</h2>
+          <p>
+            <strong>"Clipping bounds the KL divergence."</strong> It does
+            not. The clip zeroes the gradient incentive beyond ε per
+            sample, but many minibatch steps compound, and ratios drift far
+            outside the band in every real run; the surrogate being flat
+            there does not mean the policy stopped moving. This is why
+            KL monitoring, and ideally KL early stopping, belongs in the
+            loop even though the objective looks like it already handles
+            the problem. PPO imitates a trust region; it does not enforce
+            one.
+          </p>
+          <p>
+            <strong>Reusing stale log probabilities, or recomputing the
+            old ones.</strong> The ratio needs a frozen denominator from
+            collection time and a live numerator from the current
+            parameters. Recomputing both (ratio identically 1 forever)
+            silently degrades PPO into A2C with extra epochs of the same
+            gradient; storing the numerator (using collection-time log
+            probs in the loss) trains nothing after the first epoch. Both
+            bugs run without error and both show up instantly in a plot of
+            the ratio distribution, which is why reference implementations
+            log it.
+          </p>
+          <p>
+            <strong>Normalizing the wrong thing, or in the wrong
+            place.</strong> Advantage normalization is per minibatch in
+            most references, and doing it over the whole batch instead is
+            a real (usually minor) behavioral difference; normalizing
+            returns instead of advantages changes the critic's target
+            scale mid-training and destabilizes the value loss. Separately,
+            advantage normalization makes the update invariant to reward
+            scale but also erases genuinely small advantages, which
+            occasionally matters on nearly-solved tasks where every action
+            is almost equally good. And normalization of advantages does
+            nothing about the scale of the value targets themselves: on a
+            shared-trunk network, value targets in the tens or hundreds
+            produce regression gradients that drown the policy's, which is
+            exactly why this page's implementations use separate networks
+            and why the shared-trunk variant of this file stalls around a
+            return of 150 on CartPole. The
+            <a href="/rl/actor-critic">actor-critic page</a> discusses the
+            same interference from the other side.
+          </p>
+          <p>
+            <strong>Assuming value clipping is part of the
+            algorithm.</strong> It appears in the original code and most
+            descendants, but ablation studies rate it neutral to harmful,
+            and the PPO paper itself does not motivate it. Include it when
+            reproducing a baseline that used it; do not reach for it when
+            your value loss is unstable, since a lower learning rate or
+            value coefficient addresses the cause rather than the symptom.
+          </p>
+          <p>
+            <strong>Entropy collapse read as convergence.</strong> A policy
+            that goes near-deterministic early stops exploring and PPO's
+            on-policy data pipeline can never surface the states that would
+            correct it; the run then plateaus at a mediocre policy with
+            beautiful, smooth losses. Watch entropy alongside return, and
+            treat a cliff in the entropy curve during the first few percent
+            of training as a bug in reward scale, learning rate, or the
+            entropy coefficient rather than as rapid learning.
+          </p>
+
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> PPO is the actor-critic template
+            with one new idea: correct multi-epoch reuse of a rollout with
+            the importance ratio r = π<sub>new</sub>/π<sub>old</sub>, then
+            cap each sample's incentive with the pessimistic
+            min(rÂ, clip(r, 1±ε)Â) so the gradient only ever flows toward
+            the data or within ε of it. The clip is a behavioral trust
+            region, not a guarantee, so KL monitoring stays in the loop,
+            and the implementation details (advantage normalization,
+            initialization, the frozen-denominator ratio) carry as much of
+            the performance as the objective. Master this page plus GAE and
+            you hold the algorithm behind both modern game-playing agents
+            and the RLHF stage of language models; swap the critic for a
+            group baseline and you have <a href="/rl/grpo">GRPO</a>.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/code-tabs.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (!window.hljs) return;
+        hljs.configure({ languages: ["python", "bash", "c", "cpp", "rust", "go", "typescript", "swift", "sql", "json", "yaml", "plaintext"] });
+        hljs.highlightAll();
+      });
+    </script>
+  </body>
+</html>

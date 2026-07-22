@@ -1,0 +1,981 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>verl walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A full chapter on verl: a practical tutorial, the complete life of one GRPO training step from prompt batch to weight sync, deep dives into the HybridFlow single-controller model, the worker architecture, and training-inference weight resharding, plus a staged plan for reading the repository." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" integrity="sha384-eFTL69TLRZTkNfYZOLM+G04821K1qZao/4QLJbet1pP4tcF+fdXq/9CdqAbWRl/L" crossorigin="anonymous" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl" class="active">RL</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/rl">Reinforcement learning</a></div>
+        <h1>verl</h1>
+        <p class="lead">
+          <a href="https://github.com/verl-project/verl" target="_blank" rel="noreferrer">verl</a>
+          is the open source implementation of ByteDance's HybridFlow paper
+          (Sheng et al., EuroSys 2025) and the workhorse framework for RL
+          post-training of large language models: DAPO, Seed-Thinking, and a
+          long list of reasoning-model results were trained on it. This is a
+          full chapter, not a tour: a practical tutorial, the complete life of
+          one GRPO training step from prompt batch through rollout, reward,
+          advantage, and FSDP update back to a weight sync, deep dives into
+          the single-controller programming model and the training-inference
+          resharding problem, and a staged plan for reading the repository.
+          It leans on the <a href="/rl/grpo">GRPO</a>, <a href="/rl/ppo">PPO</a>,
+          and <a href="/oss/vllm">vLLM</a> chapters. File paths and commands
+          were checked against release v0.8.0 (June 2026); verl moves fast,
+          so expect drift at the edges but not in the architecture.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">Driver process (ONE Python process, the "single controller")
+  RayPPOTrainer.fit()                       verl/trainer/ppo/ray_trainer.py
+      │  for batch in dataloader:
+      │
+      ├─► generate_sequences(prompts)  ──►  rollout workers        verl/workers/rollout/
+      │        (vLLM or SGLang engines generate n samples/prompt)
+      ├─► compute reward               ──►  rule verifier or RM    verl/workers/reward_manager/
+      ├─► compute_log_prob / ref_log_prob ► training engine fwd    verl/workers/engine_workers.py
+      ├─► compute_advantage            ──►  on the driver itself   verl/trainer/ppo/core_algos.py
+      ├─► update_actor(batch)          ──►  FSDP / Megatron step   verl/workers/engine/
+      └─► update_weights()             ──►  trainer ─► rollout     resharding + transfer
+                                            (same GPUs, taking turns)</pre>
+          <p>
+            The one-sentence identity: <mark>verl is a single Python process
+            that remote-controls two heavyweight distributed systems, a
+            training engine and an inference engine, which take turns wearing
+            the same GPUs</mark>. RL post-training is awkward precisely
+            because it needs both: generation wants an inference engine built
+            for throughput (vLLM, SGLang), while the gradient update wants a
+            training engine built for sharded optimization (FSDP,
+            Megatron-LM). verl's contribution is not a new algorithm; it is
+            the machinery that lets one readable training loop drive both
+            systems and shuttle a model's weights between their incompatible
+            sharding layouts every single step.
+          </p>
+          <p>
+            The HybridFlow paper frames this as a two-level dataflow problem.
+            The control flow, "first roll out, then score, then compute
+            advantages, then update", is the RL algorithm, and it is cheap:
+            a few tensors per sequence. The computation flow inside each node
+            of that graph, a forward pass over a 70B model across 64 GPUs, is
+            enormous and multi-process. Older frameworks fused the two, so
+            every algorithm change meant touching distributed code. verl
+            separates them: <mark>the algorithm lives in one single-process
+            loop that reads like pseudocode, and each heavy operator is a
+            decorated method on a Ray worker group that knows how to split,
+            dispatch, and re-collect its own data</mark>. That is the
+            "single-controller / multi-worker" model, and everything else in
+            this chapter is either an instance of it or the plumbing it needs.
+          </p>
+          <p>
+            One naming note before any code. The project began as
+            volcengine/verl and migrated to the
+            <a href="https://github.com/verl-project/verl" target="_blank" rel="noreferrer">verl-project</a>
+            GitHub organization in January 2026; old links redirect. In the
+            same cleanup the <code>recipe/</code> directory of
+            community-contributed algorithm reproductions (DAPO, ReTool,
+            SPPO, and friends) moved into a separate
+            <code>verl-recipe</code> repository, kept in the main tree as a
+            git submodule. A lot of writing about verl also predates the
+            v0.7/v0.8 "model engine" refactor that merged the old
+            <code>fsdp_workers.py</code> and <code>megatron_workers.py</code>
+            into a unified worker layer; this chapter describes the current
+            layout and flags what moved.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <h3>Installing</h3>
+          <p>
+            verl is Linux-plus-NVIDIA-first (Python &gt;= 3.10, CUDA &gt;= 12.8
+            recommended; AMD ROCm and Ascend NPU paths exist). There is no
+            macOS story worth pursuing: the stack underneath is vLLM or
+            SGLang plus FSDP on real GPUs. The docs recommend starting from
+            the prebuilt Docker images (published under
+            <code>verlai/verl</code> on Docker Hub, built on the vLLM and
+            SGLang release images), inside which verl itself installs
+            without dependencies:
+          </p>
+          <pre><code>git clone https://github.com/verl-project/verl &amp;&amp; cd verl
+pip3 install --no-deps -e .</code></pre>
+          <p>
+            In a custom environment you install with an extra that pulls the
+            inference engine you want:
+          </p>
+          <pre><code>pip3 install -e ".[vllm]"     # rollout with vLLM
+pip3 install -e ".[sglang]"   # rollout with SGLang</code></pre>
+          <p>
+            Training additionally wants FSDP (which comes with PyTorch) or
+            Megatron-LM (a separate, version-pinned install; v0.8.0 supports
+            Megatron core v0.13.1). For everything in this chapter, FSDP plus
+            vLLM on a single node is enough.
+          </p>
+          <h3>First real session: GSM8K</h3>
+          <p>
+            The canonical first run is math with a rule-based reward. Step
+            one preprocesses GSM8K into parquet files that carry the fields
+            the reward function needs:
+          </p>
+          <pre><code>python3 examples/data_preprocess/gsm8k.py --local_save_dir ~/data/gsm8k</code></pre>
+          <p>
+            The reward is a regular expression: GSM8K solutions end in
+            <code>#### &lt;answer&gt;</code>, so
+            <code>verl/utils/reward_score/gsm8k.py</code> extracts the final
+            answer from the model output and compares it to the ground truth,
+            scoring 1.0 for correct and 0 otherwise. No reward model, no
+            human feedback, just a verifier. Step two launches training. The
+            docs' quickstart runs PPO with a critic on a single 24 GB GPU
+            with <code>Qwen/Qwen2.5-0.5B-Instruct</code>; the GRPO variant,
+            which is what most people actually run now, drops the critic and
+            samples a group per prompt. A minimal single-GPU GRPO launch:
+          </p>
+          <pre><code>PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
+ algorithm.adv_estimator=grpo \
+ data.train_files=$HOME/data/gsm8k/train.parquet \
+ data.val_files=$HOME/data/gsm8k/test.parquet \
+ data.train_batch_size=256 \
+ data.max_prompt_length=512 \
+ data.max_response_length=512 \
+ actor_rollout_ref.model.path=Qwen/Qwen2.5-0.5B-Instruct \
+ actor_rollout_ref.actor.optim.lr=1e-6 \
+ actor_rollout_ref.actor.ppo_mini_batch_size=64 \
+ actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
+ actor_rollout_ref.actor.use_kl_loss=True \
+ actor_rollout_ref.actor.kl_loss_coef=0.001 \
+ actor_rollout_ref.rollout.name=vllm \
+ actor_rollout_ref.rollout.n=5 \
+ actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
+ actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+ actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
+ actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
+ trainer.logger=console \
+ trainer.n_gpus_per_node=1 trainer.nnodes=1 \
+ trainer.total_epochs=15 2>&1 | tee verl_demo.log</code></pre>
+          <p>
+            Note that GRPO does not get its own entrypoint. <mark>In verl,
+            every algorithm in the PPO family is
+            <code>main_ppo.py</code> plus config overrides</mark>:
+            <code>algorithm.adv_estimator=grpo</code> selects the advantage
+            function, <code>rollout.n=5</code> makes the rollout engine
+            sample a group of five per prompt, and
+            <code>use_kl_loss=True</code> moves KL regularization from the
+            reward into the actor loss, per the GRPO paper. What you watch
+            in the logs is one line per step with a timing breakdown
+            (<code>timing/gen</code>, <code>timing/update_actor</code>, ...),
+            reward statistics, and, every <code>trainer.test_freq</code>
+            steps, <code>val/test_score/openai/gsm8k</code> climbing from a
+            few percent toward a ceiling that depends on the model. Exact
+            numbers vary run to run; the shape of the curve does not.
+            Checkpoints land in
+            <code>checkpoints/&lt;project&gt;/&lt;experiment&gt;/</code> in
+            sharded engine format, and
+            <code>python3 -m verl.model_merger merge --backend fsdp ...</code>
+            reassembles a Hugging Face checkpoint from them.
+          </p>
+          <h3>The knobs that matter</h3>
+          <p>
+            The config system is Hydra over a tree of YAML defaults
+            (<code>verl/trainer/config/ppo_trainer.yaml</code> composes
+            per-role files from <code>actor/</code>, <code>rollout/</code>,
+            <code>critic/</code>, <code>ref/</code>, <code>engine/</code>),
+            and the batch-size hierarchy is the part everyone trips over:
+          </p>
+          <ul>
+            <li><code>data.train_batch_size</code>: prompts sampled per
+              training step. Multiply by <code>rollout.n</code> for the
+              number of trajectories.</li>
+            <li><code>actor.ppo_mini_batch_size</code>: trajectories per
+              optimizer update; the rollout batch is split into these, so
+              one step performs <code>train_batch_size * n /
+              ppo_mini_batch_size</code> gradient updates. A global size,
+              not per GPU.</li>
+            <li><code>actor.ppo_micro_batch_size_per_gpu</code>: forward
+              or backward chunk per GPU, pure gradient accumulation.
+              <mark>Micro-batch sizes are memory knobs and never change
+              convergence; mini-batch size is an algorithm knob and
+              does</mark>. The modern alternative is
+              <code>actor.use_dynamic_bsz=True</code> with
+              <code>ppo_max_token_len_per_gpu</code>, which packs by token
+              count instead of sequence count.</li>
+            <li><code>rollout.gpu_memory_utilization</code>: the fraction of
+              the GPU handed to the inference engine during generation (0.4
+              to 0.6 typical when colocated, because the trainer needs the
+              rest).</li>
+            <li><code>algorithm.use_kl_in_reward</code> versus
+              <code>actor.use_kl_loss</code>: KL as a reward penalty (classic
+              RLHF PPO) versus KL as a loss term (GRPO). Enabling either is
+              what makes the reference policy worker exist at all.</li>
+          </ul>
+          <p>
+            The classic beginner mistake pair, wrong versus right, is
+            treating micro-batch as the tuning surface:
+          </p>
+          <pre><code># Wrong intent: "make training converge differently"
+actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16   # only changes memory/speed
+
+# Right: change the actual update granularity
+actor_rollout_ref.actor.ppo_mini_batch_size=128           # changes optimization</code></pre>
+
+          <h2>Part III: When it is the right tool</h2>
+          <p>
+            verl is the right default when the RL loop itself is the
+            workload: GRPO/PPO-style reasoning training on verifiable
+            rewards, RLHF with reward models, multi-turn agent and tool-use
+            training, at any scale from one node to thousands of GPUs, with
+            models from 0.5B to Megatron-scale MoE (the docs document
+            DeepSeek-671B and Qwen3-235B runs). Its pluggability is the
+            feature: FSDP or Megatron behind one worker API, vLLM or SGLang
+            behind another, and an algorithm zoo that turns most published
+            RL-for-LLM papers into a config diff or a recipe directory.
+          </p>
+          <p>
+            The honest alternatives: <a href="/rl/trl">TRL</a> is the
+            right choice when a Hugging Face
+            <a href="/oss/transformers">transformers</a> Trainer subclass on one node
+            covers your needs, especially for offline methods
+            (<a href="/rl/dpo">DPO</a>, SFT) where no rollout engine is
+            needed at all, and its GRPOTrainer is genuinely capable on
+            single-node setups; the step up to verl buys you Ray-based
+            multi-node orchestration, Megatron sharding for models that FSDP
+            cannot hold, and placement flexibility. OpenRLHF occupies a
+            middle position, also Ray plus vLLM, with a smaller codebase and
+            a smaller ecosystem. If your problem is "serve a model", none of
+            these apply; that is the <a href="/oss/vllm">vLLM chapter</a>.
+          </p>
+          <p>
+            The architecture-shaped warning is about colocation memory
+            choreography. In the default hybrid mode, the trainer and the
+            rollout engine share every GPU, and the design only works
+            because they alternate: vLLM's sleep mode releases weight and KV
+            memory during the training phase, and the trainer offloads or
+            frees before generation resumes. If you break the choreography,
+            by pinning <code>rollout.free_cache_engine=False</code> while
+            also keeping full FSDP parameters resident, or by sizing
+            <code>gpu_memory_utilization</code> as if the engine owned the
+            device the way a serving deployment does, you get the OOM that
+            only appears at step boundaries.
+          </p>
+          <pre class="flow">Safe (time-sliced):                    Dangerous (both resident):
+t0 rollout awake (0.5 GPU) ── gen      vLLM engine claims 0.9
+t1 rollout sleeps, frees KV+weights    FSDP params+optimizer resident too
+t2 trainer wakes ── fwd/bwd/step         → OOM at the first update step,
+t3 sync weights, rollout wakes             or thrash on every transition</pre>
+
+          <h2>Part IV: The full life of one GRPO step</h2>
+          <p>
+            The canonical operation is one iteration of
+            <code>RayPPOTrainer.fit()</code> with
+            <code>adv_estimator=grpo</code>. Everything happens on, or is
+            ordered by, the driver process; the heavy lifting happens on
+            worker groups it commands. Paths are v0.8.0.
+          </p>
+          <h3>Stage 1: Boot, once</h3>
+          <p>
+            <code>python3 -m verl.trainer.main_ppo</code> resolves the Hydra
+            config, starts Ray, and launches a <code>TaskRunner</code> actor
+            (deliberately not on the head node) whose <code>run()</code>
+            builds the tokenizer, datasets, resource pools, and the
+            role-to-worker mapping: <code>Role.ActorRollout</code> (or
+            <code>ActorRolloutRef</code> when a reference policy is needed)
+            maps to <code>ActorRolloutRefWorker</code> and
+            <code>Role.Critic</code> to <code>TrainingWorker</code>, both
+            from <code>verl/workers/engine_workers.py</code>. GRPO has no
+            critic, so only the first group is created.
+            <code>trainer.init_workers()</code> then spawns one Ray worker
+            per GPU per group, and each worker's <code>init_model()</code>
+            builds three things in place: the training engine for the actor
+            (FSDP by default), the rollout engine (a vLLM instance per
+            replica), and the checkpoint engine used later for weight sync.
+            In v0.8.0 a note in the code marks <code>main_ppo.py</code>
+            deprecated in favor of <code>main_ppo_sync.py</code>; both drive
+            the same trainer.
+          </p>
+          <h3>Stage 2: The driver builds the batch</h3>
+          <p>
+            <code>fit()</code> pulls a batch of prompts from a stateful
+            dataloader and wraps it in a <code>DataProto</code>
+            (<code>verl/protocol.py</code>), verl's universal envelope: a
+            TensorDict of batched tensors plus non-tensor arrays plus
+            meta-info, which every worker method consumes and returns. It
+            tags each prompt with a UID, then repeats the batch
+            <code>rollout.n</code> times, interleaved, because GRPO needs a
+            group of n rollouts per prompt and downstream code groups by
+            that UID.
+          </p>
+          <h3>Stage 3: Rollout generation</h3>
+          <p>
+            The driver calls
+            <code>async_rollout_manager.generate_sequences(gen_batch)</code>.
+            Under the hood the rollout side of
+            <code>ActorRolloutRefWorker</code> runs vLLM in server mode
+            (<code>verl/workers/rollout/vllm_rollout/</code>, with
+            <code>sglang_rollout/</code> and an experimental TensorRT-LLM
+            backend as siblings); requests fan out across replicas, each
+            replica being a tensor-parallel vLLM engine. Sampling
+            parameters, chat templating, and multi-turn tool loops (the
+            <code>agent_loop</code> machinery in
+            <code>verl/experimental/agent_loop/</code>) live on this side.
+            When generation returns, the driver puts the replicas to sleep,
+            releasing their weight and KV memory so the training engine can
+            have the GPUs. The output DataProto now carries
+            <code>responses</code>, masks, and optionally the rollout
+            engine's own log-probs (<code>rollout_log_probs</code>), which
+            matter in Stage 5.
+          </p>
+          <h3>Stage 4: Reward</h3>
+          <p>
+            Rewards are computed by a reward manager
+            (<code>verl/workers/reward_manager/</code>; <code>naive</code>
+            is the default, <code>dapo</code> and <code>prime</code>
+            implement paper-specific shaping). For rule-based tasks it calls
+            the per-dataset scorer in
+            <code>verl/utils/reward_score/</code> keyed by the
+            <code>data_source</code> field, or your own function via
+            <code>reward.custom_reward_function.path</code>. If a neural
+            reward model is enabled (<code>reward.reward_model.enable</code>),
+            scoring runs as a server-mode model, optionally on its own
+            resource pool. Either way the result is a token-level score
+            tensor, which for outcome rewards is zero everywhere except the
+            final response token.
+          </p>
+          <h3>Stage 5: Recomputing log-probs</h3>
+          <p>
+            The driver then asks the actor for
+            <code>compute_log_prob(batch)</code>: a forward-only pass of the
+            training engine over the generated sequences, producing
+            <code>old_log_probs</code>, the probabilities that anchor the
+            PPO/GRPO ratio. This looks redundant, since the rollout engine
+            already reported log-probs while sampling, but it is
+            load-bearing: <mark>vLLM's numerics and the training engine's
+            numerics differ, and the ratio must be computed against the
+            policy as the trainer sees it</mark>. v0.8.0 makes the
+            discrepancy a first-class citizen: the
+            <code>algorithm.rollout_correction</code> config can compute
+            importance-sampling weights between rollout and trainer policies
+            (decoupled mode), or bypass the recompute entirely and trust
+            <code>rollout_log_probs</code> (bypass mode) when you accept
+            two-policy training. If KL regularization is on, the fused
+            reference policy answers <code>compute_ref_log_prob</code> the
+            same way.
+          </p>
+          <h3>Stage 6: Advantages, on the driver</h3>
+          <p>
+            Advantage computation is deliberately cheap enough to run in the
+            driver process: <code>compute_advantage()</code> dispatches
+            through a registry in
+            <code>verl/trainer/ppo/core_algos.py</code> to
+            <code>compute_grpo_outcome_advantage</code>, which groups
+            rewards by prompt UID, subtracts the group mean, and (with
+            <code>norm_adv_by_std_in_grpo=True</code>, the default) divides
+            by the group standard deviation. Every sequence in a group gets
+            its scalar advantage broadcast across its response tokens. With
+            <code>adv_estimator=gae</code> this stage instead runs
+            generalized advantage estimation over the critic's values, which
+            is the PPO path (see the <a href="/rl/ppo">PPO page</a> for the
+            derivation).
+          </p>
+          <h3>Stage 7: The update</h3>
+          <p>
+            <code>update_actor(batch)</code> ships the assembled batch
+            (responses, old and ref log-probs, advantages) to the actor
+            workers, where <code>TrainingWorker.train_mini_batch</code>
+            slices it into mini-batches and micro-batches and drives the
+            engine (<code>verl/workers/engine/fsdp/transformer_impl.py</code>
+            or the Megatron twin) through forward, loss, backward, step. The
+            loss function is <code>ppo_loss</code> from
+            <code>verl/workers/utils/losses.py</code>, assembling the
+            clipped surrogate from <code>core_algos.py</code> pieces:
+            ratio clipping with <code>clip_ratio</code>, optional entropy
+            bonus, and the direct KL loss term when
+            <code>use_kl_loss=True</code>. Sequence-length balancing
+            (<code>trainer.balance_batch</code>,
+            <code>verl/utils/seqlen_balancing.py</code>) has already
+            reordered the batch so each data-parallel rank chews a similar
+            token count.
+          </p>
+          <h3>Stage 8: Weight sync, closing the loop</h3>
+          <p>
+            Finally the driver calls
+            <code>checkpoint_manager.update_weights(global_steps)</code>,
+            which fans out to
+            <code>ActorRolloutRefWorker.update_weights()</code>. In
+            colocated sync mode the sequence is: wake the rollout engine's
+            weight memory, stream the actor engine's parameters per tensor
+            into the vLLM replicas, offload or free trainer memory, then
+            restore the KV cache. The rollout engine now holds the
+            post-update policy, and the next iteration's generations are
+            on-policy again. This stage is the hard engineering at the
+            center of the system and gets its own deep dive below.
+          </p>
+
+          <h2>Part V: Internals deep dives</h2>
+          <h3>HybridFlow: the single-controller / multi-worker model</h3>
+          <p>
+            The paper's key observation is that RL training is a nested
+            dataflow: an outer graph whose nodes are "rollout", "reward",
+            "update" (the control flow), and inner graphs which are the
+            distributed neural computations themselves (the computation
+            flow). Prior systems made the outer graph multi-process too,
+            SPMD everywhere, which is fastest but welds the algorithm to one
+            execution strategy. verl chooses the other corner:
+            <mark>the outer graph runs in one process, and pays a data
+            movement tax at every node boundary to buy algorithm-level
+            programmability</mark>. The bet is that for LLM-scale nodes the
+            tax is small relative to the computation, and that bet has held.
+          </p>
+          <p>
+            The mechanism is in <code>verl/single_controller/</code>. A
+            <code>Worker</code> exposes methods decorated with
+            <code>@register(dispatch_mode=...)</code>
+            (<code>base/decorator.py</code>); a <code>RayWorkerGroup</code>
+            (<code>ray/base.py</code>) binds those methods onto itself so
+            the driver can call
+            <code>worker_group.method(data)</code> as if it were local. The
+            dispatch mode is the contract: <code>ONE_TO_ALL</code>
+            broadcasts the same arguments to every worker (init, checkpoint
+            ops); <code>DP_COMPUTE_PROTO</code> and the newer mesh-aware
+            <code>make_nd_compute_dataproto_dispatch_fn</code> split a
+            DataProto across data-parallel ranks, invoke, and concatenate
+            the results. The decorated signature is exactly the
+            paper's separation made concrete:
+          </p>
+          <pre class="flow">driver:   out = actor_wg.compute_log_prob(batch)     one line, single process
+            │ dispatch_fn: split batch into dp chunks
+            ▼
+workers:  each rank runs compute_log_prob(chunk)     SPMD inside
+            │ collect_fn: gather + concat
+            ▼
+driver:   out is a plain DataProto again</pre>
+          <p>
+            Two consequences are worth internalizing. First, swapping FSDP
+            for Megatron, or vLLM for SGLang, changes nothing in
+            <code>ray_trainer.py</code>, because the trainer only speaks
+            worker-group method names; that is why the same
+            <code>fit()</code> serves PPO, GRPO, and a dozen recipe
+            algorithms. Second, the driver is a real bottleneck surface:
+            every batch crosses process boundaries at least twice per stage,
+            which is why DataProto exists (a compact, serializable
+            convention rather than loose kwargs) and why newer experimental
+            paths (<code>verl/experimental/transfer_queue</code>, async
+            training) work to take bulk data off the driver hop. The famous
+            misconception to correct: "single controller" does not mean
+            single point of computation; the driver never touches model
+            weights, it only routes metadata and modest tensors, and
+            advantage computation is the one numeric task it keeps because
+            it is O(batch) rather than O(model).
+          </p>
+          <h3>The worker architecture and colocation</h3>
+          <p>
+            v0.8.0 has two load-bearing worker classes in
+            <code>verl/workers/engine_workers.py</code>.
+            <code>TrainingWorker</code> wraps one model engine, the unified
+            abstraction over FSDP/FSDP2, Megatron, TorchTitan, and VeOmni
+            backends in <code>verl/workers/engine/</code>, and exposes
+            exactly three compute verbs: <code>train_mini_batch</code>,
+            <code>train_batch</code>, <code>infer_batch</code>. The critic
+            is just a TrainingWorker with a value-head model and a value
+            loss. <code>ActorRolloutRefWorker</code> composes up to three
+            roles in one process per GPU: an actor TrainingWorker, an
+            optional ref TrainingWorker, and a rollout engine, and its
+            <code>role</code> string ("actor_rollout",
+            "actor_rollout_ref", ...) decides which get built.
+          </p>
+          <pre class="flow">One GPU, hybrid mode:
+┌────────────────────────────────────────────────┐
+│ ActorRolloutRefWorker (one Ray actor)          │
+│   actor:  TrainingWorker ── FSDP shard         │
+│   ref:    TrainingWorker ── frozen shard       │
+│   rollout: vLLM engine (TP slice of a replica) │
+│   checkpoint_engine: weight-sync transport     │
+└────────────────────────────────────────────────┘
+mapping: {ActorRolloutRef: "global_pool"}  ← all roles, all GPUs</pre>
+          <p>
+            Why fuse them? Weight sync becomes device-local (actor and
+            rollout share a GPU, so parameters move by NCCL or even
+            in-process pointer handoff instead of across a network), and the
+            reference policy is nearly free when LoRA is used, because the
+            base model already sitting under the actor's adapters is the
+            reference. The cost is the time-slicing choreography from
+            Part III. Placement is a config decision, not a code one: the
+            <code>ResourcePoolManager</code> maps roles to named GPU pools,
+            so putting a neural reward model on its own pool
+            (<code>reward.reward_model.enable_resource_pool=True</code>), or
+            disaggregating rollout from training entirely (the
+            one-step-off-policy and fully-async recipes in
+            <code>verl/experimental/</code>), is the same trainer with a
+            different mapping. The misconception to correct here: rewards
+            are not a worker by default. Rule-based scoring runs as plain
+            functions orchestrated by the reward loop, and only an actual
+            neural reward model occupies GPUs.
+          </p>
+          <h3>The resharding problem: FSDP shards to vLLM tensor parallel</h3>
+          <p>
+            Here is the hard problem stated plainly. After the optimizer
+            step, the current policy exists as FSDP shards: each of N
+            training ranks holds 1/N of every parameter, flattened and
+            wrapped. The rollout engine needs the same weights as vLLM
+            tensor-parallel shards: each of TP ranks holds specific
+            row- or column-slices of each projection matrix, in vLLM's
+            fused-layer naming scheme. These layouts share nothing, and the
+            translation must run every step, on GPUs that are also holding
+            optimizer state, without materializing a full copy of the model
+            if the model is large.
+          </p>
+          <pre class="flow">FSDP rank0  [1/N of every param]──┐
+FSDP rank1  [1/N of every param]──┤  all-gather per tensor
+   ...                            ├─►  full tensor (transient, bucketed)
+FSDP rankN  [1/N of every param]──┘        │ slice per vLLM TP rank
+                                           ▼
+                              vLLM TP0 [cols 0..k]   TP1 [cols k..2k] ...</pre>
+          <p>
+            The v0.8.0 mechanics, in
+            <code>ActorRolloutRefWorker.update_weights()</code>: the engine
+            yields parameters through
+            <code>get_per_tensor_param()</code>, a generator that
+            all-gathers one tensor (or one layer, with
+            <code>layered_summon</code>) at a time; the rollout side
+            consumes the stream and scatters slices into engine memory,
+            with <code>bucketed_weight_transfer.py</code> batching tensors
+            into buckets sized by
+            <code>rollout.checkpoint_engine.update_weights_bucket_megabytes</code>
+            (default 2048) so transfer overlaps and peak memory stays
+            bounded. Before any of this, the rollout engine's weight memory
+            is resumed from sleep; after it, trainer parameters offload and
+            the KV cache resumes. LoRA has a fast path: with
+            <code>model.lora.merge=True</code> adapters merge into base
+            weights before sync so the engine sees a standard update, and
+            without merging only adapter deltas move after a one-time base
+            sync.
+          </p>
+          <p>
+            The transport itself is pluggable through
+            <code>verl/checkpoint_engine/</code>: <code>naive</code> is the
+            colocated direct path, while <code>nccl</code>,
+            <code>nixl</code>, <code>mooncake</code>, and vendor engines
+            serve disaggregated async training where trainer and rollout
+            live on different GPUs and weights cross a fabric. Two traps to
+            correct. First, "just save a checkpoint and reload it" is the
+            strawman this machinery replaces; at 70B scale that is minutes
+            per step versus seconds. Second, weight sync is also where
+            silent correctness bugs live: if a new model architecture maps
+            names wrong between the training engine and vLLM's fused
+            parameters, training "works" while rollouts quietly come from a
+            stale or scrambled policy, which is why
+            <code>rollout_corr_helper</code> metrics comparing rollout and
+            trainer log-probs double as a canary.
+          </p>
+          <h3>The algorithm zoo and the config system</h3>
+          <p>
+            The zoo has two layers. In-tree,
+            <code>core_algos.py</code> registers advantage estimators:
+            <code>gae</code>, <code>grpo</code>,
+            <code>reinforce_plus_plus</code>, <code>remax</code>,
+            <code>rloo</code>, <code>opo</code>, <code>grpo_passk</code>,
+            <code>gpg</code>, <code>gdpo</code>, and vectorized variants;
+            <code>@register_adv_est</code> lets a user module add one
+            without forking. Combined with the policy-loss options
+            (clipping, <code>loss_agg_mode</code> token-mean versus
+            seq-mean variants, KL-in-loss versus KL-in-reward), most
+            "new algorithms" are points in this config space: DrGRPO is
+            GRPO with <code>loss_agg_mode=seq-mean-token-sum-norm</code> and
+            <code>norm_adv_by_std_in_grpo=False</code>; RLOO is a different
+            baseline in the same loop. The second layer is the
+            <code>verl-recipe</code> submodule, where paper reproductions
+            (DAPO, SPPO, ReTool, and others) subclass the trainer or
+            TaskRunner when they need loop changes, which is exactly what
+            the single-controller design makes cheap. The trap: the config
+            tree is powerful and unchecked combinations are legal-looking;
+            <code>ppo_epochs&gt;1</code> with a tiny group size, or KL in
+            both reward and loss at once, will run and quietly train
+            something you did not mean. Read
+            <code>verl/trainer/config/algorithm.py</code> and the
+            <code>validate_config</code> checks before inventing
+            combinations.
+          </p>
+
+          <h2>Part VI: Reading the repository</h2>
+          <p>
+            Verified against v0.8.0. The tree is large (about 500 files
+            under <code>verl/</code>), but the request path from Part IV
+            covers everything foundational.
+          </p>
+          <p>
+            <strong>Stage 0, orientation (one evening).</strong> Read the
+            HybridFlow paper (arXiv 2409.19256) sections 1 to 3, then
+            <code>docs/hybrid_flow.rst</code> in the repo, which is the
+            maintainers' own programming guide and matches the current
+            code. Questions: why is RL a two-level dataflow? What does the
+            single-controller choice trade away, and why is that acceptable
+            for LLMs?
+          </p>
+          <p>
+            <strong>Stage 1, the programming model.</strong> Read
+            <code>verl/protocol.py</code> (DataProto), then
+            <code>verl/single_controller/base/decorator.py</code>,
+            <code>base/worker.py</code>, <code>base/worker_group.py</code>,
+            and <code>verl/single_controller/ray/base.py</code>. Questions:
+            what exactly does <code>@register</code> attach to a method?
+            Trace one <code>DP_COMPUTE_PROTO</code> call from driver to
+            workers and back. Where does colocation of multiple roles into
+            one Ray actor happen?
+          </p>
+          <p>
+            <strong>Stage 2, the algorithm loop.</strong> Read
+            <code>verl/trainer/main_ppo.py</code>, then
+            <code>verl/trainer/ppo/ray_trainer.py</code> (start at
+            <code>fit()</code> and work outward), then
+            <code>verl/trainer/ppo/core_algos.py</code> for
+            <code>compute_grpo_outcome_advantage</code> and the loss
+            helpers. Questions: which computations run on the driver? Where
+            does <code>rollout.n</code> take effect? What is the difference
+            between bypass and decoupled rollout correction?
+          </p>
+          <p>
+            <strong>Stage 3, the workers.</strong> Read
+            <code>verl/workers/engine_workers.py</code> top to bottom, then
+            skim <code>verl/workers/engine/base.py</code> and
+            <code>engine/fsdp/transformer_impl.py</code>, and
+            <code>verl/workers/rollout/vllm_rollout/vllm_rollout.py</code>.
+            Finish with <code>update_weights()</code> and
+            <code>verl/checkpoint_engine/base.py</code>. Questions: what
+            three verbs does a TrainingWorker expose? Walk the weight-sync
+            sequence including sleep/resume. What changes when
+            <code>rollout.name=sglang</code>?
+          </p>
+          <p>
+            <strong>Stage 4, configuration and examples.</strong> Read
+            <code>verl/trainer/config/ppo_trainer.yaml</code> with the
+            config docs page open, then one real script,
+            <code>examples/grpo_trainer/run_qwen3_8b_fsdp.sh</code>, and map
+            every override to the tree. Then clone the
+            <code>verl-recipe</code> submodule and read the DAPO recipe as
+            a worked example of extending the trainer. Questions: which
+            batch size is global and which is per GPU? What would you
+            change, and only that, to run DrGRPO?
+          </p>
+          <p>
+            <strong>Where not to start:</strong> the Megatron engine
+            backend, <code>verl/experimental/</code> (async policy,
+            transfer queue, agent loops), the NPU/ROCm paths, and the
+            non-naive checkpoint engines. All are specialist territory that
+            assumes the synchronous FSDP+vLLM path is already solid in your
+            head, and none of them will teach you what verl is.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            Labs assume one Linux node with at least one 24 GB NVIDIA GPU,
+            verl installed with the vLLM extra, and the GSM8K parquet files
+            from Part II. Log wording shifts between releases; the
+            quantities do not.
+          </p>
+          <p>
+            <strong>Lab 1: run the quickstart and read one step.</strong>
+            Launch the Part II GRPO command with
+            <code>trainer.total_epochs=1</code> and
+            <code>trainer.logger=console</code>. For one step line, account
+            for every field: <code>timing/gen</code>,
+            <code>timing/old_log_prob</code>, <code>timing/adv</code>,
+            <code>timing/update_actor</code>, reward mean/max, response
+            lengths. Concept taught: the Part IV pipeline is literally the
+            log format.
+          </p>
+          <p>
+            <strong>Lab 2: PPO versus GRPO on the same data.</strong> Run
+            the docs' PPO quickstart (critic enabled, GAE) and the GRPO
+            variant, and compare: GPU memory (the critic is a whole second
+            model), time per step, and the reward curve over the first 50
+            steps. Concept taught: what the group baseline buys and costs
+            versus a learned value function.
+          </p>
+          <p>
+            <strong>Lab 3: group size and advantage collapse.</strong> Run
+            GRPO with <code>rollout.n=2</code> and <code>n=8</code>. Watch
+            the fraction of prompts where every sample gets the same reward
+            (all correct or all wrong): those groups have zero advantage and
+            contribute nothing. Concept taught: why GRPO needs meaningful
+            group sizes and why curricula filter prompts that are too easy
+            or too hard.
+          </p>
+          <p>
+            <strong>Lab 4: write a custom reward.</strong> Create
+            <code>my_reward.py</code> with
+            <code>def compute_score(data_source, solution_str, ground_truth,
+            extra_info=None):</code> returning 1.0 when the answer string
+            appears in the output, and pass
+            <code>reward.custom_reward_function.path=my_reward.py</code>.
+            Verify with <code>trainer.val_only=True</code> that validation
+            uses your scores. Concept taught: the reward manager boundary,
+            and how verifiers plug in without touching workers.
+          </p>
+          <p>
+            <strong>Lab 5: break the memory choreography on purpose.</strong>
+            On a single GPU, raise
+            <code>rollout.gpu_memory_utilization</code> to 0.9 and watch
+            where the run dies (usually at the first update or the first
+            wake-up transition), then restore 0.4 and set
+            <code>actor.fsdp_config.param_offload=True</code> and compare
+            step time. Concept taught: colocation is time-slicing, and both
+            residents must be configured as guests.
+          </p>
+          <p>
+            <strong>Lab 6: watch the weight sync matter.</strong> Set
+            <code>rollout.checkpoint_engine.update_weights_bucket_megabytes=128</code>
+            versus 2048 and compare the <code>update_weights</code> timing
+            in the logs. Then read the log lines around "Before resume
+            weights / After update_weights" (GPU memory snapshots) for one
+            step. Concept taught: resharding is a real, measurable stage
+            with a bandwidth/memory trade-off, not bookkeeping.
+          </p>
+
+          <h2>Part VIII: Understanding checks</h2>
+          <p><strong>What problem does verl solve that a plain training
+          script does not have?</strong> RL post-training needs a
+          throughput-optimized inference engine for rollouts and a
+          sharded training engine for updates, with weights synchronized
+          between incompatible layouts every step, across many GPUs. verl
+          packages that orchestration so the algorithm remains a readable
+          single-process loop.</p>
+          <p><strong>What is the single-controller model?</strong> The RL
+          control flow runs in one driver process; each heavy computation is
+          a method on a Ray worker group, decorated with a dispatch mode
+          that defines how input data is split across workers and how
+          outputs are collected. The driver composes these calls like local
+          functions; the workers run SPMD internally.</p>
+          <p><strong>What does <code>@register(dispatch_mode=...)</code>
+          actually do?</strong> It attaches dispatch and collect functions
+          to a worker method so the WorkerGroup can expose a single driver-
+          side callable: split a DataProto into per-rank chunks, invoke all
+          ranks, and concatenate results. <code>ONE_TO_ALL</code> instead
+          broadcasts identical arguments, used for init and checkpoint
+          control.</p>
+          <p><strong>Why does GRPO in verl have no separate trainer
+          entrypoint?</strong> Because GRPO and PPO share the loop
+          structure; they differ in the advantage estimator, group sampling
+          (<code>rollout.n</code>), and where KL enters. verl expresses all
+          three as config on <code>main_ppo</code>, which is the
+          single-controller thesis working as intended.</p>
+          <p><strong>Why recompute log-probs after generation instead of
+          using vLLM's?</strong> The training engine's numerics differ from
+          the inference engine's, and the PPO/GRPO ratio should anchor on
+          the policy as the trainer computes it. verl also offers explicit
+          modes: bypass (trust rollout log-probs, two-policy training) and
+          decoupled correction (importance weights between the two), making
+          the mismatch measurable instead of silent.</p>
+          <p><strong>Where are advantages computed, and why there?</strong>
+          On the driver, in <code>core_algos.py</code>. Advantage math is
+          O(batch) scalars, not O(model), so it costs nothing meaningful,
+          and keeping it on the driver means new estimators are pure Python
+          functions registered in one file rather than distributed code.</p>
+          <p><strong>Walk through the GRPO advantage.</strong> For each
+          prompt, n sampled responses are scored; the group mean is
+          subtracted from each response's reward, optionally divided by the
+          group standard deviation, and the resulting scalar is broadcast
+          over that response's tokens. The group replaces PPO's learned
+          critic as the baseline.</p>
+          <p><strong>What is the resharding problem?</strong> After each
+          update the policy exists as FSDP (or Megatron) training shards,
+          but rollouts need it as vLLM tensor-parallel shards with fused
+          parameter naming. verl streams parameters per tensor, all-gathered
+          on the training side, sliced and scattered into engine memory,
+          bucketed to bound peak memory, every step.</p>
+          <p><strong>Why does colocated verl put vLLM to sleep during
+          training?</strong> Both systems cannot hold full state
+          simultaneously on one GPU. Sleep releases the engine's weights
+          and KV cache during forward/backward; weight sync wakes weights,
+          streams updates, then restores KV. Breaking this ordering is the
+          classic step-boundary OOM.</p>
+          <p><strong>When is a critic worth its memory?</strong> When
+          rewards are dense or the token-level credit assignment of GAE
+          materially beats an outcome-level group baseline, classically in
+          RLHF with reward models. For verifiable outcome rewards, GRPO's
+          group baseline usually wins the memory-for-variance trade, which
+          is why it dominates reasoning training.</p>
+          <p><strong>What is DataProto and why does it exist?</strong> The
+          single envelope (tensors + non-tensor arrays + meta-info) that
+          every worker method consumes and returns. A fixed, serializable
+          interchange format is what lets dispatch modes split and
+          concatenate any stage's data generically across process
+          boundaries.</p>
+          <p><strong>How would you place a 70B reward model on separate
+          GPUs?</strong> Enable
+          <code>reward.reward_model.enable_resource_pool=True</code> with
+          its node/GPU counts; the ResourcePoolManager creates a second
+          pool and maps the RewardModel role onto it. The trainer code does
+          not change, which is the point of separating placement from
+          algorithm.</p>
+          <p><strong>Your reward curve is flat at zero. What do you check
+          first?</strong> That the reward function is actually matching:
+          run validation with dumped generations
+          (<code>trainer.rollout_data_dir</code>) and eyeball whether
+          outputs contain extractable answers in the expected format. A
+          format mismatch between the model's output style and the
+          verifier's regex is the most common silent failure, ahead of any
+          RL hyperparameter.</p>
+          <p><strong>Training reward rises but validation score does not.
+          What is happening?</strong> Likely reward hacking or KL drift:
+          the policy exploits the training verifier (length, format
+          tricks) or has drifted far from the reference. Check response
+          length trends, KL metrics, and spot-read generations; tighten the
+          verifier or raise KL regularization.</p>
+          <p><strong>verl versus TRL versus OpenRLHF in one breath?</strong>
+          TRL for single-node trainer-subclass ergonomics and offline
+          methods; OpenRLHF as a leaner Ray+vLLM midpoint; verl when you
+          need the placement flexibility, Megatron-scale sharding,
+          multi-backend rollout, and the recipe ecosystem, at the cost of a
+          Ray cluster and a Hydra config tree.</p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Separate the dataflow from its execution.</strong> The
+            deepest idea in the codebase: describe what computes on what,
+            and let dispatch machinery decide where. Spark did it for
+            analytics, TensorFlow's graph did it for training, verl does it
+            for RL loops. When a domain's algorithms churn faster than its
+            infrastructure, this split is what keeps the churn cheap.
+          </p>
+          <p>
+            <strong>Make placement a config, not an architecture.</strong>
+            Colocated hybrid, split pools, fully disaggregated async: the
+            same trainer serves all of them because roles map to resource
+            pools in one dictionary. Systems that hard-code placement die
+            the first time the hardware shape changes.
+          </p>
+          <p>
+            <strong>Registries beat forks.</strong> Advantage estimators,
+            reward managers, rollout backends, checkpoint engines: each is
+            a string-keyed registry with a decorator to add entries. That is
+            why paper reproductions land as recipes rather than as
+            year-long divergent forks, the same pattern that keeps vLLM's
+            model zoo and attention backends contributable.
+          </p>
+          <p>
+            <strong>Define one envelope for the seams.</strong> DataProto is
+            deliberately boring: batched tensors, arrays, metadata. Every
+            interesting boundary in the system speaks it, which makes every
+            stage loggable, balanceable, and dispatchable by generic code.
+            Protobufs at API boundaries and Arrow in data systems are the
+            same move.
+          </p>
+          <p>
+            <strong>Make numerical mismatch observable, then optional.</strong>
+            Training/inference policy mismatch was a folk bug for two years;
+            v0.8's rollout-correction machinery turns it into logged
+            importance-weight metrics with explicit modes. Upgrading a
+            silent assumption into a measured, configurable quantity is a
+            general pattern for hardening ML systems.
+          </p>
+          <p>
+            <strong>Shrink the core by exporting the periphery.</strong>
+            Moving recipes to a submodule repository and unifying five
+            worker implementations into one engine layer are deletions
+            disguised as reorganizations. Healthy infrastructure projects
+            periodically pay this cost; the alternative is a tree where
+            nobody can find the load-bearing 10%.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            One sentence: verl runs the RL algorithm as one readable process
+            that dispatches rollout, reward, and update work to worker
+            groups wrapping vLLM/SGLang and FSDP/Megatron, and re-shards the
+            policy's weights from training layout to inference layout every
+            step so the loop stays on-policy.
+          </p>
+          <pre class="flow">Prompts → Rollout(n) → Reward → old/ref logp → Advantage → Update → Weight sync → (repeat)</pre>
+          <p>The chain mapped to files (v0.8.0):</p>
+          <pre class="flow">Loop/driver   trainer/ppo/ray_trainer.py  (fit(), single process)
+Dispatch      single_controller/base/decorator.py, ray/base.py
+Rollout       workers/rollout/vllm_rollout/, sglang_rollout/
+Reward        workers/reward_manager/, utils/reward_score/
+logp / update workers/engine_workers.py → workers/engine/{fsdp,megatron}/
+Advantage     trainer/ppo/core_algos.py  (registry, on driver)
+Weight sync   engine_workers.update_weights() + checkpoint_engine/
+Config        trainer/config/ppo_trainer.yaml  (Hydra tree)</pre>
+          <p>Memorize these:</p>
+          <p>
+            <strong>The model fact:</strong> single controller, multi
+            worker: control flow in one process, computation flow in worker
+            groups, joined by <code>@register</code> dispatch modes and
+            DataProto.
+          </p>
+          <p>
+            <strong>The batch fact:</strong> train_batch_size prompts ×
+            rollout.n samples → split into global ppo_mini_batches (an
+            algorithm knob) → sliced into per-GPU micro-batches (a memory
+            knob only).
+          </p>
+          <p>
+            <strong>The sync fact:</strong> every step: rollout sleeps →
+            train → per-tensor all-gather from FSDP shards → bucketed
+            stream into vLLM TP shards → offload trainer → wake KV cache.
+          </p>
+          <p>
+            <strong>The algorithm fact:</strong> one loop, many algorithms:
+            adv_estimator selects grpo/gae/rloo/remax/...; GRPO = group
+            mean baseline + KL in the loss + no critic; DrGRPO and friends
+            are config points, recipes subclass for the rest.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> verl's insight is that RL
+            training is two dataflows, not one: a cheap algorithm graph and
+            enormously expensive computation inside each node. By running
+            the first in a single process and delegating the second to
+            interchangeable engine workers, it makes GRPO on a thousand
+            GPUs read like twenty lines of pseudocode, and it pays for that
+            luxury honestly, in the one place no abstraction can hide: the
+            per-step resharding of every weight from the trainer's layout to
+            the rollout engine's.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (!window.hljs) return;
+        hljs.configure({ languages: ["python", "bash", "c", "cpp", "rust", "go", "typescript", "swift", "sql", "json", "yaml", "plaintext"] });
+        hljs.highlightAll();
+      });
+    </script>
+  </body>
+</html>

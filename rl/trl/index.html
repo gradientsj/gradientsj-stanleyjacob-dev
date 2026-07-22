@@ -1,0 +1,880 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TRL walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A full chapter on Hugging Face TRL: a practical tutorial, the complete life of one DPOTrainer run from preference pairs to the concatenated forward pass and the DPO loss, a GRPO step with vLLM generation, deep dives into the trainer family and the transformers/accelerate/peft stack, plus a staged plan for reading the repository." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" integrity="sha384-eFTL69TLRZTkNfYZOLM+G04821K1qZao/4QLJbet1pP4tcF+fdXq/9CdqAbWRl/L" crossorigin="anonymous" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl" class="active">RL</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/rl">Reinforcement learning</a></div>
+        <h1>TRL</h1>
+        <p class="lead">
+          <a href="https://github.com/huggingface/trl" target="_blank" rel="noreferrer">TRL</a>
+          (Transformers Reinforcement Learning) is Hugging Face's
+          post-training library: the place where SFT, <a href="/rl/dpo">DPO</a>,
+          <a href="/rl/grpo">GRPO</a>, and reward modeling live as trainer
+          classes that feel exactly like fine-tuning with
+          <a href="/oss/transformers">transformers</a>, because they are
+          built on its Trainer. This is a full chapter, not a tour: a
+          practical tutorial, the complete life of one DPOTrainer run from
+          preference pairs through the concatenated forward pass to the DPO
+          loss, one GRPO step with vLLM-backed generation, deep dives into
+          the trainer family and the accessibility stack that makes RLHF fit
+          on a single GPU, and a staged plan for reading the repository.
+          File paths and defaults were checked against release v1.9.0
+          (July 2026); TRL ships releases every few weeks, so pin your
+          version and expect defaults to move.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">Hub dataset ("prompt"/"chosen"/"rejected", or "prompt" + reward fn)
+      │
+      ▼
+Dataset prep: chat template, tokenize once     trl/trainer/*_trainer.py (_prepare_dataset)
+      │
+      ▼
+Data collator: batch layout for the method     DataCollatorForPreference, ...
+      │
+      ▼
+compute_loss(): the method IS this function    dpo_trainer.py, grpo_trainer.py, ...
+      │                (GRPO adds a generation step: vLLM / transformers)
+      ▼
+transformers Trainer loop                      inherited, not reimplemented
+      │
+      ▼
+accelerate (DDP / FSDP / DeepSpeed)  +  peft (LoRA / QLoRA)  +  optimizer</pre>
+          <p>
+            The one-sentence identity: <mark>TRL is a family of loss
+            functions and data pipelines wearing the transformers
+            Trainer</mark>. Each trainer class, SFTTrainer, DPOTrainer,
+            GRPOTrainer, and their siblings, owns exactly three things: how
+            to turn a Hub-style dataset into tensors, how to lay those
+            tensors out in a batch, and what <code>compute_loss</code> does
+            with one batch. Everything else, the training loop, gradient
+            accumulation, mixed precision, checkpointing, logging,
+            distributed execution, is inherited from
+            <code>transformers.Trainer</code> and delegated to
+            <code>accelerate</code>. That is both the superpower and the
+            boundary: if a method fits the "one model, one loss, one
+            collator" shape, TRL makes it a fifty-line script; if it needs
+            its own distributed choreography, TRL stretches (GRPO with a
+            vLLM server is the stretch) and eventually you reach for
+            <a href="/rl/verl">verl</a>.
+          </p>
+          <p>
+            The second thing to internalize is the version history, because
+            it decides which documentation you can trust. TRL lived at
+            0.x from 2020 through early 2026, accumulating a dozen trainers
+            of wildly varying maturity. <mark>v1.0.0 (March 2026) drew a
+            hard line: a small stable core in <code>trl/trainer/</code>
+            (SFT, DPO, GRPO, RLOO, KTO, Reward) and everything else,
+            including PPOTrainer, OnlineDPO, ORPO, and CPO, moved to
+            <code>trl/experimental/</code></mark> with an explicit
+            no-stability-guarantee. Most tutorials on the internet predate
+            this split and import trainers from locations that no longer
+            exist. This chapter describes v1.9.0.
+          </p>
+          <p>
+            Why does a "reinforcement learning" library headline DPO, which
+            is not RL at all? Because the library tracks what the field
+            actually does: DPO turned the RLHF objective into a supervised
+            classification loss (the identity is derived on the
+            <a href="/rl/dpo">DPO page</a>), and GRPO turned online RL into
+            "sample a group, score it, weight the log-probs"
+            (<a href="/rl/grpo">GRPO page</a>). TRL's bet is that
+            post-training methods keep collapsing into shapes a Trainer
+            subclass can hold, and so far the field keeps proving it right.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <h3>Installing</h3>
+          <p>
+            TRL is a pure-Python package on top of torch and transformers,
+            so installation is the same on Linux and macOS:
+          </p>
+          <pre><code>pip install trl        # or: uv pip install trl
+pip install trl[vllm]  # adds vLLM for fast generation in online methods (Linux+GPU)
+pip install peft       # LoRA/QLoRA support, used throughout this chapter</code></pre>
+          <p>
+            CPU and Apple-silicon machines can run the small offline
+            examples (slowly); the online methods (GRPO, RLOO) want a CUDA
+            GPU, and the vLLM extra is Linux-only. Nothing else to
+            configure: multi-GPU comes later via
+            <code>accelerate launch</code>.
+          </p>
+          <h3>First real session: a DPO run</h3>
+          <p>
+            The v1-era API is aggressively minimal; strings are accepted
+            where objects used to be required, and defaults are chosen to
+            work. This is the documented quickstart, verbatim in spirit:
+          </p>
+          <pre><code># train_dpo.py
+from datasets import load_dataset
+from trl import DPOTrainer
+
+trainer = DPOTrainer(
+    model="Qwen/Qwen3-0.6B",
+    train_dataset=load_dataset("trl-lib/ultrafeedback_binarized", split="train"),
+)
+trainer.train()</code></pre>
+          <pre><code>python train_dpo.py          # single GPU
+accelerate launch train_dpo.py   # same script, multi-GPU</code></pre>
+          <p>
+            What happens: the model and tokenizer load from the Hub, the
+            dataset's conversational <code>prompt/chosen/rejected</code>
+            columns are rendered through the model's chat template and
+            tokenized once up front (with a progress bar), a frozen copy of
+            the model is created as the reference, and the standard Trainer
+            loop starts logging <code>loss</code>,
+            <code>rewards/chosen</code>, <code>rewards/rejected</code>,
+            <code>rewards/accuracies</code>, and
+            <code>rewards/margins</code> every few steps. On one modern
+            24 GB GPU the 0.6B model trains comfortably; the metrics to
+            watch are accuracy (how often the implicit reward ranks chosen
+            above rejected; drifting up from 0.5) and margin (growing from
+            zero). Add a <code>DPOConfig</code> when you want control:
+          </p>
+          <pre><code>from trl import DPOConfig, DPOTrainer
+
+args = DPOConfig(
+    output_dir="qwen-dpo",
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=4,
+    learning_rate=5e-6,
+    beta=0.1,              # strength of the preference signal (default 0.1)
+    max_length=1024,       # truncation length for prompt+completion
+    logging_steps=10,
+    bf16=True,
+)
+trainer = DPOTrainer(model="Qwen/Qwen3-0.6B", args=args, train_dataset=...)</code></pre>
+          <h3>Dataset formats: the thing to get right first</h3>
+          <p>
+            Every TRL trainer autodetects two axes of the dataset: standard
+            (plain strings) versus conversational (lists of
+            role/content messages), and explicit versus implicit prompt.
+            For DPO the recommended shape is explicit-prompt
+            conversational:
+          </p>
+          <pre><code>{"prompt":   [{"role": "user", "content": "What color is the sky?"}],
+ "chosen":   [{"role": "assistant", "content": "It is blue."}],
+ "rejected": [{"role": "assistant", "content": "It is green."}]}</code></pre>
+          <p>
+            Conversational datasets get the chat template applied
+            automatically; standard ones are used as-is. The classic
+            beginner mistake is pre-applying the chat template to a
+            conversational dataset, or feeding raw strings that contain
+            hand-written role markers: the template then gets applied twice
+            or not at all, and the model trains on malformed turn
+            structure. Wrong versus right:
+          </p>
+          <pre><code># Wrong: template applied by hand, then TRL applies it again
+row = {"prompt": "&lt;|im_start|&gt;user\nHi&lt;|im_end|&gt;", ...}
+
+# Right: give TRL messages; it owns the template
+row = {"prompt": [{"role": "user", "content": "Hi"}], ...}</code></pre>
+          <h3>A GRPO run with a reward function</h3>
+          <p>
+            GRPO needs only prompts plus something that scores completions.
+            TRL ships reward functions in <code>trl.rewards</code>
+            (<code>accuracy_reward</code> parses math answers and checks
+            them against the dataset's <code>solution</code> column,
+            <code>think_format_reward</code> checks reasoning tags), and
+            the documented quickstart is math on DeepMath-103K:
+          </p>
+          <pre><code># train_grpo.py
+from datasets import load_dataset
+from trl import GRPOTrainer
+from trl.rewards import accuracy_reward
+
+dataset = load_dataset("trl-lib/DeepMath-103K", split="train")
+
+trainer = GRPOTrainer(
+    model="Qwen/Qwen2.5-0.5B-Instruct",
+    reward_funcs=accuracy_reward,
+    train_dataset=dataset,
+)
+trainer.train()</code></pre>
+          <p>
+            Run with <code>accelerate launch train_grpo.py</code>; the docs
+            note the full dataset takes on the order of a day across 8
+            GPUs, so cap <code>max_steps</code> for a first pass. A custom
+            reward function is any callable taking <code>prompts</code>,
+            <code>completions</code>, and the dataset's extra columns as
+            keyword arguments and returning one float per completion (or
+            <code>None</code> to abstain on a sample):
+          </p>
+          <pre><code>def brevity_reward(completions, **kwargs):
+    # conversational completions: list of message lists
+    return [-len(c[0]["content"]) / 100 for c in completions]
+
+trainer = GRPOTrainer(model=..., reward_funcs=[accuracy_reward, brevity_reward],
+                      train_dataset=dataset)</code></pre>
+          <p>
+            Multiple reward functions are summed (weighted by
+            <code>reward_weights</code>), and each gets its own
+            <code>rewards/&lt;name&gt;/mean</code> metric, which is how you
+            catch one reward silently dominating another. The remaining
+            beginner mistakes worth naming: expecting a KL penalty by
+            default (<code>beta</code> defaults to 0.0 in GRPOConfig, so
+            there is no reference model and no KL term unless you set it);
+            and scoring <code>completions</code> as strings when the
+            dataset is conversational, in which case each completion is a
+            list of messages, not a string.
+          </p>
+
+          <h2>Part III: When it is the right tool</h2>
+          <p>
+            TRL is the right default for post-training that fits one
+            machine or a modest cluster: SFT on your data, DPO/KTO from
+            preference pairs, reward-model training, and GRPO-style
+            verifiable-reward RL on models up to the tens of billions with
+            LoRA. Its unfair advantages are ecosystem gravity, everything
+            on the Hub loads directly and every transformers feature
+            (quantization, attention implementations, VLMs) arrives nearly
+            for free, and the accessibility stack: with
+            <code>peft_config</code> and 4-bit loading, a single consumer
+            GPU can run DPO or GRPO on models that would otherwise need a
+            node, which no other framework in this space matches as
+            smoothly.
+          </p>
+          <p>
+            The honest alternatives: <a href="/rl/verl">verl</a> (and
+            OpenRLHF) exist for the regime where the RL loop itself is the
+            distributed system, multi-node rollouts on dedicated inference
+            fleets, Megatron-sharded models too big for FSDP, disaggregated
+            reward models, and placement control. TRL's online trainers
+            drive vLLM, but the trainer remains the center of gravity; verl
+            inverts that, orchestrating engines as peers. Axolotl and Llama
+            Factory compete on config-file ergonomics over largely the same
+            TRL-adjacent machinery rather than on architecture. A useful
+            rule: <mark>if your bottleneck is reading the docs, use TRL; if
+            your bottleneck is the cluster, use verl</mark>.
+          </p>
+          <p>
+            The architecture-shaped warning: GRPO colocate mode shares each
+            GPU between vLLM and training, with
+            <code>vllm_gpu_memory_utilization</code> defaulting to a
+            deliberately small 0.3. Treating that number like a serving
+            deployment's 0.9, or running server mode on the same GPUs as
+            the trainer, is this system's "writable SQLite on NFS": it
+            boots, then dies mid-run at the first full optimizer step, or
+            deadlocks NCCL when trainer and server fight over devices.
+          </p>
+          <pre class="flow">Safe:                                  Dangerous:
+colocate: vLLM 0.3 + training 0.7      colocate: vLLM 0.9 + training  → OOM at step 1
+server:   GPUs 0-3 trainer,            server: trainer and vllm-serve on the
+          GPUs 4-7 trl vllm-serve              same CUDA_VISIBLE_DEVICES → NCCL errors</pre>
+
+          <h2>Part IV: The full life of one DPOTrainer run</h2>
+          <p>
+            The canonical operation is one DPO training run, followed
+            through every stage. Paths are v1.9.0; the whole story lives in
+            <code>trl/trainer/dpo_trainer.py</code> (about 1,800 lines) and
+            what it inherits.
+          </p>
+          <h3>Stage 1: Construction</h3>
+          <p>
+            <code>DPOTrainer.__init__</code> resolves strings to objects:
+            the model via the architecture class named in its config, the
+            processing class via <code>AutoProcessor</code> (padding side
+            must be left for generation-adjacent code paths; a pad token is
+            required, falling back to EOS). Then the reference policy: if
+            you pass no <code>ref_model</code> and no PEFT config, it deep
+            copies the model and freezes it; if you train with LoRA, it
+            skips the copy entirely, because <mark>disabling the adapters
+            recovers the base model, so the reference policy is the same
+            weights with the adapters turned off</mark>, which halves
+            memory and is the trick that puts DPO on one GPU.
+          </p>
+          <h3>Stage 2: Dataset preparation, once</h3>
+          <p>
+            <code>_prepare_dataset</code> runs before training, not per
+            step. For conversational data it applies the chat template to
+            prompt, chosen, and rejected; it tokenizes each into
+            <code>prompt_ids</code>, <code>chosen_ids</code>,
+            <code>rejected_ids</code>, appends EOS to completions, and
+            stores plain integer lists in the dataset. Doing this eagerly
+            means tokenization cost is paid once and the collator stays
+            trivial; it also means <code>max_length</code> truncation
+            (default 1024, from the left via
+            <code>truncation_mode</code>) is a data decision you can audit
+            before burning GPU hours.
+          </p>
+          <h3>Stage 3: The collator builds the concatenated batch</h3>
+          <p>
+            <code>DataCollatorForPreference</code> is where DPO's
+            signature layout appears. For B examples it emits 2B rows:
+            <code>prompt+chosen</code> for all examples, then
+            <code>prompt+rejected</code> for all examples, right-padded
+            together, with a <code>completion_mask</code> marking which
+            positions are completion tokens:
+          </p>
+          <pre class="flow">row 0..B-1 :  [prompt | chosen   | pad]   ← first half
+row B..2B-1:  [prompt | rejected | pad]   ← second half
+completion_mask: 0 on prompt/pad, 1 on completion tokens</pre>
+          <p>
+            The point of concatenation: chosen and rejected go through the
+            model in <mark>one forward pass instead of two, halving kernel
+            launches and letting the pair share the batch's padding
+            envelope</mark>. The cost is that the effective batch the GPU
+            sees is twice <code>per_device_train_batch_size</code>, which
+            is the single most common source of DPO OOMs.
+          </p>
+          <h3>Stage 4: The policy forward pass</h3>
+          <p>
+            <code>compute_loss</code> delegates to
+            <code>_compute_loss</code>. The model runs over the 2B rows
+            with <code>use_cache=False</code>; logits are shifted against
+            the input ids, and <code>selective_log_softmax</code> extracts
+            the log-probability of each realized token, a memory-lean
+            gather that avoids materializing full log-softmax tensors.
+            Prompt and padding positions are zeroed via the completion
+            mask, per-token log-probs are summed per sequence, and
+            <code>logps.chunk(2)</code> splits the result into
+            <code>chosen_logps</code> and <code>rejected_logps</code>,
+            exploiting the collator's ordering.
+          </p>
+          <h3>Stage 5: The reference forward pass</h3>
+          <p>
+            The same computation runs under <code>torch.no_grad()</code>
+            against the reference: the frozen copy, or the PEFT model with
+            adapters disabled. Two escape hatches matter in practice:
+            <code>precompute_ref_log_probs=True</code> runs all reference
+            forwards once before training and caches
+            <code>ref_chosen_logps/ref_rejected_logps</code> in the
+            dataset, so training pays one forward per step instead of two
+            (and the reference model can be discarded entirely); and with
+            cached values the collator just passes them through.
+          </p>
+          <h3>Stage 6: The loss</h3>
+          <p>
+            With the four log-prob vectors, the log-ratios are
+            <code>chosen_logps - ref_chosen_logps</code> and its rejected
+            twin; their difference is the margin, and the default
+            <code>sigmoid</code> loss is the DPO paper's objective:
+          </p>
+          <pre><code>chosen_logratios  = chosen_logps  - ref_chosen_logps
+rejected_logratios = rejected_logps - ref_rejected_logps
+delta = chosen_logratios - rejected_logratios     # the margin
+loss = -F.logsigmoid(beta * delta)                # per pair, then mean</code></pre>
+          <p>
+            v1.9.0 generalizes this in two directions without changing the
+            skeleton: <code>f_divergence_type</code> transforms the
+            log-ratios before the margin (reverse KL is standard DPO;
+            forward KL, JS, and alpha divergences are available), and
+            <code>loss_type</code> is a list, so
+            <code>["sigmoid", "sft"]</code> with <code>loss_weights</code>
+            mixes an NLL term on the chosen response into the preference
+            loss (the RPO-style regularization), while
+            <code>ipo</code>, <code>hinge</code>, <code>robust</code>,
+            <code>apo_zero</code>, and a dozen published variants are one
+            string away. The implicit rewards logged as
+            <code>rewards/chosen</code> are just
+            <code>beta * chosen_logratios</code> detached, which is why DPO
+            needs no reward model: the policy-reference ratio is the
+            reward.
+          </p>
+          <h3>Stage 7: The inherited loop</h3>
+          <p>
+            From here it is pure transformers Trainer:
+            <code>training_step</code> calls <code>compute_loss</code>,
+            accelerate scales and backpropagates, gradient accumulation
+            and clipping apply, the optimizer steps, callbacks fire,
+            checkpoints save (with a TRL override to also save processor
+            and PEFT state correctly). Nothing DPO-specific exists in the
+            loop, which is exactly the design.
+          </p>
+          <h3>Secondarily: one GRPOTrainer step</h3>
+          <p>
+            GRPO changes the front of the pipeline, not the back. Each
+            optimization cycle, the trainer takes a generation batch of
+            prompts (sized <code>per_device_train_batch_size ×
+            num_processes × steps_per_generation</code>), generates
+            <code>num_generations</code> completions per prompt (default
+            8) through vLLM, transformers continuous batching, or plain
+            <code>generate()</code>, then calls every reward function,
+            sums weighted rewards, and computes advantages by group:
+            reward minus the group mean, divided by the group std under
+            the default <code>scale_rewards="group"</code>
+            (<code>"batch"</code> and <code>"none"</code> implement the
+            Lite-PPO and Dr.GRPO recommendations). The loss recomputes
+            per-token log-probs on the trainer side, forms the ratio
+            against the behavior policy, clips it in
+            <code>[1-epsilon, 1+epsilon]</code> (0.2, with an optional
+            DAPO-style asymmetric <code>epsilon_high</code>), and
+            aggregates with <code>loss_type="dapo"</code> token-level
+            normalization by default. Because vLLM's numerics differ from
+            the trainer's, <mark>TRL applies truncated importance sampling
+            to the vLLM log-probs by default
+            (<code>vllm_importance_sampling_correction</code>), taming the
+            training-inference mismatch that otherwise destabilizes long
+            runs</mark>. With <code>beta=0.0</code> (default) there is no
+            reference model at all; setting it nonzero adds the KL term
+            and instantiates one. The same "generate, score, weight
+            log-probs" body serves RLOOTrainer with a
+            leave-one-out baseline instead of the group mean.
+          </p>
+
+          <h2>Part V: Internals deep dives</h2>
+          <h3>The trainer family and the v1 stability line</h3>
+          <p>
+            The stable core in <code>trl/trainer/</code> is small enough to
+            memorize, and each member is "collator + loss" over the same
+            chassis:
+          </p>
+          <table>
+            <tr><th>Trainer</th><th>Data</th><th>One-line identity</th></tr>
+            <tr><td>SFTTrainer</td><td>text / messages</td><td>NLL on (optionally) completion tokens only; packing; the on-ramp</td></tr>
+            <tr><td>DPOTrainer</td><td>prompt/chosen/rejected</td><td>concatenated forward, logsigmoid on the β-scaled ratio margin</td></tr>
+            <tr><td>GRPOTrainer</td><td>prompt + reward fns</td><td>online groups, group-relative advantage, clipped token loss</td></tr>
+            <tr><td>RLOOTrainer</td><td>prompt + reward fns</td><td>online, leave-one-out baseline instead of group normalization</td></tr>
+            <tr><td>KTOTrainer</td><td>unpaired thumbs up/down</td><td>prospect-theoretic loss; stable as of v1.9</td></tr>
+            <tr><td>RewardTrainer</td><td>prompt/chosen/rejected</td><td>Bradley-Terry loss on a sequence-classification head</td></tr>
+          </table>
+          <p>
+            <mark>PPOTrainer lives in <code>trl/experimental/ppo</code>
+            now</mark>, alongside OnlineDPO, Nash-MD, XPO, ORPO, CPO, BCO,
+            PRM, GKD, and a rotating cast of research trainers; the
+            experimental namespace is explicitly allowed to break between
+            minor versions. That placement is a statement about the field:
+            classic PPO-RLHF with a learned value head has been displaced
+            by GRPO-style group baselines for verifiable rewards
+            (see <a href="/rl/ppo">PPO</a> versus
+            <a href="/rl/grpo">GRPO</a>) and by DPO offline, and TRL
+            promoted what people actually run. The trap for readers of
+            older material: imports like
+            <code>from trl import PPOTrainer</code> and pre-1.0
+            PPO tutorials do not describe the current stable API; check the
+            taxonomy page in the docs, which marks experimental trainers
+            with a flask icon.
+          </p>
+          <h3>Riding the stack: Trainer, accelerate, peft</h3>
+          <p>
+            TRL's most consequential design decision is what it refuses to
+            build. The training loop, LR schedules, eval, resumption, and
+            reporting come from <code>transformers.Trainer</code>;
+            distribution comes from accelerate, so <mark>the same script
+            scales from one GPU to DDP, FSDP, or DeepSpeed ZeRO by
+            changing the accelerate config, not the code</mark>, and TRL
+            ships ready-made configs (<code>trl/accelerate_configs/</code>:
+            <code>zero1</code> through <code>zero3</code>,
+            <code>fsdp1/fsdp2</code>, <code>multi_gpu</code>). Parameter-
+            efficiency comes from peft: pass a <code>peft_config</code> and
+            the trainer wraps the model in LoRA adapters; add a
+            <code>quantization_config</code> (bitsandbytes) and it is
+            QLoRA.
+          </p>
+          <p>
+            The accessibility story compounds across these layers. QLoRA
+            DPO on a 7B model: 4-bit base weights (~4 GB), frozen; LoRA
+            adapters and their optimizer state (megabytes); no reference
+            copy, because adapter-disabling provides it. The 2023 blog
+            title "fine-tuning 20B LLMs with RLHF on a 24 GB consumer GPU"
+            was this exact stack, and it remains TRL's center of mass: the
+            marginal cost of trying preference optimization dropped to one
+            gaming GPU, which, more than any single algorithm, is why the
+            open post-training ecosystem runs through this library. The
+            trade is inherited constraints too: Trainer's assumptions (one
+            model owns the step; the loop is sacrosanct) are exactly why
+            the heavily orchestrated online methods feel bolted on, and
+            why the escape hatch to <a href="/rl/verl">verl</a> exists.
+          </p>
+          <h3>GRPO's generation plumbing: three backends and a server</h3>
+          <p>
+            Generation dominates online-RL wall-clock, so GRPOTrainer
+            treats it as a pluggable subsystem built around
+            <a href="/oss/vllm">vLLM</a>. Colocate mode
+            (<code>use_vllm=True</code>, the default
+            <code>vllm_mode="colocate"</code>) instantiates a vLLM engine
+            inside each training process, sharing the GPU under the 0.3
+            memory default, with optional sleep mode
+            (<code>vllm_enable_sleep_mode</code>) to release engine memory
+            during the backward pass, a miniature of verl's hybrid
+            choreography. Server mode runs
+            <code>trl vllm-serve --model &lt;name&gt;</code> on dedicated
+            GPUs (<code>trl/scripts/vllm_serve.py</code>); trainers connect
+            over HTTP (<code>trl/generation/vllm_client.py</code>), and
+            updated weights stream to the server between steps so
+            generation stays near-on-policy. The third backend,
+            transformers continuous batching, is the dependency-free middle
+            ground. Two famous traps, both fixable from Part III's diagram:
+            colocate OOMs come from treating the 0.3 as too conservative,
+            and server-mode NCCL errors come from letting the server and
+            trainer see the same devices. And one correction worth stating
+            plainly: adding vLLM does not change the math by magic; it
+            changes the sampling distribution subtly, which is precisely
+            why the importance-sampling correction defaults on and why the
+            <code>vllm_importance_sampling_mode</code> knobs exist.
+          </p>
+
+          <h2>Part VI: Reading the repository</h2>
+          <p>
+            Verified against v1.9.0. The package is compact (about 640
+            files, one directory of interest) and unusually readable;
+            docstrings carry real information.
+          </p>
+          <p>
+            <strong>Stage 0, orientation (one evening).</strong> Read the
+            docs' quickstart, <code>dataset_formats</code> page, and the
+            index taxonomy; then the DPO paper (arXiv 2305.18290) and the
+            GRPO section of DeepSeekMath (arXiv 2402.03300). Questions:
+            what are standard versus conversational, explicit versus
+            implicit datasets? Which trainers are stable versus
+            experimental, and why does that split exist?
+          </p>
+          <p>
+            <strong>Stage 1, the chassis.</strong> Read
+            <code>trl/trainer/base_trainer.py</code>, then skim
+            <code>trl/trainer/sft_trainer.py</code> as the simplest
+            complete member, alongside <code>trl/data_utils.py</code>
+            (format detection, template application). Questions: what does
+            a TRL trainer add on top of transformers Trainer? Where does
+            chat templating happen, and exactly once?
+          </p>
+          <p>
+            <strong>Stage 2, DPO end to end.</strong> Read
+            <code>trl/trainer/dpo_trainer.py</code> in this order:
+            <code>DataCollatorForPreference.torch_call</code>,
+            <code>_prepare_dataset</code>, <code>_compute_loss</code>, then
+            <code>dpo_config.py</code> for every knob you just saw used.
+            Questions: why 2B rows per batch? Where would a length bias
+            enter, and which loss_types counter it? How does the PEFT
+            reference trick work?
+          </p>
+          <p>
+            <strong>Stage 3, GRPO and generation.</strong> Read
+            <code>trl/trainer/grpo_config.py</code> first (the docstrings
+            are the best GRPO systems documentation anywhere), then
+            <code>grpo_trainer.py</code> focusing on
+            <code>_generate_and_score_completions</code> and the loss, then
+            <code>trl/generation/vllm_client.py</code> and
+            <code>trl/scripts/vllm_serve.py</code>, and
+            <code>trl/rewards/</code>. Questions: trace
+            <code>num_generations</code> through batching, advantage, and
+            loss. What exactly does the importance-sampling correction
+            multiply, and when is it clipped versus masked?
+          </p>
+          <p>
+            <strong>Stage 4, the edges.</strong> Skim
+            <code>trl/experimental/</code> to see tomorrow's stable API
+            (async GRPO, OpenEnv integration), <code>trl/cli/</code> for
+            the <code>trl sft/dpo/grpo</code> command-line entry points,
+            and <code>examples/scripts/</code> for maintained end-to-end
+            scripts. Questions: what would promoting an experimental
+            trainer require? How does the CLI map flags onto the config
+            dataclasses?
+          </p>
+          <p>
+            <strong>Where not to start:</strong>
+            <code>trl/experimental/</code> as a learning surface (it
+            changes without notice), VLM-specific code paths, and the
+            Liger fused-kernel integrations. All assume you already hold
+            the collator-loss-chassis picture, and none will teach you what
+            TRL is.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            Labs 1, 2, and 5 run anywhere PyTorch does (small models);
+            labs 3 and 4 want a CUDA GPU. Losses and rewards are
+            stochastic; trends, not values, are the observable.
+          </p>
+          <p>
+            <strong>Lab 1: a minimal DPO run with real metrics.</strong>
+            Run the Part II DPO script with
+            <code>max_steps=100, logging_steps=5</code> on
+            <code>Qwen/Qwen3-0.6B</code> (or
+            <code>trl-internal-testing</code> tiny models on CPU). Plot
+            <code>rewards/accuracies</code> and
+            <code>rewards/margins</code>. Concept taught: the implicit
+            reward is the β-scaled policy/reference log-ratio, and its
+            margin is what DPO optimizes.
+          </p>
+          <p>
+            <strong>Lab 2: see the concatenated batch.</strong>
+            Instantiate <code>DataCollatorForPreference(pad_token_id=0)</code>
+            on two toy examples (the class docstring contains a worked
+            example) and print <code>input_ids</code> and
+            <code>completion_mask</code>. Confirm the first half is chosen
+            and the second rejected, then verify
+            <code>chunk(2)</code> recovers them. Concept taught: Stage 3
+            and 4 of Part IV, byte for byte.
+          </p>
+          <p>
+            <strong>Lab 3: GRPO with your own reward.</strong> Run the
+            GRPO quickstart on a 1,000-row slice with
+            <code>accuracy_reward</code> plus a custom brevity reward, and
+            watch the per-function <code>rewards/*/mean</code> metrics
+            diverge. Then set <code>reward_weights=[1.0, 0.1]</code> and
+            observe completion lengths respond. Concept taught: the reward
+            function interface and multi-reward composition.
+          </p>
+          <p>
+            <strong>Lab 4: vLLM colocate versus plain generation.</strong>
+            Repeat Lab 3 with <code>use_vllm=True</code> (after
+            <code>pip install trl[vllm]</code>) and compare
+            <code>step_time</code>. Then lower
+            <code>vllm_gpu_memory_utilization</code> to 0.1 and watch
+            generation slow as the KV cache starves; raise it until you
+            OOM to find your machine's budget line. Concept taught:
+            colocation is a memory-sharing contract.
+          </p>
+          <p>
+            <strong>Lab 5: LoRA halves the DPO footprint.</strong> Run
+            Lab 1 twice, once full-parameter and once with
+            <code>peft_config=LoraConfig(r=16)</code>, and record peak
+            memory (<code>torch.cuda.max_memory_allocated()</code>).
+            Verify the LoRA run keeps no separate reference model.
+            Concept taught: adapter-disabling as the reference policy.
+          </p>
+          <p>
+            <strong>Lab 6: beta is the thermostat.</strong> Sweep DPO
+            <code>beta</code> over {0.05, 0.1, 0.5} for 200 steps each.
+            Watch margins grow faster at high beta while
+            <code>logps/chosen</code> falls more (the policy drifts
+            further from the reference). Concept taught: beta trades
+            preference-fitting strength against staying close to the
+            reference, DPO's stand-in for a KL budget.
+          </p>
+
+          <h2>Part VIII: Understanding checks</h2>
+          <p><strong>What is TRL, structurally?</strong> A set of
+          post-training methods packaged as transformers Trainer
+          subclasses, each contributing dataset preparation, a collator,
+          and a compute_loss, while inheriting the loop, distribution
+          (accelerate), and parameter-efficiency (peft) from the
+          surrounding Hugging Face stack.</p>
+          <p><strong>Why can DPO skip the reward model and the rollout
+          engine?</strong> DPO reparameterizes the RLHF objective so the
+          optimal policy's log-ratio against the reference is itself the
+          reward; preference pairs then train it with a classification
+          loss offline. No sampling during training, no separate reward
+          network, just two forward passes per batch.</p>
+          <p><strong>Why does DPOTrainer concatenate chosen and rejected
+          into one batch?</strong> One forward pass over 2B rows instead
+          of two passes over B: fewer launches, shared padding, and the
+          chunk(2) split keeps the pairing implicit in row order. The cost
+          is doubled effective batch memory, the usual DPO OOM cause.</p>
+          <p><strong>What does the completion_mask do?</strong> It zeroes
+          per-token log-probs on prompt and padding positions so sequence
+          log-probs sum only over completion tokens. Both policy and
+          reference passes reuse the same mask, keeping the four log-prob
+          terms comparable.</p>
+          <p><strong>How does TRL avoid keeping a second copy of the model
+          as the reference when using LoRA?</strong> With PEFT, the base
+          weights are frozen and only adapters train, so disabling
+          adapters reproduces the reference policy exactly. The trainer
+          wraps the reference forward in an adapter-disable context
+          instead of cloning the model.</p>
+          <p><strong>What does <code>precompute_ref_log_probs</code>
+          buy?</strong> All reference forwards run once before training
+          and cache per-example log-probs in the dataset; training then
+          costs one forward per step instead of two, and the reference
+          model can be freed. The trade is a preprocessing pass and
+          staleness-free but fixed reference values.</p>
+          <p><strong>State the GRPO advantage computation in TRL.</strong>
+          Each prompt's <code>num_generations</code> completions form a
+          group; the summed weighted rewards get the group mean subtracted
+          and, under <code>scale_rewards="group"</code>, are divided by
+          the group std. Every token of a completion carries its
+          sequence's scalar advantage.</p>
+          <p><strong>Why is <code>beta=0.0</code> the GRPO default, and
+          what does it imply?</strong> Recent large-scale results showed
+          the KL term against a reference contributes little for
+          verifiable-reward training, so TRL drops it by default, which
+          also means no reference model is loaded at all: less memory, and
+          policy drift is bounded only by clipping.</p>
+          <p><strong>What is the training-inference mismatch in GRPO with
+          vLLM?</strong> The sampling engine and the trainer compute
+          slightly different token probabilities (kernels, precision,
+          fused ops), so trajectories are drawn from a subtly different
+          policy than the one being updated: silent off-policy bias. TRL
+          corrects it by importance-weighting with truncation or masking
+          of extreme ratios, on by default.</p>
+          <p><strong>Colocate versus server mode: when do you pick
+          which?</strong> Colocate for simplicity and single-node runs,
+          sharing each GPU between engine and trainer under a small memory
+          fraction; server for dedicated inference GPUs at larger scale,
+          started with <code>trl vllm-serve</code> and fed weight updates
+          over the wire. Never point server mode at the trainer's own
+          GPUs.</p>
+          <p><strong>Where did PPOTrainer go, and why?</strong> To
+          <code>trl/experimental/ppo</code> at the v1.0 reorganization:
+          classic value-head PPO-RLHF ceded the mainstream to GRPO/RLOO
+          online and DPO offline, and TRL scoped its stability guarantee
+          to what the field runs. Experimental modules may change between
+          minor releases.</p>
+          <p><strong>A DPO run shows accuracy near 1.0 within 50 steps.
+          Celebrate?</strong> Suspect leakage or triviality first: chosen
+          and rejected may differ by formatting artifacts the model
+          pattern-matches (length, EOS placement, template errors). Check
+          margins on held-out pairs and read samples; a real preference
+          signal climbs gradually.</p>
+          <p><strong>Your GRPO rewards are all identical within each
+          group. What happens and what do you do?</strong> Group std is
+          zero and advantages vanish, so those prompts teach nothing
+          (watch <code>frac_reward_zero_std</code>). Fix the data
+          difficulty (filter too-easy/too-hard prompts), raise sampling
+          temperature, or increase group size.</p>
+          <p><strong>When do you leave TRL for verl or OpenRLHF?</strong>
+          When rollout generation needs its own fleet, the model needs
+          Megatron-style sharding beyond FSDP, or placement of
+          actor/reward/rollout across pools becomes the problem; that
+          orchestration is verl's core competency and TRL's ceiling. For
+          one node and standard methods, TRL gets there in a tenth of the
+          code.</p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Inherit the loop, own the loss.</strong> TRL's leverage
+            comes from refusing to rebuild training infrastructure: a
+            method is a collator plus a loss on a battle-tested chassis.
+            The same shape appears in scikit-learn estimators and Keras
+            layers: libraries thrive by defining the smallest surface a
+            contributor must implement.
+          </p>
+          <p>
+            <strong>Meet users at their data.</strong> Autodetecting
+            standard/conversational and explicit/implicit formats, and
+            owning the chat template exactly once, removes the most common
+            entire class of silent bugs. Contrast with systems that accept
+            "whatever, pre-tokenized": they push correctness onto every
+            user. Format normalization at the boundary is cheap insurance.
+          </p>
+          <p>
+            <strong>Draw the stability line publicly.</strong> The
+            v1.0 stable/experimental split converts "is this API
+            trustworthy?" from tribal knowledge into a namespace. Rust's
+            std-versus-nightly and Kubernetes API versioning are the same
+            social technology: explicit tiers let a project move fast and
+            be trusted simultaneously.
+          </p>
+          <p>
+            <strong>Defaults are research positions.</strong>
+            <code>beta=0.0</code>, <code>loss_type="dapo"</code>, and
+            importance-sampling correction on-by-default each encode a
+            finding from the recent literature. Well-maintained libraries
+            curate defaults as aggressively as code; reading a config
+            dataclass's defaults, and its changelog, is reading the
+            field's current consensus.
+          </p>
+          <p>
+            <strong>Optimize the marginal cost of trying.</strong> The
+            string-accepting constructors, the one-GPU QLoRA path, the
+            bundled reward functions: all minimize the distance from idea
+            to first loss curve. Ecosystems are won by whoever makes the
+            first hour effortless, because the first hour is when tools
+            get chosen.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            One sentence: TRL turns post-training methods into transformers
+            Trainer subclasses, so DPO is a collator that concatenates
+            preference pairs plus a logsigmoid on the β-scaled ratio
+            margin, GRPO is a generation step plus group-normalized
+            advantages on a clipped token loss, and everything below the
+            loss line is inherited from Trainer, accelerate, and peft.
+          </p>
+          <pre class="flow">DPO:  pairs → tokenize once → [chosen;rejected] batch → one fwd → chunk(2)
+        → ref fwd (or adapters-off / precomputed) → β·Δlogratio → -logsigmoid → Trainer
+GRPO: prompts → vLLM gen ×G → reward fns → (r-mean)/std per group → clipped token loss</pre>
+          <p>The chain mapped to files (v1.9.0):</p>
+          <pre class="flow">Formats/template  trl/data_utils.py, docs dataset_formats
+Chassis           trl/trainer/base_trainer.py (on transformers Trainer)
+DPO               trl/trainer/dpo_trainer.py (collator, _compute_loss), dpo_config.py
+GRPO              trl/trainer/grpo_trainer.py, grpo_config.py, trl/rewards/
+Generation        trl/generation/vllm_client.py, trl/scripts/vllm_serve.py
+Scale/PEFT        trl/accelerate_configs/, peft_config= / quantization_config=
+Frontier          trl/experimental/ (incl. PPOTrainer)</pre>
+          <p>Memorize these:</p>
+          <p>
+            <strong>The DPO fact:</strong> 2B-row concatenated batch, one
+            policy forward, one reference forward (skippable via LoRA
+            adapters-off or precompute), completion-masked summed
+            log-probs, loss = -logsigmoid(β·margin); implicit reward =
+            β·log-ratio.
+          </p>
+          <p>
+            <strong>The GRPO fact:</strong> num_generations=8 per prompt,
+            reward functions receive (prompts, completions, columns) and
+            return floats or None, advantage = group-mean-centered
+            (std-scaled by default), loss_type=dapo, epsilon=0.2,
+            beta=0 so no reference model by default.
+          </p>
+          <p>
+            <strong>The stack fact:</strong> loop from transformers,
+            distribution from accelerate (DDP/FSDP/ZeRO by config),
+            LoRA/QLoRA from peft: the same script scales without edits.
+          </p>
+          <p>
+            <strong>The version fact:</strong> v1.0 (March 2026) split
+            stable (SFT, DPO, GRPO, RLOO, KTO, Reward) from experimental
+            (PPO, OnlineDPO, ORPO, CPO, ...); vllm_mode defaults to
+            colocate; most pre-1.0 tutorials are out of date.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> TRL is the thinnest possible
+            layer between a post-training paper and a running job: each
+            method reduced to its collator and its loss, mounted on the
+            transformers Trainer, scaled by accelerate, shrunk onto one
+            GPU by peft. That thinness is a deliberate boundary, and it
+            cuts both ways: it is why a DPO run is ten lines and why, when
+            the RL loop itself becomes the distributed system, the road
+            leads to verl; knowing which side of that line your problem
+            sits on is most of the architectural decision.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        if (!window.hljs) return;
+        hljs.configure({ languages: ["python", "bash", "c", "cpp", "rust", "go", "typescript", "swift", "sql", "json", "yaml", "plaintext"] });
+        hljs.highlightAll();
+      });
+    </script>
+  </body>
+</html>
