@@ -1,0 +1,509 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>k-means · Stanley Jacob</title>
+    <meta name="description" content="k-means from the distortion objective to production: Lloyd's algorithm as alternating minimization, why it converges to a local optimum, the k-means++ O(log k) guarantee, vectorized PyTorch and JAX implementations, and how scikit-learn and FAISS scale it." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml" class="active">ML</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/ml">Machine learning</a></div>
+        <h1>k-means</h1>
+        <p class="lead">
+          k-means compresses a dataset into k representative points by
+          minimizing squared distance to the nearest one, and almost everything
+          interesting about it lives in three facts: the objective is a sum of
+          per-point minima, Lloyd's algorithm is coordinate descent on that
+          objective, and where you start matters enough that a smarter seeding
+          rule carries a provable guarantee. This page derives all three, then
+          implements k-means++ and a fully vectorized Lloyd loop in PyTorch and
+          JAX and measures them against scikit-learn and FAISS.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>What it is and when you reach for it</h2>
+          <p>
+            k-means is the workhorse of unsupervised partitioning: given n
+            points in R<sup>d</sup> and a budget of k centroids, it assigns
+            every point to its nearest centroid and places each centroid at the
+            mean of its assigned points, repeating until nothing moves. It is
+            not really a clustering algorithm in the discovery sense, and
+            treating it as one is the source of most disappointment with it. It
+            is a <em>vector quantizer</em>: a lossy compressor that replaces
+            each vector with the id of its nearest representative, optimal in
+            the mean-squared-error sense for the representatives it found. When
+            the data happens to consist of compact, roughly round, roughly
+            equal-variance blobs, quantizing well and clustering well coincide,
+            and k-means looks like a clustering algorithm. When the structure is
+            elongated, nested, or density-based, they diverge, and neighbors
+            like Gaussian mixtures, spectral clustering, or DBSCAN take over.
+          </p>
+          <p>
+            You reach for k-means when you need a fast, scalable, well
+            understood way to summarize a large set of vectors with a small
+            codebook: building product-quantization codes for a vector index,
+            grouping embeddings for exploration or deduplication, reducing an
+            image to a palette, or seeding a more expressive model such as a
+            Gaussian mixture. It runs comfortably at billions of points on GPUs,
+            which none of its more statistically sophisticated neighbors do.
+          </p>
+
+          <h2>The math: distortion, Lloyd, and convergence</h2>
+          <p>
+            Fix data x<sub>1</sub>, ..., x<sub>n</sub> in R<sup>d</sup> and
+            centroids μ<sub>1</sub>, ..., μ<sub>k</sub>. The objective, called
+            the distortion or inertia, is
+          </p>
+          <p>
+            J(μ, c) = Σ<sub>i=1..n</sub> ‖x<sub>i</sub> −
+            μ<sub>c(i)</sub>‖<sup>2</sup>,
+          </p>
+          <p>
+            where c(i) ∈ {1..k} is the cluster assigned to point i. J depends on
+            two blocks of variables, the assignments c and the centroids μ, and
+            minimizing over both jointly is NP-hard even for k = 2 in general
+            dimension. Lloyd's algorithm sidesteps the joint problem by
+            alternating exact minimization over one block with the other held
+            fixed:
+          </p>
+          <p>
+            <strong>Assignment step.</strong> With μ fixed, J decomposes into n
+            independent terms, and each is minimized by sending x<sub>i</sub> to
+            its nearest centroid: c(i) = argmin<sub>j</sub> ‖x<sub>i</sub> −
+            μ<sub>j</sub>‖<sup>2</sup>. This is the best possible assignment for
+            the current centroids, so J cannot increase.
+          </p>
+          <p>
+            <strong>Update step.</strong> With c fixed, J decomposes into k
+            independent terms, one per cluster, each of the form
+            Σ<sub>i∈S<sub>j</sub></sub> ‖x<sub>i</sub> − μ<sub>j</sub>‖<sup>2</sup>.
+            Setting the gradient with respect to μ<sub>j</sub> to zero gives
+            2 Σ<sub>i∈S<sub>j</sub></sub> (μ<sub>j</sub> − x<sub>i</sub>) = 0,
+            so μ<sub>j</sub> = mean of the points in S<sub>j</sub>. The mean is
+            the unique minimizer of summed squared Euclidean distance, which is
+            the entire reason k-means is married to the squared-L2 metric: swap
+            in a different distance and the mean stops being the right center,
+            and you get a different algorithm (k-medoids, k-medians).
+          </p>
+          <p>
+            Convergence now follows from two observations. First, each half-step
+            is an exact minimization over its block, so J is monotonically
+            non-increasing along the whole trajectory. Second, there are only
+            finitely many ways to partition n points into k groups, and with a
+            consistent tie-breaking rule J strictly decreases whenever any
+            assignment changes. A bounded, non-increasing sequence over a finite
+            state space must reach a fixed point in finitely many iterations: a
+            configuration where every point is already at its nearest centroid
+            and every centroid is already at its cluster mean.
+            <mark>That fixed point is only a local optimum: it is unbeatable by
+            changing assignments alone or centroids alone, but a coordinated
+            change of both can still do better, and typically some other
+            initialization finds one that does.</mark> This is why every
+            serious use of k-means either restarts several times and keeps the
+            lowest-inertia run or invests in initialization, and usually both.
+          </p>
+
+          <h3>A worked example</h3>
+          <p>
+            Four points on a line, x = {0, 2, 10, 12}, with k = 2 and the
+            deliberately bad initialization μ = (0, 2):
+          </p>
+          <pre class="flow">
+step                      μ1    μ2    clusters          J
+init + assign             0     2     {0} {2,10,12}     0 + 0 + 64 + 100 = 164
+update (means)            0     8     {0} {2,10,12}     0 + 36 + 4 + 16  =  56
+assign (2 defects to μ1)  0     8     {0,2} {10,12}     0 + 4 + 4 + 16   =  24
+update (means)            1     11    {0,2} {10,12}     1 + 1 + 1 + 1    =   4
+assign (no change)        1     11    converged</pre>
+          <p>
+            Every row's J is at most the previous row's, exactly as the
+            monotonicity argument promises, and the final J = 4 happens to be
+            the global optimum here. With x = {0, 2, 4} and k = 2, an init of
+            μ = (0, 4) instead converges to clusters {0, 2} and {4} with J = 2,
+            while init μ = (2, 4) converges to {0} and {2, 4} with the same J by
+            symmetry; on less symmetric data the two basins have different
+            costs, which is local optimality in miniature.
+          </p>
+
+          <h3>k-means++: initialization with a guarantee</h3>
+          <p>
+            Uniform random seeding fails in a predictable way: with several
+            seeds landing in the same dense blob, Lloyd happily splits that blob
+            and leaves a distant one uncovered, and no amount of iteration
+            recovers, because no centroid is ever close enough to the orphaned
+            blob to win any of its points. k-means++ (Arthur and Vassilvitskii,
+            2007) fixes the failure mode directly. Choose the first center
+            uniformly at random from the data. Then, repeatedly: let
+            D(x)<sup>2</sup> be the squared distance from point x to the nearest
+            center chosen so far, and draw the next center from the data with
+            probability proportional to D(x)<sup>2</sup>. Points far from all
+            existing centers are heavily favored, so the seeds spread across the
+            data's extent, but because the draw is proportional rather than a
+            hard argmax, a lone outlier is unlikely to hijack a seed the way
+            farthest-point seeding allows.
+          </p>
+          <p>
+            The remarkable part is that the seeding alone, before Lloyd runs a
+            single iteration, is O(log k)-competitive: the expected distortion
+            of the k-means++ initialization satisfies E[J] ≤ 8 (ln k + 2) ·
+            J<sub>OPT</sub>. Lloyd's subsequent iterations only lower J further,
+            so the bound holds for the final result too. No such guarantee
+            exists for uniform seeding, whose expected ratio to optimal can be
+            made arbitrarily bad. The cost is k passes over the data at init
+            time, which is usually trivial next to the Lloyd iterations
+            themselves.
+          </p>
+
+          <h2>Implementation, twice</h2>
+          <p>
+            Both implementations share the same structure: k-means++ seeding,
+            then a Lloyd loop in which the assignment step is one batched
+            distance computation over all n × k pairs and the update step is one
+            scatter-mean, no Python loop over points anywhere. The PyTorch
+            version uses <code>torch.cdist</code> for the distance matrix and
+            <code>index_add_</code> for the scatter; the JAX version broadcasts
+            the squared-distance expansion, uses
+            <code>jax.ops.segment_sum</code> for the scatter, and runs the
+            iterations inside <code>lax.fori_loop</code> so the whole solver
+            jits into a single compiled program. The JAX loop runs a fixed
+            iteration count rather than testing a convergence tolerance, which
+            is the idiomatic trade under <code>jit</code>: extra iterations
+            after convergence are cheap no-ops, while data-dependent early exit
+            would force a fallback out of the compiled loop.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import torch
+
+def kmeans_pp_init(x, k, generator=None):
+    """k-means++ seeding (Arthur &amp; Vassilvitskii 2007).
+
+    Each new center is drawn with probability proportional to the
+    squared distance to the nearest center chosen so far. Maintaining
+    d2 incrementally keeps init at O(n*k*d) total, not O(n*k^2*d).
+    """
+    n, d = x.shape
+    centers = torch.empty(k, d, dtype=x.dtype, device=x.device)
+    first = torch.randint(n, (1,), generator=generator)
+    centers[0] = x[first]
+    d2 = ((x - centers[0]) ** 2).sum(-1)          # (n,) dist^2 to nearest seed
+    for j in range(1, k):
+        idx = torch.multinomial(d2, 1, generator=generator)
+        centers[j] = x[idx]
+        d2 = torch.minimum(d2, ((x - centers[j]) ** 2).sum(-1))
+    return centers
+
+def kmeans(x, k, iters=100, tol=1e-6, generator=None):
+    """Lloyd's algorithm. x: (n, d) float tensor. Returns (centers, labels)."""
+    n, d = x.shape
+    centers = kmeans_pp_init(x, k, generator)
+    for _ in range(iters):
+        # assignment: one (n, k) distance matrix, no per-point loop
+        labels = torch.cdist(x, centers).argmin(dim=1)          # (n,)
+        # update: scatter-mean of points into their clusters
+        sums = torch.zeros_like(centers).index_add_(0, labels, x)
+        counts = torch.bincount(labels, minlength=k)            # (k,)
+        new_centers = sums / counts.clamp(min=1).unsqueeze(1)
+        # empty clusters would collapse to the origin; re-seed them
+        # at the points currently farthest from their centroid
+        empty = counts == 0
+        if empty.any():
+            far = ((x - centers[labels]) ** 2).sum(-1)
+            new_centers[empty] = x[far.topk(int(empty.sum())).indices]
+        shift = (new_centers - centers).norm()
+        centers = new_centers
+        if shift &lt; tol:
+            break
+    labels = torch.cdist(x, centers).argmin(dim=1)
+    return centers, labels
+
+def inertia(x, centers, labels):
+    return ((x - centers[labels]) ** 2).sum()</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">from functools import partial
+
+import jax
+import jax.numpy as jnp
+
+def sq_dists(x, centers):
+    """(n, k) squared distances by broadcasting.
+
+    The (n, k, d) intermediate is fine at codebook scale; for huge n*k,
+    expand ||x-c||^2 = ||x||^2 - 2 x.c + ||c||^2 to stay at (n, k).
+    """
+    return ((x[:, None, :] - centers[None, :, :]) ** 2).sum(-1)
+
+def kmeans_pp_init(key, x, k):
+    """k-means++ seeding as a scan over the k-1 remaining picks."""
+    n = x.shape[0]
+    key, sub = jax.random.split(key)
+    first = x[jax.random.randint(sub, (), 0, n)]
+    d2 = ((x - first) ** 2).sum(-1)               # dist^2 to nearest seed
+
+    def pick_one(d2, key):
+        idx = jax.random.choice(key, n, p=d2 / d2.sum())
+        c = x[idx]
+        return jnp.minimum(d2, ((x - c) ** 2).sum(-1)), c
+
+    _, rest = jax.lax.scan(pick_one, d2, jax.random.split(key, k - 1))
+    return jnp.concatenate([first[None], rest])
+
+@partial(jax.jit, static_argnames=("k", "iters"))
+def kmeans(key, x, k, iters=100):
+    """Lloyd's algorithm, fully jitted: init + a fori_loop of updates."""
+    n = x.shape[0]
+    centers = kmeans_pp_init(key, x, k)
+
+    def step(_, centers):
+        labels = sq_dists(x, centers).argmin(1)                 # (n,)
+        sums = jax.ops.segment_sum(x, labels, num_segments=k)
+        counts = jax.ops.segment_sum(jnp.ones(n), labels, num_segments=k)
+        means = sums / jnp.maximum(counts, 1.0)[:, None]
+        # leave empty clusters where they were instead of moving to 0
+        return jnp.where(counts[:, None] &gt; 0, means, centers)
+
+    centers = jax.lax.fori_loop(0, iters, step, centers)
+    labels = sq_dists(x, centers).argmin(1)
+    return centers, labels
+
+def inertia(x, centers, labels):
+    return ((x - centers[labels]) ** 2).sum()</code></pre>
+          </div>
+          <p class="quiet">
+            The two versions differ deliberately on empty clusters: the PyTorch
+            loop re-seeds them at far-away points (what scikit-learn does),
+            while the JAX loop freezes them in place to stay shape-static under
+            jit. Both keep J non-increasing.
+          </p>
+
+          <h2>Using it on a real shape of problem</h2>
+          <p>
+            A representative workload is learning a 256-entry codebook over
+            100,000 embedding vectors of dimension 64, the exact shape of one
+            sub-quantizer in a product-quantization index:
+          </p>
+          <pre><code>import torch
+
+g = torch.Generator().manual_seed(0)
+x = torch.randn(100_000, 64, generator=g)
+# plant loose structure: 256 shifted blobs
+x += torch.randn(256, 64, generator=g).repeat_interleave(  # planted centers
+    100_000 // 256 + 1, dim=0)[:100_000] * 2.0
+
+centers, labels = kmeans(x, k=256, iters=50, generator=g)
+print(inertia(x, centers, labels) / x.shape[0])   # per-point distortion</code></pre>
+          <p>
+            The assignment step here is a 100,000 × 256 distance matrix, about
+            25M floats, computed in one shot; a run of 50 iterations takes a few
+            seconds on a modern GPU and well under a minute on CPU, with the
+            exact figure machine-dependent. What to expect from the trace: the
+            per-point distortion drops steeply for the first five to ten
+            iterations, then flattens into a long tail of tiny improvements as
+            points near cluster boundaries shuffle back and forth; the number of
+            label changes per iteration is a good convergence signal and usually
+            hits zero between iteration 20 and 60 at this scale. Running the
+            same problem from five different seeds will produce final inertias
+            spread over a few percent, which is the local-optimum story made
+            visible: keep the best run.
+          </p>
+
+          <h2>Applications</h2>
+          <p>
+            <strong>Quantization and codebooks.</strong> The single most
+            consequential production use of k-means is inside vector search.
+            Product quantization chops a d-dimensional vector into m subvectors
+            and learns a 256-entry k-means codebook per subspace, so each vector
+            compresses to m bytes; the coarse partition of an IVF index is
+            itself a k-means run over the corpus. Both are load-bearing in
+            <a href="/oss/faiss">FAISS</a>, where I walk through how PQ turns
+            billion-scale similarity search into table lookups; the codebooks
+            behind those tables are exactly the algorithm on this page.
+          </p>
+          <p>
+            <strong>Embedding clustering.</strong> Any pipeline that produces
+            embeddings eventually wants to group them: deduplicating
+            near-identical training documents, discovering topics in a support
+            queue, summarizing a corpus by its cluster exemplars, or sharding a
+            vector store by semantic region. k-means is the default first tool
+            because it is the only clusterer that runs comfortably at
+            hundred-million scale. A notable research example is HuBERT, which
+            builds its self-supervised speech targets by running k-means over
+            acoustic features and using the cluster ids as pseudo-labels.
+          </p>
+          <p>
+            <strong>Color quantization.</strong> The classic small-scale
+            application: treat every pixel as a point in RGB space, run k-means
+            with k = 16 or 256, and replace each pixel with its centroid. This
+            is how indexed-color images and palettes are built, and it remains
+            the cleanest visual demonstration that k-means is a compressor, not
+            a discoverer: nobody claims an image contains 256 natural clusters.
+          </p>
+          <p>
+            <strong>Initialization for richer models.</strong> A Gaussian
+            mixture fitted by EM inherits all of k-means' local-optimum
+            sensitivity plus its own, so the standard recipe (and
+            scikit-learn's default) initializes GMM responsibilities from a
+            k-means run. k-means is the cheap, robust first stage; EM then adds
+            covariances and soft assignments on top of a sane starting point.
+          </p>
+
+          <h2>Against the real libraries</h2>
+          <p>
+            The reference implementations above are honest Lloyd, and the
+            production libraries beat them on constant factors and scale rather
+            than on the math.
+            <a href="https://github.com/scikit-learn/scikit-learn" target="_blank" rel="noreferrer">scikit-learn</a>'s
+            <code>KMeans</code> defaults to k-means++ seeding and adds two
+            algorithmic upgrades. The <code>algorithm="elkan"</code> path uses
+            the triangle inequality to maintain per-point upper and lower
+            distance bounds, skipping most point-to-centroid distance
+            computations outright once centroids stop moving far; on
+            well-separated data with moderate k it does a fraction of the work
+            of plain Lloyd, at the cost of O(n k) bound storage. And
+            <code>MiniBatchKMeans</code> replaces the full-batch update with
+            stochastic updates on small random batches, converging to slightly
+            worse inertia in a small fraction of the time, which is the right
+            trade when n is tens of millions on a CPU. scikit-learn also runs
+            <code>n_init</code> independent seedings and keeps the best, a
+            pragmatic answer to local optima that a from-scratch version should
+            copy.
+          </p>
+          <p>
+            <a href="https://github.com/facebookresearch/faiss" target="_blank" rel="noreferrer">FAISS</a>
+            provides <code>faiss.Kmeans(d, k, niter=..., gpu=True)</code>,
+            which is Lloyd with the assignment step delegated to FAISS's
+            brute-force GPU nearest-neighbor kernels. That one substitution
+            changes the reachable scale entirely: training a 65,536-centroid
+            coarse quantizer over hundreds of millions of vectors is routine,
+            which is why FAISS's own IVF and PQ training uses it internally.
+            FAISS also samples the training set when n is huge (by default it
+            caps points per centroid), a reminder that the codebook converges
+            long before you have used every point.
+          </p>
+          <p>
+            When is the from-scratch version enough? Whenever n × k × d fits
+            comfortably in memory on your accelerator and you control the
+            convergence criteria: codebook learning up to a few million points,
+            embedding exploration, anything inside a research training loop
+            where you want the quantizer differentiable-adjacent and on-device.
+            The moment you need out-of-core data, billions of points, or a
+            heavily tuned CPU path, use the libraries.
+          </p>
+          <p>
+            Verification is straightforward because Lloyd is deterministic given
+            its initialization. Fix a seed, take any starting centroids, and run
+            both your implementation and
+            <code>KMeans(n_clusters=k, init=your_centers, n_init=1, max_iter=T, tol=0)</code>
+            on the same float64 data: the label sequences and final
+            <code>cluster_centers_</code> should agree to numerical tolerance
+            (say 1e-6 relative) as long as no empty cluster occurs, since
+            empty-cluster policy is the one place implementations legitimately
+            differ. A weaker but useful end-to-end check: on data with planted,
+            well-separated blobs, your final inertia should match scikit-learn's
+            best-of-10 within a percent or two.
+          </p>
+
+          <h2>Traps and misconceptions</h2>
+          <p>
+            <strong>"k-means finds the clusters in the data."</strong> It finds
+            the minimum-variance quantization of the data into k cells, whose
+            boundaries are hyperplanes (a Voronoi partition). Elongated
+            clusters get sliced, rings and moons are hopeless, and clusters of
+            very different sizes or densities get distorted because a big
+            spread-out cluster contributes more variance than a small tight one.
+            If the goal is discovery rather than compression, look at Gaussian
+            mixtures, spectral clustering, or HDBSCAN before blaming the data.
+          </p>
+          <p>
+            <strong>"It converged, so it found the answer."</strong>
+            Convergence means a fixed point of the alternation, nothing more.
+            Different seeds give different fixed points with different costs,
+            sometimes drastically so on unlucky uniform seeding. k-means++
+            bounds the expected badness and restarts shrink it further, but no
+            practical run certifies global optimality; the joint problem is
+            NP-hard.
+          </p>
+          <p>
+            <strong>"The elbow method tells you k."</strong> Inertia decreases
+            monotonically in k all the way to J = 0 at k = n, so some drop is
+            guaranteed and the "elbow" is often a smooth shoulder that two
+            readers place differently. Treat k as a design parameter set by the
+            downstream use (codebook size, number of shards) when you can, and
+            when you genuinely must estimate it, prefer silhouette scores or
+            gap statistics over squinting at an inertia curve.
+          </p>
+          <p>
+            <strong>Forgetting to scale features.</strong> Squared Euclidean
+            distance sums over coordinates, so a feature measured in thousands
+            dominates one measured in tenths, and k-means will cheerfully
+            cluster on the loud feature alone. Standardize, or choose weights
+            deliberately; this is a modeling decision the algorithm cannot make
+            for you.
+          </p>
+          <p>
+            <strong>Using k-means with a metric other than squared L2.</strong>
+            The update step is only optimal because the mean minimizes summed
+            squared Euclidean distance. Plugging cosine or L1 distance into the
+            assignment step while still taking means silently breaks the
+            monotone-descent argument. The legitimate variants change the
+            center: spherical k-means normalizes the mean for cosine geometry,
+            k-medians uses the coordinate-wise median for L1, k-medoids
+            restricts centers to data points for arbitrary metrics.
+          </p>
+
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> k-means is alternating exact
+            minimization of a single distortion objective: nearest-centroid
+            assignment is the best response for fixed centers, the mean is the
+            best response for fixed assignments, so the cost only ever falls
+            and must stop at a fixed point that is local, not global. k-means++
+            spends k cheap sampling passes to make that local answer provably
+            O(log k)-competitive in expectation, and everything the production
+            libraries add, elkan's bounds, minibatches, GPU assignment kernels,
+            is engineering around those same two steps.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/code-tabs.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+  </body>
+</html>

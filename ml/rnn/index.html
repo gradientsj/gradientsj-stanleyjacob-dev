@@ -1,0 +1,695 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RNNs and LSTMs · Stanley Jacob</title>
+    <meta name="description" content="Recurrent networks from the recurrence to the gates: backpropagation through time, vanishing and exploding gradients derived from the repeated Jacobian product, the full LSTM cell equations and why the cell-state highway fixes the problem, with from-scratch PyTorch and JAX lax.scan implementations checked against nn.LSTM." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml" class="active">ML</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/ml">Machine learning</a></div>
+        <h1>RNNs and LSTMs</h1>
+        <p class="lead">
+          A recurrent network is a loop: the same cell applied at every
+          timestep, carrying a fixed-size state forward. That loop is also the
+          whole problem, because backpropagating through it multiplies the same
+          Jacobian together once per step, and repeated products either vanish
+          or explode. The LSTM's answer is an additive highway gated by learned
+          interpolation, and it kept sequence modeling alive for twenty years.
+          This page derives the failure, derives the fix, and implements the
+          cell from scratch in PyTorch and in JAX, where lax.scan makes the
+          recurrence almost embarrassingly natural.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>What it is and when you reach for it</h2>
+          <p>
+            A recurrent neural network processes a sequence one element at a
+            time while maintaining a hidden state of fixed size. At each step
+            it consumes the next input and its own previous state, and emits a
+            new state; the same weights are reused at every position, which is
+            what lets one small cell handle sequences of any length. That
+            makes an RNN the natural model when data arrives as a stream and
+            you want a constant-memory, constant-latency summary of everything
+            seen so far: each new element costs one cell evaluation,
+            regardless of how long the history is. A transformer, by contrast,
+            attends over the whole history at every step, which buys parallel
+            training and unlimited direct access to the past at the price of
+            compute and memory that grow with context length. The RNN sits at
+            the opposite corner of that trade: O(1) state, O(1) work per new
+            token, no random access to the past at all, only whatever the
+            model chose to keep in its state. Plain RNNs cannot in practice
+            keep anything for long, for reasons the next section makes exact,
+            and the LSTM (Hochreiter and Schmidhuber, 1997) is the
+            modification that lets the state persist across hundreds of steps.
+          </p>
+
+          <h2>The math</h2>
+          <h3>The recurrence</h3>
+          <p>
+            The vanilla (Elman) RNN is one equation. With input
+            x<sub>t</sub>, hidden state h<sub>t</sub>, and weight matrices
+            W<sub>xh</sub>, W<sub>hh</sub>:
+          </p>
+          <pre class="flow">h_t = tanh(W_xh x_t + W_hh h_(t-1) + b)
+y_t = W_hy h_t                (a readout, when you need one)</pre>
+          <p>
+            Unrolled over T steps this is just a deep feedforward network with
+            T layers that all share the same weights, plus an input injected
+            at every layer. That reframing is the key to everything that
+            follows: training an RNN on a length-T sequence is training a
+            T-layer network, so any pathology of very deep networks applies,
+            amplified by the weight sharing.
+          </p>
+
+          <h3>Backpropagation through time</h3>
+          <p>
+            Training minimizes a loss summed over timesteps,
+            L = Σ<sub>t</sub> L<sub>t</sub>(y<sub>t</sub>). Backpropagation
+            through time (BPTT) is ordinary backpropagation applied to the
+            unrolled graph: gradients flow backward from each loss term
+            through every earlier timestep, and because the weights are
+            shared, the gradient for W<sub>hh</sub> is the sum of its
+            per-step contributions. The interesting object is the sensitivity
+            of the state at time t to the state at an earlier time k, which
+            by the chain rule is a product of step-to-step Jacobians:
+          </p>
+          <pre class="flow">∂h_t/∂h_k = Π_(j=k+1..t)  ∂h_j/∂h_(j-1)
+          = Π_(j=k+1..t)  diag(tanh′(a_j)) · W_hhᵀ</pre>
+          <p>
+            where a<sub>j</sub> is the pre-activation at step j. Every path
+            from a loss at time t back to an input at time k passes through
+            this product of t − k matrices, and every factor contains the same
+            W<sub>hh</sub>.
+          </p>
+
+          <h3>Vanishing and exploding gradients, from the product</h3>
+          <p>
+            Bound the norm of that product. If γ is the largest possible
+            derivative of the activation (γ = 1 for tanh, γ = 1/4 for the
+            logistic sigmoid) and σ<sub>max</sub> is the largest singular
+            value of W<sub>hh</sub>, then each factor has norm at most
+            γ · σ<sub>max</sub>, so
+          </p>
+          <pre class="flow">‖∂h_t/∂h_k‖  ≤  (γ · σ_max)^(t-k)</pre>
+          <p>
+            The bound is geometric in the gap t − k. When
+            γ · σ<sub>max</sub> &lt; 1 the gradient contribution from distant
+            timesteps decays exponentially: the network is structurally unable
+            to learn that an input a hundred steps ago mattered, because the
+            training signal that would teach it is numerically zero by the
+            time it arrives. When the product of factors instead grows, along
+            directions where the Jacobians expand, the gradient explodes and a
+            single update can throw the weights into a useless region. Pascanu,
+            Mikolov, and Bengio (2013) made this analysis precise and gave the
+            standard remedy for the exploding half: clip the global gradient
+            norm. Nothing so cheap fixes the vanishing half, because
+            vanishing is not an overflow problem but an information problem.
+          </p>
+          <p>
+            A scalar example makes the rates concrete. Take a linear scalar
+            recurrence h<sub>t</sub> = w · h<sub>t−1</sub> + x<sub>t</sub>,
+            so ∂h<sub>t</sub>/∂h<sub>k</sub> = w<sup>t−k</sup> exactly.
+            Across a gap of 20 steps: with w = 0.9 the gradient is
+            0.9<sup>20</sup> ≈ 0.12, already an eightfold attenuation; with
+            w = 0.5 it is 0.5<sup>20</sup> ≈ 9.5 × 10<sup>−7</sup>,
+            effectively gone; with w = 1.1 it is 1.1<sup>20</sup> ≈ 6.7 and
+            still growing. <mark>The only value of w that transmits gradient
+            across long gaps without distortion is w = 1: an identity
+            connection. The LSTM is a machine for learning when to be that
+            identity.</mark>
+          </p>
+
+          <h3>The LSTM cell</h3>
+          <p>
+            The LSTM splits the state in two: a cell state c<sub>t</sub> that
+            acts as a protected memory, and a hidden state h<sub>t</sub> that
+            is the cell's working output. Three sigmoid gates, each a full
+            learned layer of the inputs, control what the memory does. The
+            complete equations, in the convention PyTorch uses (gates ordered
+            i, f, g, o):
+          </p>
+          <pre class="flow">i_t = σ(W_i x_t + U_i h_(t-1) + b_i)      input gate:  write how much?
+f_t = σ(W_f x_t + U_f h_(t-1) + b_f)      forget gate: keep how much?
+g_t = tanh(W_g x_t + U_g h_(t-1) + b_g)   candidate:   write what?
+o_t = σ(W_o x_t + U_o h_(t-1) + b_o)      output gate: expose how much?
+
+c_t = f_t ⊙ c_(t-1) + i_t ⊙ g_t           the cell-state highway
+h_t = o_t ⊙ tanh(c_t)</pre>
+          <p>
+            Read the gates as learned interpolation rather than as switches.
+            Each coordinate of f<sub>t</sub> is a number in (0, 1) that
+            decides, per memory slot and per timestep, how much of the old
+            value survives; each coordinate of i<sub>t</sub> decides how much
+            of the freshly proposed content g<sub>t</sub> is added. The cell
+            state update is a convex-combination-like blend between "copy the
+            past" and "write the present", with the blending weights computed
+            from the data by a trainable function. In practice the four gate
+            computations are fused into a single matrix multiply producing a
+            vector of width 4H, then split, which is exactly how both
+            implementations below and every production kernel do it.
+          </p>
+
+          <h3>Why the highway fixes vanishing gradients</h3>
+          <p>
+            Differentiate the cell state update along the direct path:
+          </p>
+          <pre class="flow">∂c_t/∂c_(t-1) = diag(f_t)  (+ indirect terms through the gates)</pre>
+          <p>
+            The direct backward path through the memory is a product of
+            diagonal matrices whose entries are the forget gates, not a
+            product of repeated dense W<sub>hh</sub> multiplications squashed
+            through tanh derivatives. Where the network sets a forget gate
+            near 1, the corresponding gradient coordinate flows backward
+            through that step essentially unattenuated: the recurrence is
+            locally the identity, the w = 1 case of the scalar example, and it
+            is the identity precisely where and when the model has learned it
+            should be. The gradient can still shrink, when the model has
+            genuinely decided to forget, but decay is now a learned,
+            per-coordinate decision rather than a structural inevitability.
+            This is the same load-bearing idea as the
+            <a href="/ml/resnet/">residual connection</a>: make the default
+            path additive and let the network learn corrections around it.
+            One practical corollary used in the code below: initialize the
+            forget-gate bias to 1, so training starts in the remembering
+            regime instead of having to climb out of the forgetting one
+            (Jozefowicz, Zaremba, and Sutskever, 2015).
+          </p>
+
+          <h3>GRU: the cheaper cousin</h3>
+          <p>
+            The gated recurrent unit (Cho et al., 2014) folds the same
+            interpolation idea into a single state and two gates: a reset
+            gate r<sub>t</sub> that masks the old state when proposing new
+            content, and an update gate z<sub>t</sub> that interpolates
+            between the old state and the proposal:
+          </p>
+          <pre class="flow">r_t = σ(W_r x_t + U_r h_(t-1))
+z_t = σ(W_z x_t + U_z h_(t-1))
+h̃_t = tanh(W_h x_t + U_h (r_t ⊙ h_(t-1)))
+h_t = (1 - z_t) ⊙ h_(t-1) + z_t ⊙ h̃_t</pre>
+          <p>
+            (Conventions differ on which of z and 1 − z multiplies the old
+            state; PyTorch's <code>nn.GRU</code> uses the mirror image, which
+            changes nothing.) With three gate blocks instead of four, a GRU
+            has about 25 percent fewer parameters and less compute per step
+            than an LSTM of the same width, with no separate cell state to
+            manage. On many tasks the two are within noise of each other;
+            the LSTM's separate protected memory tends to matter on the
+            longest dependencies, and the GRU tends to win when the budget is
+            tight, which is why it shows up in small production models like
+            the sequence scorer in my
+            <a href="/systems/bot-detection">bot detection design</a>.
+          </p>
+
+          <h2>Implementation, twice</h2>
+          <p>
+            First the cell from scratch, plus the loop that unrolls it over a
+            sequence. The PyTorch version is a plain <code>nn.Module</code>
+            with an explicit Python loop over time, which is the honest way to
+            see the recurrence. The JAX version uses <code>lax.scan</code>,
+            and this deserves saying plainly: <mark>an RNN is the case where
+            JAX is not merely an alternative but the naturally idiomatic
+            fit</mark>, because scan is exactly the mathematical object here, a
+            function (carry, x<sub>t</sub>) → (carry, y<sub>t</sub>) folded
+            over the time axis, and XLA compiles the whole sweep into one
+            fused loop instead of tracing T copies of the cell. Gate order is
+            (i, f, g, o) in both, matching <code>nn.LSTM</code>'s weight
+            layout so the verification in the library section can compare
+            weight-for-weight.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import torch
+import torch.nn as nn
+
+class LSTMCell(nn.Module):
+    """One LSTM step, gates fused into a single 4H-wide matmul.
+
+    Gate order (i, f, g, o) matches nn.LSTM's weight layout, so
+    weights can be copied between the two for verification.
+    """
+
+    def __init__(self, input_size, hidden_size):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.ih = nn.Linear(input_size, 4 * hidden_size)
+        self.hh = nn.Linear(hidden_size, 4 * hidden_size)
+        # Forget-gate bias starts at 1: begin in the remembering
+        # regime and let training learn to forget.
+        with torch.no_grad():
+            self.ih.bias.zero_()
+            self.hh.bias.zero_()
+            self.ih.bias[hidden_size:2 * hidden_size].fill_(1.0)
+
+    def forward(self, x, state):
+        h, c = state
+        i, f, g, o = (self.ih(x) + self.hh(h)).chunk(4, dim=-1)
+        i, f, o = i.sigmoid(), f.sigmoid(), o.sigmoid()
+        g = g.tanh()
+        c = f * c + i * g          # the additive highway
+        h = o * torch.tanh(c)
+        return h, c
+
+class LSTM(nn.Module):
+    """Unrolled loop over time. x: (B, T, D) -&gt; (B, T, H)."""
+
+    def __init__(self, input_size, hidden_size):
+        super().__init__()
+        self.cell = LSTMCell(input_size, hidden_size)
+        self.hidden_size = hidden_size
+
+    def forward(self, x, state=None):
+        B, T, _ = x.shape
+        if state is None:
+            z = x.new_zeros(B, self.hidden_size)
+            state = (z, z)
+        h, c = state
+        outs = []
+        for t in range(T):         # clear, but Python-loop slow;
+            h, c = self.cell(x[:, t], (h, c))   # nn.LSTM fuses this
+            outs.append(h)
+        return torch.stack(outs, dim=1), (h, c)</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">import jax
+import jax.numpy as jnp
+from jax import lax
+
+def init_lstm(key, input_size, hidden_size):
+    k1, k2 = jax.random.split(key)
+    s_in, s_h = input_size ** -0.5, hidden_size ** -0.5
+    b = jnp.zeros(4 * hidden_size)
+    # Forget-gate bias 1.0; gate order (i, f, g, o).
+    b = b.at[hidden_size:2 * hidden_size].set(1.0)
+    return {
+        "Wx": jax.random.uniform(k1, (input_size, 4 * hidden_size),
+                                 minval=-s_in, maxval=s_in),
+        "Wh": jax.random.uniform(k2, (hidden_size, 4 * hidden_size),
+                                 minval=-s_h, maxval=s_h),
+        "b": b,
+    }
+
+def lstm_step(params, carry, x_t):
+    """(carry, x_t) -&gt; (carry, y_t): exactly the shape scan wants."""
+    h, c = carry
+    z = x_t @ params["Wx"] + h @ params["Wh"] + params["b"]
+    i, f, g, o = jnp.split(z, 4, axis=-1)
+    i, f, o = jax.nn.sigmoid(i), jax.nn.sigmoid(f), jax.nn.sigmoid(o)
+    g = jnp.tanh(g)
+    c = f * c + i * g              # the additive highway
+    h = o * jnp.tanh(c)
+    return (h, c), h
+
+@jax.jit
+def lstm(params, x):
+    """x: (B, T, D) -&gt; (B, T, H).
+
+    lax.scan folds lstm_step over the leading (time) axis and
+    compiles the whole sweep into one fused XLA loop: the
+    recurrence is written once, not traced T times.
+    """
+    B = x.shape[0]
+    H = params["Wh"].shape[0]
+    init = (jnp.zeros((B, H)), jnp.zeros((B, H)))
+    step = lambda carry, x_t: lstm_step(params, carry, x_t)
+    (h, c), ys = lax.scan(step, init, jnp.swapaxes(x, 0, 1))
+    return jnp.swapaxes(ys, 0, 1), (h, c)</code></pre>
+          </div>
+          <p>
+            Then the version you would actually ship. In PyTorch that means
+            <code>nn.LSTM</code>, which on GPU dispatches all layers and all
+            timesteps to a single fused cuDNN kernel; in JAX/Flax it means
+            wrapping a cell in <code>nn.RNN</code>, which is a thin,
+            carry-managing veneer over the same <code>lax.scan</code> you just
+            wrote by hand.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import torch
+import torch.nn as nn
+
+class CharLSTM(nn.Module):
+    """Byte-level language model: embed, 2-layer LSTM, project."""
+
+    def __init__(self, vocab=256, hidden=512, layers=2):
+        super().__init__()
+        self.embed = nn.Embedding(vocab, hidden)
+        # nn.LSTM runs all layers and timesteps in one fused cuDNN
+        # call on GPU; dropout applies between layers only.
+        self.rnn = nn.LSTM(hidden, hidden, num_layers=layers,
+                           batch_first=True, dropout=0.1)
+        self.head = nn.Linear(hidden, vocab)
+
+    def forward(self, tokens, state=None):
+        x = self.embed(tokens)            # (B, T) -&gt; (B, T, H)
+        y, state = self.rnn(x, state)     # state carries across chunks
+        return self.head(y), state</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">import jax
+import jax.numpy as jnp
+import flax.linen as nn
+
+class CharLSTM(nn.Module):
+    """Byte-level language model: embed, 2-layer LSTM, project."""
+    vocab: int = 256
+    hidden: int = 512
+
+    @nn.compact
+    def __call__(self, tokens):
+        x = nn.Embed(self.vocab, self.hidden)(tokens)  # (B, T, H)
+        # nn.RNN wraps a cell in lax.scan and manages the carry;
+        # OptimizedLSTMCell fuses the gate matmuls.
+        x = nn.RNN(nn.OptimizedLSTMCell(self.hidden))(x)
+        x = nn.RNN(nn.OptimizedLSTMCell(self.hidden))(x)
+        return nn.Dense(self.vocab)(x)
+
+model = CharLSTM()
+params = model.init(jax.random.PRNGKey(0),
+                    jnp.zeros((2, 16), jnp.int32))</code></pre>
+          </div>
+
+          <h2>Using it on a real shape of problem</h2>
+          <p>
+            The classic exercise is byte-level next-token prediction: feed a
+            text corpus as a stream of bytes, train the model to predict byte
+            t + 1 from bytes up to t. Realistic dimensions: batch 64,
+            sequence chunks of 128, hidden width 512, vocabulary 256. The
+            state is the whole point of the setup, so note the one trick that
+            makes long documents trainable: <mark>truncated BPTT</mark>. The
+            document is fed in consecutive 128-step chunks, the state is
+            carried forward between chunks so the model keeps its memory, but
+            it is detached from the graph at each chunk boundary so the
+            backward pass never spans more than 128 steps.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import torch
+import torch.nn.functional as F
+
+model = CharLSTM().cuda()
+opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
+state = None
+
+for tokens in loader:                # tokens: (64, 129) uint8 chunks
+    tokens = tokens.long().cuda()
+    x, y = tokens[:, :-1], tokens[:, 1:]
+    logits, state = model(x, state)
+    # Detach: keep the memory, cut the graph. Without this the
+    # backward pass grows with every chunk until OOM.
+    state = tuple(s.detach() for s in state)
+    loss = F.cross_entropy(logits.reshape(-1, 256), y.reshape(-1))
+    opt.zero_grad(set_to_none=True)
+    loss.backward()
+    # Clip: the standard fix for the exploding half of the problem.
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    opt.step()</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">import jax
+import jax.numpy as jnp
+import optax
+
+tx = optax.chain(optax.clip_by_global_norm(1.0),  # exploding fix
+                 optax.adamw(3e-4))
+opt_state = tx.init(params)
+
+def loss_fn(params, x, y):
+    logits = model.apply(params, x)
+    return optax.softmax_cross_entropy_with_integer_labels(
+        logits, y).mean()
+
+@jax.jit
+def train_step(params, opt_state, x, y):
+    loss, grads = jax.value_and_grad(loss_fn)(params, x, y)
+    updates, opt_state = tx.update(grads, opt_state, params)
+    return optax.apply_updates(params, updates), opt_state, loss
+
+for tokens in loader:                # tokens: (64, 129) int32 chunks
+    x, y = tokens[:, :-1], tokens[:, 1:]
+    params, opt_state, loss = train_step(params, opt_state, x, y)</code></pre>
+          </div>
+          <p>
+            What to expect: the loss starts near ln(256) ≈ 5.55 nats, the
+            entropy of a uniform guess over bytes, drops fast in the first
+            few hundred steps as the model learns byte frequencies and common
+            bigrams, then grinds down slowly as it learns words and local
+            syntax. On a few megabytes of English text a 512-wide 2-layer
+            LSTM typically settles somewhere around 1.2 to 1.6 nats per byte;
+            exact numbers depend on the corpus, the schedule, and the
+            hardware, so treat them as a sanity band rather than a target.
+            Samples drawn from the model make the progress visible: gibberish
+            with correct letter frequencies after minutes, spellable words
+            and balanced quotes after an hour of GPU time.
+          </p>
+
+          <h2>Applications</h2>
+          <p>
+            Historically, recurrent networks were how deep learning did
+            sequences, full stop. Sequence-to-sequence LSTMs (Sutskever,
+            Vinyals, and Le, 2014) established neural machine translation;
+            Google's 2016 production translation system was a stack of eight
+            LSTM layers per direction; LSTMs powered speech recognition
+            pipelines, handwriting recognition, and the language models of
+            the era. The attention mechanism itself was invented as a patch
+            for the RNN encoder's fixed-size bottleneck (Bahdanau et al.,
+            2015) before the transformer discarded the recurrence and kept
+            the attention.
+          </p>
+          <p>
+            Where recurrence still wins today is wherever its O(1)-per-step
+            signature is the requirement rather than a compromise.
+            Streaming and low-latency inference: a wake-word detector or
+            streaming speech endpoint runs on every audio frame as it
+            arrives, and a model that carries a small state and does constant
+            work per frame fits that contract exactly, with no growing
+            key-value cache to manage. Tiny models: on microcontrollers and
+            DSPs with kilobytes of memory, a GRU with a few thousand
+            parameters is often the strongest sequence model that fits, which
+            is why keyword spotting and gesture recognition on embedded
+            hardware still ship recurrent cells. Control: policies for
+            robotics and reinforcement learning frequently need memory under
+            partial observability at a rigid control frequency, and a small
+            recurrent core inside the policy remains standard. Event-stream
+            scoring in production systems is the same shape: my
+            <a href="/systems/bot-detection">bot detection design</a> runs a
+            GRU over an account's recent event sequence precisely because the
+            per-event cost and fixed state make the latency budget tractable.
+          </p>
+          <p>
+            The modern successors on the quality-per-FLOP frontier are
+            state-space models: S4 and its descendants, and Mamba (Gu and
+            Dao, 2023). At concept level they are recurrences too, with a
+            fixed-size state updated per token, but the update is kept linear
+            in the state (with input-dependent, gate-like parameters in
+            Mamba's case), and linearity is exactly what allows the whole
+            sequence to be computed with parallel scans or convolutions at
+            training time. <mark>The pitch of the SSM family is precisely
+            "the inference signature of an RNN with the training
+            parallelism of a transformer"</mark>, which is the clearest
+            evidence that constant-state streaming inference, the thing the
+            LSTM had all along, never stopped being valuable; only the
+            sequential training bottleneck did.
+          </p>
+
+          <h2>Against the real libraries</h2>
+          <p>
+            The reference cells above are for understanding and for research
+            surgery on the recurrence itself. The production baselines:
+          </p>
+          <p>
+            <a href="https://github.com/pytorch/pytorch" target="_blank" rel="noreferrer">PyTorch</a>'s
+            <code>nn.LSTM</code> and <code>nn.GRU</code> (notes on the
+            codebase itself in <a href="/oss/pytorch">my PyTorch page</a>)
+            add what no Python loop can: on CUDA devices they dispatch the
+            entire multi-layer, multi-timestep computation to cuDNN's fused
+            RNN kernels, which batch the gate matmuls across timesteps where
+            dependencies allow, fuse the pointwise gate math, and run
+            layers in a pipelined fashion. The result is commonly an order
+            of magnitude faster than a Python-level loop over an
+            <code>nn.LSTMCell</code>, with identical math. They also handle
+            the unglamorous essentials: variable-length batches via
+            <code>pack_padded_sequence</code>, bidirectionality,
+            multi-layer stacking, and inter-layer dropout.
+          </p>
+          <p>
+            On the JAX side,
+            <a href="https://github.com/google/flax" target="_blank" rel="noreferrer">Flax</a>
+            ships <code>nn.LSTMCell</code>, <code>nn.OptimizedLSTMCell</code>,
+            <code>nn.GRUCell</code>, and the <code>nn.RNN</code> combinator
+            that scans any cell over time with carry initialization,
+            optional reversal, and masking for padded sequences. There is
+            deliberately less distance between the library and the
+            from-scratch version here, because <code>lax.scan</code> plus XLA
+            fusion is already most of what cuDNN provides; the library adds
+            correctness conveniences, not a different execution strategy.
+          </p>
+          <p>
+            When is the from-scratch cell actually enough? Whenever you need
+            to modify the recurrence: peephole connections, layer norm inside
+            the cell (LayerNorm LSTM), custom gating for a research idea, or
+            exporting to a runtime that only supports primitive ops. The
+            fused kernels are monolithic; the moment the cell equations
+            change, you are back to the hand-written version, which is a real
+            reason to be able to write it.
+          </p>
+          <p>
+            Verification is unusually clean because the weight layouts can be
+            made to match. <code>nn.LSTM</code> stores
+            <code>weight_ih_l0</code>, <code>weight_hh_l0</code>,
+            <code>bias_ih_l0</code>, <code>bias_hh_l0</code> with gates
+            stacked in (i, f, g, o) order, which is the order the reference
+            cell uses. Copy them across and demand agreement to float32
+            tolerance:
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import torch
+
+torch.manual_seed(0)
+ref, lib = LSTM(32, 64), torch.nn.LSTM(32, 64, batch_first=True)
+
+# Same gate order (i, f, g, o), so the copy is direct.
+with torch.no_grad():
+    ref.cell.ih.weight.copy_(lib.weight_ih_l0)
+    ref.cell.hh.weight.copy_(lib.weight_hh_l0)
+    ref.cell.ih.bias.copy_(lib.bias_ih_l0)
+    ref.cell.hh.bias.copy_(lib.bias_hh_l0)
+
+x = torch.randn(8, 50, 32)
+y_ref, (h_ref, c_ref) = ref(x)
+y_lib, (h_lib, c_lib) = lib(x)
+assert torch.allclose(y_ref, y_lib, atol=1e-5)
+assert torch.allclose(c_ref, c_lib.squeeze(0), atol=1e-5)</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">import numpy as np
+import torch
+import jax.numpy as jnp
+
+torch.manual_seed(0)
+lib = torch.nn.LSTM(32, 64, batch_first=True)
+
+# PyTorch stores (4H, D) and computes x @ W.T; the scan version
+# stores (D, 4H) and computes x @ W, so transpose on the way over.
+params = {
+    "Wx": jnp.asarray(lib.weight_ih_l0.detach().numpy().T),
+    "Wh": jnp.asarray(lib.weight_hh_l0.detach().numpy().T),
+    "b": jnp.asarray((lib.bias_ih_l0 + lib.bias_hh_l0)
+                     .detach().numpy()),
+}
+
+x = np.random.default_rng(0).standard_normal((8, 50, 32),
+                                             dtype=np.float32)
+y_lib, _ = lib(torch.from_numpy(x))
+y_jax, _ = lstm(params, jnp.asarray(x))
+np.testing.assert_allclose(np.asarray(y_jax),
+                           y_lib.detach().numpy(),
+                           atol=1e-5)</code></pre>
+          </div>
+
+          <h2>Traps and misconceptions</h2>
+          <p>
+            <strong>"Gradient clipping fixes vanishing gradients."</strong>
+            It fixes exploding gradients only. Clipping rescales a gradient
+            that is too large; it cannot resurrect one that has decayed to
+            10<sup>−7</sup>. Vanishing is addressed architecturally, by
+            gates and additive paths, not numerically.
+          </p>
+          <p>
+            <strong>"The LSTM's hidden state is its memory."</strong> The
+            long-term memory is the cell state c, the one on the additive
+            highway; h is a gated, tanh-squashed view of it that the output
+            gate can shut off entirely. Conflating the two leads to bugs
+            like carrying only h across sequence chunks and silently
+            resetting c, which destroys exactly the long-range memory the
+            LSTM exists to provide.
+          </p>
+          <p>
+            <strong>"Forgetting to detach state in truncated BPTT."</strong>
+            If the carried state is not detached at chunk boundaries, the
+            autograd graph grows across the entire document; memory climbs
+            until the job dies, or PyTorch raises the classic "trying to
+            backward through the graph a second time" error. Detach keeps
+            the values and cuts the history, which is the definition of the
+            truncation.
+          </p>
+          <p>
+            <strong>"RNNs are obsolete."</strong> For large-scale language
+            modeling, effectively yes: the sequential dependency makes
+            training unable to saturate modern accelerators, and that, more
+            than model quality, is what ended the era. But the inference-side
+            virtues, constant state and constant per-step cost, are the
+            explicit design goal of the state-space models now competing with
+            transformers, and recurrent cells still ship in streaming,
+            embedded, and control settings where those virtues are the
+            requirement.
+          </p>
+          <p>
+            <strong>"Bidirectional LSTMs are a free accuracy upgrade."</strong>
+            Only when the full sequence is available before prediction. A
+            bidirectional encoder reads the future; using one in a streaming
+            or causal setting is a subtle form of label leakage, and results
+            built on it will not survive deployment.
+          </p>
+
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> unrolled in time, an RNN is a very
+            deep network with tied weights, so backpropagation multiplies the
+            same Jacobian t − k times, and (γσ<sub>max</sub>)<sup>t−k</sup>
+            either vanishes or explodes. The only safe multiplier is 1, and
+            the LSTM builds that 1 in: an additive cell-state highway whose
+            per-step gradient is the forget gate itself, so remembering is the
+            default and forgetting is a learned, per-coordinate decision.
+            Clip for the exploding half, gate for the vanishing half, and
+            reach for scan when you write it in JAX, because a recurrence is
+            what scan is.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/code-tabs.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+  </body>
+</html>

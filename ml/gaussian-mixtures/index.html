@@ -1,0 +1,610 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Gaussian mixtures and EM · Stanley Jacob</title>
+    <meta name="description" content="Gaussian mixture models derived honestly: why the mixture log-likelihood resists direct maximization, EM via responsibilities with the full E-step and M-step equations, log-sum-exp stability, the k-means limit, and batched PyTorch and JAX implementations (lax.scan over EM iterations) checked against scikit-learn's GaussianMixture." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml" class="active">ML</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/ml">Machine learning</a></div>
+        <h1>Gaussian mixtures and EM</h1>
+        <p class="lead">
+          A Gaussian mixture model says the data came from K bell curves and
+          nobody told you which point came from which. That single missing
+          label is what makes the likelihood impossible to maximize in closed
+          form, and expectation-maximization is the fix: guess soft labels,
+          refit each Gaussian to its share of the data, repeat, and the
+          likelihood provably never decreases. This page derives the E-step
+          and M-step in full, shows why the E-step lives or dies by
+          log-sum-exp, recovers k-means as a limiting case, and implements
+          batched EM with diagonal and full covariances in PyTorch and in JAX
+          with lax.scan, verified against scikit-learn.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>What it is and when you reach for it</h2>
+          <p>
+            A Gaussian mixture model (GMM) is a probability density built as a
+            weighted sum of K Gaussians: soft clusters with positions, shapes,
+            and sizes. It sits exactly between two neighbors. Relative to
+            k-means, it upgrades hard assignments to probabilistic ones and
+            spherical clusters to ellipsoids of any orientation, and it hands
+            you a genuine density p(x) rather than just a partition. Relative
+            to a single Gaussian fit, it is the standard way to model data
+            with multiple modes while staying in closed-form-friendly
+            territory. You reach for a GMM when you need soft clustering with
+            cluster shapes, when you need a cheap trainable density estimator
+            for scoring how typical a point is, or when a downstream system
+            needs likelihoods rather than labels: anomaly scores, speaker
+            models, acoustic feature distributions. The fitting algorithm,
+            expectation-maximization, matters beyond this one model: it is the
+            template for maximum likelihood with latent variables, and the
+            same two-step pattern reappears in hidden Markov models, factor
+            analysis, and topic models.
+          </p>
+
+          <h2>The math</h2>
+          <h3>The mixture likelihood, and why direct maximization fails</h3>
+          <p>
+            The model: to generate a point, pick component k with probability
+            π<sub>k</sub> (mixing weights, Σ<sub>k</sub> π<sub>k</sub> = 1),
+            then draw from that component's Gaussian. The density is
+          </p>
+          <p>
+            p(x) = Σ<sub>k</sub> π<sub>k</sub> N(x; μ<sub>k</sub>, Σ<sub>k</sub>)
+          </p>
+          <p>
+            and the log-likelihood of a dataset x<sub>1</sub>, …,
+            x<sub>n</sub> is
+          </p>
+          <p>
+            L = Σ<sub>i</sub> log [ Σ<sub>k</sub> π<sub>k</sub>
+            N(x<sub>i</sub>; μ<sub>k</sub>, Σ<sub>k</sub>) ].
+          </p>
+          <p>
+            For a single Gaussian (K = 1) the log meets the exponential, the
+            expression becomes a quadratic, and the maximum likelihood answer
+            is the sample mean and covariance in closed form. With K &gt; 1
+            the sum sits inside the log and nothing cancels: setting
+            ∂L/∂μ<sub>k</sub> = 0 gives an equation in which every parameter
+            appears inside every point's normalizing sum, so the stationarity
+            conditions are coupled fixed-point equations, not solvable
+            formulas. The obstruction has a name: the component assignment
+            z<sub>i</sub> of each point is a latent variable. If someone told
+            us every z<sub>i</sub>, the problem would fall apart into K
+            independent single-Gaussian fits. EM is the algorithm you get by
+            taking that observation seriously.
+          </p>
+
+          <h3>EM via responsibilities</h3>
+          <p>
+            Since we cannot observe the assignments, we infer them. Given the
+            current parameters, Bayes' rule gives the posterior probability
+            that point i came from component k, called the responsibility:
+          </p>
+          <p>
+            r<sub>ik</sub> = π<sub>k</sub> N(x<sub>i</sub>; μ<sub>k</sub>, Σ<sub>k</sub>)
+            / Σ<sub>j</sub> π<sub>j</sub> N(x<sub>i</sub>; μ<sub>j</sub>, Σ<sub>j</sub>).
+          </p>
+          <p>
+            Computing all r<sub>ik</sub> is the E-step. The M-step then
+            pretends the soft labels are real and refits each component by
+            weighted maximum likelihood, with r<sub>ik</sub> as the weights.
+            Defining the effective count N<sub>k</sub> = Σ<sub>i</sub>
+            r<sub>ik</sub>, the updates are exactly weighted versions of the
+            single-Gaussian formulas:
+          </p>
+          <pre class="flow">N_k     = Σ_i r_ik                                  (effective points in k)
+π_k     = N_k / n                                    (weight = share of mass)
+μ_k     = (1/N_k) Σ_i r_ik x_i                       (weighted mean)
+Σ_k     = (1/N_k) Σ_i r_ik (x_i - μ_k)(x_i - μ_k)ᵀ   (weighted covariance)</pre>
+          <p>
+            Why this works and does not merely feel plausible: for any
+            distribution q over the assignments, Jensen's inequality gives a
+            lower bound on the log-likelihood,
+            L ≥ Σ<sub>i</sub> Σ<sub>k</sub> q<sub>ik</sub>
+            log [ π<sub>k</sub> N(x<sub>i</sub>; μ<sub>k</sub>, Σ<sub>k</sub>) / q<sub>ik</sub> ].
+            The E-step chooses q<sub>ik</sub> = r<sub>ik</sub>, which makes
+            the bound tight (equal to L) at the current parameters; the M-step
+            maximizes the bound over the parameters, which is exactly the
+            weighted fits above because the log now sits inside the sum where
+            it splits into per-component terms. Bound tight, then bound
+            pushed up, therefore <mark>each EM iteration increases the true
+            log-likelihood or leaves it fixed, which is both the convergence
+            guarantee and the best debugging tool you have: if your
+            log-likelihood trace ever decreases, the implementation is wrong,
+            not the initialization.</mark> The guarantee is only convergence
+            to a stationary point, almost always a local optimum, which is why
+            production practice runs several random or k-means
+            initializations and keeps the best final likelihood.
+          </p>
+
+          <h3>A small worked E-step</h3>
+          <p>
+            One dimension, two components, both with σ = 1 and π = 0.5, means
+            μ<sub>1</sub> = 0 and μ<sub>2</sub> = 4. Recall
+            N(x; μ, 1) = exp(−(x−μ)²/2)/√(2π). For three points:
+          </p>
+          <pre class="flow">x = 1:  N(1;0,1) = 0.2420   N(1;4,1) = 0.0044
+        r_1 = 0.2420 / (0.2420 + 0.0044) = 0.982
+
+x = 2:  N(2;0,1) = 0.0540   N(2;4,1) = 0.0540
+        r_1 = 0.500          (equidistant, evidence is split)
+
+x = 3:  N(3;0,1) = 0.0044   N(3;4,1) = 0.2420
+        r_1 = 0.018</pre>
+          <p>
+            The point at 1 belongs to the left component with probability
+            0.982 but not certainty, the midpoint is genuinely ambiguous, and
+            the M-step mean for component 1 would be the r-weighted average
+            (0.982·1 + 0.500·2 + 0.018·3) / (0.982 + 0.500 + 0.018) ≈ 1.36:
+            pulled toward the ambiguous middle point in proportion to how much
+            of it the component owns. K-means, by contrast, would have flipped
+            a coin on x = 2 and moved the mean by a full half-point one way or
+            the other.
+          </p>
+
+          <h3>Log-sum-exp, or the E-step underflows</h3>
+          <p>
+            In any real dimensionality the Gaussian densities themselves are
+            useless as floats: a 39-dimensional acoustic feature vector two
+            standard deviations out has a density around e<sup>−100</sup>,
+            and products or sums of such numbers underflow immediately. The
+            E-step must be computed entirely in log space. Write
+            ℓ<sub>ik</sub> = log π<sub>k</sub> +
+            log N(x<sub>i</sub>; μ<sub>k</sub>, Σ<sub>k</sub>); then
+          </p>
+          <p>
+            log r<sub>ik</sub> = ℓ<sub>ik</sub> −
+            logsumexp<sub>j</sub>(ℓ<sub>ij</sub>)
+          </p>
+          <p>
+            where logsumexp subtracts the row maximum before exponentiating,
+            exactly the subtract-max invariance derived on the
+            <a href="/ml/softmax">softmax page</a>. The responsibilities are
+            literally a softmax over per-component log-joint scores, and the
+            logsumexp value itself is log p(x<sub>i</sub>), so the quantity
+            you need for the convergence check falls out of the E-step for
+            free. For full covariances, log N is computed from a Cholesky
+            factor: with Σ = LLᵀ, the Mahalanobis term is the squared norm of
+            the triangular solve L<sup>−1</sup>(x − μ) and the log-determinant
+            is 2 Σ log diag(L), which is both cheaper and far better
+            conditioned than forming Σ<sup>−1</sup>.
+          </p>
+
+          <h3>K-means as the hard-assignment limit</h3>
+          <p>
+            Fix every component's covariance to εI with ε shared and shrinking,
+            and keep the weights uniform. The responsibilities become a
+            softmax over −‖x<sub>i</sub> − μ<sub>k</sub>‖²/(2ε), and as
+            ε → 0 that softmax sharpens into a hard argmin over distances:
+            each point assigned entirely to its nearest center. The M-step
+            mean update then averages exactly the assigned points. Those two
+            steps are Lloyd's algorithm verbatim, so
+            <mark>k-means is EM on a Gaussian mixture in the limit of
+            spherical, identical, vanishing covariances, which is precisely
+            why k-means finds round, similarly-sized clusters and a GMM does
+            not have to.</mark> Every restriction you relax on the way back
+            from that limit (per-component variance, diagonal shape, full
+            shape) buys cluster geometry at the price of parameters to
+            estimate.
+          </p>
+
+          <h2>Implementation, twice</h2>
+          <p>
+            Both implementations below are batched over components: the
+            E-step evaluates all K Gaussians for all n points as one
+            broadcasted computation, and the M-step is matmuls and one
+            einsum, with no loop over components anywhere. Both support
+            <code>cov="diag"</code> (variances only, O(Kd) parameters) and
+            <code>cov="full"</code> (Cholesky-based, O(Kd²)). The PyTorch
+            version is a plain Python loop over iterations, which keeps it
+            easy to instrument; the JAX version rolls the EM iteration into
+            <code>lax.scan</code> under <code>jit</code>, so the whole fit
+            compiles to one XLA program and the per-iteration log-likelihood
+            trace comes back as the scan's stacked outputs.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import math
+import torch
+
+def log_gauss_diag(X, mu, var):
+    # X (n,d), mu (K,d), var (K,d) -&gt; (n,K) log N(x_i; mu_k, diag var_k)
+    d2 = (X[:, None, :] - mu) ** 2 / var
+    return -0.5 * (d2 + var.log() + math.log(2.0 * math.pi)).sum(dim=-1)
+
+def log_gauss_full(X, mu, Sigma):
+    # Cholesky route: mahalanobis via triangular solve, logdet from diag(L).
+    # Never forms Sigma^-1, which is the numerically honest way.
+    n, d = X.shape
+    L = torch.linalg.cholesky(Sigma)                    # (K,d,d)
+    diff = (X[:, None, :] - mu).permute(1, 2, 0)        # (K,d,n)
+    z = torch.linalg.solve_triangular(L, diff, upper=False)
+    maha = z.pow(2).sum(dim=1).T                        # (n,K)
+    logdet = 2.0 * torch.diagonal(L, dim1=-2, dim2=-1).log().sum(dim=-1)
+    return -0.5 * (maha + logdet + d * math.log(2.0 * math.pi))
+
+def gmm_em(X, K, n_iter=100, cov="full", reg=1e-6, seed=0):
+    """EM for a K-component GMM. Returns (mu, Sigma, pi, ll_trace).
+
+    Invariant worth asserting while developing: ll_trace is
+    nondecreasing up to float noise, or the code is wrong.
+    """
+    n, d = X.shape
+    g = torch.Generator().manual_seed(seed)
+    mu = X[torch.randperm(n, generator=g)[:K]].clone()  # means from data
+    var0 = X.var(dim=0).expand(K, d).clone()
+    Sigma = torch.diag_embed(var0) if cov == "full" else var0
+    log_pi = torch.full((K,), -math.log(K), dtype=X.dtype)
+    ll_trace = []
+
+    for _ in range(n_iter):
+        # E-step, entirely in log space; responsibilities are a softmax
+        # over per-component log-joints, log p(x_i) is the logsumexp
+        log_g = log_gauss_full(X, mu, Sigma) if cov == "full" \
+            else log_gauss_diag(X, mu, Sigma)
+        log_joint = log_g + log_pi                      # (n,K)
+        log_px = log_joint.logsumexp(dim=1, keepdim=True)
+        r = (log_joint - log_px).exp()                  # (n,K)
+        ll_trace.append(log_px.sum().item())
+
+        # M-step: weighted single-Gaussian fits, weights = r
+        Nk = r.sum(dim=0) + 1e-10                       # guard empty comps
+        mu = (r.T @ X) / Nk[:, None]
+        if cov == "full":
+            diff = X[:, None, :] - mu                   # (n,K,d)
+            Sigma = torch.einsum("nk,nki,nkj-&gt;kij", r, diff, diff)
+            Sigma = Sigma / Nk[:, None, None] + reg * torch.eye(d, dtype=X.dtype)
+        else:
+            # E[x^2] - mean^2 under weights r, floored to block collapse
+            Sigma = (r.T @ X.pow(2)) / Nk[:, None] - mu.pow(2) + reg
+        log_pi = (Nk / n).log()
+
+    return mu, Sigma, log_pi.exp(), torch.tensor(ll_trace)</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">import jax
+import jax.numpy as jnp
+from functools import partial
+
+def log_gauss_diag(X, mu, var):
+    # X (n,d), mu (K,d), var (K,d) -&gt; (n,K)
+    d2 = (X[:, None, :] - mu) ** 2 / var
+    return -0.5 * jnp.sum(d2 + jnp.log(var) + jnp.log(2.0 * jnp.pi), axis=-1)
+
+def log_gauss_full(X, mu, Sigma):
+    # Cholesky route: mahalanobis via triangular solve, logdet from diag(L)
+    d = X.shape[1]
+    L = jnp.linalg.cholesky(Sigma)                       # (K,d,d)
+    diff = jnp.transpose(X[:, None, :] - mu, (1, 2, 0))  # (K,d,n)
+    z = jax.scipy.linalg.solve_triangular(L, diff, lower=True)
+    maha = jnp.sum(z**2, axis=1).T                       # (n,K)
+    logdet = 2.0 * jnp.sum(jnp.log(jnp.diagonal(L, axis1=-2, axis2=-1)), -1)
+    return -0.5 * (maha + logdet + d * jnp.log(2.0 * jnp.pi))
+
+@partial(jax.jit, static_argnames=("K", "n_iter", "cov"))
+def gmm_em(X, K, n_iter=100, cov="full", reg=1e-6, seed=0):
+    """Whole fit compiles to one XLA program: lax.scan over EM steps.
+    Returns ((mu, Sigma, log_pi), ll_trace) with ll_trace shape (n_iter,)."""
+    n, d = X.shape
+    key = jax.random.PRNGKey(seed)
+    mu0 = X[jax.random.choice(key, n, (K,), replace=False)]
+    var0 = jnp.tile(X.var(axis=0), (K, 1))
+    Sigma0 = jax.vmap(jnp.diag)(var0) if cov == "full" else var0
+    log_pi0 = jnp.full((K,), -jnp.log(K), dtype=X.dtype)
+
+    def em_step(params, _):
+        mu, Sigma, log_pi = params
+        # E-step in log space; the cov branch resolves at trace time
+        log_g = log_gauss_full(X, mu, Sigma) if cov == "full" \
+            else log_gauss_diag(X, mu, Sigma)
+        log_joint = log_g + log_pi
+        log_px = jax.scipy.special.logsumexp(log_joint, axis=1, keepdims=True)
+        r = jnp.exp(log_joint - log_px)                  # responsibilities
+
+        # M-step
+        Nk = r.sum(axis=0) + 1e-10
+        mu_new = (r.T @ X) / Nk[:, None]
+        if cov == "full":
+            diff = X[:, None, :] - mu_new
+            Sigma_new = (jnp.einsum("nk,nki,nkj-&gt;kij", r, diff, diff)
+                         / Nk[:, None, None] + reg * jnp.eye(d, dtype=X.dtype))
+        else:
+            Sigma_new = (r.T @ X**2) / Nk[:, None] - mu_new**2 + reg
+        log_pi_new = jnp.log(Nk / n)
+        return (mu_new, Sigma_new, log_pi_new), log_px.sum()
+
+    params, ll_trace = jax.lax.scan(
+        em_step, (mu0, Sigma0, log_pi0), None, length=n_iter)
+    return params, ll_trace</code></pre>
+          </div>
+          <p class="quiet">
+            Two implementation notes. The reg term added to every covariance
+            is not cosmetic: it is the floor that prevents likelihood
+            singularities (next section) and it matches scikit-learn's
+            <code>reg_covar</code>. And in the JAX version, K, n_iter, and cov
+            must be static arguments because they determine array shapes and
+            trace-time branches; everything else stays traced, so refitting on
+            new data of the same shape reuses the compiled program.
+          </p>
+
+          <h2>Using it on a real shape of problem</h2>
+          <p>
+            The classic sanity problem is a few well-separated blobs in 2-D,
+            because you can check the answer by eye: means land on the blob
+            centers, ellipses match the blob shapes, weights match the blob
+            sizes.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import torch
+
+torch.manual_seed(0)
+# three anisotropic blobs, 1500 points, d = 2
+centers = torch.tensor([[0., 0.], [6., 0.], [3., 5.]])
+scales = torch.tensor([[1.0, 0.3], [0.4, 1.2], [0.8, 0.8]])
+X = torch.cat([centers[k] + scales[k] * torch.randn(500, 2)
+               for k in range(3)]).double()
+
+mu, Sigma, pi, ll = gmm_em(X, K=3, n_iter=200, cov="full", seed=0)
+print(pi)                      # each ~0.333
+print(mu)                      # near the three centers, order arbitrary
+assert (ll[1:] - ll[:-1] &gt;= -1e-8).all()   # EM invariant: LL never drops
+
+# soft assignment of a new point, and its density under the model
+x_new = torch.tensor([[3.0, 2.5]]).double()
+log_joint = log_gauss_full(x_new, mu, Sigma) + pi.log()
+print(log_joint.softmax(dim=1))            # responsibilities
+print(log_joint.logsumexp(dim=1))          # log p(x_new), anomaly score</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">import jax
+import jax.numpy as jnp
+
+key = jax.random.PRNGKey(0)
+centers = jnp.array([[0., 0.], [6., 0.], [3., 5.]])
+scales = jnp.array([[1.0, 0.3], [0.4, 1.2], [0.8, 0.8]])
+noise = jax.random.normal(key, (3, 500, 2))
+X = (centers[:, None, :] + scales[:, None, :] * noise).reshape(-1, 2)
+
+(mu, Sigma, log_pi), ll = gmm_em(X, K=3, n_iter=200, cov="full", seed=0)
+print(jnp.exp(log_pi))         # each ~0.333
+print(mu)                      # near the three centers, order arbitrary
+assert jnp.all(ll[1:] - ll[:-1] &gt;= -1e-8)  # EM invariant: LL never drops
+
+x_new = jnp.array([[3.0, 2.5]])
+log_joint = log_gauss_full(x_new, mu, Sigma) + log_pi
+print(jax.nn.softmax(log_joint, axis=1))   # responsibilities
+print(jax.scipy.special.logsumexp(log_joint, axis=1))  # log p(x_new)</code></pre>
+          </div>
+          <p>
+            What to expect: the log-likelihood trace rises steeply for the
+            first handful of iterations, then flattens; on separations this
+            clean it converges in well under 50 iterations, though the exact
+            count depends on the random initialization and the machine's
+            arithmetic. The recovered weights come out near one third each and
+            the covariances recover the anisotropy (the second blob's ellipse
+            is tall, the first is wide). Component order is arbitrary: run it
+            twice with different seeds and the same clusters come back with
+            permuted indices, which is why any comparison against a reference
+            must match components up first. On overlapping blobs, expect the
+            responsibilities along the seam to sit near 0.5 rather than
+            snapping to a side; that softness is the model working, not
+            failing.
+          </p>
+
+          <h2>Applications</h2>
+          <p>
+            The purest use is density estimation: a GMM with enough components
+            approximates any continuous density, and because it gives a real
+            log p(x), thresholding that score is a classic anomaly detector.
+            Fit the mixture on normal operation, flag anything whose
+            log-likelihood falls below a percentile calibrated on held-out
+            normal data; this pattern shows up in network intrusion detection,
+            manufacturing sensor monitoring, and fraud screening, and it is
+            what scikit-learn's <code>score_samples</code> exists for. The
+            same machinery runs inside computer vision's classic background
+            subtraction: the Stauffer-Grimson method keeps a small per-pixel
+            GMM over color, updated online, and OpenCV still ships it as
+            <code>BackgroundSubtractorMOG2</code>.
+          </p>
+          <p>
+            The heritage application is speech. Before neural embeddings,
+            speaker recognition was GMMs almost by definition: the GMM-UBM
+            approach of Reynolds, Quatieri, and Dunn (2000) fits a large
+            universal background model on everyone's speech, adapts it to each
+            enrolled speaker by MAP-updating the means, and scores test audio
+            by likelihood ratio. Its successors, GMM supervectors and then
+            i-vectors, kept the mixture at the core and powered a decade of
+            NIST speaker recognition evaluations. Acoustic models in the
+            Kaldi-era HMM systems were GMMs over cepstral features per HMM
+            state. Speaker diarization inherited all of it: classic pipelines
+            segment audio, model each segment or cluster with a GMM, and
+            merge clusters via BIC or likelihood-ratio criteria, and even
+            modern embedding-based diarization stacks keep GMM-shaped scoring
+            in their clustering stages. My
+            <a href="/ai/projects/speech-diarization-lab">speech diarization
+            lab</a> project walks through exactly where mixture models sit in
+            that pipeline. Beyond audio, mixture responsibilities are the
+            standard soft-clustering answer in bioinformatics (expression
+            data), astronomy (stellar populations), and as the output layer of
+            mixture density networks when a regression needs multimodal
+            predictions.
+          </p>
+
+          <h2>Against the real libraries</h2>
+          <p>
+            The production implementation is
+            <a href="https://github.com/scikit-learn/scikit-learn" target="_blank" rel="noreferrer">scikit-learn</a>'s
+            <code>sklearn.mixture.GaussianMixture</code>. It fits with exactly
+            the EM of this page, and its <code>covariance_type</code> options
+            map onto the geometry trade-off directly: <code>"full"</code> (one
+            ellipsoid of any orientation per component),
+            <code>"diag"</code> (axis-aligned ellipsoids, what our diagonal
+            path computes), <code>"tied"</code> (all components share one full
+            covariance, giving linear boundaries between them), and
+            <code>"spherical"</code> (one variance per component, the closest
+            to k-means). What the library adds over this reference is the
+            operational shell around EM rather than different mathematics:
+            k-means and k-means++ based initialization (<code>init_params</code>),
+            <code>n_init</code> restarts keeping the best likelihood,
+            a relative-change convergence test (<code>tol</code>) instead of a
+            fixed iteration count, <code>reg_covar</code> collapse protection,
+            warm starts, and sampling from the fitted model. The companion
+            <code>BayesianGaussianMixture</code> goes further and puts a
+            Dirichlet process prior on the weights, letting superfluous
+            components shrink toward zero weight, which softens the "choose K"
+            problem.
+          </p>
+          <p>
+            For selecting K, <code>GaussianMixture</code> exposes
+            <code>bic(X)</code> and <code>aic(X)</code>. The log-likelihood
+            alone always improves with more components, so it cannot choose
+            K; BIC = k·ln n − 2·ln L̂ and AIC = 2k − 2·ln L̂ charge for the
+            parameter count k, and the standard recipe is to fit a range of
+            component counts and covariance types and keep the minimum BIC.
+            BIC's penalty grows with n, so it chooses more conservatively
+            than AIC and is the usual default for mixtures.
+          </p>
+          <p>
+            The from-scratch version is enough when the GMM lives inside a
+            larger differentiable pipeline (the JAX version is jit-compiled
+            and runs on GPU or TPU unchanged, which scikit-learn does not do),
+            when you need a nonstandard weighting or constraint in the M-step,
+            or when the model is a component of a system you must own end to
+            end. Verify it against the library the honest way: because EM is
+            deterministic given a starting point, initialize both from the
+            same parameters and compare trajectories, rather than comparing
+            two different random fits.
+          </p>
+          <pre><code>import numpy as np, torch
+from sklearn.mixture import GaussianMixture
+
+rng = np.random.default_rng(0)
+X = np.vstack([rng.normal(0, 1, (300, 2)),
+               rng.normal(5, 1.5, (300, 2))])
+
+sk = GaussianMixture(n_components=2, covariance_type="full",
+                     max_iter=200, reg_covar=1e-6,
+                     random_state=0).fit(X)
+
+# same data, our EM; average per-point log-likelihood must match
+# sklearn's score(X) at the fitted optimum to ~1e-4 even though the
+# two runs took different paths there
+mu, Sigma, pi, ll = gmm_em(torch.tensor(X), K=2,
+                           n_iter=200, cov="full", seed=0)
+assert abs(ll[-1].item() / len(X) - sk.score(X)) &lt; 1e-4
+
+# and the means must agree up to component permutation
+perm = np.argsort(mu[:, 0].numpy())
+assert np.allclose(np.sort(sk.means_[:, 0]),
+                   mu[perm, 0].numpy(), atol=1e-2)</code></pre>
+
+          <h2>Traps and misconceptions</h2>
+          <p>
+            <strong>Trusting one run.</strong> EM converges to a local
+            optimum, and bad initializations produce confidently wrong fits:
+            two components sharing one blob while another blob goes unmodeled.
+            The fix is boring and mandatory: multiple restarts, keep the best
+            final likelihood, and prefer k-means-based initialization, which
+            is what scikit-learn defaults to.
+          </p>
+          <p>
+            <strong>Ignoring singularities.</strong> The mixture likelihood
+            is actually unbounded: let one component's mean sit on a single
+            data point and shrink its variance toward zero, and the
+            likelihood diverges to infinity while the "model" degenerates
+            into a spike memorizing one point. Unregularized EM will find
+            these spikes, especially with many components or few points. The
+            covariance floor (<code>reg</code> here,
+            <code>reg_covar</code> in scikit-learn) is what rules them out,
+            which is why it is a correctness feature, not a numerical nicety.
+          </p>
+          <p>
+            <strong>Choosing K by likelihood.</strong> More components never
+            hurt the training likelihood, so maximizing it selects the
+            largest K you try. Use BIC or AIC, a held-out likelihood, or the
+            Bayesian mixture's shrinking weights; and remember that the
+            statistically best K is a statement about density fit, not a
+            guarantee that the components correspond to your idea of the true
+            groups.
+          </p>
+          <p>
+            <strong>Reading component indices as identities.</strong> The
+            likelihood is invariant to permuting components, so component 0
+            of one run is component 2 of the next. Any evaluation that
+            compares fitted parameters across runs, machines, or libraries
+            must first align components, by matching means or by solving a
+            small assignment problem.
+          </p>
+          <p>
+            <strong>Treating k-means and GMMs as rivals.</strong> They are
+            the same algorithm at different temperatures: k-means is the
+            spherical, equal, vanishing-covariance limit of EM. That is a
+            practical statement, not trivia. If clusters look round and
+            similar in size, k-means gives you the same answer faster; the
+            GMM earns its extra parameters exactly when clusters are
+            elongated, differently sized, or overlapping enough that soft
+            assignments carry real information.
+          </p>
+
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> a GMM is a sum of Gaussians with
+            the labels missing, and EM is what maximum likelihood becomes
+            when you alternate between inferring those labels softly (a
+            softmax over log-joint scores, stabilized by log-sum-exp) and
+            refitting each Gaussian by weighted closed-form updates. The
+            likelihood never decreases, which makes the algorithm easy to
+            trust and easy to test, but it climbs to a local optimum of an
+            unbounded objective, so restarts and a covariance floor are part
+            of the algorithm, not add-ons. Squeeze the covariances to nothing
+            and k-means falls out; let them breathe and you get the density
+            estimator that carried speech technology for twenty years.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/code-tabs.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+  </body>
+</html>

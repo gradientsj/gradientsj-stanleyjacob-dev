@@ -1,0 +1,623 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Attention &amp; the Transformer Block · Stanley Jacob</title>
+    <meta name="description" content="Scaled dot-product attention derived as a soft dictionary lookup, why the sqrt(d) scaling exists, causal masking, multi-head attention as parallel subspace attention, and the full pre-LN transformer block, implemented in PyTorch and JAX and verified against F.scaled_dot_product_attention." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml" class="active">ML</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/ml">Machine learning</a></div>
+        <h1>Attention and the transformer block</h1>
+        <p class="lead">
+          Scaled dot-product attention is a differentiable dictionary lookup:
+          every position asks a question, every position advertises an answer,
+          and the output is a similarity-weighted average of values. Wrap it in
+          learned projections, split it across heads, add a two-layer MLP and
+          residual connections, and you have the transformer block, the single
+          module that modern language models, vision models, and diffusion
+          models all repeat dozens of times. This page derives the mechanism,
+          builds it in PyTorch and JAX, and verifies both against the fused
+          kernels you would actually ship.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>What it is and when you reach for it</h2>
+          <p>
+            Attention answers one question: given a sequence of vectors, how
+            should each position gather information from the others? Before
+            attention, the answers were recurrence (carry a state left to
+            right, as in LSTMs) and convolution (mix a fixed local window).
+            Both impose a path length between distant positions that grows with
+            distance, and recurrence resists parallel training because step t
+            depends on step t−1. Attention replaces both with a direct,
+            content-based route: any position can read from any other in a
+            single step, the routing weights are computed from the data rather
+            than fixed by architecture, and the whole thing is a few matrix
+            multiplies, which is exactly the shape of compute GPUs are best at.
+            You reach for it whenever the relationships that matter are not
+            local and not known in advance: which earlier word a pronoun
+            refers to, which image patch contains the object a query cares
+            about, which frame of a trajectory explains the current one. The
+            transformer block is attention plus the machinery that makes
+            stacking it a hundred layers deep trainable: residual connections,
+            normalization, and a position-wise MLP. Almost everything after
+            2017 that people call "a transformer" is this one block repeated.
+          </p>
+
+          <h2>The math</h2>
+          <h3>Attention as a soft dictionary lookup</h3>
+          <p>
+            Start from an ordinary dictionary. A lookup takes a query, finds
+            the key that exactly matches it, and returns that key's value.
+            Attention relaxes "exactly matches" into "matches by dot product"
+            and returns a weighted blend instead of a single value. Each input
+            vector x<sub>i</sub> is linearly projected three ways: a query
+            q<sub>i</sub> = x<sub>i</sub>W<sub>Q</sub> (what position i is
+            looking for), a key k<sub>i</sub> = x<sub>i</sub>W<sub>K</sub>
+            (what position i offers to be found by), and a value
+            v<sub>i</sub> = x<sub>i</sub>W<sub>V</sub> (what position i hands
+            over when selected). The output at position i is
+          </p>
+          <p>
+            out<sub>i</sub> = Σ<sub>j</sub> softmax<sub>j</sub>(q<sub>i</sub>·k<sub>j</sub> / √d<sub>k</sub>) v<sub>j</sub>,
+          </p>
+          <p>
+            or in matrix form Attention(Q, K, V) = softmax(QK<sup>T</sup>/√d<sub>k</sub>) V.
+            The softmax turns raw similarity scores into a convex combination,
+            so the output always lies inside the convex hull of the values: a
+            hard lookup in the limit where one score dominates, a uniform
+            average in the limit where all scores tie, and everything in
+            between is differentiable, which is what lets the projections be
+            learned by gradient descent. The separation into three roles is
+            the load-bearing design choice: what a token seeks, what it can be
+            found by, and what it contributes are three different learned
+            functions of the same vector, and conflating them (as older
+            "dot-product over raw embeddings" models did) forces one
+            representation to serve all three jobs.
+          </p>
+          <p>
+            A worked example with two positions and d<sub>k</sub> = 2. Let the
+            query be q = [1, 1], the keys k<sub>1</sub> = [1, 1] and
+            k<sub>2</sub> = [1, −1], the values v<sub>1</sub> = [1, 0] and
+            v<sub>2</sub> = [0, 1]. Raw scores are q·k<sub>1</sub> = 2 and
+            q·k<sub>2</sub> = 0; dividing by √2 gives [1.414, 0]. Softmax of
+            that is [e<sup>1.414</sup>, e<sup>0</sup>] / (e<sup>1.414</sup> + e<sup>0</sup>)
+            = [4.113, 1] / 5.113 ≈ [0.804, 0.196]. The output is
+            0.804·v<sub>1</sub> + 0.196·v<sub>2</sub> = [0.804, 0.196]: mostly
+            the value of the well-matched key, with a differentiable remainder
+            from the other.
+          </p>
+
+          <h3>Why the √d scaling exists</h3>
+          <p>
+            The √d<sub>k</sub> divisor looks cosmetic and is not. Suppose the
+            components of q and k are independent with mean 0 and variance 1,
+            which is roughly what normalization layers and sensible
+            initialization give you. Then the dot product q·k =
+            Σ<sub>m</sub> q<sub>m</sub>k<sub>m</sub> is a sum of d<sub>k</sub>
+            terms, each with mean 0 and variance 1, so it has variance
+            d<sub>k</sub> and standard deviation √d<sub>k</sub>. At
+            d<sub>k</sub> = 64 (a typical head size) the raw scores have
+            standard deviation 8, and a softmax over logits that spread out is
+            nearly one-hot. That is bad for learning, not for prediction: the
+            softmax Jacobian is diag(y) − yy<sup>T</sup>, and every entry of
+            it goes to zero as y saturates toward a one-hot vector, so
+            gradients through the attention weights vanish and the projections
+            stop training. <mark>Dividing by √d<sub>k</sub> restores the
+            scores to unit variance regardless of head size, keeping the
+            softmax in the regime where it still passes gradient.</mark> This
+            is the same saturation analysis that motivates temperature in any
+            softmax; here the "temperature" is derived from the geometry
+            rather than tuned.
+          </p>
+
+          <h3>Causal masking</h3>
+          <p>
+            A language model trained to predict token t+1 must not let
+            position t read positions after t, or the training task collapses
+            into copying. The fix acts on the score matrix before the softmax:
+            set every score s<sub>ij</sub> with j &gt; i to −∞. After
+            exponentiation those entries become exactly 0, the softmax
+            renormalizes over the surviving prefix, and each row remains a
+            valid distribution over positions 1..i. Two details matter. The
+            mask must be applied before the softmax, not by zeroing weights
+            after it, because zeroing afterwards leaves rows that no longer
+            sum to one and quietly leaks probability mass to the future
+            during normalization. And masking with a very negative finite
+            number instead of −∞ works in float32 but can round to a nonzero
+            weight in float16, so use the dtype's proper −inf and let
+            exp(−inf) = 0 do the work. The triangular structure also means a
+            causal model can cache keys and values for a growing prefix and
+            attend from only the newest query at inference time, which is the
+            entire basis of fast autoregressive decoding.
+          </p>
+
+          <h3>Multi-head attention: parallel subspace attention</h3>
+          <p>
+            One attention pattern per layer is a bottleneck: the softmax
+            produces a single distribution per query, so a position that needs
+            to simultaneously look at "the previous verb" and "the matching
+            open bracket" has to average the two needs into one blurry lookup.
+            Multi-head attention runs h independent attentions in parallel,
+            each in a d<sub>model</sub>/h dimensional subspace: the
+            projections W<sub>Q</sub>, W<sub>K</sub>, W<sub>V</sub> are split
+            into h smaller ones, each head computes
+            softmax(Q<sub>h</sub>K<sub>h</sub><sup>T</sup>/√(d/h))V<sub>h</sub>
+            with its own weights and its own attention pattern, the h outputs
+            are concatenated back to d<sub>model</sub>, and a final output
+            projection W<sub>O</sub> mixes them. Because the subspaces are
+            slices of the same projections, the parameter count and FLOPs are
+            essentially identical to one full-width head; what changes is
+            expressiveness, h separate distributions instead of one. In
+            trained models the heads do specialize measurably: some track
+            positional offsets, some track syntax, some are induction heads
+            that implement in-context copying. In code, heads are nothing more
+            than a reshape of (B, T, C) into (B, h, T, C/h) so the batched
+            matmul treats the head axis as more batch.
+          </p>
+
+          <h3>The transformer block</h3>
+          <p>
+            Attention mixes information across positions but is itself almost
+            linear: values are averaged, and averaging cannot compute
+            per-position nonlinear functions of what was gathered. The block
+            therefore pairs it with a position-wise MLP (two linear layers
+            with a GELU between, hidden width conventionally 4×d<sub>model</sub>)
+            that processes each position independently. A useful reading:
+            attention moves information between positions, the MLP transforms
+            information within a position. Both sublayers sit on a residual
+            stream:
+          </p>
+          <pre class="flow">x ──────────────────────────────┐
+│                               │
+├─► LayerNorm ─► Attention ─►(+)┤   x = x + Attn(LN(x))
+│                               │
+├─► LayerNorm ─► MLP ────────►(+)   x = x + MLP(LN(x))
+│                               │
+▼                               ▼
+        (repeated N times)</pre>
+          <p>
+            The residual connections make the identity the default behavior
+            of every layer: a block that has learned nothing yet passes its
+            input through unchanged, so gradients flow to the bottom of a
+            deep stack from step one. Normalization placement is the one real
+            fork in the road. The original transformer used post-LN,
+            x = LN(x + sublayer(x)), which normalizes the residual stream
+            itself; it can reach slightly better final loss but is famously
+            touchy at depth, needing learning-rate warmup to avoid early
+            divergence because gradient magnitudes vary sharply across
+            layers. GPT-2 popularized pre-LN, x = x + sublayer(LN(x)), where
+            the residual path is never touched and each sublayer merely reads
+            a normalized view of the stream and writes a delta back. Pre-LN
+            trains stably at large depth without warmup gymnastics and is the
+            default in essentially all modern LLMs (usually with RMSNorm in
+            place of LayerNorm); the one wrinkle is that the stream itself is
+            never normalized, so a final norm after the last block is
+            required before the output head. The implementations below are
+            pre-LN.
+          </p>
+
+          <h2>Implementation, twice</h2>
+          <p>
+            First the core function and the multi-head causal self-attention
+            module. The PyTorch version mirrors the
+            <code>CausalSelfAttention</code> module in
+            <a href="https://github.com/karpathy/nanoGPT" target="_blank" rel="noreferrer">nanoGPT</a>
+            (my annotated walkthrough of that codebase lives at
+            <a href="/oss/nanogpt">/oss/nanogpt</a>): one fused linear
+            produces q, k, and v for all heads at once, and heads are a
+            reshape, not a loop. The JAX version says the same thing with
+            einsum, with every shape written out.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+def scaled_dot_product_attention(q, k, v, causal=False):
+    """q, k: (..., T, d); v: (..., T, dv). Returns (..., T, dv)."""
+    d = q.size(-1)
+    # (..., Tq, d) @ (..., d, Tk) -&gt; (..., Tq, Tk)
+    scores = q @ k.transpose(-2, -1) / math.sqrt(d)
+    if causal:
+        Tq, Tk = scores.shape[-2:]
+        future = torch.triu(torch.ones(Tq, Tk, dtype=torch.bool,
+                                       device=scores.device), diagonal=1)
+        # -inf BEFORE softmax: exp(-inf) = 0, rows renormalize
+        # over the visible prefix and still sum to 1.
+        scores = scores.masked_fill(future, float('-inf'))
+    w = F.softmax(scores, dim=-1)
+    return w @ v                          # convex combination of values
+
+class CausalSelfAttention(nn.Module):
+    """Multi-head causal self-attention, shaped like nanoGPT's.
+
+    One fused linear emits q, k, v for every head at once;
+    splitting into heads is a view + transpose, so multi-head
+    costs the same parameters and FLOPs as one full-width head.
+    """
+
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        assert n_embd % n_head == 0
+        self.n_head = n_head
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd)   # q, k, v together
+        self.c_proj = nn.Linear(n_embd, n_embd)       # mixes heads (W_O)
+
+    def forward(self, x):                             # x: (B, T, C)
+        B, T, C = x.shape
+        q, k, v = self.c_attn(x).split(C, dim=2)      # each (B, T, C)
+        # (B, T, C) -&gt; (B, n_head, T, C // n_head): head axis is batch
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        y = scaled_dot_product_attention(q, k, v, causal=True)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)  # concat heads
+        return self.c_proj(y)</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">import jax
+import jax.numpy as jnp
+
+def scaled_dot_product_attention(q, k, v, causal=False):
+    """q, k: (..., T, d); v: (..., T, dv). Returns (..., T, dv)."""
+    d = q.shape[-1]
+    # (..., Tq, d) x (..., Tk, d) -&gt; (..., Tq, Tk)
+    scores = jnp.einsum('...qd,...kd-&gt;...qk', q, k) / jnp.sqrt(d)
+    if causal:
+        Tq, Tk = scores.shape[-2:]
+        visible = jnp.tril(jnp.ones((Tq, Tk), dtype=bool))
+        # -inf BEFORE softmax so masked weights are exactly zero
+        # and each row renormalizes over its visible prefix.
+        scores = jnp.where(visible, scores, -jnp.inf)
+    w = jax.nn.softmax(scores, axis=-1)   # rows sum to 1
+    # (..., Tq, Tk) x (..., Tk, dv) -&gt; (..., Tq, dv)
+    return jnp.einsum('...qk,...kv-&gt;...qv', w, v)
+
+def init_attention(key, n_embd):
+    k1, k2 = jax.random.split(key)
+    s = 1.0 / jnp.sqrt(n_embd)
+    return {
+        'w_qkv': jax.random.normal(k1, (n_embd, 3 * n_embd)) * s,
+        'b_qkv': jnp.zeros(3 * n_embd),
+        'w_out': jax.random.normal(k2, (n_embd, n_embd)) * s,
+        'b_out': jnp.zeros(n_embd),
+    }
+
+def causal_self_attention(params, x, n_head):
+    B, T, C = x.shape                             # (batch, time, model dim)
+    qkv = x @ params['w_qkv'] + params['b_qkv']   # (B, T, 3C)
+    q, k, v = jnp.split(qkv, 3, axis=-1)          # each (B, T, C)
+
+    def heads(t):                                 # (B, T, C) -&gt; (B, H, T, C//H)
+        return t.reshape(B, T, n_head, C // n_head).swapaxes(1, 2)
+
+    y = scaled_dot_product_attention(heads(q), heads(k), heads(v),
+                                     causal=True)  # (B, H, T, C//H)
+    y = y.swapaxes(1, 2).reshape(B, T, C)          # concat heads
+    return y @ params['w_out'] + params['b_out']</code></pre>
+          </div>
+          <p>
+            Then the full pre-LN block: two sublayers, two norms, two
+            residual additions, and a 4× MLP. Note how short the forward
+            is once the sublayers exist; the block is plumbing, and the
+            plumbing is the point.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">class MLP(nn.Module):
+    def __init__(self, n_embd):
+        super().__init__()
+        self.c_fc = nn.Linear(n_embd, 4 * n_embd)   # conventional 4x widen
+        self.c_proj = nn.Linear(4 * n_embd, n_embd)
+
+    def forward(self, x):
+        return self.c_proj(F.gelu(self.c_fc(x)))
+
+class Block(nn.Module):
+    """Pre-LN transformer block. The residual stream is never
+    normalized in place: each sublayer reads a normalized view
+    and writes a delta back, so the identity path stays clean."""
+
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(n_embd)
+        self.attn = CausalSelfAttention(n_embd, n_head)
+        self.ln_2 = nn.LayerNorm(n_embd)
+        self.mlp = MLP(n_embd)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))   # mix across positions
+        x = x + self.mlp(self.ln_2(x))    # transform within positions
+        return x</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">def layer_norm(x, gain, bias, eps=1e-5):
+    mu = x.mean(axis=-1, keepdims=True)
+    var = x.var(axis=-1, keepdims=True)
+    return gain * (x - mu) / jnp.sqrt(var + eps) + bias
+
+def init_block(key, n_embd):
+    ka, k1, k2 = jax.random.split(key, 3)
+    s = 1.0 / jnp.sqrt(n_embd)
+    return {
+        'attn': init_attention(ka, n_embd),
+        'ln1': (jnp.ones(n_embd), jnp.zeros(n_embd)),
+        'ln2': (jnp.ones(n_embd), jnp.zeros(n_embd)),
+        'w_fc': jax.random.normal(k1, (n_embd, 4 * n_embd)) * s,
+        'b_fc': jnp.zeros(4 * n_embd),
+        'w_proj': jax.random.normal(k2, (4 * n_embd, n_embd)) * s,
+        'b_proj': jnp.zeros(n_embd),
+    }
+
+def block(params, x, n_head):
+    """Pre-LN: x = x + Attn(LN(x)); x = x + MLP(LN(x))."""
+    x = x + causal_self_attention(
+        params['attn'], layer_norm(x, *params['ln1']), n_head)
+    h = layer_norm(x, *params['ln2'])
+    h = jax.nn.gelu(h @ params['w_fc'] + params['b_fc'])
+    return x + h @ params['w_proj'] + params['b_proj']</code></pre>
+          </div>
+
+          <h2>Using it on a real shape of problem</h2>
+          <p>
+            GPT-2 small dimensions are the standard smoke test: batch 8,
+            context 1024, model width 768, 12 heads of size 64. The block is
+            shape-preserving, (B, T, C) in and (B, T, C) out, which is what
+            makes stacking trivial.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">torch.manual_seed(0)
+blk = Block(n_embd=768, n_head=12)
+x = torch.randn(8, 1024, 768)
+y = blk(x)
+print(y.shape)                    # torch.Size([8, 1024, 768])
+print(sum(p.numel() for p in blk.parameters()))  # ~7.1M per block</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">key = jax.random.PRNGKey(0)
+params = init_block(key, n_embd=768)
+x = jax.random.normal(key, (8, 1024, 768))
+apply = jax.jit(lambda p, x: block(p, x, n_head=12))
+y = apply(params, x)              # first call compiles, later calls are fast
+print(y.shape)                    # (8, 1024, 768)</code></pre>
+          </div>
+          <p>
+            The thing to internalize from running this is the memory shape,
+            not the output. The materialized score matrix is (B, h, T, T):
+            at these dimensions that is 8 × 12 × 1024 × 1024 float32 values,
+            about 400 MB for a single block's forward, growing quadratically
+            with context. That number, more than any FLOP count, is why the
+            fused kernels in the next-to-last section exist. Exact timings
+            are machine-dependent, but on any GPU you will see the naive
+            version's memory climb with T² while a fused kernel's stays
+            flat.
+          </p>
+
+          <h2>Applications</h2>
+          <p>
+            The honest summary is "everything", but it pays to say it
+            precisely. Decoder-only language models (GPT-4, Llama, Claude,
+            Gemini) are exactly the causal block above repeated 30 to 100+
+            times with a token embedding at the bottom and a softmax over the
+            vocabulary at the top; the differences between them live in
+            normalization flavor, positional encoding, and scale, not in the
+            mechanism. Encoder-style bidirectional attention (no causal mask)
+            powers BERT-family retrieval and embedding models. Vision
+            Transformers cut an image into 16×16 patches, embed each patch as
+            a token, and run the identical block; ViT and its descendants
+            replaced convnets at the top of most image benchmarks and are the
+            visual encoder inside CLIP and most multimodal LLMs. Cross-attention,
+            where queries come from one sequence and keys and values from
+            another, is the standard conditioning mechanism: in Stable
+            Diffusion, U-Net layers attend from image feature positions to
+            CLIP text embeddings, which is literally how the prompt steers
+            the image. The same cross-attention pattern conditions Whisper's
+            speech decoder on audio features and lets AlphaFold's structure
+            module attend over residue pairs. When one mechanism serves
+            language, vision, audio, protein structure, and robot control,
+            the interesting question stops being "where does it apply" and
+            becomes "what are its costs", which is the next section.
+          </p>
+
+          <h2>Against the real libraries</h2>
+          <p>
+            The from-scratch version above materializes the (T, T) score
+            matrix in global memory. Production kernels do not, and that is
+            the entire gap.
+          </p>
+          <p>
+            <a href="https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html" target="_blank" rel="noreferrer">torch.nn.functional.scaled_dot_product_attention</a>
+            is the API to reach for first in PyTorch. It is one call with the
+            exact semantics of the reference function above, and behind it a
+            dispatcher picks among fused backends: a FlashAttention-2 kernel,
+            a memory-efficient kernel derived from the xFormers line of work,
+            a cuDNN backend, and a plain math fallback that behaves like the
+            naive version. You can pin a backend for benchmarking with the
+            <code>torch.nn.attention.sdpa_kernel</code> context manager.
+            nanoGPT itself switched its inner loop to this call; my notes on
+            the surrounding codebase are at
+            <a href="/oss/nanogpt">/oss/nanogpt</a>.
+          </p>
+          <p>
+            <a href="https://github.com/Dao-AILab/flash-attention" target="_blank" rel="noreferrer">flash-attention</a>
+            (Dao et al.) is the kernel most of those backends trace back to.
+            The algorithmic core is online softmax: because a softmax can be
+            computed in one streaming pass carrying only a running (max, sum)
+            pair, the score matrix can be processed tile by tile in on-chip
+            SRAM and never written to global memory, turning attention from
+            memory-bound to compute-bound and making 100k-token contexts
+            affordable. I derive that rescaling identity on the
+            <a href="/ml/softmax">softmax page</a>, and my own step-by-step
+            CUDA reconstruction of the forward pass is written up at
+            <a href="/oss/flash-attention">/oss/flash-attention</a>. The
+            production repo adds what a reference implementation never needs:
+            dropout inside the kernel, paged KV-cache support for serving,
+            head dimensions beyond 128, and a backward pass that recomputes
+            tiles instead of storing them.
+          </p>
+          <p>
+            On the JAX side,
+            <a href="https://github.com/google/flax" target="_blank" rel="noreferrer">flax</a>'s
+            <code>MultiHeadDotProductAttention</code> module is the
+            production analogue of the functional version above, adding the
+            things real training runs need: separate q/k/v/output kernels
+            with configurable initializers, attention dropout, an
+            autoregressive decoding cache, and pluggable attention functions
+            so a fused TPU or Pallas kernel can be swapped in. Recent JAX
+            also ships <code>jax.nn.dot_product_attention</code> with a
+            cuDNN flash path. And
+            <a href="https://github.com/huggingface/transformers" target="_blank" rel="noreferrer">huggingface/transformers</a>
+            (notes at <a href="/oss/transformers">/oss/transformers</a>) is
+            where you see the block at industrial scale: every model file in
+            that repo is some dialect of the block on this page, with
+            per-model choices of norm, positional scheme, and attention
+            backend selected by one <code>attn_implementation</code> flag.
+          </p>
+          <p>
+            The from-scratch version is genuinely enough for research at
+            small scale: short contexts, model surgery, interpretability work
+            where you want the attention weights as an inspectable tensor
+            (the fused kernels never form them). The correctness check is
+            one comparison, run in float64 so tolerance failures mean logic
+            bugs rather than accumulation order:
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">torch.manual_seed(0)
+q, k, v = torch.randn(3, 4, 8, 128, 64, dtype=torch.float64).unbind(0)
+
+ref = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+ours = scaled_dot_product_attention(q, k, v, causal=True)
+
+print((ref - ours).abs().max())   # ~1e-16 in float64
+assert torch.allclose(ref, ours, atol=1e-12)
+# In float32 expect ~1e-6: same math, different summation order.</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">key = jax.random.PRNGKey(0)
+kq, kk, kv = jax.random.split(key, 3)
+# jax.nn.dot_product_attention uses (B, T, H, d) layout
+q = jax.random.normal(kq, (4, 128, 8, 64))
+k = jax.random.normal(kk, (4, 128, 8, 64))
+v = jax.random.normal(kv, (4, 128, 8, 64))
+
+ref = jax.nn.dot_product_attention(q, k, v, is_causal=True)
+# our function wants (B, H, T, d): move the head axis
+ours = scaled_dot_product_attention(
+    q.swapaxes(1, 2), k.swapaxes(1, 2), v.swapaxes(1, 2),
+    causal=True).swapaxes(1, 2)
+
+print(jnp.abs(ref - ours).max())  # ~1e-6 in float32
+assert jnp.allclose(ref, ours, atol=1e-4)</code></pre>
+          </div>
+
+          <h2>Traps and misconceptions</h2>
+          <p>
+            <strong>Masking after the softmax.</strong> Zeroing forbidden
+            weights after normalization leaves rows that do not sum to one
+            and lets future positions influence the normalizer. The mask
+            must be −∞ on the scores, before the softmax, so the surviving
+            prefix renormalizes cleanly. Relatedly, a row where everything
+            is masked (padding-only rows in an encoder) makes softmax
+            produce NaN, since it normalizes over an empty set; production
+            code guards those rows explicitly.
+          </p>
+          <p>
+            <strong>"More heads means more compute."</strong> Heads split
+            the model width; they do not multiply it. Twelve heads of size
+            64 cost the same parameters and matmul FLOPs as one head of
+            size 768. What you buy is twelve independent attention
+            distributions per layer; what you pay is a smaller dot-product
+            subspace per head, which is why head size rarely drops below
+            about 64.
+          </p>
+          <p>
+            <strong>Forgetting the scaling, or scaling by d.</strong>
+            Dropping the √d<sub>k</sub> often still trains at small width and
+            then quietly degrades at larger d<sub>k</sub> as the softmax
+            saturates and attention gradients vanish. The divisor is √d, not
+            d: the standard deviation of the dot product grows as √d, and
+            overcorrecting by d pushes the softmax toward uniform, which
+            blurs every lookup.
+          </p>
+          <p>
+            <strong>"Attention is all you need, so the MLP is optional."</strong>
+            In parameter terms the block is mostly MLP: at 4× widening the
+            MLP holds about two thirds of the block's weights, and ablating
+            it cripples the model. Attention routes; the MLP computes.
+            Interpretability work locates most factual-recall behavior in
+            the MLPs, not the attention maps.
+          </p>
+          <p>
+            <strong>Reading attention weights as explanations.</strong> The
+            weights say where a head looked, in one layer, in one subspace,
+            before the output projection and the other heads mix everything
+            back together. They are a useful debugging signal and a weak
+            explanation of model behavior, and several papers have shown you
+            can perturb them substantially without changing predictions.
+            Treat weight visualizations as hypotheses, not evidence.
+          </p>
+
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> attention is a differentiable
+            dictionary: queries, keys, and values are three learned views of
+            the same stream, √d keeps the softmax trainable, −∞ before the
+            softmax keeps the future invisible, and heads are a free reshape
+            that buys parallel attention patterns. The transformer block
+            wraps that lookup with residuals, norms, and an MLP so it stacks
+            a hundred deep, and every production speedup, FlashAttention
+            included, changes the memory choreography while computing exactly
+            the math on this page.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/code-tabs.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+  </body>
+</html>

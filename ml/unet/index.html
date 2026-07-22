@@ -1,0 +1,570 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>U-Net · Stanley Jacob</title>
+    <meta name="description" content="U-Net from first principles: why skip connections carry the detail that pooling destroys, the output-size arithmetic, segmentation losses under class imbalance, complete PyTorch and JAX implementations, and how the diffusers conditioned U-Net grows out of the vanilla one." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml" class="active">ML</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/ml">Machine learning</a></div>
+        <h1>U-Net</h1>
+        <p class="lead">
+          U-Net is an encoder-decoder convolutional network whose one
+          structural idea, concatenating each encoder stage's feature map into
+          the matching decoder stage, solved the central tension of dense
+          prediction: you need deep pooling to understand what is in an image,
+          and you need full resolution to say exactly where it is. This page
+          derives why the skips are necessary, walks the output-size
+          arithmetic, builds a complete U-Net in PyTorch and in JAX, and then
+          follows the architecture into its second life as the denoising
+          backbone of diffusion models.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>What it is and when you reach for it</h2>
+          <p>
+            U-Net, introduced by Ronneberger, Fischer, and Brox in the 2015
+            paper
+            <a href="https://arxiv.org/abs/1505.04597" target="_blank" rel="noreferrer">U-Net: Convolutional Networks for Biomedical Image Segmentation</a>,
+            is the default architecture for any task whose output is an image
+            the same size as its input: semantic segmentation, depth
+            estimation, denoising, super-resolution, image-to-image
+            translation. A classifier like ResNet ends in a pooled vector
+            because it only has to answer one question about the whole image.
+            A segmentation network has to answer that question at every pixel,
+            which means it must somehow be simultaneously deep, so that each
+            output pixel sees enough context to know it belongs to a tumor and
+            not a shadow, and shallow, so that the boundary of that tumor lands
+            on the right pixel and not sixteen pixels away. U-Net resolves
+            this by running a normal contracting classifier-style encoder,
+            then mirroring it with an expanding decoder, and wiring each
+            encoder resolution directly across to the decoder at the same
+            resolution. You reach for it when the output is spatial and dense;
+            you reach for something else (DETR-style heads, Mask R-CNN) when
+            the output is a set of discrete objects, and for plain encoders
+            when the output is a label or embedding.
+          </p>
+
+          <h2>The math: what pooling destroys and skips restore</h2>
+          <p>
+            Each 2&times;2 max-pool halves the spatial resolution. After four
+            of them a 256&times;256 image has become a 16&times;16 grid, so
+            each bottleneck cell summarizes a 16&times;16 patch of the input
+            (and, through the stacked convolutions, sees a receptive field far
+            larger than that). In signal-processing terms, downsampling by 16
+            discards everything above 1/16 of the original Nyquist frequency:
+            the bottleneck can represent "there is a cell membrane running
+            roughly here" but is mathematically incapable of representing on
+            which of 16 candidate pixel rows the membrane sits. That
+            information is not hidden in the bottleneck waiting to be decoded;
+            it is gone. <mark>No decoder, however clever, can recover
+            high-frequency position from features in which it was never
+            stored, so the decoder must be handed a second input that still
+            has it.</mark> That second input is the skip connection: the
+            encoder feature map from before each pooling step, still at full
+            frequency for its resolution, concatenated channel-wise onto the
+            upsampled decoder stream. The decoder convolutions then see both
+            the semantic verdict (upsampled, blurry, low-frequency) and the
+            local evidence (edges, texture, exact offsets) and can fuse them
+            into a sharp, semantically correct boundary. Ablate the skips and
+            the same network produces masks with the right topology and
+            blobby, quantized edges; that experiment is worth running once to
+            believe it.
+          </p>
+          <p>
+            The shape of the network is the U that names it. Channel counts
+            double at each pooling as resolution halves, the standard trade
+            that keeps the volume of computation roughly constant per level:
+          </p>
+          <pre class="flow">
+input 3ch @ 256x256
+    |
+[DoubleConv]  64ch @ 256 ----------------- skip ------------------&gt; concat -&gt; [DoubleConv]  64ch @ 256 --&gt; 1x1 conv --&gt; C logits @ 256
+    | pool /2                                                          ^ up x2
+[DoubleConv] 128ch @ 128 ------------- skip --------------&gt; concat -&gt; [DoubleConv] 128ch @ 128
+    | pool /2                                                  ^ up x2
+[DoubleConv] 256ch @ 64  --------- skip ----------&gt; concat -&gt; [DoubleConv] 256ch @ 64
+    | pool /2                                          ^ up x2
+[DoubleConv] 512ch @ 32  ----- skip -----&gt; concat -&gt; [DoubleConv] 512ch @ 32
+    | pool /2                                  ^ up x2
+              [DoubleConv] 1024ch @ 16   (bottleneck)
+          </pre>
+          <p>
+            Every level is the same "DoubleConv" motif, two 3&times;3
+            convolutions each followed by normalization and ReLU, so the whole
+            network is one repeated block plus the pooling/upsampling
+            plumbing. With base width 64 doubling to 1024, the parameter count
+            lands around 31 million, essentially all of it in the deep, wide
+            levels: a single 3&times;3 conv from 1024 to 1024 channels alone
+            is 9.4M parameters, while the entire first level is under 40K.
+          </p>
+          <h3>Output arithmetic</h3>
+          <p>
+            The original paper used unpadded convolutions, and the arithmetic
+            is worth doing once because it explains the strange numbers in the
+            paper's Figure 1. A 3&times;3 valid convolution shrinks each side
+            by 2, a DoubleConv by 4, and pooling halves. Starting from the
+            paper's 572&times;572 input: 572 &rarr; 568 &rarr; pool &rarr; 284
+            &rarr; 280 &rarr; 140 &rarr; 136 &rarr; 68 &rarr; 64 &rarr; 32
+            &rarr; 28 at the bottleneck; then each up-convolution doubles and
+            each DoubleConv trims 4 again: 56 &rarr; 52, 104 &rarr; 100, 200
+            &rarr; 196, 392 &rarr; 388. The network maps 572&times;572 to
+            388&times;388, and every skip must be center-cropped before
+            concatenation because the encoder maps are larger than their
+            decoder partners. Modern practice pads the convolutions
+            (padding=1) so that every level preserves its resolution, crops
+            disappear, and output size equals input size, at the cost of
+            slightly degraded borders. The one constraint that survives is
+            divisibility: <mark>with four poolings, input height and width
+            must be divisible by 16, or the upsampled maps will not align with
+            their skips.</mark> Libraries either assert this or silently pad,
+            and hand-rolled code should do one or the other explicitly.
+          </p>
+          <h3>Losses: BCE, Dice, and class imbalance</h3>
+          <p>
+            The output head is a 1&times;1 convolution producing C logits per
+            pixel, so segmentation is just per-pixel classification and the
+            baseline loss is per-pixel cross-entropy (binary cross-entropy
+            with logits for two classes). The catch is class imbalance:
+            in retinal vessel or lesion segmentation the foreground can be 1%
+            of pixels, and a network that predicts "background everywhere" is
+            already at 99% pixel accuracy and a comfortable BCE value. Dice
+            loss attacks this by scoring overlap rather than per-pixel
+            agreement. For predicted probabilities p and mask y, the soft Dice
+            coefficient is 2&Sigma;p<sub>i</sub>y<sub>i</sub> /
+            (&Sigma;p<sub>i</sub> + &Sigma;y<sub>i</sub>), and the loss is one
+            minus it. A four-pixel example: y = [1, 1, 0, 0],
+            p = [0.9, 0.6, 0.3, 0.1] gives intersection 1.5, sums 1.9 + 2.0,
+            Dice = 3.0/3.9 &asymp; 0.769, loss 0.231. Because both numerator
+            and denominator scale with region size, a small lesion counts as
+            much as a large organ, which is exactly the reweighting imbalance
+            calls for. In practice the workhorse is the sum BCE + Dice: BCE
+            supplies smooth, well-conditioned per-pixel gradients early in
+            training, Dice supplies the overlap objective you are actually
+            evaluated on. A smoothing constant &epsilon; added to numerator
+            and denominator keeps the loss defined on empty masks.
+          </p>
+
+          <h3>Upsampling: transposed convolution or interpolation</h3>
+          <p>
+            The decoder needs an operation that doubles resolution, and there
+            are two standard answers. A 2&times;2 transposed convolution with
+            stride 2 is the learned inverse of pooling: every output pixel is
+            a linear function of one input pixel, with weights trained like
+            any other layer. Its known pathology is checkerboard artifacts,
+            since with kernel sizes that do not divide the stride evenly,
+            output pixels are painted by overlapping numbers of kernel taps
+            and a regular grid pattern emerges; the 2&times;2/stride-2 choice
+            avoids the overlap but still learns per-position filters that can
+            tile visibly early in training. The alternative is fixed bilinear
+            interpolation followed by an ordinary convolution, which cannot
+            produce checkerboards, costs fewer parameters, and in many
+            segmentation settings performs identically. The implementations
+            below use the transposed convolution because it is the choice in
+            the original paper and it halves the channel count in the same
+            stroke, but swapping in bilinear upsampling is a two-line change
+            and a legitimate default. It matters less than it seems either
+            way: the skip concatenation immediately hands the following
+            convolutions clean full-resolution features, so the decoder is
+            never forced to invent detail from the upsampled path alone.
+          </p>
+
+          <h2>Implementation, twice</h2>
+          <p>
+            Here is a complete U-Net in both frameworks, built from the three
+            blocks the diagram suggests: DoubleConv, Down (pool then conv),
+            and Up (upsample, concatenate the skip, conv). The PyTorch version
+            is an explicit nn.Module hierarchy with BatchNorm, the standard
+            modern choice. The Flax version uses GroupNorm instead, and the
+            reason is itself instructive: BatchNorm carries running statistics
+            that Flax treats as mutable state threaded through apply(), and
+            GroupNorm, which normalizes within each sample, keeps the model a
+            pure function of its parameters. Channel counts are annotated at
+            every level.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class DoubleConv(nn.Module):
+    """(3x3 conv -&gt; BatchNorm -&gt; ReLU) twice. padding=1 preserves H, W."""
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+    def forward(self, x):
+        return self.net(x)
+
+class Down(nn.Module):
+    """Halve resolution, then DoubleConv."""
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.net = nn.Sequential(nn.MaxPool2d(2), DoubleConv(in_ch, out_ch))
+    def forward(self, x):
+        return self.net(x)
+
+class Up(nn.Module):
+    """Double resolution, concatenate the skip, DoubleConv.
+
+    The transposed conv halves the channels, so after the concat
+    with the equally-wide skip, DoubleConv sees in_ch channels.
+    """
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_ch, in_ch // 2, 2, stride=2)
+        self.conv = DoubleConv(in_ch, out_ch)
+    def forward(self, x, skip):
+        x = self.up(x)
+        # Odd sizes leave x a pixel short of the skip; pad to align.
+        dh, dw = skip.size(2) - x.size(2), skip.size(3) - x.size(3)
+        x = F.pad(x, (dw // 2, dw - dw // 2, dh // 2, dh - dh // 2))
+        return self.conv(torch.cat([skip, x], dim=1))
+
+class UNet(nn.Module):
+    def __init__(self, in_ch=3, n_classes=1, base=64):
+        super().__init__()
+        self.inc = DoubleConv(in_ch, base)         #   64 @ H
+        self.d1  = Down(base,      base * 2)       #  128 @ H/2
+        self.d2  = Down(base * 2,  base * 4)       #  256 @ H/4
+        self.d3  = Down(base * 4,  base * 8)       #  512 @ H/8
+        self.d4  = Down(base * 8,  base * 16)      # 1024 @ H/16 (bottleneck)
+        self.u1  = Up(base * 16,   base * 8)       #  512 @ H/8
+        self.u2  = Up(base * 8,    base * 4)       #  256 @ H/4
+        self.u3  = Up(base * 4,    base * 2)       #  128 @ H/2
+        self.u4  = Up(base * 2,    base)           #   64 @ H
+        self.out = nn.Conv2d(base, n_classes, 1)   # per-pixel logits
+
+    def forward(self, x):
+        x1 = self.inc(x)
+        x2 = self.d1(x1)
+        x3 = self.d2(x2)
+        x4 = self.d3(x3)
+        x5 = self.d4(x4)
+        x = self.u1(x5, x4)
+        x = self.u2(x, x3)
+        x = self.u3(x, x2)
+        x = self.u4(x, x1)
+        return self.out(x)      # no activation: pair with a logits loss</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">import jax
+import jax.numpy as jnp
+from flax import linen as nn
+
+class DoubleConv(nn.Module):
+    """(3x3 conv -&gt; GroupNorm -&gt; ReLU) twice.
+
+    GroupNorm rather than BatchNorm: it keeps no running batch
+    statistics, so apply() stays a pure function of the params
+    and no mutable 'batch_stats' collection is needed.
+    """
+    ch: int
+    @nn.compact
+    def __call__(self, x):
+        for _ in range(2):
+            x = nn.Conv(self.ch, (3, 3), padding='SAME', use_bias=False)(x)
+            x = nn.GroupNorm(num_groups=8)(x)
+            x = nn.relu(x)
+        return x
+
+class UNet(nn.Module):
+    n_classes: int = 1
+    base: int = 64
+
+    @nn.compact
+    def __call__(self, x):                      # x: (N, H, W, C), NHWC
+        chs = [self.base * m for m in (1, 2, 4, 8)]   # 64 128 256 512
+        skips = []
+        for ch in chs:                          # encoder: H, H/2, H/4, H/8
+            x = DoubleConv(ch)(x)
+            skips.append(x)                     # saved BEFORE pooling
+            x = nn.max_pool(x, (2, 2), strides=(2, 2))
+        x = DoubleConv(self.base * 16)(x)       # bottleneck: 1024 @ H/16
+        for ch, skip in zip(reversed(chs), reversed(skips)):
+            x = nn.ConvTranspose(ch, (2, 2), strides=(2, 2))(x)
+            x = jnp.concatenate([skip, x], axis=-1)   # channels last
+            x = DoubleConv(ch)(x)               # 512, 256, 128, 64
+        return nn.Conv(self.n_classes, (1, 1))(x)     # per-pixel logits</code></pre>
+          </div>
+          <p class="quiet">
+            The two models are the same architecture up to the normalization
+            choice and memory layout: PyTorch is NCHW, JAX convolutions
+            default to NHWC. Both take any input whose sides are divisible by
+            16 and return logits at input resolution.
+          </p>
+
+          <h2>Using it on a real shape of problem</h2>
+          <p>
+            A realistic binary-segmentation setup: batches of 256&times;256
+            RGB crops with one-channel masks, BCE plus soft Dice, Adam at
+            1e-4. One training step in each framework:
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">def dice_loss(logits, y, eps=1.0):
+    p = torch.sigmoid(logits)
+    inter = (p * y).sum(dim=(2, 3))
+    denom = p.sum(dim=(2, 3)) + y.sum(dim=(2, 3))
+    # eps keeps the loss finite and its gradient sane on empty masks
+    return 1 - ((2 * inter + eps) / (denom + eps)).mean()
+
+model = UNet(in_ch=3, n_classes=1)
+opt = torch.optim.Adam(model.parameters(), lr=1e-4)
+bce = nn.BCEWithLogitsLoss()
+
+x = torch.randn(4, 3, 256, 256)                       # image batch
+y = (torch.rand(4, 1, 256, 256) &gt; 0.7).float()        # binary masks
+
+logits = model(x)                                     # (4, 1, 256, 256)
+loss = bce(logits, y) + dice_loss(logits, y)
+opt.zero_grad()
+loss.backward()
+opt.step()</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">import optax
+
+model = UNet(n_classes=1)
+key = jax.random.PRNGKey(0)
+x = jax.random.normal(key, (4, 256, 256, 3))          # NHWC
+y = (jax.random.uniform(key, (4, 256, 256, 1)) &gt; 0.7).astype(jnp.float32)
+
+params = model.init(key, x)
+opt = optax.adam(1e-4)
+opt_state = opt.init(params)
+
+def loss_fn(params, x, y, eps=1.0):
+    logits = model.apply(params, x)                   # (4, 256, 256, 1)
+    bce = optax.sigmoid_binary_cross_entropy(logits, y).mean()
+    p = jax.nn.sigmoid(logits)
+    inter = (p * y).sum(axis=(1, 2, 3))
+    denom = p.sum(axis=(1, 2, 3)) + y.sum(axis=(1, 2, 3))
+    dice = 1 - ((2 * inter + eps) / (denom + eps)).mean()
+    return bce + dice
+
+@jax.jit
+def train_step(params, opt_state, x, y):
+    loss, grads = jax.value_and_grad(loss_fn)(params, x, y)
+    updates, opt_state = opt.update(grads, opt_state)
+    return optax.apply_updates(params, updates), opt_state, loss
+
+params, opt_state, loss = train_step(params, opt_state, x, y)</code></pre>
+          </div>
+          <p>
+            On a real dataset (Carvana car masks, the DRIVE retinal vessels,
+            or any Kaggle segmentation set) the combined loss starts near 1.7,
+            roughly ln 2 from BCE at chance plus a Dice loss near its ceiling,
+            and the qualitative trajectory is more informative than the
+            number: the network first predicts a uniform gray, then coarse
+            blobs in approximately the right places, and only later do
+            boundaries snap to edges as the shallow skip pathways start
+            contributing. Exact loss values and wall-clock speed are machine-
+            and dataset-dependent, but the blobs-then-edges progression is
+            robust and is a useful sanity signal that the skips are wired
+            correctly. Budget memory around activations, not parameters: the
+            full-resolution 64-channel maps at both ends of the U dominate,
+            which is why batch sizes for 2D U-Nets are often single digits and
+            why people train on crops rather than whole slides.
+          </p>
+
+          <h2>Applications</h2>
+          <p>
+            U-Net is the segmentation workhorse, and nowhere more than in
+            medical imaging, the domain it was invented for. It won the ISBI
+            cell-tracking challenge it debuted at, and a decade later
+            essentially every organ, tumor, vessel, and lesion segmentation
+            pipeline in radiology research is a U-Net variant; nnU-Net, a
+            self-configuring U-Net framework, has been the reference baseline
+            across dozens of medical segmentation challenges without changing
+            the core architecture. Outside medicine it segments roads and
+            buildings in satellite imagery, defects on factory lines, people
+            in video-call background blur, and fields in precision
+            agriculture. The same shape, sometimes without the name, does
+            image restoration: denoising, deblurring, and super-resolution
+            models are frequently U-Nets whose "mask" is a residual image.
+          </p>
+          <p>
+            Its second life is larger than its first. <mark>The denoising
+            network inside modern diffusion models is a U-Net: the model that
+            predicts the noise added to an image is exactly a dense
+            image-to-image map, which is the problem U-Net was built
+            for.</mark> Stable Diffusion's backbone is a conditioned U-Net
+            operating on latents, with three additions over the vanilla
+            architecture: a sinusoidal timestep embedding injected into every
+            residual block so one network can denoise at every noise level,
+            cross-attention layers at the lower resolutions that let text
+            embeddings steer the denoising, and self-attention to give the
+            convolutional trunk global context. The skip connections are not
+            incidental there; the noise prediction needs exactly the
+            high-frequency information the bottleneck discards. How the
+            denoising objective itself arises is the subject of the
+            <a href="/ml/diffusion">diffusion page</a>.
+          </p>
+
+          <h2>Against the real libraries</h2>
+          <p>
+            Three production libraries define the landscape, and each adds
+            something specific to the reference implementation above.
+          </p>
+          <p>
+            <a href="https://github.com/qubvel-org/segmentation_models.pytorch" target="_blank" rel="noreferrer">segmentation-models-pytorch</a>
+            keeps the U-Net decoder but replaces the from-scratch encoder with
+            a pretrained classification backbone (ResNet, EfficientNet, and
+            hundreds more via timm), tapping its intermediate feature maps as
+            the skips. That is the single highest-leverage upgrade available:
+            on small datasets, which segmentation datasets usually are because
+            masks are expensive to label, ImageNet-pretrained encoders
+            converge faster and generalize better than a randomly initialized
+            contracting path. It also ships Unet++, FPN, DeepLabV3+, and the
+            other decoder families behind one API, plus the standard loss zoo
+            (Dice, Jaccard, Focal, Tversky).
+            <a href="https://github.com/Project-MONAI/MONAI" target="_blank" rel="noreferrer">MONAI</a>
+            is the medical-imaging framework: its U-Nets are n-dimensional, so
+            the same class segments 3D CT and MRI volumes, and the value is as
+            much in the machinery around the model as the model itself,
+            sliding-window inference for volumes too large for GPU memory,
+            medically sensible transforms and I/O for NIfTI/DICOM, and
+            carefully debugged DiceLoss/DiceCELoss implementations.
+            <a href="https://github.com/huggingface/diffusers" target="_blank" rel="noreferrer">diffusers</a>
+            provides UNet2DConditionModel, the Stable Diffusion backbone
+            discussed above. The honest parameter comparison: the classic
+            U-Net at base width 64 is about 31M parameters; Stable Diffusion
+            1.x's UNet2DConditionModel is about 860M, roughly 28 times
+            larger. Structurally the growth comes from a base width of 320
+            instead of 64, timestep embeddings feeding every ResNet block,
+            and self- plus cross-attention blocks interleaved at the lower
+            resolutions; it is width and attention, not depth, and the
+            encoder-skip-decoder skeleton is unchanged.
+          </p>
+          <p>
+            The from-scratch version is genuinely enough more often than the
+            library ecosystem suggests: for a single well-defined 2D task with
+            a few thousand labeled images, the ~100 lines above plus
+            augmentation is competitive, and it is the right starting point
+            whenever you need to modify the architecture itself. Reach for
+            the libraries when you need pretrained encoders (almost always
+            worth it), 3D, or interoperability with pretrained diffusion
+            checkpoints. Verification is straightforward because the contract
+            is just shapes and losses: instantiate
+            <code>smp.Unet(encoder_name="resnet34", classes=1)</code> and your
+            own model, confirm both map (N, 3, 256, 256) to (N, 1, 256, 256);
+            then check your Dice loss against MONAI's
+            <code>DiceLoss(sigmoid=True)</code> on a fixed random
+            logits/target pair, where the two agree to float tolerance once
+            you match the smoothing constants. For the architecture itself, a
+            useful end-to-end test is overfitting a single (image, mask) pair:
+            a correctly wired U-Net drives BCE + Dice essentially to zero on
+            one example within a few hundred steps, and a broken skip usually
+            shows up as edges it cannot reproduce.
+          </p>
+
+          <h2>Traps and misconceptions</h2>
+          <p>
+            <strong>Applying sigmoid or softmax before the loss.</strong> The
+            model ends in raw logits on purpose.
+            <code>BCEWithLogitsLoss</code> and <code>CrossEntropyLoss</code>
+            apply the activation internally in a numerically stable, fused
+            form; feeding them already-activated outputs silently computes the
+            wrong loss and saturates gradients. Activate only at inference,
+            for thresholding.
+          </p>
+          <p>
+            <strong>Skip connections are not residual connections.</strong>
+            ResNet skips add, exist to ease optimization of deep stacks, and
+            connect points at the same resolution a few layers apart. U-Net
+            skips concatenate, exist to route information around the
+            resolution bottleneck, and connect encoder to decoder across the
+            whole network. Conflating them invites the question "why not just add?", and
+            adding works passably, but concatenation lets the decoder learn how
+            to weigh detail against semantics per channel instead of being
+            forced to sum them.
+          </p>
+          <p>
+            <strong>Ignoring the divisibility constraint.</strong> A
+            250&times;250 input reaches the bottleneck at 15&times;15 via
+            floor division, upsamples to 30, and no longer matches its
+            31-pixel skip. The pad-to-match line in the Up block above masks
+            the symptom; the principled fixes are padding inputs to a multiple
+            of 16 or resizing, done deliberately rather than by crash report.
+          </p>
+          <p>
+            <strong>Trusting pixel accuracy.</strong> At 1% foreground, 99%
+            accuracy is the score of the all-background constant predictor.
+            Evaluate with IoU or Dice per class and report the foreground
+            numbers; this is also the argument for putting Dice in the loss
+            rather than only in the metrics.
+          </p>
+          <p>
+            <strong>Treating Dice loss as safe on empty masks.</strong> With
+            an all-zero target the Dice denominator is just &Sigma;p, and
+            without a smoothing constant the loss is ill-conditioned:
+            gradients blow up as predictions correctly approach zero. The
+            &epsilon; in both implementations above is load-bearing, and its
+            value changes behavior on small structures, which is why library
+            implementations expose it as a parameter.
+          </p>
+
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> U-Net is the statement that
+            downsampling destroys exactly the information dense prediction
+            needs, plus the minimal fix: save each resolution's features
+            before pooling and hand them back to the decoder at the same
+            scale. Everything since, pretrained encoders, 3D variants, the
+            attention-laden diffusion backbones, upgrades the blocks while
+            keeping that contract, because the argument it answers is about
+            information, not architecture fashion.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/code-tabs.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+  </body>
+</html>

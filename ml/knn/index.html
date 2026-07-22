@@ -1,0 +1,480 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>k-nearest neighbors · Stanley Jacob</title>
+    <meta name="description" content="k-nearest neighbors from the math to production retrieval: the bias-variance role of k, distance metrics, the curse of dimensionality with concrete numbers, vectorized top-k in PyTorch and JAX, and when KDTree, BallTree, and FAISS take over from brute force." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml" class="active">ML</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/ml">Machine learning</a></div>
+        <h1>k-nearest neighbors</h1>
+        <p class="lead">
+          kNN is the model that refuses to model: keep the training set, and
+          answer every query by looking at the k most similar examples. That
+          refusal makes it the cleanest lens on bias and variance, the most
+          honest victim of the curse of dimensionality, and, reborn as
+          embedding retrieval, one of the most heavily deployed algorithms in
+          production ML. This page works through the statistics, implements
+          brute-force vectorized search, classification, and regression in
+          PyTorch and JAX, and maps where trees and approximate indexes take
+          over.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>What it is and when you reach for it</h2>
+          <p>
+            k-nearest neighbors is nonparametric and lazy: there is no training
+            phase beyond storing the data, and all the work happens at query
+            time. Given a query point, find the k training points closest to it
+            under some distance, then predict by majority vote of their labels
+            (classification) or by averaging their targets (regression). The
+            entire inductive bias is one assumption, that nearby points have
+            similar outputs, which makes kNN the natural baseline whenever you
+            trust your representation more than you trust any parametric family:
+            if a linear model and kNN disagree, the disagreement itself tells
+            you whether the decision surface is simpler or more local than you
+            guessed.
+          </p>
+          <p>
+            Its neighbors in the toolbox are logistic regression and trees on
+            the parametric side, kernel regression as its smooth cousin (kNN is
+            kernel regression with a hard, adaptive-bandwidth window), and, in
+            modern practice, the entire field of vector retrieval, which is kNN
+            over learned embeddings at industrial scale. You reach for it as a
+            few-lines baseline on tabular problems, as the standard probe for
+            embedding quality, and, in its approximate form, as the serving
+            layer behind search and recommendation.
+          </p>
+
+          <h2>The math</h2>
+          <h3>k as the bias-variance dial</h3>
+          <p>
+            kNN regression estimates f(x) by the average of the k nearest
+            targets: f̂(x) = (1/k) Σ<sub>i∈N<sub>k</sub>(x)</sub> y<sub>i</sub>.
+            Write y = f(x) + ε with noise variance σ<sup>2</sup>. The variance
+            of the estimate is σ<sup>2</sup>/k: averaging more neighbors
+            averages away more noise, exactly like any sample mean. The bias is
+            the price paid for those neighbors: E[f̂(x)] − f(x) =
+            (1/k) Σ<sub>i</sub> (f(x<sub>i</sub>) − f(x)), and as k grows the
+            neighborhood N<sub>k</sub>(x) must physically expand to contain k
+            points, dragging in training points whose true f values differ from
+            f(x). Small k: low bias, high variance, jagged decision boundaries
+            that trace individual noisy points. Large k: smooth, stable,
+            increasingly blind to local structure, until k = n predicts the
+            global mean everywhere. <mark>k is a bandwidth, and choosing it is
+            not a nuisance hyperparameter search but the entire statistical
+            content of the method.</mark> Test error against k is typically
+            U-shaped, and cross-validation over k is the honest way to sit at
+            the bottom; distance-weighted voting (weights 1/d or a kernel)
+            softens the choice by letting far neighbors count less.
+          </p>
+          <p>
+            The classic asymptotic result calibrates the small-k end: Cover and
+            Hart (1967) showed that as n → ∞, the error rate of the 1-NN rule is
+            at most twice the Bayes error, the best achievable by any
+            classifier. Memorizing the data and copying the single nearest
+            label, with no learning at all, already gets within a factor of two
+            of optimal in the infinite-data limit. That is both an
+            advertisement for kNN as a baseline and a warning about how much
+            work the phrase "as n → ∞" is doing, because the next subsection is
+            about how fast that limit recedes with dimension.
+          </p>
+          <h3>A worked example</h3>
+          <p>
+            Six labeled points in the plane, one of them a mislabeled outlier,
+            and a query at (0.6, 0.6):
+          </p>
+          <pre class="flow">
+train point   label   Euclidean distance to query (0.6, 0.6)
+(0, 0)        A       sqrt(0.36 + 0.36) = 0.849
+(1, 0)        A       sqrt(0.16 + 0.36) = 0.721
+(0, 1)        A       sqrt(0.36 + 0.16) = 0.721
+(1, 1)        B*      sqrt(0.16 + 0.16) = 0.566   * mislabeled outlier
+(4, 4)        B       4.808
+(5, 4)        B       5.541</pre>
+          <p>
+            With k = 1 the prediction follows the single nearest point, the
+            outlier at (1, 1), and answers B: zero bias toward any smoothing
+            assumption, full exposure to one noisy label. With k = 3 the
+            neighborhood is {(1, 1) B, (1, 0) A, (0, 1) A} and the vote goes
+            2 to 1 for A, the answer the surrounding region supports. Raise k
+            to 6 and the vote ties 3-3 across the whole dataset, bias taken to
+            its limit: the neighborhood has grown until it no longer says
+            anything about the query's locality. The whole bias-variance story
+            is visible in one table.
+          </p>
+          <h3>Distance metrics</h3>
+          <p>
+            The metric is the model. Euclidean distance ‖a − b‖ is the default
+            and the only one most vectorized implementations need, because of a
+            useful identity: for unit-normalized vectors,
+            ‖a − b‖<sup>2</sup> = 2 − 2 a·b, so ranking by Euclidean distance
+            and ranking by cosine similarity are the same ordering. Normalize
+            your embeddings once and you never need a separate cosine code
+            path. Beyond that: Mahalanobis distance whitens correlated
+            features, which is what "learning a metric" mostly means; Hamming
+            distance serves binary codes and fingerprints; L1 is more robust to
+            single-coordinate outliers. On raw tabular features, scaling is
+            part of the metric whether you chose it or not, since an unscaled
+            feature with a large range silently dominates the sum.
+          </p>
+          <h3>The curse of dimensionality, concretely</h3>
+          <p>
+            "Nearby" degrades in high dimension in a way worth stating with
+            numbers rather than adjectives. Suppose data is uniform in the unit
+            cube [0, 1]<sup>d</sup> and you want a cubical neighborhood
+            containing 1% of the data. Its edge length must be
+            0.01<sup>1/d</sup>: for d = 1 that is 0.01, for d = 10 it is
+            already 0.63, and for d = 100 it is 0.955. A "local" neighborhood
+            in 100 dimensions spans 95% of the range of every coordinate, which
+            is to say it is not local at all. A second symptom: distances
+            concentrate. For i.i.d. coordinates, ‖a − b‖<sup>2</sup> is a sum
+            of d independent terms, so its mean grows like d while its standard
+            deviation grows like √d, and the ratio of nearest to farthest
+            neighbor distance drifts toward 1. When every point is nearly
+            equidistant from every other, the identity of the "nearest" one is
+            mostly noise, and both the statistics (bias) and the data
+            structures (tree pruning) built on locality fail together.
+          </p>
+          <p>
+            The reason kNN nevertheless thrives in modern ML is that learned
+            embeddings are not uniform in R<sup>768</sup>. Representation
+            learning concentrates data near much lower-dimensional structure
+            and trains the metric so that semantic similarity aligns with
+            distance; the curse applies to the ambient dimension, retrieval
+            quality depends on the effective one. Raw pixels in R<sup>3072</sup>
+            make kNN useless; CLIP embeddings of the same images make it a
+            strong classifier. Same algorithm, different geometry.
+          </p>
+
+          <h2>Implementation, twice</h2>
+          <p>
+            Brute-force kNN is two lines of math: a pairwise distance matrix
+            and a row-wise top-k. Everything else is memory discipline. The
+            PyTorch version computes distances with <code>torch.cdist</code>
+            and selects with <code>topk(largest=False)</code>, chunking queries
+            so the (chunk, n) matrix stays bounded; the JAX version writes the
+            single-query computation and lifts it over the batch with
+            <code>vmap</code>, selecting with <code>lax.top_k</code> (a max-k
+            primitive, so nearest means negating squared distances). Both
+            support classification by one-hot vote counting, which vectorizes
+            where a per-row mode would not, and regression by neighbor
+            averaging with optional inverse-distance weights.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import torch
+
+@torch.no_grad()
+def knn_search(x_train, x_query, k, chunk=2048):
+    """Exact k nearest neighbors by brute force.
+
+    Chunking queries bounds peak memory at chunk*n floats while
+    keeping every operation a batched matrix computation.
+    Returns (distances, indices), each (m, k).
+    """
+    dists, idxs = [], []
+    for q in x_query.split(chunk):
+        d = torch.cdist(q, x_train)               # (b, n)
+        dk, ik = d.topk(k, dim=1, largest=False)  # k smallest per row
+        dists.append(dk)
+        idxs.append(ik)
+    return torch.cat(dists), torch.cat(idxs)
+
+@torch.no_grad()
+def knn_classify(x_train, y_train, x_query, k, num_classes=None):
+    """Majority vote; one-hot summing vectorizes the vote."""
+    if num_classes is None:
+        num_classes = int(y_train.max()) + 1
+    _, idx = knn_search(x_train, x_query, k)
+    neigh = y_train[idx]                          # (m, k) labels
+    votes = torch.nn.functional.one_hot(neigh, num_classes).sum(dim=1)
+    return votes.argmax(dim=1)                    # (m,)
+
+@torch.no_grad()
+def knn_regress(x_train, y_train, x_query, k, weighted=False):
+    """Neighbor mean, optionally inverse-distance weighted."""
+    d, idx = knn_search(x_train, x_query, k)
+    neigh = y_train[idx]                          # (m, k) targets
+    if not weighted:
+        return neigh.mean(dim=1)
+    w = 1.0 / d.clamp(min=1e-12)                  # exact hits dominate, as they should
+    return (w * neigh).sum(dim=1) / w.sum(dim=1)</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">from functools import partial
+
+import jax
+import jax.numpy as jnp
+
+@partial(jax.jit, static_argnames=("k",))
+def knn_search(x_train, x_query, k):
+    """Exact kNN: write it for one query, vmap over the batch.
+
+    lax.top_k is a max-k primitive, so negate squared distances
+    to get the k nearest. Returns (distances^2, indices), (m, k).
+    """
+    def one_query(q):
+        d2 = ((x_train - q) ** 2).sum(-1)         # (n,)
+        neg, idx = jax.lax.top_k(-d2, k)
+        return -neg, idx
+
+    return jax.vmap(one_query)(x_query)
+
+@partial(jax.jit, static_argnames=("k", "num_classes"))
+def knn_classify(x_train, y_train, x_query, k, num_classes):
+    _, idx = knn_search(x_train, x_query, k)
+    neigh = y_train[idx]                          # (m, k) labels
+    votes = jax.nn.one_hot(neigh, num_classes).sum(axis=1)
+    return votes.argmax(axis=-1)                  # (m,)
+
+@partial(jax.jit, static_argnames=("k", "weighted"))
+def knn_regress(x_train, y_train, x_query, k, weighted=False):
+    d2, idx = knn_search(x_train, x_query, k)
+    neigh = y_train[idx]                          # (m, k) targets
+    if not weighted:                              # static flag: resolved at trace time
+        return neigh.mean(axis=1)
+    w = 1.0 / jnp.sqrt(d2).clip(1e-12)
+    return (w * neigh).sum(axis=1) / w.sum(axis=1)</code></pre>
+          </div>
+          <p class="quiet">
+            One subtlety when evaluating on the training set itself: each
+            point's nearest neighbor is the point, so leave-one-out evaluation
+            should ask for k+1 neighbors and drop the first column.
+          </p>
+
+          <h2>Using it on a real shape of problem</h2>
+          <p>
+            A realistic embedding workload: 50,000 training vectors of
+            dimension 512 (a day of product embeddings from a two-tower model,
+            say), 1,000 queries, k = 10:
+          </p>
+          <pre><code>import torch
+
+g = torch.Generator().manual_seed(0)
+x_train = torch.nn.functional.normalize(
+    torch.randn(50_000, 512, generator=g), dim=1)
+y_train = torch.randint(0, 100, (50_000,), generator=g)
+x_query = torch.nn.functional.normalize(
+    torch.randn(1_000, 512, generator=g), dim=1)
+
+d, idx = knn_search(x_train, x_query, k=10)
+preds = knn_classify(x_train, y_train, x_query, k=10)</code></pre>
+          <p>
+            The full distance matrix is 1,000 × 50,000, about 200 MB in
+            float32, which is why the chunked version matters: at 2,048 queries
+            per chunk peak memory stays around 400 MB and the whole search runs
+            in well under a second on a GPU and a few seconds on CPU, with
+            exact timings machine-dependent. On normalized random vectors like
+            these, expect the top-10 distances to sit in a narrow band (the
+            concentration effect from the math section, visible in your own
+            tensors); on real embeddings with actual structure, the nearest
+            distances separate sharply from the bulk, and that gap is a quick
+            sanity check that your representation contains signal. Scaling law
+            to keep in mind: brute force is O(m · n · d) per query batch, so
+            10× the corpus is 10× the time, which is the line of reasoning
+            that eventually leads to the index structures below.
+          </p>
+
+          <h2>Applications</h2>
+          <p>
+            <strong>Retrieval.</strong> Embedding search is kNN, full stop:
+            embed the corpus, embed the query, return the nearest vectors.
+            Image search, semantic text search, and RAG retrieval all reduce to
+            it, with the exact algorithm swapped for an approximate index once
+            the corpus outgrows brute force. My
+            <a href="/systems/visual-search">visual search</a> design walks the
+            production version end to end, from embedding model to serving.
+          </p>
+          <p>
+            <strong>Recommendation candidate generation.</strong> Two-tower
+            recommenders train user and item embeddings so that the dot product
+            predicts engagement, then serve by finding each user's nearest few
+            hundred items out of millions, a pattern established at scale by
+            YouTube's candidate generation stage. kNN is the funnel's first
+            stage; heavier rankers only ever see what it surfaces.
+          </p>
+          <p>
+            <strong>kNN-LM.</strong> Khandelwal et al. (2020) attached kNN to
+            a language model directly: store (context embedding, next token)
+            pairs for every position in a corpus, and at inference interpolate
+            the LM's softmax with a distribution built from the current
+            context's nearest stored neighbors. The hybrid improved perplexity
+            over the base LM without any retraining, and the idea, that a
+            model can consult explicit memories instead of relying purely on
+            weights, is an ancestor of today's retrieval-augmented systems.
+          </p>
+          <p>
+            <strong>Few-shot baselines and representation probing.</strong>
+            When a new task arrives with 5 examples per class, kNN in a good
+            embedding space is the baseline to beat, and self-supervised
+            vision papers institutionalized this: DINO and its successors
+            report a kNN classifier on frozen features as a standard
+            evaluation, precisely because it adds no learned parameters that
+            could flatter a weak representation. If kNN accuracy is high, the
+            geometry is good; no such conclusion follows from a tuned linear
+            head.
+          </p>
+
+          <h2>Against the real libraries</h2>
+          <p>
+            <a href="https://github.com/scikit-learn/scikit-learn" target="_blank" rel="noreferrer">scikit-learn</a>
+            wraps the whole exact-kNN decision space:
+            <code>KNeighborsClassifier</code>, <code>KNeighborsRegressor</code>,
+            and <code>NearestNeighbors</code> sit over three engines selectable
+            via <code>algorithm=</code>. <code>KDTree</code> recursively splits
+            space on coordinate medians; a query descends to one leaf and then
+            backtracks, pruning any branch whose bounding region is provably
+            farther than the current k-th best. In low dimension the pruning
+            bites and queries cost roughly O(log n) against brute force's O(n).
+            <code>BallTree</code> plays the same game with nested hyperspheres,
+            which stay tighter than axis-aligned boxes as dimension grows, and
+            accepts many more metrics. The crossover is the practical headline:
+            tree pruning depends on neighborhoods being small, so as d climbs
+            past roughly 15 to 20 (effective, not ambient), pruning stops
+            firing, the trees visit most of the data anyway, and a
+            BLAS-batched brute force wins because it at least streams memory
+            perfectly. <code>algorithm="auto"</code> encodes this heuristic,
+            choosing brute force for high-dimensional or sparse inputs. For
+            tabular data in a handful of dimensions, the trees are excellent
+            and exact.
+          </p>
+          <p>
+            <a href="https://github.com/facebookresearch/faiss" target="_blank" rel="noreferrer">FAISS</a>
+            is the answer when n reaches 10<sup>8</sup> and beyond, and it
+            changes the contract: approximate nearest neighbors, tunable recall
+            against latency. Its exact <code>IndexFlatL2</code> is a heavily
+            optimized brute force (and a fine drop-in replacement for the code
+            above); the interesting indexes partition the corpus with IVF
+            (k-means cells, probe a few per query), navigate a small-world
+            graph with HNSW, and compress vectors with product quantization so
+            billion-scale corpora fit in RAM, all with GPU implementations. I
+            cover the internals on the <a href="/oss/faiss">FAISS page</a> and
+            the system built around them in
+            <a href="/systems/visual-search">visual search</a>; the short
+            version is that production retrieval is kNN with the exactness
+            traded away deliberately, one measured recall point at a time.
+          </p>
+          <p>
+            The from-scratch version is genuinely enough more often than the
+            index literature suggests: up to a few hundred thousand vectors on
+            a GPU, brute force is exact, trivially correct, and often faster
+            than building any index, which is why it is the right default
+            inside training loops (contrastive negatives, kNN evaluation
+            callbacks) and for one-off analyses. Verify it against
+            scikit-learn exactly, not approximately:
+            <code>NearestNeighbors(n_neighbors=k, algorithm="brute").fit(X).kneighbors(Q)</code>
+            must return identical index sets on the same float64 arrays
+            (allowing order to differ only where distances tie), and
+            <code>KNeighborsClassifier</code> predictions must match your vote
+            outputs wherever no vote is tied, since tie-breaking is the one
+            legitimately implementation-defined behavior. Run the check with
+            distinct distances (random floats guarantee this almost surely)
+            and the comparison is exact, no tolerance needed on the indices.
+          </p>
+
+          <h2>Traps and misconceptions</h2>
+          <p>
+            <strong>"kNN has no training cost, so it's cheap."</strong> The
+            cost was moved, not removed: every query pays O(n · d), and the
+            whole training set lives in serving memory forever. A parametric
+            model amortizes its training over infinite cheap queries; kNN does
+            the opposite, which is exactly the trade that ANN indexes exist to
+            renegotiate.
+          </p>
+          <p>
+            <strong>Skipping feature scaling.</strong> On raw tabular data,
+            distance is dominated by whichever feature has the largest numeric
+            range: age in years is invisible next to income in dollars.
+            Standardize features (fitting the scaler on training data only, or
+            the test set leaks into the metric) before trusting any kNN
+            result. Embeddings sidestep this because the network chose the
+            scale, but the normalize-for-cosine step is the same idea.
+          </p>
+          <p>
+            <strong>"High dimension kills kNN," stated without
+            qualification.</strong> The curse is real for data that fills its
+            ambient space, and 100-dimensional uniform noise truly has no
+            usable neighbors. But learned embeddings concentrate near
+            low-dimensional structure with a metric trained to mean something,
+            and kNN over them powers some of the largest systems running. The
+            correct statement is that kNN inherits the effective geometry of
+            the representation, failing on bad geometry and thriving on good.
+          </p>
+          <p>
+            <strong>Even k and ties.</strong> With k = 4 and a 2-2 vote, the
+            prediction is an arbitrary tie-break, and implementations differ
+            (scikit-learn takes the lowest class index; the one-hot argmax
+            above does too). Use odd k for binary problems, or
+            distance-weighted votes, which break ties on geometry instead of
+            on class numbering, and never let a library's silent tie rule
+            masquerade as signal in an evaluation.
+          </p>
+          <p>
+            <strong>Confusing cosine and Euclidean results.</strong> Teams
+            regularly report that switching metrics changed retrieval quality
+            when what actually changed was normalization. On unit vectors the
+            two produce identical rankings (‖a − b‖<sup>2</sup> = 2 − 2 a·b);
+            on unnormalized vectors Euclidean is sensitive to magnitude and
+            cosine is not, and embedding magnitude often encodes frequency or
+            confidence rather than semantics. Decide whether magnitude is
+            signal, then pick the metric; do not A/B metrics across an
+            uncontrolled normalization change.
+          </p>
+
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> kNN is a bet that the metric already
+            contains the model: k dials variance against bias like a bandwidth,
+            Cover and Hart guarantee the bet pays within 2× of optimal given
+            enough data, and the curse of dimensionality says how fast "enough"
+            explodes when the geometry is bad. Modern ML resolved the tension
+            by learning the geometry, so kNN's production form is embedding
+            retrieval: brute-force top-k while the corpus is small, KDTree and
+            BallTree in low dimension, and FAISS-style approximate indexes when
+            exactness becomes the thing you trade for scale.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/code-tabs.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+  </body>
+</html>

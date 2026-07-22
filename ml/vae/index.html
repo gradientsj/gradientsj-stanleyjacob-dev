@@ -1,0 +1,555 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Autoencoders and VAEs · Stanley Jacob</title>
+    <meta name="description" content="From plain autoencoders as nonlinear PCA to the VAE: the ELBO derived step by step, the reparameterization trick, the closed-form Gaussian KL, full PyTorch and JAX/Flax implementations with explicit RNG threading, and the KL autoencoder inside Stable Diffusion." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml" class="active">ML</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/ml">Machine learning</a></div>
+        <h1>Autoencoders and VAEs</h1>
+        <p class="lead">
+          An autoencoder learns to compress; a variational autoencoder learns
+          a probability distribution over data, and the distance between those
+          two sentences is one of the most instructive derivations in machine
+          learning. This page starts with the plain autoencoder as nonlinear
+          PCA, derives the ELBO step by step, explains why you cannot
+          backpropagate through sampling and how the reparameterization trick
+          fixes it, and implements the full VAE in PyTorch and in JAX, where
+          threading the random key by hand turns out to be a lesson in itself.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>What it is and when you reach for it</h2>
+          <p>
+            A plain autoencoder is a pair of networks, an encoder f mapping
+            data x to a low-dimensional code z and a decoder g mapping z back,
+            trained so that g(f(x)) &asymp; x. It is the tool you reach for
+            when you want a learned compression or representation of data and
+            have no labels: dimensionality reduction beyond what PCA can do,
+            pretraining features, anomaly detection by reconstruction error.
+            The variational autoencoder, introduced by Kingma and Welling in
+            <a href="https://arxiv.org/abs/1312.6114" target="_blank" rel="noreferrer">Auto-Encoding Variational Bayes</a>
+            (2013), keeps the encoder-decoder shape but changes the claim: it
+            is a generative model, defining a distribution p(x) you can sample
+            new data from, with a latent space regularized to be smooth and
+            complete rather than an arbitrary embedding. You reach for a VAE
+            when you need generation, a latent space you can interpolate and
+            do arithmetic in, or a principled density-ish score; you stay with
+            the plain autoencoder when reconstruction quality is all that
+            matters. Among generative models, VAEs trade sample sharpness for
+            training stability and a real encoder, which is precisely the
+            trade that later made them the compression stage of latent
+            diffusion rather than the star of the show.
+          </p>
+
+          <h2>The math</h2>
+          <h3>The plain autoencoder, and nonlinear PCA</h3>
+          <p>
+            The plain autoencoder objective is nothing but reconstruction:
+            minimize &Sigma;<sub>x</sub> ||x &minus; g(f(x))||<sup>2</sup>
+            over the parameters of both networks. If f and g are single
+            linear maps, f(x) = Wx and g(z) = Vz, this is exactly the
+            rank-k matrix approximation problem, and a classical result
+            (Baldi and Hornik, 1989) says the optimum spans the same subspace
+            as the top k principal components; the linear autoencoder cannot
+            beat PCA, only match it in a rotated basis. Add nonlinearities
+            and depth and the model becomes nonlinear PCA: it can flatten
+            curved manifolds, like unrolling a spiral, that no linear
+            projection can. What it does not become is a generative model.
+            Nothing in the objective says anything about the code space
+            between training points: decode a z that no training image maps
+            to and you get garbage, because the encoder was free to scatter
+            codes into an arbitrary, hole-riddled point cloud. <mark>The
+            plain autoencoder learns a dictionary from data to codes; it
+            never learns which codes are plausible.</mark>
+          </p>
+          <h3>The VAE as a latent-variable model</h3>
+          <p>
+            The VAE fixes this by starting from a probabilistic story and
+            deriving the autoencoder shape as a consequence. Assume data is
+            generated by first drawing a latent z from a fixed prior
+            p(z) = N(0, I), then drawing x from a decoder distribution
+            p<sub>&theta;</sub>(x|z), a neural network with parameters
+            &theta; producing, say, per-pixel Bernoulli means. The model's
+            density is p<sub>&theta;</sub>(x) = &int;
+            p<sub>&theta;</sub>(x|z) p(z) dz, and maximum likelihood asks us
+            to maximize log p<sub>&theta;</sub>(x). That integral over all of
+            latent space is intractable, and so is the posterior
+            p<sub>&theta;</sub>(z|x) we would need for EM. The variational
+            move is to introduce a second network, the encoder
+            q<sub>&phi;</sub>(z|x) = N(&mu;<sub>&phi;</sub>(x),
+            diag(&sigma;<sub>&phi;</sub><sup>2</sup>(x))), as a tractable
+            stand-in for that posterior.
+          </p>
+          <h3>The ELBO, step by step</h3>
+          <p>
+            Multiply and divide by q inside the log, then apply Jensen's
+            inequality (log of an expectation is at least the expectation of
+            the log):
+          </p>
+          <pre class="flow">
+log p(x) = log &int; p(x|z) p(z) dz
+         = log E<sub>z~q(z|x)</sub>[ p(x|z) p(z) / q(z|x) ]
+         &ge; E<sub>z~q(z|x)</sub>[ log p(x|z) + log p(z) &minus; log q(z|x) ]
+         = E<sub>z~q(z|x)</sub>[ log p(x|z) ]  &minus;  KL( q(z|x) || p(z) )
+         = ELBO(&theta;, &phi;; x)
+          </pre>
+          <p>
+            The last line names the two terms every VAE trains on: an
+            expected reconstruction log-likelihood, which wants codes that
+            let the decoder redraw x, and a KL divergence pulling the
+            per-example posterior toward the prior, which wants codes that
+            look like standard normal noise. The inequality is not the whole
+            story; an exact identity pins down the gap. Writing
+            log p(x) = E<sub>q</sub>[log p(x, z) &minus; log q(z|x)] +
+            KL(q(z|x) || p(z|x)) shows that
+            <mark>log p(x) = ELBO + KL(q(z|x) || p(z|x)): the bound is tight
+            exactly when the encoder matches the true posterior, so
+            maximizing the ELBO in &phi; is posterior inference and
+            maximizing it in &theta; is (bounded) maximum likelihood,
+            simultaneously.</mark> The regularizer is not a heuristic bolted
+            onto an autoencoder; both terms fall out of one bound on one
+            quantity.
+          </p>
+          <h3>The reparameterization trick</h3>
+          <p>
+            Training needs the gradient of
+            E<sub>z~q<sub>&phi;</sub></sub>[log p<sub>&theta;</sub>(x|z)]
+            with respect to &phi;, and there is a real obstruction: the
+            expectation is taken over a distribution that depends on &phi;.
+            Estimate it by sampling and the sample z is a draw from a random
+            number generator, not a differentiable function of &mu; and
+            &sigma;; autograd sees a constant. The gradient of an expectation
+            is not the expectation of the gradient when the measure itself
+            moves. The trick is to move the randomness out of the way:
+            a draw from N(&mu;, &sigma;<sup>2</sup>) is exactly
+            z = &mu; + &sigma; &odot; &epsilon; with &epsilon; ~ N(0, I).
+            Now the expectation is over &epsilon;, whose distribution is
+            fixed, and z is a plain differentiable function of &mu;, &sigma;,
+            and a constant-like noise input, so
+            &nabla;<sub>&phi;</sub> E<sub>&epsilon;</sub>[log p(x | &mu; +
+            &sigma;&epsilon;)] = E<sub>&epsilon;</sub>[&nabla;<sub>&phi;</sub>
+            log p(x | &mu; + &sigma;&epsilon;)], and a single-sample Monte
+            Carlo estimate of the right-hand side is exactly what one forward
+            pass computes. The alternative, the REINFORCE/score-function
+            estimator, needs no reparameterization but has variance high
+            enough that VAEs were not practical until this trick made the
+            low-variance pathwise gradient available.
+          </p>
+          <h3>The Gaussian KL in closed form</h3>
+          <p>
+            The KL term never needs sampling at all. For a diagonal Gaussian
+            posterior against the standard normal prior, integrating the two
+            log-densities gives, per dimension,
+          </p>
+          <pre class="flow">
+KL( N(&mu;, &sigma;<sup>2</sup>) || N(0, 1) ) = &frac12; ( &mu;<sup>2</sup> + &sigma;<sup>2</sup> &minus; log &sigma;<sup>2</sup> &minus; 1 )
+          </pre>
+          <p>
+            summed over latent dimensions. Sanity checks it should pass:
+            at &mu; = 0, &sigma; = 1 it is zero, and it grows if the mean
+            drifts from 0 or the variance from 1 in either direction. One
+            worked number: &mu; = 1, &sigma; = 0.5 gives
+            &frac12;(1 + 0.25 &minus; log 0.25 &minus; 1) =
+            &frac12;(0.25 + 1.3863) &asymp; 0.818 nats. In code the encoder
+            outputs log &sigma;<sup>2</sup> rather than &sigma; so the value
+            is unconstrained, and the formula becomes
+            &minus;&frac12; &Sigma; (1 + log&sigma;<sup>2</sup> &minus;
+            &mu;<sup>2</sup> &minus; &sigma;<sup>2</sup>), the exact line you
+            will see in both implementations below.
+          </p>
+
+          <h2>Implementation, twice</h2>
+          <p>
+            First the plain autoencoder, because it is the baseline the VAE
+            should be read against: same shape, no distributions, no noise,
+            no KL.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import torch
+import torch.nn as nn
+
+class AutoEncoder(nn.Module):
+    """Deterministic autoencoder: nonlinear PCA, nothing more."""
+    def __init__(self, d_in=784, d_hidden=400, d_latent=32):
+        super().__init__()
+        self.enc = nn.Sequential(nn.Linear(d_in, d_hidden), nn.ReLU(),
+                                 nn.Linear(d_hidden, d_latent))
+        self.dec = nn.Sequential(nn.Linear(d_latent, d_hidden), nn.ReLU(),
+                                 nn.Linear(d_hidden, d_in), nn.Sigmoid())
+    def forward(self, x):
+        return self.dec(self.enc(x))
+
+# training: minimize F.mse_loss(model(x), x) on flattened images</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">import jax.numpy as jnp
+from flax import linen as nn
+
+class AutoEncoder(nn.Module):
+    """Deterministic autoencoder: nonlinear PCA, nothing more."""
+    d_hidden: int = 400
+    d_latent: int = 32
+
+    @nn.compact
+    def __call__(self, x):
+        z = nn.Dense(self.d_latent)(nn.relu(nn.Dense(self.d_hidden)(x)))
+        h = nn.relu(nn.Dense(self.d_hidden)(z))
+        return nn.sigmoid(nn.Dense(x.shape[-1])(h))
+
+# training: minimize jnp.mean((model.apply(params, x) - x) ** 2)</code></pre>
+          </div>
+          <p>
+            The VAE adds three things and only three things: the encoder ends
+            in two heads (&mu; and log &sigma;<sup>2</sup>), a sampling step
+            connects encoder to decoder via the reparameterization, and the
+            loss gains the closed-form KL. The JAX version carries an extra
+            lesson. JAX has no global random state: every random draw
+            consumes an explicit PRNG key, so the sampling inside the model
+            must be fed a key at apply() time through the
+            <code>rngs</code> argument, and training must split a fresh key
+            every step. What PyTorch hides inside
+            <code>torch.randn_like</code> is a visible, threaded value in
+            Flax, which makes the reparameterization trick's structure,
+            "noise is an input, not an operation", impossible to miss.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class VAE(nn.Module):
+    def __init__(self, d_in=784, d_hidden=400, d_latent=20):
+        super().__init__()
+        self.fc1 = nn.Linear(d_in, d_hidden)
+        self.fc_mu = nn.Linear(d_hidden, d_latent)
+        self.fc_logvar = nn.Linear(d_hidden, d_latent)  # log sigma^2: unconstrained
+        self.fc3 = nn.Linear(d_latent, d_hidden)
+        self.fc4 = nn.Linear(d_hidden, d_in)
+
+    def encode(self, x):
+        h = F.relu(self.fc1(x))
+        return self.fc_mu(h), self.fc_logvar(h)
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)   # randomness enters as an input,
+        return mu + eps * std         # so grads flow to mu and std
+
+    def decode(self, z):
+        return torch.sigmoid(self.fc4(F.relu(self.fc3(z))))
+
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        return self.decode(z), mu, logvar
+
+def vae_loss(recon, x, mu, logvar):
+    # Reconstruction: Bernoulli log-likelihood, SUMMED over pixels.
+    bce = F.binary_cross_entropy(recon, x, reduction='sum')
+    # KL( N(mu, sigma^2) || N(0, I) ), closed form, summed to match.
+    kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    return bce + kld    # = negative ELBO (up to a constant)</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">import jax
+import jax.numpy as jnp
+from flax import linen as nn
+
+class VAE(nn.Module):
+    d_hidden: int = 400
+    d_latent: int = 20
+
+    @nn.compact
+    def __call__(self, x):
+        h = nn.relu(nn.Dense(self.d_hidden)(x))
+        mu = nn.Dense(self.d_latent)(h)
+        logvar = nn.Dense(self.d_latent)(h)   # log sigma^2: unconstrained
+        # JAX has no global RNG. The key is requested by name here and
+        # must be supplied at apply() time: rngs={'latent': key}.
+        eps = jax.random.normal(self.make_rng('latent'), mu.shape)
+        z = mu + jnp.exp(0.5 * logvar) * eps  # reparameterization
+        h = nn.relu(nn.Dense(self.d_hidden)(z))
+        recon = nn.sigmoid(nn.Dense(x.shape[-1])(h))
+        return recon, mu, logvar
+
+def vae_loss(recon, x, mu, logvar, eps=1e-7):
+    # Bernoulli log-likelihood, summed over pixels and batch.
+    bce = -jnp.sum(x * jnp.log(recon + eps)
+                   + (1 - x) * jnp.log(1 - recon + eps))
+    kld = -0.5 * jnp.sum(1 + logvar - mu**2 - jnp.exp(logvar))
+    return bce + kld    # = negative ELBO (up to a constant)</code></pre>
+          </div>
+
+          <h2>Using it on a real shape of problem</h2>
+          <p>
+            The canonical proving ground is MNIST flattened to 784-vectors in
+            [0, 1], a 20-dimensional latent, Adam at 1e-3, exactly the recipe
+            of the original paper and of pytorch/examples. One training step
+            in each framework, on an MNIST-shaped random batch:
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            </div>
+            <pre data-lang="pytorch" class="lang active"><code class="language-python">model = VAE()
+opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+x = torch.rand(128, 784)      # stand-in for a batch of MNIST images
+
+recon, mu, logvar = model(x)
+loss = vae_loss(recon, x, mu, logvar)
+opt.zero_grad()
+loss.backward()
+opt.step()
+print(loss.item() / x.size(0))   # negative ELBO per image, in nats</code></pre>
+            <pre data-lang="jax" class="lang"><code class="language-python">import optax
+
+model = VAE()
+key = jax.random.PRNGKey(0)
+init_key, sample_key, data_key, loop_key = jax.random.split(key, 4)
+x = jax.random.uniform(data_key, (128, 784))   # MNIST-shaped batch
+
+# init also needs the 'latent' stream: the model samples in forward.
+params = model.init({'params': init_key, 'latent': sample_key}, x)
+opt = optax.adam(1e-3)
+opt_state = opt.init(params)
+
+def loss_fn(params, x, rng):
+    recon, mu, logvar = model.apply(params, x, rngs={'latent': rng})
+    return vae_loss(recon, x, mu, logvar)
+
+@jax.jit
+def train_step(params, opt_state, x, rng):
+    rng, step_rng = jax.random.split(rng)   # fresh noise every step:
+    loss, grads = jax.value_and_grad(loss_fn)(params, x, step_rng)
+    updates, opt_state = opt.update(grads, opt_state)
+    return optax.apply_updates(params, updates), opt_state, loss, rng
+
+params, opt_state, loss, loop_key = train_step(params, opt_state, x, loop_key)</code></pre>
+          </div>
+          <p>
+            On real MNIST the summed loss starts around 550 nats per image
+            (the BCE of a gray-mean prediction) and falls steeply; with this
+            architecture it typically settles in the low hundreds of nats
+            after a handful of epochs, with the exact figure depending on
+            binarization, seed, and machine. More diagnostic than the total
+            is the split: reconstruction should fall throughout, while KL
+            rises from near zero, as posteriors individuate away from the
+            prior, before flattening out at a few nats per active latent
+            dimension. Then do the two experiments the plain autoencoder
+            fails: decode z ~ N(0, I) draws, which should yield recognizable
+            if soft digits, and interpolate between two encodings, which
+            should morph one digit into the other through plausible
+            intermediates rather than through ghostly superpositions.
+          </p>
+
+          <h2>Applications</h2>
+          <p>
+            As representation learners, autoencoders and VAEs produce compact
+            codes used downstream for clustering, retrieval, and
+            visualization; in single-cell genomics, tools such as scVI are
+            VAEs whose latents have become standard coordinates for analyzing
+            gene-expression data. Anomaly detection is the plain
+            autoencoder's flagship: train on normal data only, and anomalies
+            at test time reconstruct badly because the model never learned
+            their structure; the reconstruction error is the anomaly score.
+            This runs in industrial defect inspection, network intrusion and
+            fraud detection, and medical screening, with the VAE variant
+            adding a likelihood-flavored score (the ELBO) instead of a raw
+            error. VAEs also earned an early place in model-based
+            reinforcement learning: the World Models line of work compresses
+            game frames through a VAE so the dynamics model and controller
+            operate on a small latent instead of raw pixels, the same
+            compress-then-model pattern latent diffusion later scaled up.
+          </p>
+          <p>
+            The application that gave the VAE its second wind is latent
+            diffusion. <mark>Stable Diffusion is a diffusion model run inside
+            the latent space of a VAE: a KL-regularized autoencoder
+            compresses 512&times;512&times;3 images into
+            64&times;64&times;4 latents, a 48-fold compression, and the
+            expensive iterative denoising happens in that small space.</mark>
+            The
+            <a href="https://arxiv.org/abs/2112.10752" target="_blank" rel="noreferrer">latent diffusion paper</a>
+            calls this stage the KL autoencoder: architecturally a VAE with a
+            very small KL weight, trained with perceptual and adversarial
+            reconstruction losses, so it behaves as a superb compressor with
+            a lightly regularized latent rather than as a full generative
+            model on its own. Every image Stable Diffusion produces is
+            decoded through that VAE decoder; the denoising U-Net that lives
+            in the middle is covered on the <a href="/ml/unet">U-Net
+            page</a> and the surrounding process on the
+            <a href="/ml/diffusion">diffusion page</a>. Finally, the
+            beta-VAE line of work
+            (<a href="https://openreview.net/forum?id=Sy2fzU9gl" target="_blank" rel="noreferrer">Higgins et al., 2017</a>)
+            scales the KL term by a factor &beta; &gt; 1: pressing posteriors
+            harder toward an isotropic prior encourages latent dimensions
+            that vary independently, and on datasets like dSprites individual
+            dimensions come to encode interpretable factors, position, scale,
+            rotation, at a cost in reconstruction fidelity. The concept to
+            retain is that the KL weight is a dial between reconstruction
+            and latent structure, with the plain autoencoder at zero and
+            disentanglement pressure past one.
+          </p>
+
+          <h2>Against the real libraries</h2>
+          <p>
+            The reference points here are one classic and one production
+            system.
+            <a href="https://github.com/pytorch/examples/tree/main/vae" target="_blank" rel="noreferrer">pytorch/examples/vae</a>
+            is the original didactic implementation, and the PyTorch code
+            above deliberately matches its structure (fc1 through fc4, the
+            same loss lines), so diffing against it is a direct check of
+            yours; it adds only the data loading, the epoch loop, and sample
+            saving. The production library is
+            <a href="https://github.com/huggingface/diffusers" target="_blank" rel="noreferrer">diffusers</a>
+            with <code>AutoencoderKL</code>, the Stable Diffusion VAE. What
+            it adds over the MLP above is everything scale demands: a
+            convolutional ResNet encoder-decoder with attention at the
+            bottleneck, outputs shaped as a diagonal Gaussian over a spatial
+            latent grid rather than a vector, tiled and sliced
+            encoding/decoding so large images fit in memory, and pretrained
+            weights (the SD 1.x VAE is about 84 million parameters, against
+            roughly 1.1 million for the MLP VAE here). It is also a useful
+            reality check on theory versus deployment: <code>AutoencoderKL</code>
+            ships the &mu;, log&sigma;<sup>2</sup> machinery, but because its
+            training weighted KL so lightly, pipelines typically take the
+            posterior mode rather than sampling, and apply a scaling factor
+            (0.18215 for SD 1.x) to normalize latent variance for the
+            diffusion model.
+          </p>
+          <p>
+            The from-scratch version is enough surprisingly often: for
+            anomaly detection on tabular or sensor data, for learning about
+            latent-variable models, and for research prototypes where you
+            need to modify the objective, a hundred lines you fully
+            understand beat a framework. Reach for the libraries when you
+            need pretrained image compressors or interop with diffusion
+            checkpoints. For verification, the sharpest check is the KL term,
+            because it has a closed form an independent implementation can
+            confirm. PyTorch's distributions module computes the divergence
+            symbolically, so on a fixed seed:
+          </p>
+          <pre><code>from torch.distributions import Normal, kl_divergence
+torch.manual_seed(0)
+mu, logvar = torch.randn(8, 20), torch.randn(8, 20)
+ours = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+ref  = kl_divergence(Normal(mu, (0.5 * logvar).exp()), Normal(0.0, 1.0))
+assert torch.allclose(ours, ref, atol=1e-6)</code></pre>
+          <p>
+            The same tensors pushed through the JAX loss should agree to
+            float32 tolerance, and a full-model check is to run both
+            frameworks' training loops on the same fixed batch and confirm
+            the initial losses match once the parameter initializations are
+            copied across.
+          </p>
+
+          <h2>Traps and misconceptions</h2>
+          <p>
+            <strong>Treating the logvar head as a variance.</strong> The
+            encoder's second output is log &sigma;<sup>2</sup>, chosen so the
+            network can emit any real number. Using it as &sigma; directly,
+            or forgetting the 0.5 in <code>exp(0.5 * logvar)</code>, produces
+            a model that trains and generates garbage, one of the quietest
+            bugs in the genre because nothing crashes.
+          </p>
+          <p>
+            <strong>Mismatched reductions between the two loss terms.</strong>
+            The ELBO is a sum over pixels plus a sum over latent dimensions.
+            Take the mean over 784 pixels but the sum over the KL, and you
+            have silently multiplied the KL's relative weight by 784, an
+            accidental extreme beta-VAE that collapses to the prior. Sum
+            both, or mean both and rescale deliberately; know which
+            &beta; you are actually training.
+          </p>
+          <p>
+            <strong>Posterior collapse is a real failure mode, not a
+            symptom of buggy code.</strong> With a decoder powerful enough to
+            model x unconditionally (an autoregressive decoder, or a heavy
+            KL weight), the optimum can set q(z|x) = p(z) everywhere: the KL
+            term reaches zero and the latent carries no information. If KL
+            drops to zero and stays there, the latent is dead; remedies
+            include KL annealing (warming the KL weight from 0), free bits,
+            and weaker decoders.
+          </p>
+          <p>
+            <strong>"VAEs are blurry" is a statement about the loss, not the
+            framework.</strong> Pixelwise Gaussian or Bernoulli likelihoods
+            score the per-pixel mean, and the mean of several sharp
+            plausible images is a blur; a one-sample z also averages over
+            decoder uncertainty. Change the reconstruction term, as the
+            Stable Diffusion VAE does with perceptual and adversarial
+            losses, and the same architecture produces crisp images.
+          </p>
+          <p>
+            <strong>Evaluating generation by encoding test images.</strong>
+            Reconstruction quality is the autoencoder's metric. The VAE's
+            claims are about p(x): sample from the prior, inspect
+            interpolations, or estimate held-out likelihood with importance
+            sampling. A model can reconstruct beautifully while its prior
+            samples are nonsense, which is exactly the plain autoencoder's
+            failure sneaking back in.
+          </p>
+
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> a plain autoencoder learns a
+            mapping; a VAE learns a distribution, and everything that
+            distinguishes it, the two-headed encoder, the sampling layer, the
+            KL term, falls out of one derivation: bound the intractable
+            log-likelihood by the ELBO, make the bound differentiable with
+            the reparameterization trick, and evaluate the Gaussian KL in
+            closed form. Hold onto the KL weight as a dial, autoencoder at
+            zero, disentanglement past one, nearly zero again inside Stable
+            Diffusion's compressor, and the whole family becomes one model
+            read at different settings.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/code-tabs.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+  </body>
+</html>
