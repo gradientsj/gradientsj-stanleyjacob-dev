@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Softmax · Stanley Jacob</title>
+    <meta name="description" content="Softmax from the math to the metal: numerical stability, the online single-pass variant behind FlashAttention, the backward pass from the Jacobian, and matching NumPy, PyTorch, Triton, and CUDA implementations." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml" class="active">ML</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/ml">Machine learning</a></div>
+        <h1>Softmax</h1>
+        <p class="lead">
+          Softmax turns a vector of arbitrary scores into a probability
+          distribution, and it hides two ideas that matter far beyond it: the
+          subtract-max trick that keeps exponentials finite, and the online
+          rescaling trick that lets the reduction stream over data it never
+          holds at once, which is the heart of FlashAttention. This page derives
+          both, then implements the row-wise forward four ways: a NumPy
+          reference, PyTorch with a hand-written backward, a Triton kernel, and
+          a CUDA kernel.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>The math, and why the naive version overflows</h2>
+          <p>
+            For a row of scores x, softmax(x)<sub>i</sub> =
+            exp(x<sub>i</sub>) / Σ<sub>j</sub> exp(x<sub>j</sub>). The
+            definition is one line, but computed literally it fails on real
+            inputs: exp(89) already overflows a float32, and logits from a large
+            model routinely reach that scale. The fix follows from an
+            invariance: adding any constant c to every score multiplies both the
+            numerator and the denominator by exp(c), so the result is unchanged.
+            Choosing c = −max(x) makes the largest exponent exactly exp(0) = 1,
+            every other exponent at most 1, and underflow of far-away scores
+            harmless, since a score forty units below the max contributes
+            nothing to the sum anyway. Every serious implementation, from NumPy
+            to cuDNN, is the same three reductions: a max, a sum of shifted
+            exponentials, and a divide.
+          </p>
+
+          <h2>Forward, four ways</h2>
+          <p>
+            The four implementations below compute the same row-wise softmax on
+            a 2-D array. Reading them against each other shows exactly what the
+            GPU versions add: nothing mathematical, only a mapping of the three
+            reductions onto parallel hardware, one program or thread block per
+            row.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="python" class="active">NumPy</button>
+              <button data-lang="pytorch">PyTorch</button>
+              <button data-lang="triton">Triton</button>
+              <button data-lang="cuda">CUDA</button>
+            </div>
+            <pre data-lang="python" class="lang active"><code class="language-python">import numpy as np
+
+def softmax(x, axis=-1):
+    """Numerically stable row-wise softmax.
+
+    Subtracting the row max changes nothing mathematically
+    (top and bottom are both scaled by exp(-max)) but keeps
+    every exponent in (-inf, 0], so exp never overflows.
+    """
+    shifted = x - x.max(axis=axis, keepdims=True)
+    e = np.exp(shifted)
+    return e / e.sum(axis=axis, keepdims=True)</code></pre>
+            <pre data-lang="pytorch" class="lang"><code class="language-python">import torch
+
+class Softmax(torch.autograd.Function):
+    """Row-wise softmax with a hand-written backward.
+
+    Forward saves y rather than x: the gradient of softmax
+    is expressible entirely in terms of its output, which is
+    why frameworks never need to keep the logits around.
+    """
+
+    @staticmethod
+    def forward(ctx, x):
+        shifted = x - x.amax(dim=-1, keepdim=True)
+        y = shifted.exp()
+        y = y / y.sum(dim=-1, keepdim=True)
+        ctx.save_for_backward(y)
+        return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        (y,) = ctx.saved_tensors
+        # dx_i = y_i * (dy_i - sum_j dy_j y_j)
+        return (dy - (dy * y).sum(dim=-1, keepdim=True)) * y
+
+softmax = Softmax.apply</code></pre>
+            <pre data-lang="triton" class="lang"><code class="language-python">import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def softmax_kernel(x_ptr, out_ptr, n_cols,
+                   x_stride, out_stride,
+                   BLOCK: tl.constexpr):
+    # One program per row. BLOCK is the next power of two
+    # above n_cols, so the whole row fits in registers and
+    # each reduction is a single tl.max / tl.sum.
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    mask = offs &lt; n_cols
+    x = tl.load(x_ptr + row * x_stride + offs,
+                mask=mask, other=float('-inf'))
+    x = x - tl.max(x, axis=0)   # -inf padding drops out here
+    num = tl.exp(x)
+    den = tl.sum(num, axis=0)   # exp(-inf) = 0, so padding adds 0
+    tl.store(out_ptr + row * out_stride + offs,
+             num / den, mask=mask)
+
+def softmax(x):
+    rows, cols = x.shape
+    out = torch.empty_like(x)
+    BLOCK = triton.next_power_of_2(cols)
+    softmax_kernel[(rows,)](x, out, cols,
+                            x.stride(0), out.stride(0),
+                            BLOCK=BLOCK)
+    return out</code></pre>
+            <pre data-lang="cuda" class="lang"><code class="language-cpp">// One thread block per row; each of the three reductions
+// (max, sum, normalize) is a strided loop over the row
+// followed by a shared-memory tree reduction.
+__global__ void softmax_kernel(const float* __restrict__ x,
+                               float* __restrict__ out,
+                               int cols) {
+    extern __shared__ float shm[];
+    const float* xr  = x   + (long)blockIdx.x * cols;
+    float*       outr = out + (long)blockIdx.x * cols;
+
+    // 1. row max
+    float m = -INFINITY;
+    for (int i = threadIdx.x; i &lt; cols; i += blockDim.x)
+        m = fmaxf(m, xr[i]);
+    shm[threadIdx.x] = m;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s &gt; 0; s &gt;&gt;= 1) {
+        if (threadIdx.x &lt; s)
+            shm[threadIdx.x] = fmaxf(shm[threadIdx.x],
+                                     shm[threadIdx.x + s]);
+        __syncthreads();
+    }
+    m = shm[0];
+    __syncthreads();
+
+    // 2. sum of shifted exponentials
+    float sum = 0.f;
+    for (int i = threadIdx.x; i &lt; cols; i += blockDim.x)
+        sum += expf(xr[i] - m);
+    shm[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s &gt; 0; s &gt;&gt;= 1) {
+        if (threadIdx.x &lt; s)
+            shm[threadIdx.x] += shm[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv = 1.f / shm[0];
+
+    // 3. normalize
+    for (int i = threadIdx.x; i &lt; cols; i += blockDim.x)
+        outr[i] = expf(xr[i] - m) * inv;
+}
+
+// launch, with blockDim a power of two:
+// softmax_kernel&lt;&lt;&lt;rows, 256, 256 * sizeof(float)&gt;&gt;&gt;(x, out, cols);</code></pre>
+          </div>
+          <p class="quiet">
+            The Triton and CUDA versions are numerically identical to the NumPy
+            reference; a test that compares all four to within float32 tolerance
+            on random rows, including rows containing -inf and rows of equal
+            values, is the first thing to write.
+          </p>
+
+          <h2>Online softmax: the trick FlashAttention is built on</h2>
+          <p>
+            The three-pass structure above reads the row three times, and for
+            attention that is fatal: the row is a whole matrix of scores that
+            never fits in fast memory. The online variant folds the max and the
+            sum into a single left-to-right pass. Keep a running maximum m and a
+            running sum s of exponentials relative to m; when a new element v
+            raises the maximum, the sum accumulated so far is expressed relative
+            to a stale m, so rescale it by exp(m − m_new) before adding the new
+            term. The rescale is exact, not an approximation:
+          </p>
+          <pre><code>def online_softmax(row):
+    m, s = float('-inf'), 0.0
+    for v in row:                      # one pass, O(1) state
+        m_new = max(m, v)
+        s = s * math.exp(m - m_new) + math.exp(v - m_new)
+        m = m_new
+    return [math.exp(v - m) / s for v in row]</code></pre>
+          <p>
+            Because the state is just (m, s), the pass can be tiled: process the
+            row in blocks, and merge each block's (m, s) pair with the running
+            pair using the same rescaling. That is precisely what
+            <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noreferrer">FlashAttention</a>
+            does, streaming tiles of the attention score matrix through on-chip
+            memory and carrying (m, s) per query row, so the full score matrix
+            is never materialized. My
+            <a href="https://github.com/gradientsj/flash-attention-cuda" target="_blank" rel="noreferrer">flash-attention-cuda</a>
+            repository builds the forward pass from exactly this kernel, step by
+            step from a naive baseline, with each step's speedup measured on an
+            RTX 4090.
+          </p>
+
+          <h2>The backward pass</h2>
+          <p>
+            Differentiating y<sub>i</sub> = exp(x<sub>i</sub>) / Σ exp gives the
+            Jacobian ∂y<sub>i</sub>/∂x<sub>j</sub> =
+            y<sub>i</sub>(δ<sub>ij</sub> − y<sub>j</sub>): a diagonal term minus
+            a rank-one term. Multiplying the incoming gradient dy through it
+            collapses to dx<sub>i</sub> = y<sub>i</sub>(dy<sub>i</sub> −
+            Σ<sub>j</sub> dy<sub>j</sub>y<sub>j</sub>), which is one dot product
+            and one elementwise multiply, no Jacobian ever materialized. Two
+            things are worth noticing. The backward needs only the output y, not
+            the input x, which is why the PyTorch tab saves y. And when softmax
+            is immediately followed by cross-entropy loss, the composite
+            gradient simplifies further to y − onehot(target), which is why
+            every framework fuses the two and why you should never put an
+            explicit softmax before <code>CrossEntropyLoss</code>.
+          </p>
+
+          <h2>Performance notes</h2>
+          <p>
+            Softmax is memory-bound: three reads and a write per element against
+            a handful of exponentials, so the roofline is bandwidth, not FLOPs.
+            The Triton version holds the row in registers and reads it once,
+            which is why a fused one-pass kernel beats the three-pass CUDA
+            version above on rows that fit in a block, and the CUDA version in
+            turn exists to make the reduction structure explicit. The remaining
+            distance to cuDNN is fusion: production kernels fold the shift,
+            exponential, and normalize into neighboring operations (the
+            attention matmul, the loss) rather than round-tripping through
+            global memory. On the numerics side, <code>expf</code> can be
+            swapped for the faster <code>__expf</code> intrinsic at a small
+            accuracy cost, a trade worth measuring rather than assuming.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> softmax is three reductions and an
+            invariance. The subtract-max trick is the invariance used for
+            safety, online softmax is the same invariance used for streaming,
+            and once the state shrinks to a running (max, sum) pair, the kernel
+            tiles, which is the whole reason attention over long sequences is
+            affordable at all.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/code-tabs.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+  </body>
+</html>
