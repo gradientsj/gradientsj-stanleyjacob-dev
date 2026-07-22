@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>RocksDB walkthrough · Stanley Jacob</title>
-    <meta name="description" content="A walkthrough of the RocksDB repository: how to use it in five minutes, how memtables, SST files, and compaction fit together, what column families are for, and a guided reading path from the public headers to the write path and compaction code." />
+    <meta name="description" content="A full chapter on RocksDB: a practical tutorial, a systems-internals walkthrough following one Put and one Get through the WAL, memtable, flush, SST levels, bloom filters, and block cache, deep dives into the LSM amplification trade-offs, SST anatomy, and the MANIFEST, plus a staged repository reading plan and db_bench labs." />
     <link rel="stylesheet" href="/style.css" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
   </head>
@@ -32,16 +32,19 @@
         <p class="lead">
           <a href="https://github.com/facebook/rocksdb" target="_blank" rel="noreferrer">RocksDB</a>
           is an embeddable persistent key-value store from Meta's database
-          engineering team, built on the earlier LevelDB work of Sanjay Ghemawat
-          and Jeff Dean, and it has quietly become the storage engine that other
-          systems are made of: MyRocks puts it under MySQL, TiKV and Kafka
-          Streams and Flink's state backend all keep their bytes in it. It is
-          the LSM tree in production form, and this walkthrough covers how to
-          use it in five minutes, the ideas that define it, and a guided path
-          for reading the repository. It pairs with my
-          <a href="/systems/key-value-store">key-value store design
-          write-up</a>, which derives the same LSM structure from requirements
-          instead of from code.
+          engineering team, built on the earlier LevelDB work of Sanjay
+          Ghemawat and Jeff Dean, and it has quietly become the storage engine
+          that other systems are made of: MyRocks puts it under MySQL, and
+          TiKV, Kafka Streams, and Flink's state backend all keep their bytes
+          in it. It is the LSM tree in production form. This is a full
+          chapter, not a tour: a practical tutorial, a systems-internals
+          walkthrough that follows one Put and one Get from the API through
+          the WAL, memtable, flush, and compaction to the SST levels and
+          back up through bloom filters and the block cache, deep dives into
+          the load-bearing subsystems, a staged plan for reading the
+          repository, and labs built on db_bench and sst_dump. File names
+          and defaults were checked against the current main branch of the
+          repository.
         </p>
       </div>
     </header>
@@ -49,22 +52,77 @@
     <section class="soft">
       <div class="wrap">
         <article class="prose article">
-          <h2>Using it in five minutes</h2>
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">write:  Put(k,v) ─▶ WriteBatch ─▶ WAL append ─▶ memtable (skiplist, sorted)
+                                                   │ fills (64 MB default)
+                                                   ▼
+                                     flush ─▶ L0 SST file (sorted, immutable)
+                                                   │ L0 piles up (4 files)
+                                                   ▼
+                              compaction ─▶ L1 ─▶ L2 ─▶ ... ─▶ L6 (each ~10× larger)
+
+read:   Get(k) ─▶ memtable ─▶ immutable memtables ─▶ L0 files (newest first)
+                     ─▶ L1..Ln (one binary-searched file per level)
+                          each file: bloom filter ─▶ index block ─▶ data block
+                                          (block cache in front of the disk)</pre>
           <p>
-            RocksDB is a library, not a server. There is no daemon to start and
-            no port to bind; you link it into your process and it manages a
-            directory of files on disk. The canonical way in is to build from
-            source, though prebuilt packages exist on most platforms
-            (<code>librocksdb-dev</code> on Debian and Ubuntu, a
-            <code>rocksdb</code> formula on Homebrew):
+            The one-sentence identity: <mark>RocksDB is a log-structured
+            merge tree in a library: writes are absorbed by a sorted
+            in-memory buffer and a sequential log, disk data lives only in
+            sorted immutable files, and a background merge process
+            perpetually renegotiates the price of reads, writes, and
+            space.</mark> There is no server, no port, no SQL; you link the
+            library into your process and it manages a directory of files.
+            Everything in the repository serves one of the three verbs in
+            the diagram: absorb writes (WAL plus memtable), reorganize data
+            (flush plus compaction), or answer reads (filters, indexes,
+            caches, merging iterators).
           </p>
-          <pre><code>git clone https://github.com/facebook/rocksdb.git
-cd rocksdb
-make static_lib
-cd examples &amp;&amp; make all</code></pre>
           <p>
-            The entire public API lives behind a handful of headers, and the
-            minimal program is short enough to read in one breath:
+            The deep reason for the shape is the difference between random
+            and sequential I/O. A B-tree updates pages in place, paying a
+            random write per update but keeping one copy of each key. An LSM
+            never updates anything in place: every write is an append or a
+            new sorted file, which turns the write path into pure sequential
+            I/O that both flash and disks love, and pushes the deferred cost
+            into background merges and into reads that must consult several
+            places. RocksDB is what happens when that idea is engineered for
+            a decade against production workloads at Meta: the trade-offs
+            become explicit options, and the bookkeeping (which files exist,
+            at which level, holding which key ranges) becomes its own small
+            database, the MANIFEST.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <h3>Installing on Linux and macOS</h3>
+          <p>
+            RocksDB is a C++ library. Prebuilt packages exist
+            (<code>librocksdb-dev</code> on Debian and Ubuntu, the
+            <code>rocksdb</code> formula on Homebrew), and building from
+            source is the canonical route and the one you want for reading
+            anyway:
+          </p>
+          <pre><code># Debian/Ubuntu build prerequisites
+sudo apt install build-essential libgflags-dev libsnappy-dev \
+    zlib1g-dev libbz2-dev liblz4-dev libzstd-dev
+
+git clone https://github.com/facebook/rocksdb.git
+cd rocksdb
+make static_lib -j$(nproc)        # librocksdb.a
+make db_bench sst_dump ldb -j$(nproc)   # the tools this chapter uses
+cd examples &amp;&amp; make simple_example</code></pre>
+          <p>
+            On macOS, <code>brew install rocksdb</code> gives you the
+            library and tools (the benchmark binary may be installed as
+            <code>rocksdb_bench</code> and similar prefixed names). The
+            debug default of the Makefile is slow by design; when you
+            benchmark, build with <code>DEBUG_LEVEL=0</code>.
+          </p>
+          <h3>A first real program</h3>
+          <p>
+            The natural language is C++, and the minimal program is short
+            enough to read in one breath (this is a lightly trimmed
+            <code>examples/simple_example.cc</code>):
           </p>
           <pre><code>#include "rocksdb/db.h"
 #include "rocksdb/options.h"
@@ -80,150 +138,727 @@ assert(s.ok());
 
 s = db-&gt;Put(rocksdb::WriteOptions(), "key1", "value");
 std::string value;
-s = db-&gt;Get(rocksdb::ReadOptions(), "key1", &amp;value);</code></pre>
+s = db-&gt;Get(rocksdb::ReadOptions(), "key1", &amp;value);
+assert(s.ok() &amp;&amp; value == "value");</code></pre>
           <p>
-            This is a lightly trimmed version of
-            <code>examples/simple_example.cc</code> in the repository, which
-            goes on to show <code>WriteBatch</code> for atomic multi-key writes
-            and <code>PinnableSlice</code> for copy-free reads. Every call
-            returns a <code>Status</code> rather than throwing, iterators give
-            you ordered range scans with <code>Seek</code> and
-            <code>Next</code>, and the repository ships two inspection tools
-            worth knowing early: <code>ldb</code> for poking at a live database
-            from the command line and <code>sst_dump</code> for reading the
-            files it produces.
+            Iterators give ordered range scans, which is the capability that
+            separates an LSM store from a plain hash store:
+          </p>
+          <pre><code>rocksdb::Iterator* it = db-&gt;NewIterator(rocksdb::ReadOptions());
+for (it-&gt;Seek("user:"); it-&gt;Valid() &amp;&amp; it-&gt;key().starts_with("user:");
+     it-&gt;Next()) {
+  // keys arrive in sorted order across memtables and all SST files
+}
+delete it;</code></pre>
+          <h3>Mistake one: ignoring Status</h3>
+          <p>
+            Nothing throws. Every call returns a <code>rocksdb::Status</code>,
+            and a Get for a missing key is not an error you can skip:
+          </p>
+          <pre><code>// wrong: value is garbage-or-stale on any failure, and a missing
+// key is silently conflated with success
+db-&gt;Get(rocksdb::ReadOptions(), key, &amp;value);
+use(value);
+
+// right
+auto s = db-&gt;Get(rocksdb::ReadOptions(), key, &amp;value);
+if (s.IsNotFound()) { /* distinct, normal case */ }
+else if (!s.ok())   { /* corruption, I/O error: handle or die loudly */ }
+else                { use(value); }</code></pre>
+          <h3>Mistake two: unbatched multi-key writes</h3>
+          <p>
+            Related updates written as separate Puts are neither atomic nor
+            fast; a <code>WriteBatch</code> is both, applied as one WAL
+            record and one memtable pass:
+          </p>
+          <pre><code>// wrong: a crash between the two Puts leaves the pair inconsistent
+db-&gt;Put(wopts, "order:42", order_bytes);
+db-&gt;Put(wopts, "order_index:2026-07:42", "");
+
+// right: atomic, and cheaper than two round trips through the write path
+rocksdb::WriteBatch batch;
+batch.Put("order:42", order_bytes);
+batch.Put("order_index:2026-07:42", "");
+db-&gt;Write(wopts, &amp;batch);</code></pre>
+          <h3>Mistake three: opening the same directory twice</h3>
+          <p>
+            RocksDB is an embedded, single-process store. A LOCK file makes
+            the second <code>DB::Open</code> on the same directory fail
+            rather than corrupt, and the fix is architectural, not a flag:
+            one process owns the DB, others talk to that process (or use the
+            read-only and secondary open modes for followers).
+          </p>
+          <h3>Mistake four: reading your own writes with stale iterators</h3>
+          <p>
+            An iterator (and a snapshot) sees the database as of its
+            creation. Beginners create one iterator at startup and wonder
+            why new writes never appear; iterators are cheap views meant to
+            be created, used, and deleted, and long-lived ones also pin old
+            files on disk, inflating space.
+          </p>
+          <h3>Mistake five: benchmarking the debug build with tiny values</h3>
+          <p>
+            The default Makefile target carries assertions and no
+            optimization, and single-record loops measure your syscall
+            overhead rather than the engine. Use <code>DEBUG_LEVEL=0</code>,
+            realistic value sizes, and <code>db_bench</code> (Lab 1) before
+            drawing any conclusion about throughput.
           </p>
 
-          <h2>The write path: memtables, WAL, and SST files</h2>
+          <h2>Part III: When it is the right tool</h2>
           <p>
-            RocksDB describes itself in its own README as a
-            log-structured-merge database, and the write path is the cleanest
-            place to see what that means. A write goes to two places: it is
-            appended to a write-ahead log for durability, and it is inserted
-            into the memtable, an in-memory sorted structure that is a skiplist
-            by default. Nothing else happens at write time, which is why writes
-            are fast and why they never depend on how much data is already on
-            disk. When the memtable fills (64 MB by default, the
-            <code>write_buffer_size</code> option), it becomes immutable, a
-            fresh memtable takes over, and a background thread flushes the
-            frozen one to disk as an SST file, a sorted string table holding
-            keys in order alongside an index block and optional bloom filter.
+            RocksDB is the right tool when you are building a system that
+            needs a fast, persistent, ordered key-value core inside its own
+            process: a database engine, a stream processor's state store, a
+            message broker's index, a blockchain node, an embedded cache
+            that must survive restarts. Its sweet spots are write-heavy
+            workloads (the LSM absorbs bursts sequentially), datasets larger
+            than memory on flash, and any design that needs prefix scans
+            over sorted keys. It scales down badly in one specific sense:
+            it is not a shared database, and it brings real operational
+            surface (compaction tuning, stalls, file descriptors) that a
+            simple app may not want.
           </p>
           <p>
-            <mark>The LSM tree turns random writes into sequential I/O by
-            absorbing them in memory and only ever writing sorted, immutable
-            files.</mark> The cost is paid on the read side: a Get must consult
-            the memtables first, then the SST files from newest to oldest,
-            because a newer file may shadow an older value for the same key.
-            Bloom filters let most files answer "definitely not here" without a
-            disk read, and the block cache keeps hot data blocks (about 4 KB
-            uncompressed by default) in memory, but the fundamental tension
-            remains: the more files accumulate, the more expensive reads
-            become. Managing that accumulation is the job of compaction.
-          </p>
-
-          <h2>Compaction is where the trade-offs live</h2>
-          <p>
-            Compaction rewrites SST files in the background, merging
-            overlapping files, dropping overwritten and deleted entries, and
-            keeping read cost bounded. The README frames the whole engine as
-            offering flexible trade-offs between write amplification, read
-            amplification, and space amplification, and the compaction style is
-            the main lever. <mark>You cannot minimize all three at once, and
-            choosing a compaction strategy is choosing which one you are
-            willing to pay.</mark>
-          </p>
-          <p>
-            Leveled compaction, the default, organizes files into levels of
-            exponentially increasing size (roughly ten times per level by
-            default) where each level except L0 is a single sorted run;
-            freshly flushed files land in L0, and once enough of them pile up
-            (four by default) they are merged down into L1 and onward. This
-            keeps space and read amplification low at the price of rewriting
-            data as it migrates down, which is write amplification. Universal
-            compaction is the tiered alternative: it merges files of similar
-            size into larger sorted runs without rewriting the destination,
-            trading much lower write amplification for temporarily higher space
-            use and more runs to check on reads, which suits ingest-heavy
-            workloads. FIFO compaction barely compacts at all; it simply drops
-            the oldest files once a size budget is exceeded, which makes
-            RocksDB behave like a persistent cache for time-ordered data.
-          </p>
-
-          <h2>Column families and the knobs that matter</h2>
-          <p>
-            A column family is an independent keyspace inside one database:
-            each has its own memtable, its own SST files, and its own options,
-            so one family can run universal compaction with heavy compression
-            while its neighbor runs leveled with none. What they share is the
-            write-ahead log, and that sharing is the point, because it gives
-            you atomic writes across families and a consistent view when
-            reading from several at once. The pattern shows up everywhere
-            RocksDB is embedded: a system stores its data in one family and
-            its metadata or secondary index in another, tuned differently but
-            committed together.
-          </p>
-          <p>
-            The options surface is famously large, but a small set carries
-            most of the weight in practice: <code>write_buffer_size</code> and
-            <code>max_write_buffer_number</code> control how much RAM absorbs
-            writes before flushes and stalls, the L0 file triggers control
-            when compaction starts and when writes are throttled, the block
-            cache size controls read hit rates, bloom filter bits per key
-            trade memory for skipped reads, and per-level compression lets you
-            keep upper levels fast and the bottom level small. The defaults
-            are deliberately conservative, and the wiki's tuning guide is
-            honest that most users should change only a few of these; my
+            The alternatives frame the boundaries.
+            <a href="/oss/sqlite">SQLite</a> is the other great embedded
+            engine: B-tree storage, real SQL, superb for read-mostly
+            relational data, but its page-oriented write path and
+            single-writer model make it the wrong core for a write-hammered
+            state store. LMDB is a memory-mapped copy-on-write B-tree,
+            outstanding for read-dominated workloads with modest write
+            rates. LevelDB is RocksDB's ancestor and still fine for small
+            embedded uses, but it lacks column families, real concurrency,
+            and a decade of tuning. And when multiple services need the
+            data, you want a served database; my
             <a href="/software/notes/databases-for-system-design">databases
-            note</a> covers where an LSM engine fits relative to B-tree
-            storage when you are choosing rather than tuning.
+            note</a> maps that decision space, and my
+            <a href="/systems/key-value-store">key-value store design
+            write-up</a> derives this same LSM architecture from
+            requirements instead of from code.
+          </p>
+          <p>
+            The architecture-shaped warning: <mark>RocksDB is a library with
+            exactly one writing process; do not architect as if it were a
+            shared network service, and do not put its directory on NFS or
+            any shared filesystem.</mark> The LOCK file, the WAL, and the
+            MANIFEST all assume local-filesystem semantics and a single
+            owner.
+          </p>
+          <pre class="flow">safe:      service A ──RPC──▶ storage service ──▶ RocksDB on local SSD
+           service B ──RPC──▶      (one process owns the directory)
+
+dangerous: service A ──▶ /shared-nfs/db ◀── service B
+           two writers, network filesystem locks: corruption waiting to happen</pre>
+
+          <h2>Part IV: The full life of one operation</h2>
+          <p>
+            This is the core of the chapter. We follow
+            <code>Put("k1", "v1")</code> all the way to a compacted SST
+            file, then follow <code>Get("k1")</code> back up. Every stage
+            names the files that implement it, so this section doubles as a
+            map of <code>db/</code>.
           </p>
 
-          <h2>Reading the repository</h2>
+          <h3>Stage 1: Put becomes a WriteBatch</h3>
           <p>
-            Start where users start, in <code>include/rocksdb/</code>: the
-            headers <code>db.h</code> and <code>options.h</code> are the
-            contract everything else implements, and the options comments are
-            some of the best documentation in the project. Then read
-            <code>examples/simple_example.cc</code> and its siblings, which
-            demonstrate column families, transactions, and compaction filters
-            in a page each.
+            <code>DB::Put</code> is a convenience: it wraps the single
+            key-value pair in a <code>WriteBatch</code>, the unit the write
+            path actually processes. A batch is a small serialized buffer of
+            operations (Put, Delete, Merge, and friends) with a count and a
+            sequence-number slot in its header, which is why a batch is
+            atomic for free: it is one blob that either lands in the WAL or
+            does not.
+          </p>
+
+          <h3>Stage 2: the write group forms</h3>
+          <p>
+            The batch enters <code>DBImpl::WriteImpl</code> in
+            <code>db/db_impl/db_impl_write.cc</code>, and the first thing
+            that happens is social. Concurrent writers register with
+            <code>WriteThread</code> (<code>db/write_thread.cc</code>),
+            which links them into a queue; the front writer becomes the
+            leader, absorbs the batches of the writers behind it into one
+            group, and does the WAL work for all of them while the others
+            wait. This is group commit, the same trick every serious storage
+            engine plays: <mark>many logical writes, one physical log write,
+            one fsync.</mark> Each operation in the merged group receives a
+            monotonically increasing sequence number, the timestamp of the
+            whole MVCC story: snapshots are just sequence numbers, and a
+            newer version of a key is simply the entry with the higher
+            sequence.
+          </p>
+
+          <h3>Stage 3: the WAL append</h3>
+          <p>
+            The leader appends the group's batches to the current WAL, a
+            <code>.log</code> file written by <code>db/log_writer.cc</code>.
+            The format is records packed into fixed 32&nbsp;KB blocks, each
+            record framed by a checksum, size, and type, where the type
+            marks whether a record is full or a first/middle/last fragment
+            spanning blocks. Durability is a dial:
+            <code>WriteOptions::sync</code> forces an fsync before
+            acknowledging; the default leaves the data in OS buffers, so a
+            machine crash (not just a process crash) can lose recent
+            writes, and <code>disableWAL</code> removes even process-crash
+            safety for callers who have an external log of their own.
+          </p>
+
+          <h3>Stage 4: the memtable insert</h3>
+          <p>
+            Only after the WAL append does the group insert into the
+            memtable (<code>db/memtable.cc</code>), by default an
+            <code>InlineSkipList</code> from <code>memtable/</code>: a
+            lock-free-for-readers skiplist keyed by the internal key, which
+            is user key plus inverted sequence number plus type. That
+            composite key is defined in <code>db/dbformat.h</code>, and it
+            is the detail that makes everything else work: entries for the
+            same user key sort newest-first, so a lookup finds the latest
+            version first, and a Delete is just an entry of type tombstone.
+            <mark>Nothing is ever modified in place; a write is always a new
+            versioned entry, and reconciliation is deferred to reads and
+            compaction.</mark> The Put is now done and acknowledged,
+            typically in microseconds: one queue hop, one log append, one
+            skiplist insert.
+          </p>
+
+          <h3>Stage 5: flush freezes and writes L0</h3>
+          <p>
+            When the memtable reaches <code>write_buffer_size</code> (64
+            MB default), it is marked immutable, a fresh memtable takes
+            over, and a background flush job
+            (<code>db/flush_job.cc</code>) walks the frozen skiplist in
+            sorted order and hands the stream to
+            <code>BlockBasedTableBuilder</code>
+            (<code>table/block_based/block_based_table_builder.cc</code>),
+            which emits an SST file into level 0. Once the file is durable,
+            the WAL segments covering that memtable become garbage and are
+            deleted; this is the moment the log has served its purpose.
+            L0 is special: because each L0 file is a frozen memtable, L0
+            files overlap each other's key ranges, and every one of them
+            must be checked by reads. That is a debt the next stage exists
+            to pay down.
+          </p>
+
+          <h3>Stage 6: compaction carries it downward</h3>
+          <p>
+            When L0 accumulates <code>level0_file_num_compaction_trigger</code>
+            files (4 by default), the compaction picker
+            (<code>db/compaction/compaction_picker_level.cc</code> for the
+            default leveled style) selects the L0 files plus the overlapping
+            files in L1, and a <code>CompactionJob</code>
+            (<code>db/compaction/compaction_job.cc</code>) merge-sorts them,
+            keeping only the newest version of each key, dropping tombstones
+            when nothing older can exist below, and writes fresh files into
+            L1. Each level except L0 is one sorted run, non-overlapping
+            files of about <code>target_file_size_base</code> (64 MB), and
+            each level's total budget grows by
+            <code>max_bytes_for_level_multiplier</code> (10×) from
+            <code>max_bytes_for_level_base</code> (256 MB), out to
+            <code>num_levels</code> (7). When a level exceeds its budget,
+            files are compacted into the next one down. Our
+            <code>"k1"</code> will migrate down over time until it settles
+            in the bottom populated level or is superseded by a newer
+            write. Every file change is committed as a
+            <code>VersionEdit</code> logged to the MANIFEST, which the
+            third deep dive covers.
+          </p>
+
+          <h3>Stage 7: Get, from the top</h3>
+          <p>
+            <code>Get("k1")</code> enters <code>DBImpl::GetImpl</code>,
+            grabs the current superversion (a consistent bundle of memtable,
+            immutable memtables, and SST file list), and checks in newest-first
+            order: the active memtable, then immutable memtables awaiting
+            flush. A hit at any point wins immediately, including a
+            tombstone hit, which returns NotFound. Only on a miss does the
+            read go to disk via <code>Version::Get</code> in
+            <code>db/version_set.cc</code>: every L0 file newest to oldest,
+            then for each deeper level a binary search over file metadata
+            locates the single file whose range could contain the key.
+            This ordering is why <mark>read amplification in an LSM is
+            "number of sorted runs you might have to consult", and why L0
+            pileup is the classic read-latency incident.</mark>
+          </p>
+
+          <h3>Stage 8: inside one SST file</h3>
+          <p>
+            For each candidate file, the table cache
+            (<code>db/table_cache.cc</code>) provides an open
+            <code>BlockBasedTableReader</code>. If the file has a bloom
+            filter, the filter block is consulted first and usually answers
+            "definitely not present" for the files that do not hold the key,
+            saving their data-block reads entirely. On a maybe, the index
+            block maps the key to a data block, the block is fetched
+            (through the block cache if resident, from disk if not,
+            decompressing on the way), and a scan inside the block finds
+            the entry. The value returns up the stack; a Get that hits the
+            block cache never touches storage at all. Round trip complete:
+            a write that cost a log append and a skiplist insert, a read
+            that cost a memtable probe plus at most a few filtered block
+            reads.
+          </p>
+
+          <h2>Part V: Internals deep dives</h2>
+
+          <h3>Deep dive: the LSM tree and the three amplifications</h3>
+          <p>
+            Every LSM design lives inside a triangle of costs. Write
+            amplification: total bytes written to disk per byte of user
+            write, incurred as data is rewritten on its way down the levels.
+            Read amplification: how many places a read might consult.
+            Space amplification: bytes on disk per byte of live data, from
+            not-yet-merged old versions and tombstones.
+            <mark>You cannot minimize all three at once, and choosing a
+            compaction style is choosing which one you agree to pay.</mark>
+          </p>
+          <pre class="flow">              write amp
+                 ▲
+                / \      leveled:    low read amp, low space amp, HIGH write amp
+               /   \     universal:  low write amp, higher space + read amp
+              /     \    FIFO:       almost no compaction, drops old data
+             ▼       ▼
+        read amp ◀─▶ space amp</pre>
+          <p>
+            Leveled compaction (the default) keeps each level a single
+            sorted run with exponentially growing budgets. Reads are cheap:
+            one run per level plus L0, so a handful of candidate files.
+            Space is tight: stale versions survive only until the next
+            merge, and the 10× fanout means roughly 90% of data sits in the
+            bottom level, bounding space overhead. The bill is write
+            amplification: a key rewritten at every level boundary, with a
+            per-level cost on the order of the fanout, can cost tens of
+            physical writes per logical write across a deep tree. Universal
+            (tiered) compaction inverts the deal: it accumulates sorted
+            runs of similar size and merges them together only when there
+            are too many, rewriting data far less often, at the price of
+            more runs to consult on reads and transiently holding
+            duplicate data (a full merge can briefly need on the order of
+            twice the space). Ingest-heavy, scan-light workloads take that
+            trade happily. FIFO compaction barely compacts at all: it drops
+            the oldest files past a size budget, which turns RocksDB into a
+            persistent TTL-ish cache for time-ordered data.
           </p>
           <p>
-            The implementation of the DB interface lives under
-            <code>db/</code>, with the DBImpl class as the hub; follow a Put
-            through the write path to see the WAL append and memtable insert,
-            including the group commit logic that batches concurrent writers.
-            Memtable implementations live in <code>memtable/</code>, and the
-            SST file format, block layout, bloom filters, and table reader and
-            builder live under <code>table/</code>, with the block-based table
-            as the default format. Compaction has its own corner of
-            <code>db/</code>, split between the pickers, which decide what to
-            compact under each style, and the job that does the merging; beside
-            it, the version set code is worth real attention because it holds
-            the metadata heart of the engine, the MANIFEST log that records
-            which SST files constitute each level at each point in time, which
-            is how the database recovers its shape after a crash. The block
-            cache lives in <code>cache/</code>, and <code>utilities/</code>
-            holds the optional layers, transactions, backup, and TTL among
-            them, that show how far the core primitives stretch.
+            The famous trap in this area is flow control. Compaction is not
+            optional housekeeping; it is the engine's debt service, and
+            RocksDB enforces it: at 20 L0 files (default) writes are slowed,
+            at 36 they stop entirely until compaction catches up. A
+            benchmark that writes flat out for a minute measures the
+            memtable; production throughput is compaction throughput. The
+            second trap: <mark>deletes are writes.</mark> A Delete adds a
+            tombstone that must itself flow down the tree before the space
+            comes back, and a mass-delete followed by a scan is a
+            worst-case workload, because iterators must step over the
+            tombstones (the wiki's answer is DeleteRange and periodic
+            compaction).
+          </p>
+
+          <h3>Deep dive: anatomy of an SST file</h3>
+          <pre class="flow">┌──────────────────────────┐
+│ data block │ ~4 KB, sorted keys, prefix-compressed, restart points
+│ data block │
+│    ...     │
+│ filter block   │ bloom bits for every key in the file (if configured)
+│ properties     │ counts, sizes, options used, user-defined stats
+│ index block    │ last-key-of-each-data-block → block offset
+│ footer         │ fixed size: offsets of index+meta, magic number
+└──────────────────────────┘  read a file back-to-front: footer first</pre>
+          <p>
+            The block-based table is the default and only format you need to
+            know. Data blocks hold about <code>block_size</code> (4&nbsp;KB
+            uncompressed by default) of sorted entries; within a block, keys
+            are prefix-compressed, with periodic restart points where a full
+            key is stored so binary search can land and scan forward. The
+            index block is a sorted map from each data block's last key to
+            its offset, so point lookups binary-search the index, then one
+            data block. The properties block records everything about how
+            the file was made, which is why <code>sst_dump</code> (Lab 4)
+            is such a good teacher. A reader starts from the fixed-size
+            footer at the end, which locates the metaindex and index and
+            carries the magic number.
           </p>
           <p>
-            A good first session is to run the simple example, then look at
-            what it left behind: list the database directory, run
-            <code>sst_dump</code> on an SST file to see blocks and properties,
-            open the LOG file and read the compaction statistics RocksDB
-            prints. The LSM tree stops being a diagram the first time you
-            watch level sizes shift under load.
+            Bloom filters deserve their own paragraph because the default
+            surprises people: <mark>filter_policy defaults to null, so a
+            stock RocksDB has no bloom filters until you configure
+            them.</mark> The conventional setting,
+            <code>NewBloomFilterPolicy(10)</code>, spends 10 bits per key
+            for roughly a 1% false-positive rate, converting most
+            "check this file" operations into a memory test instead of a
+            disk read; point-lookup-heavy workloads should consider it
+            mandatory. The related knobs are about where this metadata
+            lives: by default index and filter blocks are held by open
+            table readers, and <code>cache_index_and_filter_blocks</code>
+            moves them into the block cache (32&nbsp;MB by default if you
+            do not supply one, far too small for serious use) so their
+            memory is bounded and observable. Compression is per-level in
+            spirit: cheap-or-none at upper levels that get rewritten
+            often, strong (zstd) at the bottom level where 90% of the data
+            rests.
+          </p>
+
+          <h3>Deep dive: the MANIFEST and version sets</h3>
+          <p>
+            An LSM database is, at any instant, "these exact SST files at
+            these exact levels." That statement is itself state, it changes
+            with every flush and compaction, and it must survive crashes.
+            RocksDB stores it the same way it stores everything: in a log.
+            The MANIFEST file is an append-only log of
+            <code>VersionEdit</code> records (file added at level N, file
+            deleted, WAL number advanced), and a <code>Version</code>
+            (<code>db/version_set.cc</code>, <code>version_edit.cc</code>)
+            is the in-memory result of folding those edits: an immutable
+            list of the live files per level for one column family. The
+            <code>VersionSet</code> owns the chain of versions; the CURRENT
+            file names the active MANIFEST; recovery is "read CURRENT, replay
+            the MANIFEST, then replay WALs newer than the last recorded
+            flush."
+          </p>
+          <pre class="flow">CURRENT ─▶ MANIFEST-000123: {edit: +file 7 @L0} {edit: +8 @L0} {edit: -7 -8, +9 @L1} ...
+                                  fold ▶ Version N: L0=[]  L1=[9]  L2=[3,4]
+reads pin a Version ──▶ files of that Version cannot be deleted while pinned</pre>
+          <p>
+            Versions are immutable and reference-counted, which is how
+            reads, iterators, and compactions all proceed without locking
+            each other: each pins the Version it started with, and
+            obsolete files are physically deleted only when no Version
+            references them. Two practical consequences double as the traps
+            of this subsystem. First, a long-lived iterator or snapshot
+            pins old versions, so disk usage can stay high long after
+            deletes, and the fix is to keep read views short-lived. Second,
+            <mark>never "clean up" SST files by hand; a file that looks
+            old may be referenced by the MANIFEST, and deleting it corrupts
+            the database as surely as deleting a B-tree page.</mark> The
+            LOG file (plain text, despite the name) narrates all of this
+            machinery live, which is Lab 3.
+          </p>
+
+          <h3>Deep dive: the tuning surface, at concept level</h3>
+          <p>
+            The options struct has hundreds of fields, but the load-bearing
+            ones map one-to-one onto the pipeline, and the wiki's own tuning
+            guide says most users should touch only a few. On the write
+            side, <code>write_buffer_size</code> (64&nbsp;MB) and
+            <code>max_write_buffer_number</code> (2) set how much RAM
+            absorbs writes before flush pressure; bigger buffers mean fewer,
+            larger flushes and better dedup of hot keys before disk. The
+            L0 triggers (4 compact, 20 slow down, 36 stop) are the flow
+            control connecting ingest rate to compaction throughput, and
+            <code>max_background_jobs</code> (2) is how much parallelism
+            compaction gets to keep up. On the shape side,
+            <code>target_file_size_base</code> (64&nbsp;MB) and
+            <code>max_bytes_for_level_base</code> (256&nbsp;MB) with its
+            10× multiplier set the granularity and depth of the tree. On
+            the read side, bloom bits per key and the block cache size are
+            the two levers that matter, and per-level compression choices
+            trade CPU for space. The right method is not memorizing
+            numbers: <mark>identify which amplification hurts your
+            workload, then move the one or two knobs that trade away
+            something you have spare.</mark> Column families exist so that
+            differently-shaped data inside one process can make different
+            choices while sharing one WAL and atomic batches.
+          </p>
+
+          <h2>Part VI: Reading the repository</h2>
+          <p>
+            <strong>Stage 0, the contract.</strong> Read
+            <code>include/rocksdb/db.h</code>, <code>options.h</code>,
+            <code>advanced_options.h</code>, and <code>table.h</code>; the
+            option comments are some of the best documentation in the
+            project. Then <code>examples/simple_example.cc</code> and its
+            siblings. Questions: what is a column family? What does a
+            Status-based API imply about error handling? Which options in
+            this chapter can you now find with their documented defaults?
+          </p>
+          <p>
+            <strong>Stage 1, the write path.</strong>
+            <code>db/db_impl/db_impl_write.cc</code>
+            (<code>WriteImpl</code>), <code>db/write_thread.cc</code>,
+            <code>db/log_writer.cc</code>, <code>db/memtable.cc</code>, and
+            the internal key in <code>db/dbformat.h</code>. Questions: how
+            does group commit pick a leader? Why does the WAL append happen
+            before the memtable insert? Why do internal keys embed an
+            inverted sequence number?
+          </p>
+          <p>
+            <strong>Stage 2, flush and the file format.</strong>
+            <code>db/flush_job.cc</code>, then
+            <code>table/block_based/block_based_table_builder.cc</code> and
+            its reader counterpart. Questions: what makes L0 special? In
+            what order are the blocks of an SST written, and why is the
+            footer last? Where would a bloom filter be consulted?
+          </p>
+          <p>
+            <strong>Stage 3, metadata.</strong> <code>db/version_edit.h</code>
+            and <code>db/version_set.cc</code> (start from the class
+            comments), plus <code>db/column_family.cc</code>. Questions:
+            what exactly is in a VersionEdit? How does recovery rebuild the
+            file list? What keeps an SST file alive on disk?
+          </p>
+          <p>
+            <strong>Stage 4, compaction.</strong>
+            <code>db/compaction/compaction_picker.cc</code>, the
+            leveled and universal pickers beside it, and
+            <code>compaction_job.cc</code>. Questions: what makes a level
+            "need" compaction under the leveled picker? When can a
+            tombstone finally be dropped? Where do write stalls come from?
+          </p>
+          <p>
+            <strong>Stage 5, the extras.</strong> <code>cache/</code> for
+            the block cache, <code>tools/</code> for
+            <code>db_bench_tool.cc</code>, <code>sst_dump.cc</code>, and
+            <code>ldb_cmd.cc</code>, and <code>utilities/</code> for
+            transactions, backup, and TTL, which show how far the core
+            primitives stretch.
+          </p>
+          <p>
+            <strong>Where not to start:</strong>
+            <code>db/db_impl/db_impl.cc</code> read top to bottom (it is
+            the hub of everything and reads as noise until you know the
+            spokes), the transaction layer, and BlobDB; and do not begin
+            with the options code, which is machinery, not ideas.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <h3>Lab 1: db_bench basics</h3>
+          <pre><code>./db_bench --benchmarks=fillseq,readrandom --num=1000000 \
+           --db=/tmp/rocks_lab --value_size=100</code></pre>
+          <p>
+            Expect a report per benchmark with micros/op and ops/sec
+            (numbers vary enormously by hardware and build flags; a release
+            build on SSD will show fillseq far faster than readrandom).
+            Concept taught: sequential absorption versus multi-place reads,
+            the LSM's fundamental asymmetry.
+          </p>
+          <h3>Lab 2: watch SST files appear on flush</h3>
+          <pre><code>./db_bench --benchmarks=fillrandom --num=2000000 \
+           --db=/tmp/rocks_lab2 --write_buffer_size=1048576 &amp;
+watch -n1 'ls -l /tmp/rocks_lab2/*.sst | tail; echo; ls /tmp/rocks_lab2 | wc -l'</code></pre>
+          <p>
+            With a deliberately tiny 1&nbsp;MB write buffer, memtables fill
+            fast and <code>.sst</code> files appear every few seconds, then
+            periodically consolidate as compaction merges them. Concept
+            taught: flush creates files, compaction consumes them; the
+            directory is the LSM tree made visible.
+          </p>
+          <h3>Lab 3: read the LOG file</h3>
+          <pre><code>grep -E "flush|compact" /tmp/rocks_lab2/LOG | head -30
+grep "Compaction start" /tmp/rocks_lab2/LOG | head
+grep -A12 "Compaction Stats" /tmp/rocks_lab2/LOG | tail -20</code></pre>
+          <p>
+            The LOG narrates every flush and compaction with byte counts,
+            and the periodic Compaction Stats table shows per-level file
+            counts, sizes, and the read/write bytes that compose write
+            amplification. Concept taught: the amplification triangle,
+            measured on your own machine.
+          </p>
+          <h3>Lab 4: dissect a real SST file</h3>
+          <pre><code>SST=$(ls /tmp/rocks_lab2/*.sst | head -1)
+./sst_dump --file=$SST --show_properties --command=none
+./sst_dump --file=$SST --command=scan --read_num=5</code></pre>
+          <p>
+            The properties dump shows entry counts, data and index block
+            sizes, compression, and whether a filter is present (with stock
+            options: no filter, confirming the null default); the scan
+            prints real internal entries with sequence numbers and types.
+            Concept taught: SST anatomy from the deep dive, on disk rather
+            than in a diagram.
+          </p>
+          <h3>Lab 5: bloom filters change the read path</h3>
+          <pre><code>./db_bench --benchmarks=fillrandom,readrandom --num=2000000 \
+           --db=/tmp/rocks_bloom --bloom_bits=10 --cache_size=8388608
+./db_bench --benchmarks=fillrandom,readrandom --num=2000000 \
+           --db=/tmp/rocks_nobloom --bloom_bits=-1 --cache_size=8388608</code></pre>
+          <p>
+            Compare readrandom micros/op with and without 10-bit bloom
+            filters; the gap grows with dataset size relative to cache. The
+            exact ratio varies, so treat the direction, not the number, as
+            the result. Concept taught: filters convert disk probes into
+            memory tests.
+          </p>
+          <h3>Lab 6: dump the MANIFEST</h3>
+          <pre><code>./ldb --db=/tmp/rocks_lab2 manifest_dump | head -40</code></pre>
+          <p>
+            You will see the folded state: each level's files with their
+            numbers, sizes, and smallest/largest keys, exactly the Version
+            the engine holds in memory. Delete nothing by hand; instead,
+            re-run Lab 2 briefly and dump again to watch the file lists
+            shift. Concept taught: the MANIFEST as the database's database.
+          </p>
+
+          <h2>Part VIII: Understanding checks</h2>
+          <p><strong>What is RocksDB in one sentence?</strong>
+            An embeddable LSM-tree key-value library: writes go to a WAL
+            and a sorted memtable, disk holds only sorted immutable SST
+            files organized into levels, and background compaction
+            continuously trades write work for read and space efficiency.</p>
+          <p><strong>Why are LSM writes fast?</strong>
+            Because the foreground write path is one sequential log append
+            plus one in-memory skiplist insert, independent of how much
+            data exists on disk. All reorganization is deferred to
+            background flush and compaction.</p>
+          <p><strong>Walk the path of a Put.</strong>
+            Put wraps into a WriteBatch; WriteThread forms a group and
+            assigns sequence numbers; the leader appends the group to the
+            WAL; the batch inserts into the memtable keyed by user key plus
+            inverted sequence; on memtable fill, flush writes an L0 SST and
+            frees the WAL segment; compaction later merges it down the
+            levels, with each file change logged to the MANIFEST.</p>
+          <p><strong>Walk the path of a Get.</strong>
+            Check the active memtable, then immutable memtables, then all
+            L0 files newest-first, then one binary-searched file per deeper
+            level; within each candidate file, bloom filter first, then
+            index block, then one data block via the block cache. The first
+            hit wins, and a tombstone hit means NotFound.</p>
+          <p><strong>What are the three amplifications, and why can't you have all three?</strong>
+            Write amp (disk bytes per user byte written), read amp (places
+            consulted per read), space amp (disk bytes per live byte). They
+            trade against each other because keeping data more merged
+            (good for reads and space) requires rewriting it more often
+            (bad for writes); leveled favors reads and space, universal
+            favors writes.</p>
+          <p><strong>Why is L0 special?</strong>
+            Each L0 file is a flushed memtable, so L0 files overlap in key
+            range and every one must be consulted on a read, unlike deeper
+            levels where non-overlapping files allow a single binary-searched
+            candidate. That is why L0 count drives both compaction
+            triggering (4) and write stalls (20 slowdown, 36 stop).</p>
+          <p><strong>What is in an SST file?</strong>
+            Prefix-compressed ~4 KB data blocks with restart points, an
+            index block mapping each block's last key to its offset, an
+            optional bloom filter block, a properties block describing how
+            the file was built, and a fixed footer, read first, that
+            locates everything.</p>
+          <p><strong>Do you get bloom filters by default?</strong>
+            No; filter_policy defaults to null. NewBloomFilterPolicy(10)
+            is the conventional choice, about 10 bits per key for roughly
+            1% false positives, and point-read-heavy workloads should treat
+            it as mandatory.</p>
+          <p><strong>What is the MANIFEST and why does it exist?</strong>
+            An append-only log of VersionEdits recording every SST file
+            addition and deletion per level. The live file list is itself
+            mutable crash-critical state, so RocksDB stores it the LSM way:
+            as a replayable log named by the CURRENT file, folded into
+            immutable, reference-counted in-memory Versions.</p>
+          <p><strong>What is a tombstone and why do deletes cost space before they free it?</strong>
+            A Delete writes a marker entry that shadows older versions; the
+            actual space returns only when compaction merges the tombstone
+            far enough down that no older version can exist beneath it.
+            Until then, deletes add bytes, and scans must skip over them.</p>
+          <p><strong>Why did writes suddenly stall?</strong>
+            Ingest outran compaction: L0 reached the slowdown (20) or stop
+            (36) trigger, or pending-compaction bytes tripped their limits.
+            Fixes are throttling ingest, giving compaction more parallelism
+            (max_background_jobs), larger write buffers, or accepting
+            universal compaction's trade.</p>
+          <p><strong>How does a crash recover?</strong>
+            Read CURRENT to find the MANIFEST, replay its edits to rebuild
+            the file lists, then replay WAL records newer than the last
+            flushed sequence into a fresh memtable. Both replays are logs;
+            recovery is the same idea applied twice.</p>
+          <p><strong>Why choose RocksDB over SQLite, or the reverse?</strong>
+            RocksDB when you need a write-heavy, ordered key-value core
+            inside a system you are building and are willing to bring your
+            own data model; SQLite when you want relational queries,
+            ad-hoc reads, and a stable single file with a B-tree's
+            read-mostly economics. They are both embedded, and they sit on
+            opposite corners of the write-versus-query-power trade.</p>
+          <p><strong>A long-running iterator is held open for hours. What goes wrong?</strong>
+            It pins a superversion and therefore old SST files and
+            memtables, so disk space and memory stay elevated regardless of
+            deletes and compaction, and the view grows stale. Read views
+            should be short-lived; snapshots are cheap to take and retake.</p>
+          <p><strong>Why does compaction happen in the background at all, rather than merging on write like a B-tree?</strong>
+            Merging on write would put random I/O and rewrite cost on the
+            foreground path, which is exactly what the LSM exists to avoid.
+            Deferring merges keeps write latency flat and lets the engine
+            batch reorganization into large sequential operations, at the
+            price of scheduling debt that the stall mechanism enforces.</p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Turn mutation into accumulation plus merge.</strong>
+            The LSM's core move, never update in place, always append and
+            reconcile later, reappears in Git, in CRDTs, in event-sourced
+            services, and in columnar warehouses' delta-plus-base files.
+            It buys sequential I/O and trivial crash stories, and costs a
+            background debt service.
+          </p>
+          <p>
+            <strong>Make the trade-off a first-class option.</strong>
+            RocksDB does not pick a winner among the three amplifications;
+            it exposes compaction styles and per-column-family options so
+            each embedder picks. Engines that hardcode one point on the
+            curve (LevelDB) get outgrown by their users.
+          </p>
+          <p>
+            <strong>Metadata deserves the same rigor as data.</strong> The
+            MANIFEST is a WAL for the file list, with the same
+            append-replay-checkpoint lifecycle as user data. Any system
+            whose "what exists right now" state must survive crashes ends
+            up reinventing this (Kubernetes' etcd, Iceberg's metadata
+            layers), so it pays to recognize the pattern.
+          </p>
+          <p>
+            <strong>Group commit is free throughput.</strong> Letting one
+            leader do the physical log write for a queue of waiting writers
+            multiplies throughput at essentially no latency cost, and the
+            same structure appears in Postgres's WAL, in Kafka's producer
+            batching, and in every syscall-batching layer.
+          </p>
+          <p>
+            <strong>Backpressure must be designed, not discovered.</strong>
+            The L0 slowdown and stop triggers are an explicit admission
+            that background debt needs foreground flow control. Systems
+            that lack a designed stall mechanism still stall; they just do
+            it unpredictably, at the OOM killer or the full disk.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            The one-sentence summary: <mark>RocksDB absorbs writes into a
+            log and a sorted memory buffer, spills them as immutable sorted
+            files, merges those files downward forever, and answers reads
+            by checking newest-to-oldest with filters and caches shielding
+            the disk.</mark>
+          </p>
+          <pre class="flow">write: Put → Batch → Group → WAL → MemTable → Flush → L0 → Compact → L1..L6
+read:  Get → MemTable → Imm → L0* → L1..L6 (bloom → index → block cache → disk)
+
+db_impl_write.cc → write_thread.cc → log_writer.cc → memtable.cc
+→ flush_job.cc → block_based_table_builder.cc
+→ compaction_picker*.cc → compaction_job.cc → version_set.cc (MANIFEST)</pre>
+          <p>Memorize these blocks:</p>
+          <p>
+            <strong>The defaults:</strong> write buffer 64 MB, two of them;
+            L0 triggers 4 / 20 / 36 (compact / slow / stop); level base
+            256 MB growing 10× across 7 levels; target file size 64 MB;
+            block size 4 KB; block cache 32 MB if unset; bloom filters
+            absent until configured, 10 bits per key ≈ 1% false positives.
+          </p>
+          <p>
+            <strong>The invariants:</strong> nothing on disk is ever
+            modified, only written and deleted; every entry is (user key,
+            sequence, type); L0 overlaps, deeper levels do not; a Version
+            is immutable and pins its files; recovery is MANIFEST replay
+            plus WAL replay.
+          </p>
+          <p>
+            <strong>The costs:</strong> leveled pays write amp for read and
+            space; universal pays space and read for write; deletes are
+            writes until compacted away; stalls are compaction debt made
+            visible.
           </p>
           <div class="takeaway">
             <strong>Key takeaway:</strong> RocksDB is the LSM tree taken
             seriously as an engineering artifact. Writes are absorbed in
             memory and logged, files on disk are sorted and immutable, and
             compaction continuously renegotiates the balance between write,
-            read, and space amplification; column families and the options
-            surface exist so that each embedded use can strike that balance
-            differently without forking the engine.
+            read, and space amplification; the MANIFEST gives the file
+            hierarchy itself a crash-safe log, and column families and the
+            options surface exist so that each embedded use can strike the
+            balance differently without forking the engine.
           </div>
         </article>
       </div>

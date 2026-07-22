@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>torchtitan walkthrough · Stanley Jacob</title>
-    <meta name="description" content="A walkthrough of pytorch/torchtitan: launching a pretraining run in five minutes, how DTensor and device meshes make FSDP2, tensor, pipeline, and context parallelism composable, and a guided reading path through the repository." />
+    <meta name="description" content="A full chapter on pytorch/torchtitan: a practical tutorial, the complete life of one Llama 3 training step from run_train.sh through the trainer loop, parallelized model, collectives, and checkpointing, deep dives on DTensor, composable parallelisms, and distributed checkpointing, a staged reading plan, labs, and understanding checks." />
     <link rel="stylesheet" href="/style.css" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
   </head>
@@ -31,17 +31,18 @@
         <h1>torchtitan</h1>
         <p class="lead">
           <a href="https://github.com/pytorch/torchtitan" target="_blank" rel="noreferrer">torchtitan</a>
-          is the PyTorch team's own answer to the question of how large
-          language models should be pretrained in native PyTorch, without a
-          Megatron or DeepSpeed layered on top: a platform that trains models
-          like Llama 3.1 from 8B to 405B by composing FSDP2, tensor, pipeline,
-          and context parallelism over DTensor. It matters because it is
-          simultaneously a usable trainer and the reference showcase for
-          PyTorch's distributed stack, so reading it is the shortest path to
-          understanding how modern N-dimensional parallelism actually fits
-          together. This walkthrough covers launching a run in five minutes,
-          the two ideas that carry the design, and a reading path through the
-          repository.
+          is the PyTorch team's own answer to how large language models
+          should be pretrained in native PyTorch, without a Megatron or
+          DeepSpeed layered on top: a platform that trains models like
+          Llama 3.1 from 8B to 405B by composing FSDP2, tensor, pipeline,
+          and context parallelism over DTensor. This chapter is three things
+          at once: a practical tutorial for launching real runs, a
+          systems-internals walkthrough that follows one training step of
+          Llama 3 8B from <code>run_train.sh</code> down to the collectives
+          and back up to the checkpoint on disk, and a staged guide to
+          reading the repository. It ends with runnable labs, understanding
+          checks with model answers, and a compact framework for keeping the
+          whole system in your head.
         </p>
       </div>
     </header>
@@ -49,140 +50,960 @@
     <section class="soft">
       <div class="wrap">
         <article class="prose article">
-          <h2>Using it in five minutes</h2>
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">run_train.sh              torchrun spawns NGPU ranks (default 8)
+      |
+      v
+torchtitan/train.py       ConfigManager: --module llama3 --config llama3_8b
+      |
+      v
+torchtitan/trainer.py     Trainer builds every component from one Config object
+      |
+      v
+ParallelDims -&gt; DeviceMesh    distributed/parallel_dims.py
+      |                       axes: pp, dp_replicate, fsdp, cp, tp (product = world size)
+      v
+plain Llama3Model on meta device    models/llama3/model.py
+      |
+      |  parallelize_llama: CP -&gt; TP -&gt; activation ckpt -&gt; compile -&gt; FSDP2
+      v
+sharded model             every parameter is now a DTensor with placements
+      |
+      v
+train loop                data -&gt; forward -&gt; loss -&gt; backward -&gt; clip -&gt; step
+      |
+      v
+collectives (NCCL)        all-gather, reduce-scatter, all-reduce, P2P send/recv
+      |
+      v
+CheckpointManager -&gt; DCP  components/checkpoint.py (async, reshardable)</pre>
           <p>
-            There is a <code>pip install torchtitan</code> release, but the
-            project moves with PyTorch nightlies and is really meant to be run
-            from source:
+            The one-sentence identity: <mark>torchtitan is the reference
+            pretraining platform that proves N-dimensional parallelism can
+            be composed onto a plain, single-device model definition,
+            because PyTorch's DTensor makes layout a property of tensors
+            rather than a property of model code.</mark> Classic megamodel
+            trainers achieve tensor or pipeline parallelism by rewriting the
+            model: column-parallel linear layers, manually placed
+            collectives, forked architecture files per strategy. torchtitan
+            inverts that. The model file is close in spirit to a scaled-up
+            <a href="/oss/nanogpt">nanoGPT</a>, and every distribution
+            technique is applied to it from outside, as a transformation,
+            in a deliberate order.
+          </p>
+          <p>
+            Two consequences follow. First, the parallelisms multiply
+            instead of interfering: the same Llama definition trains with
+            FSDP alone on eight GPUs or with four parallelism dimensions
+            composed on thousands, and scaling up is a config change, not a
+            code change. Second, the repository doubles as the official
+            showcase of PyTorch's distributed stack, so reading it is the
+            shortest path to understanding how DTensor, device meshes,
+            FSDP2, <code>torch.distributed.pipelining</code>, and
+            distributed checkpointing actually fit together. Everything in
+            this chapter is verified against the main branch in July 2026;
+            the project tracks PyTorch nightlies and moves fast, so where a
+            detail is likely to shift I say so and stay at concept level.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <p>
+            torchtitan is a Linux-and-GPUs project (NVIDIA or AMD). The
+            intended way to run it is from source, against a recent PyTorch
+            nightly or a current stable release:
           </p>
           <pre><code>git clone https://github.com/pytorch/torchtitan
 cd torchtitan
-pip install -r requirements.txt</code></pre>
+pip install -r requirements.txt
+# when running on a PyTorch nightly, torchdata must come from the nightly index:
+pip install --pre torchdata --index-url https://download.pytorch.org/whl/nightly/cpu</code></pre>
           <p>
-            Training a Llama model needs its tokenizer, which a helper script
-            downloads from HuggingFace once you have accepted the license and
-            have a token:
+            There are also stable releases (v0.2.2 as I write) via
+            <code>pip install torchtitan</code>, each pinning the torch
+            version it was tested against. On macOS the package installs
+            and is pleasant to read and step through, but training needs
+            CUDA or ROCm; the honest macOS workflow is reading code locally
+            and running on a Linux box, plus the dry-run mode below, which
+            can validate a config without a cluster.
+          </p>
+          <p>
+            A first real session should be the debug model, which is the
+            registered default. <code>run_train.sh</code> wraps
+            <code>torchrun</code>, takes the GPU count from
+            <code>NGPU</code> (default 8), and selects a model family and a
+            registered configuration by name:
+          </p>
+          <pre><code>NGPU=1 ./run_train.sh          # MODULE=llama3 CONFIG=llama3_debugmodel by default</code></pre>
+          <p>
+            Expect a burst of setup logging (config dump, mesh construction,
+            model building), then ten training steps on a tiny test dataset,
+            each logging step number, loss, peak memory, tokens per second,
+            and MFU, with loss falling steadily. It finishes in well under a
+            minute on one GPU, which also makes it the right thing to step
+            through with a debugger on a first read. The real thing needs
+            the Llama tokenizer, which a helper script downloads from
+            Hugging Face once you have accepted the license and have a
+            token:
           </p>
           <pre><code>python scripts/download_hf_assets.py --repo_id meta-llama/Llama-3.1-8B \
-  --assets tokenizer --hf_token=...</code></pre>
+  --assets tokenizer --hf_token=...
+
+MODULE=llama3 CONFIG=llama3_8b ./run_train.sh    # Llama 3.1 8B on 8 GPUs</code></pre>
           <p>
-            A run is then one script. <code>run_train.sh</code> wraps
-            <code>torchrun</code>, takes the GPU count from <code>NGPU</code>
-            (default 8), and selects a model family and a registered
-            configuration by name:
+            The <code>llama3_8b</code> configuration trains on the C4
+            dataset with sequence length 8192, a local batch size of 1 per
+            data-parallel rank, AdamW at lr 3e-4, selective activation
+            checkpointing, and a checkpoint interval of 500 steps. Every
+            one of those knobs, and the degree of every parallelism
+            dimension, is a field on a config dataclass and can be
+            overridden on the command line:
           </p>
-          <pre><code>MODULE=llama3 CONFIG=llama3_8b ./run_train.sh</code></pre>
+          <pre><code>MODULE=llama3 CONFIG=llama3_8b ./run_train.sh \
+  --parallelism.tensor_parallel_degree 2 \
+  --training.steps 100 \
+  --checkpoint.enable</code></pre>
           <p>
-            Every knob, from batch size to the degree of each parallelism
-            dimension, lives in the named config and can be overridden as a
-            command line flag, so scaling an experiment from FSDP-only on one
-            node to FSDP plus tensor parallel plus pipeline parallel on many
-            is a config change rather than a code change. The default config
-            is a tiny debug model that runs in seconds, which is also the
-            right thing to step through with a debugger on a first read.
+            One caution on old documentation: torchtitan originally used
+            TOML files for configuration, and most blog posts still show
+            <code>CONFIG_FILE=...toml</code>. Current main uses Python
+            config registries instead (<code>--module</code> picks the model
+            family, <code>--config</code> picks a registered function that
+            returns a config object), so translate old examples
+            accordingly.
+          </p>
+          <p>
+            Now the mistakes beginners make. First, running
+            <code>llama3_8b</code> before downloading assets fails on the
+            tokenizer path (<code>hf_assets_path</code> points at
+            <code>./assets/hf/Llama-3.1-8B</code>); the debug model avoids
+            this by shipping a test tokenizer in-repo. Second, parallelism
+            degrees must multiply to the world size, and only
+            <code>data_parallel_shard_degree</code> may be left at
+            <code>-1</code> to absorb the remainder:
+          </p>
+          <pre><code># wrong: 8 GPUs, tp=3 does not divide anything sensible
+NGPU=8 ./run_train.sh --parallelism.tensor_parallel_degree 3
+# AssertionError: ... cp(1) * tp(3) * pp(1) != WORLD_SIZE(8)
+
+# right: tp=2 leaves dp_shard = 8 / 2 = 4, filled in automatically
+NGPU=8 ./run_train.sh --parallelism.tensor_parallel_degree 2</code></pre>
+          <p>
+            Third, batch-size confusion: <code>training.local_batch_size</code>
+            is per data-parallel rank, the effective global batch is local
+            times the data-parallel degree, and if you set
+            <code>training.global_batch_size</code> larger than that product
+            the trainer makes up the difference with gradient accumulation.
+            Fourth, and most fundamental: <mark>do not edit
+            <code>model.py</code> to parallelize anything. In this codebase
+            distribution is configuration applied from outside, and the
+            moment you hand-place a collective in the model you have
+            forfeited the composability the whole design exists to
+            provide.</mark>
           </p>
 
-          <h2>DTensor makes parallelism a property of tensors</h2>
+          <h2>Part III: When it is the right tool</h2>
           <p>
-            Classic megamodel trainers achieve tensor or pipeline parallelism
-            by rewriting the model: column-parallel linear layers, manually
-            placed collectives, forked architecture files per strategy. The
-            bet torchtitan demonstrates is that PyTorch's DTensor abstraction
-            dissolves most of that. A DTensor is an ordinary tensor plus a
-            placement: it knows which devices it lives on, via a device mesh, a
-            logical N-dimensional grid over the GPUs, and how it is laid out
-            across them, sharded along some dimension or replicated.
-            <mark>Once layout is metadata carried by the tensor itself, the
-            framework can insert the required communication automatically, and
-            parallelizing a model becomes annotating it rather than rewriting
-            it.</mark>
+            torchtitan is the right tool when you are pretraining (or
+            heavily continued-pretraining) transformer models on PyTorch and
+            want a clean, forkable baseline that already composes FSDP2,
+            TP, PP, and CP correctly: research labs scaling a new
+            architecture, teams that want to understand and own their
+            training stack, and anyone learning modern distributed training,
+            for whom it is frankly the best textbook available. It is also
+            the natural home for PyTorch-native features (Float8, async TP,
+            meta-device init, torchft fault tolerance) months before they
+            appear anywhere else.
           </p>
           <p>
-            FSDP2, the data parallel workhorse here, shows why this is more
-            than aesthetics. The original FSDP flattened each wrapped module's
-            parameters into one opaque buffer; FSDP2 instead represents every
-            parameter as a DTensor sharded per parameter along its first
-            dimension. Because the sharding is visible and typed, it composes
-            with tensor parallelism (the same weight can be sharded one way by
-            TP across one mesh dimension and another way by FSDP across
-            another), with fine-grained control over what stays in which
-            precision, and with distributed checkpointing that can resave and
-            reshard a run onto a different world size.
+            The honest cases for alternatives: Megatron-LM when you need
+            every last percent of MFU on NVIDIA hardware and accept a
+            framework that owns your model code; DeepSpeed when you are
+            embedded in its ecosystem or need ZeRO-style features integrated
+            with Hugging Face tooling; torchtune or the usual
+            fine-tuning stacks when your job is adapting an existing
+            checkpoint rather than pretraining, which is a different problem
+            with different defaults. torchtitan itself is deliberately not a
+            general-purpose trainer with a thousand options; it is a
+            reference platform with opinions.
+          </p>
+          <p>
+            The architecture-shaped warning is about mapping parallelism to
+            physical interconnect. Tensor parallelism exchanges activations
+            inside every layer, several times per transformer block, and
+            only survives on NVLink-class bandwidth; FSDP and pipeline
+            parallelism communicate an order of magnitude less often and
+            tolerate inter-node links. Composing them in the wrong
+            orientation is the NFS-mounted-SQLite of this domain:
+          </p>
+          <pre class="flow">dangerous:  TP group spans nodes
+   node0 [g0 g1 g2 g3] --ethernet/IB-- node1 [g4 g5 g6 g7]
+            &lt;------ TP all-reduces cross the slow link every layer ------&gt;
+
+safe:       TP inside the node, FSDP/PP across nodes
+   node0 [g0 g1 g2 g3]  = one TP group on NVLink
+   node1 [g4 g5 g6 g7]  = another TP group
+            &lt;-- only FSDP all-gather/reduce-scatter or PP p2p cross nodes --&gt;</pre>
+          <p>
+            torchtitan's mesh construction makes the safe layout natural
+            (the innermost mesh axis is TP, so consecutive ranks within a
+            node form the TP groups), but nothing stops a bad degree choice
+            from spanning nodes, and the symptom is simply catastrophic
+            step time rather than an error.
           </p>
 
-          <h2>One model definition, N dimensions of parallelism</h2>
+          <h2>Part IV: The full life of one training step</h2>
           <p>
-            The second idea is a discipline about where code lives. The model
-            definition in torchtitan is deliberately plain, single-device
-            PyTorch, close in spirit to a scaled-up nanoGPT, and all
-            distribution logic is applied to it from outside. A
-            <code>ParallelDims</code> object turns the configured degrees into
-            a device mesh, and a per-model parallelize function then walks the
-            model and applies each technique in a careful order: tensor
-            parallel sharding of attention and MLP weights (with an async
-            variant that overlaps the TP collectives with compute), activation
-            checkpointing, <code>torch.compile</code>, and finally FSDP2 across
-            the data parallel mesh dimension. Pipeline parallelism splits the
-            stack of blocks into stages scheduled across ranks, and context
-            parallelism shards the sequence dimension itself so million-token
-            contexts fit, with the attention exchange handled under the hood.
-          </p>
-          <p>
-            The payoff of keeping these techniques orthogonal is that they
-            multiply instead of interfere: the same Llama definition trains
-            with FSDP alone on eight GPUs or with four parallelism dimensions
-            composed on thousands, plus meta-device initialization so the 405B
-            model never has to materialize on one host, Float8 training, and
-            fault-tolerant checkpointing. <mark>torchtitan's real product is
-            the demonstration that composability, not a monolithic trainer, is
-            how PyTorch wants large-scale training to be expressed.</mark> The
-            same properties that make checkpoints reshardable here are what
-            make them loadable by inference engines later.
+            The specimen: one step of Llama 3.1 8B, launched with
+            <code>MODULE=llama3 CONFIG=llama3_8b ./run_train.sh</code> on a
+            multi-GPU mesh. Most of the machinery below runs identically on
+            8 GPUs with FSDP only or on hundreds with TP and PP composed in;
+            where the path forks I follow both briefly.
           </p>
 
-          <h2>Reading the repository</h2>
+          <h3>Stage 1: run_train.sh and torchrun</h3>
           <p>
-            Everything of interest is under the <code>torchtitan/</code>
-            package. Start with <code>train.py</code> and
-            <code>trainer.py</code> at its top level: the Trainer owns the
-            loop, and one pass through it shows the full lifecycle of a step,
-            batch loading, forward, loss, backward, clipping, optimizer, and
-            metrics, with every distributed concern delegated outward. Then
-            read one model family end to end, <code>models/llama3/</code>
-            being the canonical one: <code>model.py</code> is the plain
-            definition, <code>parallelize.py</code> is where the ordered
-            application of TP, activation checkpointing, compile, and FSDP2
-            happens, and <code>config_registry.py</code> is where named
-            configurations like <code>llama3_8b</code> are assembled as
-            ordinary Python objects.
+            <code>run_train.sh</code> is thirty lines of bash worth actually
+            reading. It takes <code>NGPU</code> (default 8),
+            <code>MODULE</code> (default <code>llama3</code>), and
+            <code>CONFIG</code> (default <code>llama3_debugmodel</code>)
+            from the environment, then execs <code>torchrun
+            --nproc_per_node=$NGPU</code> with a c10d rendezvous on
+            <code>-m torchtitan.train</code>, passing any extra flags
+            through. torchrun spawns one Python process per GPU and sets
+            <code>RANK</code>, <code>LOCAL_RANK</code>, and
+            <code>WORLD_SIZE</code>; everything after this point is
+            SPMD, the same program running on every rank. The script also
+            exposes <code>COMM_MODE=fake_backend</code>, which runs the
+            whole setup path with fake process groups on a single device,
+            so a 512-GPU config can be validated without a cluster.
+          </p>
+
+          <h3>Stage 2: ConfigManager and the registry</h3>
+          <p>
+            <code>torchtitan/train.py</code> is a short main: build a
+            <code>ConfigManager</code> (<code>torchtitan/config/manager.py</code>),
+            parse args, construct the trainer, call
+            <code>trainer.train()</code>. The manager resolves
+            <code>--module llama3</code> by importing
+            <code>torchtitan.models.llama3.config_registry</code>
+            (six families are supported in-tree on main:
+            <code>llama3</code>, <code>deepseek_v3</code>, <code>flux</code>,
+            <code>gpt_oss</code>, <code>qwen3</code>, <code>qwen3_5</code>)
+            and calls the function named by <code>--config</code>.
+            <code>llama3_8b()</code> in
+            <code>models/llama3/config_registry.py</code> just constructs a
+            <code>Trainer.Config</code> dataclass in ordinary Python:
+            model spec from <code>model_registry("8B")</code>, optimizer,
+            dataloader, checkpointing, activation checkpointing, all as
+            nested config objects. Remaining command-line flags are then
+            applied onto that dataclass by the tyro CLI library, so
+            <code>--parallelism.tensor_parallel_degree 2</code> is just
+            attribute assignment with type checking. Finally
+            <code>config.build()</code> instantiates the Trainer:
+            configuration as code, no YAML or TOML interpreter in sight.
+          </p>
+
+          <h3>Stage 3: Trainer construction, mesh first, model second</h3>
+          <p>
+            <code>Trainer.__init__</code> in
+            <code>torchtitan/trainer.py</code> does the whole setup dance.
+            First distributed init:
+            <code>ParallelDims.from_config</code>
+            (<code>distributed/parallel_dims.py</code>) validates the
+            degrees, fills in <code>dp_shard = world_size /
+            (dp_replicate * cp * tp * pp)</code> when it is left at
+            <code>-1</code>, asserts the product matches the world size, and
+            calls <code>build_mesh()</code> to create the
+            <code>DeviceMesh</code>, a logical N-dimensional grid over the
+            ranks with named axes. Then the model: the config's
+            <code>ModelSpec</code> builds a plain <code>Llama3Model</code>
+            (<code>models/llama3/model.py</code>, a thin subclass of the
+            shared <code>Decoder</code> in <code>models/common/</code>) on
+            the <em>meta</em> device, so an 8B, 70B, or 405B parameter set
+            exists only as shapes and dtypes with no memory allocated.
+            <code>parallelize_llama</code>
+            (<code>models/llama3/parallelize.py</code>) then applies the
+            transformations in a fixed order examined in the deep dive:
+            context parallelism, tensor parallelism, activation
+            checkpointing, per-block <code>torch.compile</code>, and
+            finally FSDP2. Only after the model is fully sharded does each
+            rank materialize its own shard (<code>to_empty</code> plus the
+            model's init functions), which is why the 405B model never has
+            to fit on any single host. Optimizers, LR schedulers, the
+            dataloader, metrics, and the <code>CheckpointManager</code> are
+            built last, and a previous checkpoint is loaded if one exists.
+          </p>
+
+          <h3>Stage 4: train_step, microbatches, and the loss</h3>
+          <p>
+            The loop in <code>Trainer.train()</code> calls
+            <code>train_step()</code> once per step. Read
+            <code>train_step</code> and <code>forward_backward_step</code>
+            in <code>trainer.py</code> side by side; they are the heart of
+            the repo. The step first zeroes gradients, then pulls
+            <code>gradient_accumulation_steps</code> microbatches from the
+            dataloader on CPU, counting valid (non-padding) label tokens.
+            That count is all-reduced across the data-parallel mesh, because
+            correct loss normalization needs the <em>global</em> token
+            count: this is the kind of subtle correctness detail reference
+            implementations exist to teach. Each microbatch is then moved to
+            the GPU and run through <code>forward_backward_step</code>. In
+            the common non-pipeline case that is exactly the eager PyTorch
+            idiom, one forward, one loss, one <code>loss.backward()</code>;
+            with pipeline parallelism enabled the trainer instead calls
+            <code>pp_schedule.step(...)</code> and the schedule
+            interleaves forward and backward across microbatches and
+            stages internally, with only the last stage computing losses.
+          </p>
+
+          <h3>Stage 5: what communication actually fires</h3>
+          <p>
+            The model code contains no collectives, but the wrapped model
+            fires plenty. During forward, FSDP2 all-gathers each
+            transformer block's parameter shards just before the block runs
+            and frees them right after (prefetching the next block's
+            all-gather to overlap with compute); parameters travel in
+            bfloat16 under the default mixed-precision policy. If TP is on,
+            every block additionally exchanges activations inside attention
+            and the MLP, as all-reduces, or reduce-scatter/all-gather pairs
+            when sequence parallelism is enabled, on the <code>tp</code>
+            mesh axis. If CP is on, attention runs over a
+            sequence-sharded input and the wrapped inner attention
+            all-gathers key/value shards across the <code>cp</code> axis
+            (<code>distributed/context_parallel.py</code>). During
+            backward, everything happens mirrored: FSDP2 re-all-gathers
+            parameters for each block's backward, computes local gradients,
+            and immediately reduce-scatters them (in float32 by default) so
+            each rank keeps only its gradient shard; TP runs the transposed
+            collectives; PP sends activation gradients upstream over P2P.
+            The scheduling goal throughout is overlap: communication for
+            block N+1 rides under computation of block N, on separate CUDA
+            streams.
+          </p>
+
+          <h3>Stage 6: clip, step, and the metrics reductions</h3>
+          <p>
+            Back in <code>train_step</code>, gradients now live as DTensor
+            shards. <code>dist_utils.clip_grad_norm_</code>
+            (<code>distributed/utils.py</code>) computes the global gradient
+            norm, which requires reducing partial norms across every mesh
+            dimension that shards gradients, and scales in place. The
+            trainer then waits for any in-flight async checkpoint staging
+            (<code>checkpointer.maybe_wait_for_staging()</code>), runs
+            <code>optimizers.step()</code>, whose AdamW states are sharded
+            exactly like the parameters they belong to, so optimizer state
+            for 8B parameters is also divided by the FSDP degree, and
+            advances the LR schedulers. Finally, on logging steps, the loss
+            is reduced across the data-parallel and context-parallel mesh
+            to produce the global average loss, a max-reduction produces
+            the worst per-rank loss, and the metrics processor logs step,
+            loss, memory, tokens per second, and MFU. A non-finite global
+            loss raises immediately and kills the run, on purpose.
+          </p>
+
+          <h3>Stage 7: the checkpoint</h3>
+          <p>
+            With <code>--checkpoint.enable</code> set (it defaults to off),
+            every <code>checkpoint.interval</code> steps (500 for
+            <code>llama3_8b</code>) <code>CheckpointManager.save</code>
+            (<code>components/checkpoint.py</code>) collects the stateful
+            objects, model parts, optimizers, LR schedulers, the dataloader
+            position, and the trainer's own step counter, and hands them to
+            <code>torch.distributed.checkpoint</code> (DCP). Every rank
+            writes its own shards into the step folder; nothing is
+            gathered to rank zero. In async mode the tensors are first
+            staged off the GPU (optionally into pre-allocated pinned
+            memory) and a background thread or process does the writing,
+            so training continues while the previous checkpoint drains to
+            disk. Because everything saved is a DTensor with recorded
+            placements, the checkpoint can later be loaded on a different
+            world size or parallelism layout, and a
+            <code>state_dict_adapter</code> per model family converts to
+            and from Hugging Face safetensors. That closes the loop of one
+            step: tokens in, gradients across the mesh, bytes durably out.
+          </p>
+
+          <h2>Part V: Internals deep dives</h2>
+
+          <h3>Deep dive: DTensor and device meshes</h3>
+          <p>
+            A <code>DeviceMesh</code> is a logical N-dimensional array of
+            ranks with named axes; a DTensor is an ordinary local tensor
+            plus a mesh and a list of <em>placements</em>, one per mesh
+            axis, saying how the global logical tensor is laid out along
+            that axis: <code>Shard(dim)</code>, <code>Replicate()</code>, or
+            <code>Partial()</code> (values that still need a reduction).
+            Consider eight GPUs as a 2x4 mesh and a weight of shape
+            (1024, 4096):
+          </p>
+          <pre class="flow">mesh axes: ("fsdp", "tp"), shape (2, 4)
+
+        tp0     tp1     tp2     tp3
+fsdp0 [ g0      g1      g2      g3 ]
+fsdp1 [ g4      g5      g6      g7 ]
+
+W: global (1024, 4096), placements [Shard(0) on fsdp, Shard(1) on tp]
+   -&gt; each GPU holds a (512, 1024) local tile
+   g1's tile = rows 0:512, cols 1024:2048</pre>
+          <p>
+            The placement metadata is what buys composability.
+            <code>redistribute</code> converts between placements by
+            inserting exactly the collectives required: Shard to Replicate
+            is an all-gather, Partial to Replicate is an all-reduce,
+            Partial to Shard is a reduce-scatter, and each runs only on its
+            own mesh axis's process group. Operators on DTensors propagate
+            placements through a sharding-rule system, so a matmul between
+            a row-sharded activation and a column-sharded weight knows its
+            output is Partial and a reduction is owed.
+            <mark>Once layout is typed metadata carried by the tensor
+            itself, the framework can insert communication automatically,
+            and parallelizing a model becomes annotating it rather than
+            rewriting it.</mark>
           </p>
           <p>
-            The conceptual core is the <code>distributed/</code> directory,
-            one focused file per technique: <code>parallel_dims.py</code> for
-            the device mesh construction, <code>fsdp.py</code>,
-            <code>tensor_parallel.py</code>, <code>pipeline_parallel.py</code>,
-            <code>context_parallel.py</code>, and
-            <code>activation_checkpoint.py</code>. Reading these against the
-            corresponding PyTorch APIs they orchestrate is the fastest way I
-            know to learn the current distributed stack. The
-            <code>components/</code> directory holds the swappable parts,
-            checkpointing, optimizers, learning rate schedules, quantization,
-            metrics, and validation, and the <code>experiments/</code> tree is
-            where newer work like reinforcement learning and torchft-based
-            fault tolerance incubates; the <code>docs/</code> folder has a
-            readable note per subsystem. If the model side is the part you
-            want to internalize first, the exercises in my
-            <a href="/ml">ML implementations section</a> build the
-            single-device pieces this repository assumes.
+            In torchtitan, <code>ParallelDims</code> owns mesh
+            construction. The axis names on main are
+            <code>pp</code>, <code>dp_replicate</code>, <code>fsdp</code>
+            (the dp-shard axis, merged with <code>cp</code> for FSDP
+            purposes when CP is on), <code>cp</code>, <code>tp</code>, and
+            for MoE models <code>ep</code> and <code>efsdp</code>; helper
+            views like <code>batch</code> and <code>loss</code> are flattened
+            combinations used for the token-count and loss reductions from
+            Part IV. Traps to correct: DTensor is bookkeeping, not
+            acceleration, and a bad layout is a slow layout with tidy
+            types. And a <code>Partial</code> DTensor prints like real
+            data; until something forces the pending reduction (such as
+            <code>full_tensor()</code>), per-rank values are partial sums,
+            which surprises everyone once.
+          </p>
+
+          <h3>Deep dive: the four parallelisms and how they nest</h3>
+          <p>
+            Each technique shards a different axis of the training problem,
+            and each buys memory or scale with a specific communication
+            cost:
+          </p>
+          <table>
+            <tr><th>Technique</th><th>Shards</th><th>Main communication</th><th>Interconnect need</th></tr>
+            <tr><td>FSDP2</td><td>parameters, grads, optimizer state</td><td>all-gather + reduce-scatter per block</td><td>moderate</td></tr>
+            <tr><td>TP (+SP)</td><td>weights and activations within layers</td><td>all-reduce or ag/rs pairs, every layer</td><td>NVLink-class</td></tr>
+            <tr><td>PP</td><td>the layer stack itself</td><td>P2P activations between stages</td><td>modest</td></tr>
+            <tr><td>CP</td><td>the sequence dimension</td><td>KV exchange inside attention</td><td>moderate</td></tr>
+          </table>
+          <p>
+            FSDP2 is the workhorse and the biggest conceptual upgrade over
+            its predecessor. Original FSDP flattened each wrapped module's
+            parameters into one opaque buffer; FSDP2's
+            <code>fully_shard</code> instead leaves every parameter a
+            separate DTensor, sharded along its first dimension across the
+            <code>fsdp</code> axis. <code>distributed/fsdp.py</code> applies
+            it per transformer block and then once over the whole model, and
+            installs the mixed-precision policy (bfloat16 parameter
+            all-gathers, float32 gradient reductions by default,
+            configurable via <code>training.mixed_precision_param</code> and
+            <code>mixed_precision_reduce</code>). Because sharding is
+            per-parameter and typed, the same weight can simultaneously be
+            sharded by TP along one mesh axis and by FSDP along another,
+            which is precisely the 2D layout drawn above, and state dicts
+            stay meaningful for checkpointing.
+          </p>
+          <p>
+            TP splits attention heads and MLP hidden dimensions across the
+            <code>tp</code> axis, following the classic Megatron pairing:
+            column-shard the first projection, row-shard the second, so the
+            intermediate activation stays sharded and only the block
+            boundary needs a reduction; sequence parallelism extends this by
+            keeping activations sequence-sharded through the norms, turning
+            all-reduces into reduce-scatter/all-gather pairs. On current
+            main torchtitan expresses these layouts declaratively:
+            <code>models/llama3/sharding.py</code> attaches sharding
+            configs to module configs and <code>model.parallelize()</code>
+            applies whichever declarations match the live mesh, with
+            <code>distributed/tensor_parallel.py</code> adding the async-TP
+            option that overlaps TP collectives with matmuls via
+            micro-pipelining. The exact API here has moved several times
+            (upstream's <code>ColwiseParallel</code>/<code>RowwiseParallel</code>
+            style plans, now the declarative sharding configs), so learn
+            the layout algebra, not the current spelling.
+          </p>
+          <p>
+            PP (<code>distributed/pipeline_parallel.py</code>) splits the
+            block stack into stages placed on the <code>pp</code> axis and
+            drives them with a schedule from
+            <code>torch.distributed.pipelining</code>: 1F1B,
+            Interleaved1F1B, zero-bubble variants like ZBVZeroBubble, and
+            DualPipeV are all selectable by config string. The trainer
+            visibly forks here, which is the honest cost of PP: it breaks
+            the single-program illusion (your rank may never see the loss),
+            and its bubbles mean efficiency depends on microbatch count and
+            schedule choice. CP
+            (<code>distributed/context_parallel.py</code>) shards the
+            sequence dimension so million-token contexts fit, wrapping the
+            inner attention so each rank gets the key/value blocks it needs;
+            attention is the only place sequence positions interact, which
+            is why CP is a surgical wrap of one function rather than a
+            model rewrite. The attention math that makes this exchange
+            tractable is the same tiling story told in my
+            <a href="/oss/flash-attention">FlashAttention</a> and
+            <a href="/ml/softmax">online softmax</a> write-ups.
+          </p>
+          <p>
+            Finally, nesting order. <code>parallelize_llama</code> applies
+            CP and TP first (they change what modules compute), then
+            activation checkpointing (wraps blocks), then per-block
+            <code>torch.compile</code> (must see the AC-wrapped block), then
+            FSDP2 outermost (it must own the final parameters to shard and
+            prefetch them). <mark>The order of wrapping is an API: apply
+            FSDP before compile or AC in the wrong order and you get broken
+            graphs or checkpointing the wrong thing, which is why torchtitan
+            centralizes the order in one function per model family instead
+            of trusting every user to know it.</mark> The famous
+            misconception to correct here: these techniques are not
+            interchangeable ways to "go faster". FSDP without enough memory
+            pressure is pure overhead, TP across slow links is a
+            catastrophe, PP with too few microbatches is mostly bubble, and
+            the art is choosing degrees that match model size, batch size,
+            and interconnect.
+          </p>
+
+          <h3>Deep dive: config as code, and checkpoints that reshard</h3>
+          <p>
+            The config system is small and worth imitating. Every component
+            (trainer, optimizer container, dataloader, checkpoint manager,
+            profiler) is <code>Configurable</code>: it declares a nested
+            <code>Config</code> dataclass, and <code>config.build()</code>
+            constructs the object graph. A model family contributes a
+            <code>config_registry.py</code> of named functions returning
+            fully-formed <code>Trainer.Config</code> objects, and tyro maps
+            dataclass fields to CLI flags mechanically. The payoffs:
+            configs are type-checked, diffable, composable by ordinary
+            function calls (the 70B config literally builds on the same
+            helpers as the 8B one), and there is no stringly-typed layer
+            between the flag you pass and the field it sets. The
+            <code>experiments/</code> tree plugs into the same registry,
+            which is how research forks stay rebased on the core.
+          </p>
+          <p>
+            Distributed checkpointing deserves its own correction of
+            misconceptions, because the classic mental model, "a checkpoint
+            is a file", is wrong here. A DCP checkpoint is a directory per
+            step containing shard files written concurrently by every rank
+            plus metadata mapping each fully qualified parameter name to
+            the placements and shapes of its shards. Loading is a
+            resharding operation: each rank asks for the pieces of each
+            named tensor that its <em>current</em> layout needs, and DCP
+            reads and reassembles across whatever the old layout was.
+            <mark>That is why torchtitan can save on 256 GPUs and resume on
+            64 with different parallelism degrees, and why optimizer state,
+            which is sharded like the parameters, survives the move
+            too.</mark> On top of this, <code>components/checkpoint.py</code>
+            adds async modes (a background thread, or a separate process
+            with pinned staging memory, so saving barely dents step time),
+            retention policy with a purge thread, an initial-load path for
+            importing weights, seed checkpoints for deterministic
+            debugging, and export to Hugging Face safetensors through DCP's
+            <code>HuggingFaceStorageWriter</code>. The trap: none of this
+            makes checkpoints portable across <em>model code</em> changes;
+            renaming a module changes the FQNs, and the state dict adapter
+            is where such translations must live.
+          </p>
+
+          <h2>Part VI: Reading the repository</h2>
+          <p>
+            The tree is small enough to read completely, which is half its
+            value. All paths verified on main, July 2026.
+          </p>
+          <p>
+            <strong>Stage 0, orientation.</strong> Read the
+            <code>README.md</code>, then <code>docs/composability.md</code>,
+            then <code>run_train.sh</code> and
+            <code>torchtitan/train.py</code>. Questions: what exactly does
+            torchrun add over plain python, where do
+            <code>--module</code> and <code>--config</code> get resolved,
+            and what is the object that <code>config.build()</code>
+            returns?
+          </p>
+          <p>
+            <strong>Stage 1, the trainer.</strong> Read
+            <code>torchtitan/trainer.py</code> top to bottom, with
+            <code>train_step</code> and <code>forward_backward_step</code>
+            as the destination. Questions: why is the valid-token count
+            all-reduced before the microbatch loop, what changes in the
+            step when PP is enabled, and where would gradient accumulation
+            interact badly with checkpoint intervals?
+          </p>
+          <p>
+            <strong>Stage 2, one model family end to end.</strong>
+            <code>models/llama3/model.py</code>, then the shared pieces it
+            leans on in <code>models/common/</code> (notably
+            <code>decoder.py</code> and <code>attention.py</code>), then
+            <code>models/llama3/__init__.py</code> (the size registry),
+            <code>parallelize.py</code>, and
+            <code>config_registry.py</code>. Questions: what makes the
+            model definition single-device, in what order are the five
+            transformations applied and why, and what does
+            <code>model_registry("8B")</code> actually return?
+          </p>
+          <p>
+            <strong>Stage 3, the distributed core.</strong> One focused
+            file per technique in <code>torchtitan/distributed/</code>:
+            <code>parallel_dims.py</code>, <code>fsdp.py</code>,
+            <code>tensor_parallel.py</code>,
+            <code>pipeline_parallel.py</code>,
+            <code>context_parallel.py</code>,
+            <code>activation_checkpoint.py</code>, and
+            <code>utils.py</code> for the clip-and-reduce helpers. Read
+            each against the PyTorch API it orchestrates. Questions: how is
+            <code>dp_shard=-1</code> resolved, which mesh axes does
+            <code>clip_grad_norm_</code> reduce over, and why does CP wrap
+            only the inner attention function?
+          </p>
+          <p>
+            <strong>Stage 4, components and config.</strong>
+            <code>components/checkpoint.py</code> (the longest and best
+            file in the repo), <code>optimizer.py</code>,
+            <code>dataloader.py</code>, <code>metrics.py</code>,
+            <code>validate.py</code>, and the <code>config/</code> package.
+            Questions: what states end up in a checkpoint, what happens on
+            a resume with a different world size, and how does a CLI flag
+            become a dataclass field?
+          </p>
+          <p>
+            <strong>Stage 5, the frontier.</strong> The
+            <code>experiments/</code> tree (RL, torchft fault tolerance,
+            and friends) and the per-subsystem notes in <code>docs/</code>
+            (<code>checkpoint.md</code>, <code>fsdp.md</code>,
+            <code>debugging.md</code>, <code>extension.md</code>).
+          </p>
+          <p>
+            Where <em>not</em> to start: the <code>spmd_types</code> and
+            <code>full_dtensor</code> alternative backends threaded through
+            the code behind config flags are an in-flight rewrite of how
+            sharding is expressed, interesting later and confusing first;
+            the MoE machinery (<code>deepep</code>, expert parallelism) adds
+            two mesh axes you should meet only after the dense story is
+            solid; and <code>experiments/</code> is by definition
+            unstable.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            Labs 1, 2, and 3 need at most one GPU (lab 3 needs none); labs
+            4 through 6 want two or more. Log formats vary with the fast
+            pace of main.
+          </p>
+          <p><strong>Lab 1: ten steps of the debug model.</strong> Concept: the trainer lifecycle of Part IV.</p>
+          <pre><code>NGPU=1 ./run_train.sh</code></pre>
+          <p>
+            Observe the setup logs in order: config dump, mesh construction,
+            model build, then ten step lines with loss, memory, tps, and
+            MFU, then a final checkpoint-free shutdown. Match each log
+            phase to a stage of Part IV. Rerun with
+            <code>LOG_RANK=0,1 NGPU=2</code> and watch both ranks interleave.
+          </p>
+          <p><strong>Lab 2: dry-run a cluster you do not have.</strong> Concept: ParallelDims validation and the SPMD setup path.</p>
+          <pre><code>NGPU=64 COMM_MODE="fake_backend" ./run_train.sh \
+  --parallelism.tensor_parallel_degree 8 \
+  --parallelism.pipeline_parallel_degree 2</code></pre>
+          <p>
+            The whole 64-rank setup runs on one device with fake process
+            groups and executes a single validation step. Observe the
+            resolved mesh in the logs (dp_shard becomes 4). Then break it:
+            set <code>tensor_parallel_degree 6</code> and read the
+            assertion naming every degree and the world size. This mode is
+            how you validate a production config in seconds.
+          </p>
+          <p><strong>Lab 3: DTensor with your bare hands.</strong> Concept: meshes, placements, redistribute. CPU only.</p>
+          <pre><code># dtensor_lab.py
+import torch, torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import distribute_tensor, Shard, Replicate
+
+mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("dp", "tp"))
+w = torch.arange(16.0).reshape(4, 4)
+dt = distribute_tensor(w, mesh, [Replicate(), Shard(0)])
+print(f"rank {dist.get_rank()}: placements={dt.placements}, local={dt.to_local().shape}")
+full = dt.redistribute(mesh, [Replicate(), Replicate()])   # all-gather on the tp axis
+print(f"rank {dist.get_rank()}: full={full.to_local().shape}")</code></pre>
+          <pre><code>torchrun --nproc_per_node=4 dtensor_lab.py</code></pre>
+          <p>
+            Observe each rank reporting placements
+            <code>(Replicate(), Shard(dim=0))</code> with a (2, 4) local
+            shard, and (4, 4) after redistribution. Change
+            <code>Shard(0)</code> to <code>Shard(1)</code> and predict the
+            local shapes before running.
+          </p>
+          <p><strong>Lab 4: compose FSDP and TP.</strong> Concept: 2D layouts and mesh-aware wrapping.</p>
+          <pre><code>NGPU=2 ./run_train.sh --parallelism.tensor_parallel_degree 2   # tp=2, dp_shard=1
+NGPU=2 ./run_train.sh                                          # dp_shard=2, no tp</code></pre>
+          <p>
+            Compare the logged mesh, per-GPU peak memory, and tps between
+            the two runs; with 4 or 8 GPUs, try
+            <code>tensor_parallel_degree 2</code> so both axes are active
+            at once. Enable the profiler
+            (<code>--profiler.enable_profiling</code>) and open the
+            resulting trace in Perfetto to see all-gathers and
+            reduce-scatters overlapping compute, which is Stage 5 of
+            Part IV made visible.
+          </p>
+          <p><strong>Lab 5: checkpoint, kill, reshard, resume.</strong> Concept: DCP resharding.</p>
+          <pre><code>NGPU=2 ./run_train.sh --checkpoint.enable --training.steps 10
+ls outputs/checkpoint/step-10/          # per-rank .distcp shard files + metadata
+NGPU=1 ./run_train.sh --checkpoint.enable --training.steps 20   # resumes at step 10</code></pre>
+          <p>
+            Observe the second run loading the step-10 checkpoint despite a
+            different world size, and the loss curve continuing rather than
+            restarting. Then add <code>--checkpoint.async_mode async</code>
+            and compare the step time of checkpointing steps against
+            synchronous saving.
+          </p>
+          <p><strong>Lab 6: gradient accumulation from the batch math.</strong> Concept: local versus global batch size.</p>
+          <pre><code>NGPU=2 ./run_train.sh --training.global_batch_size 32
+# debug model default local_batch_size is 8, so:
+# grad accumulation steps = 32 / (8 * 2 dp ranks) = 2</code></pre>
+          <p>
+            Observe the startup log reporting the computed gradient
+            accumulation steps, and that each optimizer step now consumes
+            two microbatches per rank. Set a global batch size not
+            divisible by the product and read the failure; the arithmetic
+            in <code>trainer.py</code> is the lesson.
+          </p>
+
+          <h2>Part VIII: Questions and model answers</h2>
+          <p>
+            Understanding checks. Answer aloud before reading.
+          </p>
+          <p><strong>1. What is torchtitan, in one sentence?</strong></p>
+          <p>
+            The PyTorch team's reference pretraining platform, which trains
+            Llama-class models by composing FSDP2, tensor, pipeline, and
+            context parallelism onto a plain single-device model definition
+            via DTensor placements on a device mesh.
+          </p>
+          <p><strong>2. What is a DTensor and why does it matter here?</strong></p>
+          <p>
+            An ordinary local tensor plus a device mesh and per-axis
+            placements (Shard, Replicate, Partial) describing how the
+            logical global tensor is laid out. Because layout is typed
+            metadata on the tensor, the framework can insert exactly the
+            required collectives and different parallelisms can shard the
+            same tensor along different mesh axes without knowing about
+            each other.
+          </p>
+          <p><strong>3. How does FSDP2 differ from the original FSDP?</strong></p>
+          <p>
+            FSDP1 flattened each wrapped module's parameters into one
+            opaque flat buffer; FSDP2 keeps every parameter an individual
+            DTensor sharded on its first dimension. That makes sharding
+            visible and composable with TP, enables per-parameter control
+            over precision and freezing, and yields state dicts that
+            distributed checkpointing can reshard.
+          </p>
+          <p><strong>4. Trace the ordering in parallelize_llama and justify it.</strong></p>
+          <p>
+            CP and TP first, because they change what the modules compute;
+            activation checkpointing next, wrapping blocks; compile next,
+            so it captures the AC-wrapped block; FSDP2 last and outermost,
+            because it must own the final parameters to shard, all-gather,
+            and prefetch them. Reordering these produces broken graphs or
+            wraps the wrong thing, which is why the order lives in one
+            function.
+          </p>
+          <p><strong>5. What communication does one FSDP2-only training step perform?</strong></p>
+          <p>
+            Per transformer block: an all-gather of that block's parameter
+            shards before its forward (freed after), another all-gather
+            before its backward, and a reduce-scatter of its gradients
+            after backward, plus small all-reduces for the token count,
+            gradient norm, and logged loss. Prefetching overlaps each
+            block's communication with the previous block's compute.
+          </p>
+          <p><strong>6. Why must tensor parallelism stay inside a node?</strong></p>
+          <p>
+            TP exchanges activations several times per layer, every layer,
+            so its collectives sit on the critical path at high frequency
+            and need NVLink-class bandwidth. FSDP and PP communicate per
+            block or per microbatch and tolerate inter-node links, so the
+            standard layout is TP innermost within a node and the other
+            dimensions across nodes.
+          </p>
+          <p><strong>7. Why is the valid-token count all-reduced before the loss is computed?</strong></p>
+          <p>
+            The loss is normalized by the number of real (non-padding)
+            label tokens, and with data parallelism plus gradient
+            accumulation each rank sees a different count. Normalizing by
+            the global count makes the summed gradients equal the true
+            global-batch gradient; normalizing locally would silently
+            weight ranks with fewer valid tokens more heavily.
+          </p>
+          <p><strong>8. What is in a DCP checkpoint, and why can it be loaded on a different world size?</strong></p>
+          <p>
+            A directory of shard files written concurrently by every rank
+            plus metadata mapping each fully qualified tensor name to its
+            shards' placements and shapes. Loading reshards: each rank
+            requests the pieces its current layout needs by name, so world
+            size and parallelism degrees can differ between save and load.
+            What it cannot survive is renamed modules, since names are the
+            keys.
+          </p>
+          <p><strong>9. How does the 405B model get initialized without fitting on any host?</strong></p>
+          <p>
+            The model is built on the meta device, so parameters are shapes
+            without storage; parallelization assigns every parameter its
+            sharded layout; and only then does each rank materialize and
+            initialize just its own shards. No rank ever holds the full
+            model.
+          </p>
+          <p><strong>10. What changes about the trainer when pipeline parallelism is on?</strong></p>
+          <p>
+            The model becomes a list of stage modules, and instead of
+            calling forward and backward itself the trainer calls
+            <code>pp_schedule.step()</code>, which interleaves microbatch
+            forwards and backwards across stages by P2P; only the last
+            stage computes losses, so other ranks report a placeholder.
+            It is the one parallelism that visibly breaks the
+            single-program shape of the loop.
+          </p>
+          <p><strong>11. When would you pick Megatron-LM or DeepSpeed over torchtitan?</strong></p>
+          <p>
+            Megatron when maximum MFU on large NVIDIA clusters outweighs
+            owning a framework that owns your model code; DeepSpeed when
+            you need its ecosystem and Hugging Face integration. torchtitan
+            wins on clarity, PyTorch-native composability, and being a
+            baseline you can fork and fully understand; for fine-tuning
+            rather than pretraining, torchtune-style stacks fit better.
+          </p>
+          <p><strong>12. A run at scale suddenly has terrible step times but no errors. Name three suspects from this chapter.</strong></p>
+          <p>
+            A parallelism layout mismatch with the interconnect, such as TP
+            groups spanning nodes after a degree change; lost
+            communication-compute overlap, visible in a profiler trace as
+            serialized all-gathers; or checkpointing running synchronously
+            (or staging stalls) so saves periodically stall steps. The
+            profiler trace distinguishes them quickly.
+          </p>
+          <p><strong>13. What does COMM_MODE=fake_backend give you?</strong></p>
+          <p>
+            The entire setup path, config validation, mesh construction,
+            and model parallelization for an arbitrary world size, run on a
+            single device with fake process groups and no real
+            communication. It turns "will this 512-GPU config even
+            start" into a seconds-long local check.
+          </p>
+          <p><strong>14. Why does context parallelism only need to wrap attention?</strong></p>
+          <p>
+            Every other operation in a transformer is pointwise along the
+            sequence, so sequence-sharded activations flow through
+            embeddings, norms, and MLPs unchanged. Attention is the sole
+            place where positions interact, so exchanging key/value shards
+            there is sufficient for exact computation over the full
+            context.
+          </p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Keep the model plain; apply infrastructure from
+            outside.</strong> The model file stays single-device and
+            legible, and every distributed concern is a transformation
+            applied to it. This is mechanism/policy separation, the same
+            instinct as keeping business logic free of persistence code, or
+            aspect-style middleware wrapping a plain handler.
+          </p>
+          <p>
+            <strong>Make layout a type.</strong> Encoding sharding as
+            DTensor placements turns "will these parallelisms compose"
+            from an integration nightmare into propagation over typed
+            metadata. Units-of-measure types, ownership in Rust, and schema
+            systems in data pipelines all win the same way: represent the
+            invariant in the data, and composition becomes checkable.
+          </p>
+          <p>
+            <strong>Order of wrapping is an API; centralize it.</strong>
+            CP, TP, AC, compile, FSDP2 must nest in one order, and
+            torchtitan puts that order in one audited function per model
+            family rather than in every user's script. Wherever correctness
+            depends on layering (middleware stacks, lock ordering,
+            interceptor chains), the layering itself deserves a single
+            owner.
+          </p>
+          <p>
+            <strong>Configuration as code with a registry.</strong> Named
+            Python functions returning typed dataclasses give diffable,
+            composable, type-checked configs and a CLI for free, avoiding
+            the slow drift of a bespoke config language. The same pattern
+            runs through Bazel rules, pytest fixtures, and infrastructure
+            DSLs that eventually admit they are Python.
+          </p>
+          <p>
+            <strong>Address durable state by logical name, not physical
+            layout.</strong> DCP keys checkpoints by parameter FQN plus
+            shard metadata, so the physical layout can change between save
+            and load. This is schema-on-read, stable storage keys under
+            resharding in distributed databases, and every good migration
+            story: never let today's partitioning leak into the persistent
+            format.
+          </p>
+          <p>
+            <strong>Build the debugging modes into the front door.</strong>
+            A debug model that runs in seconds, a fake-backend dry run for
+            arbitrary world sizes, and a first-class profiler are shipped
+            in the entry script, not in a wiki. Systems that make their own
+            verification cheap get verified; the pattern shows up as
+            single-node modes in distributed databases and simulation
+            harnesses in consensus implementations.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            The one-sentence summary: <mark>torchtitan turns parallelism
+            degrees into a named device mesh, applies CP, TP, activation
+            checkpointing, compile, and FSDP2 in that order to a plain
+            model whose parameters become DTensors, and runs an ordinary
+            training loop whose communication and reshardable checkpoints
+            fall out of the placements.</mark>
+          </p>
+          <pre class="flow">run_train.sh -&gt; torchrun -&gt; ConfigManager (--module/--config)
+  -&gt; Trainer -&gt; ParallelDims -&gt; DeviceMesh (pp, dp_replicate, fsdp, cp, tp)
+  -&gt; meta-device model -&gt; parallelize: CP -&gt; TP -&gt; AC -&gt; compile -&gt; FSDP2
+  -&gt; train_step: data -&gt; fwd -&gt; loss -&gt; bwd -&gt; clip -&gt; optim step
+  -&gt; DCP checkpoint (async, reshardable)</pre>
+          <p>The chain mapped to source:</p>
+          <pre class="flow">launch            run_train.sh, torchtitan/train.py
+config            torchtitan/config/, models/llama3/config_registry.py
+mesh              torchtitan/distributed/parallel_dims.py
+model             models/llama3/model.py (+ models/common/)
+transformations   models/llama3/parallelize.py -&gt; distributed/{context_parallel,
+                  tensor_parallel, activation_checkpoint, compile, fsdp}.py
+loop              torchtitan/trainer.py (train_step, forward_backward_step)
+checkpoint        components/checkpoint.py -&gt; torch.distributed.checkpoint</pre>
+          <p>Memorize these blocks:</p>
+          <ul>
+            <li><strong>Mesh axes:</strong> pp, dp_replicate, fsdp (dp-shard), cp, tp (plus ep/efsdp for MoE); degrees multiply to the world size, and only dp_shard may be -1.</li>
+            <li><strong>Wrap order:</strong> CP, TP, activation checkpointing, compile, FSDP2, outermost last because FSDP must own the final parameters.</li>
+            <li><strong>Communication costs:</strong> FSDP all-gathers and reduce-scatters per block; TP reduces inside every layer (keep it on NVLink); PP sends activations point to point; CP exchanges KV inside attention only.</li>
+            <li><strong>Checkpoint truth:</strong> a DCP checkpoint is a directory of per-rank shards keyed by parameter name plus placement metadata, which is exactly why it reshards across world sizes.</li>
+            <li><strong>llama3_8b defaults:</strong> seq 8192, local batch 1, AdamW lr 3e-4, C4, selective AC, checkpoint every 500 steps.</li>
+          </ul>
+
+          <h2>Part XI: Final takeaway</h2>
+          <p>
+            If the single-device pieces this repository assumes are the gap,
+            the <a href="/ml">ML implementations section</a> builds them
+            from scratch, and the attention-memory story behind CP and
+            selective checkpointing is derived in the
+            <a href="/oss/flash-attention">FlashAttention chapter</a>. Then
+            come back and read <code>trainer.py</code> once more; it will
+            read like plain PyTorch, which is the entire point.
           </p>
           <div class="takeaway">
             <strong>Key takeaway:</strong> torchtitan shows that large-scale
             pretraining does not require a framework that owns your model.
-            Represent layout as DTensor placements on a device mesh, keep the
-            model definition single-device and plain, and apply each
-            parallelism as a composable transformation, and the same few
-            hundred lines of training loop carry you from one GPU to
-            thousands.
+            Represent layout as DTensor placements on a device mesh, keep
+            the model definition single-device and plain, and apply each
+            parallelism as a composable transformation in a disciplined
+            order, and the same few hundred lines of training loop carry
+            you from one GPU to thousands, with checkpoints that survive
+            the journey.
           </div>
         </article>
       </div>

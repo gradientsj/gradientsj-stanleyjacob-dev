@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>SGLang walkthrough · Stanley Jacob</title>
-    <meta name="description" content="A walkthrough of the SGLang repository: how to serve a model in five minutes, how RadixAttention prefix caching and grammar-constrained generation work, what the frontend DSL adds, and a guided reading path through the runtime." />
+    <meta name="description" content="A full chapter on SGLang: a practical tutorial, the complete life of one structured-generation request through the SRT runtime, deep dives into RadixAttention, constrained decoding with jump-forward and XGrammar, and the frontend DSL, plus a staged plan for reading the repository." />
     <link rel="stylesheet" href="/style.css" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
   </head>
@@ -36,9 +36,11 @@
           al., NeurIPS 2024) and now lives under the LMSYS non-profit, with
           production deployments at companies like xAI running it at enormous
           GPU scale. Its founding claim is that the runtime and the programming
-          interface should be co-designed, and this walkthrough covers how to
-          serve a model in five minutes, the three ideas that follow from that
-          claim, and a guided path for reading the repository.
+          interface should be co-designed. This is a full chapter: a practical
+          tutorial, the complete life of one structured-generation request
+          through the SRT runtime, deep dives into RadixAttention, constrained
+          decoding, and the frontend DSL, and a staged plan for reading the
+          repository. File paths were checked against release v0.5.15.
         </p>
       </div>
     </header>
@@ -46,31 +48,143 @@
     <section class="soft">
       <div class="wrap">
         <article class="prose article">
-          <h2>Using it in five minutes</h2>
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">HTTP request (OpenAI JSON, schema attached)
+      │
+      ▼
+FastAPI server                            srt/entrypoints/http_server.py
+      │
+      ▼
+TokenizerManager: tokenize, dispatch      srt/managers/tokenizer_manager.py
+      │   (ZMQ queue to the scheduler process)
+      ▼
+Scheduler loop                            srt/managers/scheduler.py
+      ├─► radix tree: longest cached prefix?   srt/mem_cache/radix_cache.py
+      ├─► grammar: compile schema → automaton  srt/constrained/
+      ├─► build batch                          srt/managers/schedule_batch.py
+      ▼
+TP worker ──► model runner ──► attention  srt/managers/tp_worker.py,
+      │        backend kernel              srt/model_executor/, srt/layers/attention/
+      ▼
+grammar bitmask ──► sample one token      srt/layers/sampler.py
+      │        (or jump-forward: append many tokens, no forward pass)
+      ▼
+DetokenizerManager: ids → text            srt/managers/detokenizer_manager.py
+      │   (ZMQ back to TokenizerManager)
+      ▼
+SSE chunk to the client; KV pages stay indexed in the radix tree</pre>
           <p>
-            SGLang installs from PyPI (the docs recommend the uv installer and
-            pin matching PyTorch builds, so check the install guide if you hit
-            version friction) and launches as a server process:
+            The one-sentence identity: <mark>SGLang is a serving runtime
+            organized around reuse: a radix tree that makes every past
+            computation a candidate for sharing, grammars that skip tokens the
+            output format has already determined, and a frontend language
+            whose programs expose that structure on purpose</mark>. Where
+            <a href="/oss/vllm">vLLM</a> begins from memory allocation and
+            adds caching as a feature, SGLang begins from the observation that
+            real workloads repeat themselves, and builds the runtime around
+            exploiting the repetition.
           </p>
-          <pre><code>pip install sglang</code></pre>
+          <p>
+            Three ideas carry the design. RadixAttention keeps the entire KV
+            cache pool indexed by a radix tree over token sequences, so a new
+            request's prompt is first matched against everything the server
+            has ever computed and still holds, and only the unmatched suffix
+            is prefilled. Constrained decoding compiles a JSON schema, regex,
+            or grammar into an automaton that masks invalid tokens each step,
+            and, crucially, fast-forwards through stretches where the grammar
+            permits exactly one continuation, so the model only ever runs
+            forward passes where it has a real choice. And the frontend DSL,
+            the Structured Generation Language the project is named for, lets
+            callers write whole multi-call programs whose branching and
+            sharing the runtime can see and schedule for, instead of inferring
+            structure from a stream of isolated requests.
+          </p>
+          <p>
+            Operationally, the runtime (called SRT, the SGLang Runtime) is a
+            pipeline of processes connected by message queues: an HTTP process
+            that tokenizes, a scheduler process that owns the GPU, and a
+            detokenizer process, so Python string work never blocks a forward
+            pass. Keep that pipeline in your head; every stage in Part IV is
+            one hop along it.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <h3>Installing</h3>
+          <p>
+            The runtime targets Linux. On an NVIDIA GPU box with Python 3.10+:
+          </p>
+          <pre><code>pip install sglang
+# the docs recommend uv for speed and correct pins:
+uv pip install sglang</code></pre>
+          <p>
+            The wheels pull in a matched CUDA PyTorch plus the
+            <code>sgl-kernel</code> package of custom kernels; when you hit
+            version friction (usually a PyTorch/driver mismatch), the install
+            guide's pinned combinations and the official
+            <code>lmsysorg/sglang</code> Docker images are the reliable path,
+            and Docker is what the project recommends for production. AMD
+            ROCm and CPU backends exist behind their own extras. On macOS you
+            can install the package for the frontend language and clients,
+            but the serving runtime itself needs Linux; point the DSL at a
+            remote server instead.
+          </p>
+          <h3>First real session</h3>
           <pre><code>python3 -m sglang.launch_server \
-  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --model-path Qwen/Qwen2.5-0.5B-Instruct \
   --host 0.0.0.0 --port 30000</code></pre>
           <p>
-            The server is OpenAI-compatible, so the usual client works with a
-            base URL change:
+            Startup logs show weight loading, KV cache pool sizing (derived
+            from <code>--mem-fraction-static</code>, which is auto-computed by
+            default), and CUDA graph capture, then the server listens on port
+            30000. Once running, every request prints scheduler telemetry
+            shaped like this (wording varies by release):
+          </p>
+          <pre><code>Prefill batch. #new-seq: 1, #new-token: 42, #cached-token: 0, ...
+Decode batch. #running-req: 1, #token: 60, token usage: 0.00, gen throughput (token/s): ...</code></pre>
+          <p>
+            That <code>#cached-token</code> field is RadixAttention speaking,
+            and you will use it constantly. The server is OpenAI-compatible,
+            so the usual client works with a base URL change:
           </p>
           <pre><code>from openai import OpenAI
 
 client = OpenAI(base_url="http://localhost:30000/v1", api_key="unused")
 resp = client.chat.completions.create(
-    model="meta-llama/Llama-3.1-8B-Instruct",
+    model="Qwen/Qwen2.5-0.5B-Instruct",
     messages=[{"role": "user", "content": "Hello"}],
 )</code></pre>
+          <h3>Structured output</h3>
           <p>
-            The same package also contains the frontend language the project is
-            named for, a Python-embedded DSL that runs against the server you
-            just launched:
+            The signature feature. Attach a JSON schema through the OpenAI
+            structured-outputs surface and the server guarantees the response
+            parses, enforced at the token level by the grammar backend
+            (XGrammar by default, verified in the v0.5.15 server args):
+          </p>
+          <pre><code>resp = client.chat.completions.create(
+    model="Qwen/Qwen2.5-0.5B-Instruct",
+    messages=[{"role": "user", "content": "Extract: Ada Lovelace, born 1815."}],
+    response_format={
+        "type": "json_schema",
+        "json_schema": {
+            "name": "person",
+            "schema": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}, "born": {"type": "integer"}},
+                "required": ["name", "born"],
+            },
+        },
+    },
+)</code></pre>
+          <p>
+            The native <code>/generate</code> endpoint accepts the same
+            constraint directly in <code>sampling_params</code>
+            (<code>json_schema</code>, <code>regex</code>, or an EBNF
+            grammar), which is handy for scripting outside the OpenAI shapes.
+          </p>
+          <h3>The frontend DSL</h3>
+          <p>
+            The same package contains the language the project is named for,
+            a Python-embedded DSL that runs against the server you launched:
           </p>
           <pre><code>from sglang import function, gen, system, user, assistant, RuntimeEndpoint
 from sglang.lang.api import set_default_backend
@@ -85,95 +199,662 @@ def basic_qa(s, question):
 
 state = basic_qa("List 3 countries and their capitals.")
 print(state["answer"])</code></pre>
-
-          <h2>Idea one: RadixAttention</h2>
+          <h3>The mistakes beginners make</h3>
           <p>
-            Real workloads repeat themselves. Multi-turn chats resend the whole
-            conversation each turn, few-shot prompts share their examples across
-            thousands of requests, and agent loops replay long histories with
-            small additions, so the same prompt prefixes get re-processed
-            constantly. Prefix caching, reusing the KV cache of a shared prefix
-            instead of recomputing it, is the fix, and
-            <a href="/oss/vllm">vLLM</a> offers it as a lookup layered over its
-            paged cache. SGLang's contribution was to promote it from a feature
-            to the organizing principle of the runtime.
-            <mark>RadixAttention keeps the entire KV cache pool indexed by a
-            radix tree over token sequences, so every cached prefix of every
-            past request is a candidate for reuse</mark>, with cold branches
-            evicted LRU when memory runs short. Because the tree makes reuse
-            visible ahead of time, the scheduler can be cache-aware, ordering
-            waiting requests so that ones sharing prefixes run near each other
-            and hit rates stay high, which is why SGLang shines on exactly the
-            workloads above.
+            The classic one is defeating the radix cache with prompt ordering.
+            The tree shares <em>prefixes</em>, so any dynamic content placed
+            before the static content splits the tree at token one:
+          </p>
+          <pre><code># Wrong: timestamp first → zero prefix reuse across requests
+prompt = f"[{datetime.now()}] {LONG_SYSTEM_PROMPT}\n{question}"
+
+# Right: static prefix first, dynamic content last
+prompt = f"{LONG_SYSTEM_PROMPT}\n{question}\n(asked at {datetime.now()})"</code></pre>
+          <p>
+            The same applies to few-shot examples (keep them identical and
+            leading) and to chat histories (append, never rewrite earlier
+            turns). The second mistake is benchmarking with a sequential
+            loop; like every continuous-batching engine, SGLang shows its
+            throughput only under concurrency, so use an async client and
+            <code>asyncio.gather</code>. The third is assuming a schema makes
+            output correct rather than parseable: constrained decoding
+            guarantees syntax, and a model can still hallucinate a perfectly
+            valid wrong answer into it. The fourth is reading
+            <code>token usage</code> panic into normal behavior: a nearly
+            full KV pool is often just the radix cache holding warm history,
+            which eviction reclaims on demand.
           </p>
 
-          <h2>Idea two: structured generation as a fast path</h2>
+          <h2>Part III: When it is the right tool</h2>
           <p>
-            Constrained decoding usually means compiling a JSON schema, regex,
-            or grammar into an automaton and masking invalid tokens at each
-            step, which guarantees valid output but pays the full per-token
-            decoding cost even for characters the grammar has already decided.
-            SGLang's insight, introduced as jump-forward decoding with a
-            compressed finite state machine, is that <mark>whenever the grammar
-            permits exactly one continuation, the server can append those
-            tokens directly and skip the forward passes entirely</mark>, so the
-            model only ever decodes where it has a real choice. In a JSON
-            object that is most of the punctuation and every fixed key. The
-            grammar engine itself is pluggable, with
+            SGLang shines exactly where its ideas bite: multi-turn chat and
+            agent loops that resend growing histories, few-shot evaluation
+            sweeps where thousands of requests share their examples,
+            heavy structured-output pipelines (extraction, tool calls, JSON
+            APIs), and large multi-replica deployments where its
+            disaggregated prefill/decode serving and cache-aware routing were
+            built at real scale. If your traffic has high prefix overlap or
+            is mostly schema-constrained, it is the strongest choice.
+          </p>
+          <p>
+            The alternatives: <a href="/oss/vllm">vLLM</a> overlaps almost
+            completely, has the larger ecosystem and broadest day-one model
+            and quantization support, and is the safer generic default; the
+            two projects have converged hard (vLLM has prefix caching and
+            XGrammar too; SGLang has paged memory and chunked prefill), so
+            the choice is often benchmarks on your own workload. TensorRT-LLM
+            trades flexibility for peak NVIDIA performance with ahead-of-time
+            builds. llama.cpp and Ollama own single-user local inference,
+            where a scheduler built for thousands of concurrent requests is
+            dead weight.
+          </p>
+          <p>
+            The architecture-shaped warning: <mark>RadixAttention's value is
+            destroyed one layer above it, at the load balancer</mark>. Each
+            replica has its own radix tree; a cache-blind round-robin sprays
+            a conversation's turns across replicas, so every turn misses:
+          </p>
+          <pre class="flow">Dangerous:                          Safe:
+turn 1 ─► replica A  (miss)         turn 1 ─► replica A  (miss)
+turn 2 ─► replica B  (miss!)        turn 2 ─► replica A  (hit)
+turn 3 ─► replica C  (miss!)        turn 3 ─► replica A  (hit)
+   round-robin LB                     prefix-aware / sticky routing</pre>
+          <p>
+            The project ships its own answer, a Rust model gateway
+            (<code>sgl-model-gateway/</code> at the repo root, descended from
+            the sgl-router project) that routes with an approximate view of
+            each replica's cached prefixes. If you front SGLang with your own
+            balancer, you need at least session stickiness, or you are paying
+            for a cache you never hit.
+          </p>
+
+          <h2>Part IV: The full life of one request</h2>
+          <p>
+            The canonical operation is one structured-generation request: a
+            chat completion carrying a JSON schema, streamed back. Paths are
+            <code>python/sglang/</code>-relative where obvious, verified
+            against v0.5.15.
+          </p>
+          <h3>Stage 1: HTTP arrival</h3>
+          <p>
+            <code>launch_server.py</code> boots the FastAPI app in
+            <code>srt/entrypoints/http_server.py</code>; the OpenAI-compatible
+            routes live in <code>srt/entrypoints/openai/</code> and translate
+            the request into the internal generate form: chat template applied
+            to the messages, the schema captured as a constraint in the
+            sampling parameters. (There are also gRPC and offline
+            <code>Engine</code> entrypoints beside it; all converge on the
+            same next stage.)
+          </p>
+          <h3>Stage 2: TokenizerManager</h3>
+          <p>
+            The <code>TokenizerManager</code>
+            (<code>srt/managers/tokenizer_manager.py</code>) lives in the HTTP
+            process. It tokenizes the prompt, wraps everything into a
+            tokenized request message (the message types are all in
+            <code>srt/managers/io_struct.py</code>, a surprisingly clarifying
+            file to read early), sends it over a ZMQ queue to the scheduler
+            process, and keeps the mapping needed to stream results back to
+            the right HTTP response later.
+          </p>
+          <h3>Stage 3: Grammar compilation</h3>
+          <p>
+            Because the request carries a schema, the scheduler routes it
+            through the grammar machinery in <code>srt/constrained/</code>
+            before it can run: the backend (XGrammar via
+            <code>xgrammar_backend.py</code> by default; Outlines and
+            llguidance are alternatives behind
+            <code>base_grammar_backend.py</code>) compiles schema to grammar
+            to automaton. Compilation can take real milliseconds, so compiled
+            grammars are cached by key and the request simply waits in a
+            grammar queue on a cold miss while other requests keep the GPU
+            busy. Every later request with the same schema skips this
+            entirely.
+          </p>
+          <h3>Stage 4: Radix match and admission</h3>
+          <p>
+            The scheduler (<code>srt/managers/scheduler.py</code>) runs the
+            engine's event loop. For our waiting request it asks the radix
+            cache (<code>srt/mem_cache/radix_cache.py</code>) for the longest
+            cached prefix of the prompt's token IDs. Whatever matches, a
+            shared system prompt, the previous turns of this conversation, is
+            reused directly: the matched KV pages are locked against eviction
+            and only the unmatched suffix needs prefill. The admission logic
+            in <code>srt/managers/schedule_policy.py</code> then packs a
+            prefill batch under token and memory budgets (long suffixes are
+            chunked, like vLLM's chunked prefill), and the scheduling policy
+            orders the waiting queue: the current release defaults to
+            <code>fcfs</code>, with <code>lpm</code>, longest-prefix-match
+            first, as the classic cache-aware policy from the paper that
+            groups prefix-sharing requests together to keep hit rates high.
+          </p>
+          <h3>Stage 5: Batch formation and the forward pass</h3>
+          <p>
+            <code>srt/managers/schedule_batch.py</code> turns the chosen
+            requests into a batch, allocating KV pages from the token pools in
+            <code>srt/mem_cache/memory_pool.py</code> and
+            <code>srt/mem_cache/allocator/</code>. The batch crosses to the
+            tensor-parallel worker (<code>srt/managers/tp_worker.py</code>)
+            and the model runner
+            (<code>srt/model_executor/model_runner.py</code>, with per-batch
+            metadata in <code>forward_batch_info.py</code>), which executes
+            the model with an attention backend chosen from
+            <code>srt/layers/attention/</code> (FlashAttention and FlashInfer
+            backends among many; custom kernels live in the separate
+            <code>sgl-kernel/</code> package at the repo root). Decode steps
+            replay captured CUDA graphs, and by default the scheduler runs an
+            overlap mode that prepares the next batch on CPU while the GPU
+            executes the current one, hiding Python time entirely.
+          </p>
+          <h3>Stage 6: Constrained sampling, or no sampling at all</h3>
+          <p>
+            The forward pass yields one logits row for our request. Before
+            sampling, the grammar automaton supplies a bitmask of legal next
+            tokens, applied to the logits so illegal tokens get probability
+            zero; then the sampler draws normally (temperature, top-k/top-p).
+            The automaton advances on the chosen token. And here is the fast
+            path: <mark>when the automaton reports that only one string can
+            follow, for example <code>", "born": </code> after a closed name
+            field, the runtime appends those tokens directly, without any
+            forward passes, and resumes decoding at the next real
+            choice</mark>. That is jump-forward decoding, and it is why rigid
+            schemas get faster while pure free-text does not.
+          </p>
+          <h3>Stage 7: Detokenize and stream</h3>
+          <p>
+            Output token IDs go over ZMQ to the
+            <code>DetokenizerManager</code>
+            (<code>srt/managers/detokenizer_manager.py</code>), which performs
+            incremental, stateful detokenization (BPE pieces are not
+            characters; it buffers until clean UTF-8 and stop conditions can
+            be checked), then sends text deltas back to the
+            <code>TokenizerManager</code>, which resolves them to the waiting
+            HTTP response as SSE chunks.
+          </p>
+          <h3>Stage 8: The cache remembers</h3>
+          <p>
+            When the request finishes, its KV pages are not freed in the vLLM
+            sense; the token sequence, prompt plus generated output, is
+            inserted into the radix tree and the pages stay resident, unlocked
+            and evictable LRU. The next turn of this conversation will match
+            almost its entire prompt. This is the philosophical signature of
+            the system: <mark>completion does not free memory, it publishes
+            the computation for reuse</mark>.
+          </p>
+
+          <h2>Part V: Internals deep dives</h2>
+          <h3>RadixAttention and the radix-tree prefix cache</h3>
+          <p>
+            A radix tree is a compressed trie: edges carry token sequences,
+            not single tokens, and nodes split only where stored sequences
+            diverge. SGLang keys the tree on token IDs, and each node maps its
+            edge's tokens to their KV page indices in the pool:
+          </p>
+          <pre class="flow">                    root
+                     │ [system prompt, 1200 tokens]
+                     ●
+          ┌──────────┴───────────┐
+   [chat A turn 1]         [chat B turn 1]
+          ●                       ●
+     ┌────┴────┐                  │ [chat B turn 2]
+[A turn 2] [A turn 2']            ●
+   (two sampled branches)
+
+match_prefix(new prompt) → walks from root, returns
+longest shared prefix's KV indices + the node to lock</pre>
+          <p>
+            Three operations define it. <code>match_prefix</code> walks the
+            tree along a new prompt and returns the reusable KV; insertion
+            after a request finishes extends or splits nodes (a divergence in
+            the middle of an edge splits it, exactly like a trie); and
+            eviction walks leaves in LRU order, freeing pages of branches
+            nobody has touched, but never nodes whose <code>lock_ref</code> is
+            held by a running request. The important accounting fact, and the
+            misconception to kill: <mark>the tree stores no tensor data; it is
+            an index over the one shared KV pool, so "the radix cache" costs
+            metadata, not duplicate KV memory</mark>. A full-looking pool is
+            mostly evictable history, and the
+            <code>/flush_cache</code> endpoint empties it on demand.
+          </p>
+          <p>
+            Granularity is a real design difference from vLLM: SGLang's KV
+            allocation page size defaults to a single token on CUDA
+            (<code>--page-size</code>, default resolved to 1, verified in the
+            v0.5.15 source), so the tree can share prefixes to token
+            precision, where vLLM's block hashing shares only whole 16-token
+            blocks. Larger pages are supported and some attention backends
+            require them; the trade is coarser sharing for friendlier memory
+            layout. Around the core sit the production variants you should
+            know exist before reading <code>srt/mem_cache/</code>, because
+            the directory is crowded: <code>chunk_cache.py</code> is the
+            degenerate no-sharing cache used when the radix cache is disabled
+            (<code>--disable-radix-cache</code>), and
+            <code>hiradix_cache.py</code> plus <code>hicache_storage.py</code>
+            extend the tree hierarchically so evicted-from-GPU prefixes can
+            live in CPU RAM or remote storage and be pulled back instead of
+            recomputed.
+          </p>
+          <p>
+            Cache-awareness closes the loop with scheduling: because the tree
+            makes reuse visible before running anything, the scheduler's
+            <code>lpm</code> policy can sort waiting requests by matched
+            prefix length so requests sharing prefixes run together, raising
+            hit rates under load; the paper reports large throughput wins from
+            this on shared-prefix benchmarks. Note honestly that the current
+            release defaults to plain <code>fcfs</code> (predictable ordering,
+            priority support), with <code>lpm</code> one flag away, and that
+            under memory pressure the scheduler <em>retracts</em> running
+            requests, SGLang's word for preemption, tunable via
+            <code>--schedule-conservativeness</code>.
+          </p>
+          <h3>Constrained decoding: masks, compressed FSMs, jump-forward</h3>
+          <p>
+            Baseline grammar-constrained decoding compiles the constraint to
+            an automaton over tokens and, each step, masks the logits so only
+            legal tokens survive. Correct, but it still pays one full forward
+            pass per token, even for tokens the grammar has already decided.
+            SGLang's contribution (introduced as jump-forward decoding with a
+            compressed finite state machine, in the paper and the early 2024
+            blog post) starts from a simple observation about automata:
+            <mark>runs of states with exactly one outgoing edge are stretches
+            where the model has no choice, so they can be compressed into one
+            edge and emitted in one step</mark>.
+          </p>
+          <pre class="flow">Schema: {"name": string, "born": integer}
+
+{"name": "  A d a  " , " b o r n " :  1 8 1 5 }
+└───┬────┘ └─┬─┘ └──────┬───────┘ └─┬──┘
+ jump       model      jump        model
+ (0 passes) decodes    (0 passes)  decodes</pre>
+          <p>
+            For a rigid schema most of the output is punctuation and fixed
+            keys, so most tokens cost zero forward passes. One subtlety makes
+            the implementation honest rather than naive: jumped text is
+            appended as a <em>string</em> and the boundary re-tokenized,
+            because tokenizers merge across the seam (the last generated
+            token plus the jumped text may tokenize differently than their
+            concatenation), and getting this wrong corrupts the KV cache's
+            correspondence to the text. The retokenization logic sits with the
+            jump-forward map in
+            <code>srt/constrained/outlines_jump_forward.py</code> for the
+            regex/FSM backend.
+          </p>
+          <p>
+            The default engine, though, is
             <a href="https://github.com/mlc-ai/xgrammar" target="_blank" rel="noreferrer">XGrammar</a>
-            as the default backend, and it is all reachable through the OpenAI
-            API's structured-output parameters, so clients get schema-guaranteed
-            JSON without knowing any of this is happening.
+            (<code>srt/constrained/xgrammar_backend.py</code>; default
+            confirmed in the v0.5.15 server args), which generalizes from
+            regular expressions to context-free grammars with a
+            pushdown-automaton design: it precomputes token bitmasks for
+            context-independent automaton states at compile time and computes
+            only the context-dependent remainder at runtime, overlapping that
+            CPU work with the GPU forward pass, and it exposes its own
+            jump-forward strings. Outlines and llguidance remain as
+            alternative backends behind the common
+            <code>base_grammar_backend.py</code> interface. Two corrections
+            worth internalizing: constrained decoding does not slow generation
+            down in any fundamental way (with mask precomputation it is
+            near-free per step, and jump-forward makes rigid formats
+            <em>faster</em> than unconstrained); and it does subtly reshape
+            the distribution, because masking renormalizes among legal tokens,
+            so a schema guarantees syntax, not the answer the unconstrained
+            model "would have" given.
           </p>
-
-          <h2>Idea three: the frontend DSL</h2>
+          <h3>The frontend DSL and the co-design argument</h3>
           <p>
-            The name stands for Structured Generation Language, and the
-            frontend is the co-design half of the paper: if callers describe
-            whole programs instead of issuing isolated completion calls, the
-            runtime can see structure it could never infer from raw requests. A
-            function decorated with <code>@function</code> builds up a prompt
-            state with primitives like <code>gen</code>, <code>select</code>,
-            and <code>fork</code>, using ordinary Python control flow in
-            between. <code>gen</code> is non-blocking, <code>select</code> asks
-            the model to choose among fixed options by comparing their
-            probabilities, and <code>fork</code> branches one state into
-            parallel continuations, which the runtime executes concurrently
-            while the radix tree shares the common prefix's KV cache among all
-            branches. In practice most production users drive SGLang through
-            the plain OpenAI API and the DSL is the less-traveled half of the
-            project, but it explains the architecture: the runtime is built to
-            exploit exactly the sharing and parallelism the language expresses.
+            SGLang stands for Structured Generation Language, and the
+            language half (<code>python/sglang/lang/</code>) is the original
+            point of the paper: if callers describe whole programs, the
+            runtime can see structure it could never infer from isolated
+            requests. A decorated function builds an intermediate
+            representation (<code>lang/ir.py</code>) executed by an
+            interpreter (<code>lang/interpreter.py</code>) that manages a
+            per-call prompt state asynchronously against a backend
+            (<code>lang/backend/</code>, with <code>RuntimeEndpoint</code>
+            speaking the server's native API). Three primitives do the work:
+            <code>gen</code> appends a generation slot and is non-blocking,
+            so Python only waits when you read the value; <code>select</code>
+            picks among fixed options by scoring each continuation's
+            probability under the model (the normalization choices live in
+            <code>lang/choices.py</code>) instead of free-decoding and
+            parsing; and <code>fork</code> splits one state into parallel
+            branches:
+          </p>
+          <pre><code>@function
+def compare(s, topic):
+    s += user("Analyze " + topic + " from three angles.")
+    forks = s.fork(3)
+    for f, angle in zip(forks, ["cost", "risk", "speed"]):
+        f += assistant(gen("view", max_tokens=128, stop="\n"))
+    s += assistant("Summary: " + gen("summary", max_tokens=128))</code></pre>
+          <p>
+            The co-design is that each primitive maps to a runtime strength:
+            <code>fork</code>'s branches all share the parent prompt's KV
+            through the radix tree, so three branches cost one prefill;
+            <code>select</code> is a few cheap scoring passes over cached
+            prefix; interleaved <code>gen</code> calls across many program
+            instances keep the continuous batch full. Honesty requires saying
+            that most production users drive SGLang through the plain OpenAI
+            API and the DSL is the less-traveled half of the project. But it
+            explains the architecture: the runtime is built to exploit
+            exactly the sharing and parallelism the language expresses, and
+            the radix tree serves API users precisely because it was designed
+            for programs shaped like the one above.
           </p>
 
-          <h2>Reading the repository</h2>
+          <h2>Part VI: Reading the repository</h2>
           <p>
             Almost everything lives under <code>python/sglang/</code>, split
-            between <code>lang/</code>, the frontend language, and
-            <code>srt/</code>, the SGLang Runtime, which is the serving engine
-            and the part worth most of your time.
-            <code>launch_server.py</code> is the entry point; from there the
-            HTTP layer in <code>srt/entrypoints/</code> hands requests to a
-            pipeline of processes you can read in
-            <code>srt/managers/</code>: a tokenizer manager feeding a
-            scheduler feeding a detokenizer, connected by queues so
-            tokenization never blocks the GPU. The scheduler is the heart, it
-            owns continuous batching and the cache-aware policy, and it leans
-            on <code>srt/mem_cache/</code>, where the radix cache and the KV
-            allocators implement RadixAttention's bookkeeping. Model execution
-            is <code>srt/model_executor/</code> plus the attention backends and
-            layers under <code>srt/layers/</code>, with grammar-constrained
-            decoding wired in under <code>srt/constrained/</code>. Custom CUDA
-            kernels live in the separate <code>sgl-kernel/</code> package at
-            the repo root, and the Rust model gateway beside it routes traffic
-            across replicas with the same cache-awareness applied one level up.
-            A good first session is to launch the server with one small model,
-            send the same long prompt twice, and watch the logs report the
-            second request's prefix hit; then read the radix cache with that
-            observation in hand. For how these serving-layer choices compose
-            into a whole platform, my
-            <a href="/systems/llm-inference">LLM serving design write-up</a>
-            covers the same ground from the requirements side.
+            between <code>lang/</code> (the frontend) and <code>srt/</code>
+            (the runtime, where to spend your time). The tree has grown a lot
+            of production surface (disaggregation, hierarchical cache,
+            speculative decoding, many mixins), so read on rails:
+          </p>
+          <p>
+            <strong>Stage 0, orientation (one evening).</strong> Read the
+            SGLang paper (Zheng et al., NeurIPS 2024) and the jump-forward
+            blog post. Questions: what does co-design mean concretely? Why a
+            radix tree rather than a hash map of prefixes?
+          </p>
+          <p>
+            <strong>Stage 1, the skeleton.</strong> Read
+            <code>python/sglang/launch_server.py</code>,
+            <code>srt/entrypoints/http_server.py</code>, and skim
+            <code>srt/entrypoints/engine.py</code> and
+            <code>srt/managers/io_struct.py</code>. Questions: which processes
+            exist and what flows between them? Where does the OpenAI layer end
+            and the native API begin?
+          </p>
+          <p>
+            <strong>Stage 2, the pipeline.</strong> Read
+            <code>srt/managers/tokenizer_manager.py</code> and
+            <code>srt/managers/detokenizer_manager.py</code>. Questions: why
+            is detokenization its own process? What state does each side keep
+            per in-flight request?
+          </p>
+          <p>
+            <strong>Stage 3, the heart.</strong> Read
+            <code>srt/managers/scheduler.py</code> (long; read the event loop
+            first), then <code>schedule_policy.py</code> and
+            <code>schedule_batch.py</code>. Questions: walk one iteration of
+            the loop. What is a retraction and when does it fire? How does
+            <code>lpm</code> ordering differ from <code>fcfs</code>?
+          </p>
+          <p>
+            <strong>Stage 4, the memory.</strong> Read
+            <code>srt/mem_cache/radix_cache.py</code> alongside
+            <code>memory_pool.py</code>, then skim
+            <code>chunk_cache.py</code> as the contrast case. Questions: what
+            do <code>match_prefix</code>, insert, and evict do to the tree?
+            What does <code>lock_ref</code> protect against? Where is the
+            actual KV tensor?
+          </p>
+          <p>
+            <strong>Stage 5, compute and constraints.</strong> Read
+            <code>srt/model_executor/model_runner.py</code> and
+            <code>forward_batch_info.py</code>, one backend in
+            <code>srt/layers/attention/</code>
+            (<code>flashinfer_backend.py</code> or
+            <code>flashattention_backend.py</code>), then
+            <code>srt/constrained/base_grammar_backend.py</code> and
+            <code>xgrammar_backend.py</code>. Questions: how does a batch
+            describe itself to the kernel? Where exactly does the bitmask
+            meet the logits? Where does jump-forward re-enter the scheduler?
+          </p>
+          <p>
+            <strong>Stage 6, the language.</strong> Read
+            <code>lang/api.py</code>, <code>lang/ir.py</code>, and
+            <code>lang/interpreter.py</code>. Questions: what does
+            <code>fork</code> actually send to the server? Why is
+            <code>gen</code> lazy?
+          </p>
+          <p>
+            <strong>Where not to start:</strong> the disaggregated
+            prefill/decode machinery, <code>sgl-kernel/</code>, speculative
+            decoding, the hierarchical cache variants, and the swarm of
+            <code>*_mixin.py</code> files. All are real production
+            engineering layered on the core loop, and none make sense before
+            Stages 3 and 4 are solid.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            All labs assume a Linux GPU box running
+            <code>python3 -m sglang.launch_server --model-path Qwen/Qwen2.5-0.5B-Instruct --port 30000</code>.
+            Log wording varies by release; the fields named here are
+            long-standing.
+          </p>
+          <p>
+            <strong>Lab 1: watch the radix cache work.</strong> Send a
+            request with a ~2,000-token prompt and note the prefill log line's
+            <code>#cached-token: 0</code>. Send the identical prompt again and
+            watch <code>#cached-token</code> jump to nearly the full prompt
+            length, with time-to-first-token collapsing. Then
+            <code>curl -X POST localhost:30000/flush_cache</code> and repeat
+            to see it go cold. Concept taught: match, insert, and the fact
+            that finishing a request publishes its KV.
+          </p>
+          <p>
+            <strong>Lab 2: break the cache with prompt ordering.</strong>
+            Run 20 requests whose shared 1,500-token context comes first and
+            sum the <code>#cached-token</code> values; then run 20 with a
+            unique timestamp prepended and watch reuse drop to zero. Concept
+            taught: radix sharing is prefix sharing, byte-for-byte from token
+            one.
+          </p>
+          <p>
+            <strong>Lab 3: measure jump-forward.</strong> Ask for a
+            ~40-field flat JSON object twice: once free-form ("respond in
+            JSON"), once with a strict schema via <code>response_format</code>.
+            Compare wall-clock generation time and the decode throughput log
+            lines: the constrained run finishes in far fewer forward passes
+            because keys and punctuation are jumped. Concept taught: the
+            grammar fast path. (First schema use pays a one-time compile;
+            send it twice and time the second.)
+          </p>
+          <p>
+            <strong>Lab 4: cache-aware scheduling.</strong> Prepare 64
+            requests, 8 groups of 8 sharing a distinct long prefix, and fire
+            them all at once, interleaved across groups. Run once with the
+            default policy and once with
+            <code>--schedule-policy lpm</code>, comparing total completion
+            time and summed <code>#cached-token</code>. Concept taught: the
+            scheduler can raise hit rates by reordering admission.
+          </p>
+          <p>
+            <strong>Lab 5: pressure and retraction.</strong> Restart with
+            <code>--max-total-tokens 20000</code> (a debugging flag that caps
+            the KV pool) and fire 64 concurrent requests each generating
+            1,000 tokens. Watch <code>token usage</code> climb toward 1.0 and
+            retraction warnings appear as the scheduler pushes running
+            requests back to the queue, yet every request completes. Concept
+            taught: eviction and retraction as the pressure valves.
+          </p>
+          <p>
+            <strong>Lab 6: fork in the DSL.</strong> Run the
+            <code>compare</code> program from Part V against the server and
+            watch the logs: one prefill for the shared prompt, then the
+            branches show up with high <code>#cached-token</code>, decoding
+            concurrently. Concept taught: language structure mapping directly
+            onto tree structure.
+          </p>
+
+          <h2>Part VIII: Understanding checks</h2>
+          <p><strong>What is SGLang in one sentence?</strong> A serving
+          runtime co-designed with a programming interface, organized around
+          reuse: a radix tree indexes the whole KV cache for prefix sharing,
+          grammars skip tokens the format has determined, and the frontend
+          language exposes program structure the runtime exploits.</p>
+          <p><strong>What exactly does RadixAttention cache?</strong> Nothing
+          beyond the ordinary KV pool: it is an index. The radix tree maps
+          token-sequence prefixes to KV page indices in the shared pool, so
+          "cached" prefixes are just finished computations left resident and
+          evictable, discoverable by tree walk.</p>
+          <p><strong>Why a radix tree instead of a hash map of prompts?</strong>
+          A hash map can only find exact or precomputed-boundary matches; a
+          radix tree finds the longest shared prefix of any new prompt against
+          all history in one walk, handles mid-edge divergence by splitting,
+          and gives eviction a natural leaf-LRU structure.</p>
+          <p><strong>How does this differ from vLLM's prefix caching?</strong>
+          Mechanism and emphasis. vLLM hashes fixed-size blocks into a map,
+          sharing at block granularity as one feature of its paged allocator;
+          SGLang indexes token-granularity pages (page size defaults to 1) in
+          a tree that is the organizing structure of memory, feeding a
+          cache-aware scheduler. The two systems have otherwise converged
+          substantially.</p>
+          <p><strong>Walk the process pipeline of SRT.</strong> The HTTP
+          process holds the TokenizerManager, which tokenizes and forwards
+          over ZMQ to the scheduler process owning the GPU; output IDs flow to
+          the detokenizer process, then back to the TokenizerManager for the
+          HTTP response. String work never blocks forward passes.</p>
+          <p><strong>What happens when the KV pool fills?</strong> First,
+          eviction: LRU leaves of the radix tree are freed, never nodes locked
+          by running requests. If running requests still cannot grow, the
+          scheduler retracts some back to the waiting queue to resume later.
+          Frequent retraction means the pool is undersized for the
+          concurrency, tunable via schedule conservativeness or memory
+          fraction.</p>
+          <p><strong>Why does constrained decoding need a bitmask rather than
+          post-hoc validation?</strong> Sampling is committal: an illegal
+          token, once emitted, has already consumed a step and poisoned the
+          sequence. Masking logits before sampling makes invalid output
+          unrepresentable, which is a guarantee, where retry-until-parses is a
+          probability.</p>
+          <p><strong>What makes jump-forward correct despite tokenizers?</strong>
+          Jumped text is appended as a string and the boundary re-tokenized,
+          because the concatenation of the last token and the jumped string
+          may tokenize differently than the pieces; skipping that step would
+          desynchronize the token sequence, the KV cache, and the text.</p>
+          <p><strong>What does XGrammar add over a regex FSM?</strong>
+          Context-free grammars via a pushdown automaton, so recursive
+          structures like nested JSON are first-class; precomputed bitmasks
+          for context-independent states with the context-dependent remainder
+          computed at runtime, overlapped with the GPU; and its own
+          jump-forward strings. It is SGLang's default backend.</p>
+          <p><strong>Does a JSON schema make outputs correct?</strong> No,
+          only parseable. Masking renormalizes probability among legal
+          tokens, so the model can still assert a wrong value in flawless
+          syntax, and the constrained distribution differs subtly from what
+          unconstrained decoding plus rejection would give.</p>
+          <p><strong>What do gen, select, and fork map to in the runtime?</strong>
+          <code>gen</code> is an async generation slot filling a named
+          variable; <code>select</code> scores each fixed option's
+          continuation probability over the cached prefix instead of
+          free-decoding; <code>fork</code> creates parallel branches whose
+          shared parent prompt is one radix-tree prefix, so N branches cost
+          one prefill.</p>
+          <p><strong>When would you choose vLLM instead?</strong> When you
+          need the broadest model, hardware, and quantization ecosystem, or
+          your workload has little prefix overlap and no output constraints,
+          where SGLang's signature machinery buys little. For serious
+          deployments, benchmark both on your own traffic; they have
+          converged enough that workload shape decides.</p>
+          <p><strong>Throughput is fine but cache hit rate is near zero in
+          production. What do you check?</strong> The load balancer first:
+          round-robin across replicas defeats per-replica radix trees, so
+          check for sticky or prefix-aware routing. Then prompt construction:
+          dynamic content (timestamps, request IDs, shuffled few-shot
+          examples) ahead of the static prefix splits the tree at the first
+          divergent token.</p>
+          <p><strong>Why can the scheduler overlap CPU work with the GPU?</strong>
+          Because batch N+1's composition does not depend on batch N's sampled
+          values, only on request states the scheduler already tracks, so it
+          can build the next batch while the GPU runs the current one and
+          reconcile afterwards; this overlap mode is the default event
+          loop.</p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Turn a cache into an index and it becomes an
+            architecture.</strong> Prefix caching as a lookup table is a
+            feature; a radix tree over all history makes reuse visible to the
+            scheduler, the router, and the eviction policy, and suddenly the
+            whole system can plan around it. The same promotion happens when
+            databases turn a buffer cache into a buffer manager the planner
+            can reason about.
+          </p>
+          <p>
+            <strong>Co-design the interface with the engine.</strong> fork,
+            select, and gen exist because the runtime can honor them
+            specially, and the runtime's radix tree exists because programs
+            shaped like fork occur. API and engine designed together each
+            make the other better; the same story as SQL and query
+            optimizers, or map-reduce and its schedulers.
+          </p>
+          <p>
+            <strong>Spend compute only where there is a decision.</strong>
+            Jump-forward is a profound pattern wearing a small trick's
+            clothes: identify the parts of the work whose outcome is already
+            determined and skip the expensive machine for them. Branch
+            prediction, memoization, and incremental compilation are the same
+            lesson in other clothes.
+          </p>
+          <p>
+            <strong>Pipeline by process, not by thread.</strong> Tokenizer,
+            scheduler, and detokenizer as separate processes joined by queues
+            buys isolation from Python's GIL and from each other's latency
+            spikes, at the cost of serialization. Every serious serving
+            system rediscovers this shape; so did print spoolers.
+          </p>
+          <p>
+            <strong>Keep the escape hatch simple.</strong>
+            <code>chunk_cache.py</code>, the dumb no-sharing cache behind
+            <code>--disable-radix-cache</code>, is small and boring on
+            purpose: when the clever structure is suspected of a bug or
+            mismatched to a workload, the fallback isolates it in one flag.
+            Clever systems age well when their off switch is trustworthy.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            One sentence: SGLang bets that inference workloads are full of
+            structure, repeated prefixes, constrained formats, branching
+            programs, and builds the runtime so every one of those structures
+            converts into skipped work.
+          </p>
+          <pre class="flow">HTTP → Tokenize → Grammar → Radix match → Batch → Forward → Mask/Jump → Sample → Detok → SSE → Insert into tree</pre>
+          <p>The chain mapped to files (verified at v0.5.15, under <code>python/sglang/srt/</code>):</p>
+          <pre class="flow">HTTP          entrypoints/http_server.py (+ entrypoints/openai/)
+Tokenize      managers/tokenizer_manager.py     (HTTP process)
+Grammar       constrained/xgrammar_backend.py    (compiled, cached)
+Radix match   mem_cache/radix_cache.py           (index over the pool)
+Batch         managers/scheduler.py, schedule_policy.py, schedule_batch.py
+Forward       managers/tp_worker.py → model_executor/model_runner.py
+                → layers/attention/* (+ sgl-kernel/)
+Mask/Sample   layers/sampler.py + grammar bitmask; jump-forward skips passes
+Detok         managers/detokenizer_manager.py    (own process)
+Insert        radix tree keeps the finished KV, LRU-evictable</pre>
+          <p>Memorize these:</p>
+          <p>
+            <strong>The cache fact:</strong> the radix tree is an index, not a
+            store; match on admission, insert on completion, evict LRU leaves,
+            <code>lock_ref</code> pins what is running; page size defaults to
+            one token, so sharing is token-precise.
+          </p>
+          <p>
+            <strong>The grammar fact:</strong> compile once and cache, mask
+            logits every step, and when the automaton has a single outgoing
+            path, append the string, re-tokenize the seam, and skip the
+            forward passes entirely.
+          </p>
+          <p>
+            <strong>The pipeline fact:</strong> three processes,
+            tokenizer to scheduler to detokenizer, joined by ZMQ; the
+            scheduler overlaps building batch N+1 with executing batch N.
+          </p>
+          <p>
+            <strong>The deployment fact:</strong> the cache lives per
+            replica, so routing decides the hit rate; prefix-aware or sticky
+            routing above, static-prefix-first prompts below.
+          </p>
+          <p>
+            For how these serving-layer choices compose into a whole
+            platform, my <a href="/systems/llm-inference">LLM serving design
+            write-up</a> covers the same ground from the requirements side,
+            and the kernel-level story of attention over cached memory is on
+            the <a href="/oss/flash-attention">FlashAttention page</a> with
+            the underlying math on the <a href="/ml/softmax">softmax
+            page</a>.
           </p>
           <div class="takeaway">
             <strong>Key takeaway:</strong> SGLang is a bet on structure: index

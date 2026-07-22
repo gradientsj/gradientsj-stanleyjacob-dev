@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>DuckDB walkthrough · Stanley Jacob</title>
-    <meta name="description" content="A walkthrough of the DuckDB repository: how to query Parquet files in five minutes, how in-process columnar-vectorized execution works, what morsel-driven parallelism means, and a guided reading path from the parser to the pipeline executor." />
+    <meta name="description" content="A full chapter on DuckDB: a practical tutorial, the complete life of one analytical query over a Parquet file through parser, binder, optimizer, and morsel-driven pipelines, deep dives into vectorized execution and storage, a staged plan for reading the repository, and hands-on labs." />
     <link rel="stylesheet" href="/style.css" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
   </head>
@@ -32,15 +32,16 @@
         <p class="lead">
           <a href="https://github.com/duckdb/duckdb" target="_blank" rel="noreferrer">DuckDB</a>
           is an in-process analytical database, a single MIT-licensed library
-          that runs full SQL with no server and no dependencies, started at the
-          CWI research institute in Amsterdam by Mark Raasveldt and Hannes
-          Mühleisen and often summarized as SQLite for analytics. It matters
-          because it moved serious columnar query execution into the places
-          data scientists actually work, a Python process, a notebook, a
-          laptop, and made "just query the Parquet file" a normal thing to
-          type. This walkthrough covers how to use it in five minutes, the
-          execution ideas that make it fast, and a guided path for reading the
-          repository.
+          that runs full SQL with no server and no dependencies, started at
+          the CWI research institute in Amsterdam by Mark Raasveldt and Hannes
+          Mühleisen and often summarized as SQLite for analytics. This is a
+          full chapter, not a tour: a practical tutorial, then the complete
+          life of one analytical query over a Parquet file, from the Python
+          call through parser, binder, optimizer, physical plan, and
+          morsel-driven pipelines pushing vectors of 2048 values, then deep
+          dives into vectorized execution, parallelism, storage, and
+          out-of-core work, a staged plan for reading the C++ repository, labs
+          to run, and understanding checks at the end.
         </p>
       </div>
     </header>
@@ -48,147 +49,845 @@
     <section class="soft">
       <div class="wrap">
         <article class="prose article">
-          <h2>Using it in five minutes</h2>
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">SQL text  "SELECT city, avg(price) FROM 'listings.parquet' GROUP BY city"
+   |
+Parser        (src/parser, Postgres-derived grammar)  -&gt; statement tree
+   |
+Binder        (src/planner/binder)  names -&gt; catalog entries, types resolved,
+   |           'listings.parquet' -&gt; replacement scan -&gt; parquet table function
+Logical plan  LogicalGet -&gt; LogicalAggregate -&gt; LogicalProjection
+   |
+Optimizer     (src/optimizer)  pushdown, statistics propagation, join order
+   |
+Physical plan (src/execution)  TABLE_SCAN -&gt; HASH_GROUP_BY -&gt; PROJECTION
+   |
+Pipelines     (src/parallel)  plan broken at pipeline breakers,
+   |           worker threads pull morsels of input through each pipeline
+Vectors       DataChunks of up to 2048 values per column flow through operators
+   |
+Result        columnar chunks handed to the host process (pandas, Arrow, CLI)</pre>
           <p>
-            The command-line shell installs with one line and starts in an
-            in-memory database, and because DuckDB treats file paths as table
-            names, the first query can run against a raw Parquet file with no
-            import step:
+            The one-sentence identity: <mark>DuckDB is a complete analytical
+            SQL engine, parser to storage, compiled into a library that lives
+            inside your process and executes queries as parallel pipelines of
+            column vectors</mark>. There is no port to connect to and no
+            daemon to manage; "the database" is a stack of C++ objects behind
+            a connection handle, and the data it queries is as often a Parquet
+            file or a pandas DataFrame sitting next to it in memory as it is
+            DuckDB's own storage file.
           </p>
-          <pre><code>curl https://install.duckdb.org | sh</code></pre>
-          <pre><code>duckdb
-SELECT city, avg(price) FROM 'listings.parquet' GROUP BY city;
-SELECT count(*) FROM 'logs/*.csv.gz';</code></pre>
           <p>
-            The Python client is the same engine as a module, and it is where
-            most people meet DuckDB:
+            The diagram is the textbook database pipeline on purpose, and that
+            is what makes the repository such a good read: each named stage is
+            a directory. What distinguishes DuckDB from the textbook is
+            concentrated in the bottom half. Operators do not exchange one row
+            at a time; they exchange chunks of column vectors, up to 2048
+            values per call, so interpreter overhead is amortized to near
+            nothing while inner loops stay cache-resident. And the executor
+            does not assign static partitions to threads; it breaks the plan
+            into pipelines and lets a pool of workers pull small fragments of
+            input, morsels, through each pipeline until the input is gone,
+            which keeps every core busy regardless of skew.
           </p>
-          <pre><code>pip install duckdb</code></pre>
+          <p>
+            Hold both halves together: the top half is why DuckDB speaks
+            thoroughly standard SQL with a real optimizer, and the bottom half
+            is why it routinely embarrasses row-at-a-time engines and
+            single-threaded dataframe code on analytical scans, joins, and
+            aggregations.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <h3>Install</h3>
+          <p>
+            The CLI installs with one line on Linux and macOS, or via
+            Homebrew; the Python client is a wheel with zero dependencies:
+          </p>
+          <pre><code>curl https://install.duckdb.org | sh     # Linux and macOS
+brew install duckdb                       # macOS alternative
+pip install duckdb                        # Python client, same engine</code></pre>
+          <p>
+            I verified this chapter against the 1.5 line (1.5.0 "Variegata"
+            and its patch releases); everything here is stable behavior, and
+            where the repository moves I say so.
+          </p>
+          <h3>First session</h3>
+          <p>
+            The shell starts in a transient in-memory database, and because
+            DuckDB treats file paths as table names, the first query can run
+            against a raw Parquet file with no import step:
+          </p>
+          <pre><code>$ duckdb
+DuckDB v1.5.x (Variegata)
+Enter ".help" for usage hints.
+Connected to a transient in-memory database.
+D SELECT city, avg(price) FROM 'listings.parquet' GROUP BY city LIMIT 3;
+┌─────────┬────────────────────┐
+│  city   │     avg(price)     │
+│ varchar │       double       │
+├─────────┼────────────────────┤
+│ ...     │                ... │
+└─────────┴────────────────────┘</code></pre>
+          <p>
+            (Banner and box formatting vary slightly by version.) The Python
+            client is the same engine as a module, and it is where most people
+            meet DuckDB:
+          </p>
           <pre><code>import duckdb
 
-duckdb.sql("SELECT 42").show()
 duckdb.sql("SELECT city, avg(price) FROM 'listings.parquet' GROUP BY city").show()
 
-con = duckdb.connect("analytics.db")   # persistent single-file database
-con.sql("CREATE TABLE test AS SELECT * FROM 'listings.parquet'")</code></pre>
+con = duckdb.connect("analytics.db")     # persistent single-file database
+con.sql("CREATE TABLE listings AS SELECT * FROM 'listings.parquet'")
+con.sql("SELECT count(*) FROM listings").show()</code></pre>
           <p>
-            With no argument, <code>connect</code> gives an in-memory database;
-            with a path, everything persists to one file. Query results
-            convert to and from pandas DataFrames and Arrow tables directly,
-            and you can query a DataFrame sitting in your Python process by
-            simply naming the variable in SQL, which is the feature that tends
-            to convert people on first contact.
+            Results convert to and from pandas and Arrow directly
+            (<code>.df()</code>, <code>.arrow()</code>), and you can query a
+            DataFrame sitting in your process by naming the variable in SQL,
+            which is the feature that tends to convert people on first
+            contact:
+          </p>
+          <pre><code>import pandas as pd
+df = pd.DataFrame({"city": ["ams", "ams", "nyc"], "price": [90, 110, 250]})
+duckdb.sql("SELECT city, avg(price) FROM df GROUP BY city").show()</code></pre>
+          <h3>Mistakes beginners make</h3>
+          <p>
+            <strong>Losing tables to the in-memory default.</strong>
+            <code>duckdb.sql(...)</code> and bare <code>duckdb.connect()</code>
+            use an in-memory database; every table vanishes with the process.
+            If you meant to keep it, connect to a path:
+          </p>
+          <pre><code># wrong: CREATE TABLE into the default in-memory database, gone at exit
+duckdb.sql("CREATE TABLE t AS SELECT * FROM 'listings.parquet'")
+
+# right: a file-backed database that persists
+con = duckdb.connect("analytics.db")
+con.sql("CREATE TABLE t AS SELECT * FROM 'listings.parquet'")</code></pre>
+          <p>
+            <strong>Dragging results through Python row by row.</strong>
+            <code>fetchall()</code> plus a Python loop rebuilds every value as
+            a Python object, which can cost more than the query. Keep data
+            columnar until the last moment:
+          </p>
+          <pre><code># wrong: millions of Python tuples, then summed in interpreted code
+rows = con.sql("SELECT price FROM t").fetchall()
+total = sum(r[0] for r in rows)
+
+# right: aggregate in the engine, or hand columns to pandas/Arrow wholesale
+total = con.sql("SELECT sum(price) FROM t").fetchone()[0]
+frame = con.sql("SELECT city, price FROM t").df()</code></pre>
+          <p>
+            <strong>Re-decoding the same Parquet file in a loop.</strong>
+            Querying <code>'listings.parquet'</code> is a scan-and-decode
+            every time; that is the point for one-shot queries, and a waste
+            for twenty. If you will query it repeatedly, load it once with
+            <code>CREATE TABLE ... AS</code> into a persistent database, or at
+            least create a view so the path and schema live in one place.
+          </p>
+          <p>
+            <strong><code>SELECT *</code> over wide files.</strong> DuckDB
+            only reads the Parquet columns the query references; asking for
+            all 300 columns turns projection pushdown off by definition.
+            Select what you need, especially over HTTP.
+          </p>
+          <p>
+            <strong>Treating the database file like Postgres.</strong> One
+            process opens a DuckDB file read-write at a time; a second writer
+            gets a lock error rather than queueing. Multiple processes can
+            open the same file together only if all of them pass
+            <code>read_only=True</code>. Cross-process concurrency is an
+            architecture question, which the next section is about.
           </p>
 
-          <h2>In-process, columnar, vectorized</h2>
+          <h2>Part III: When it is the right tool</h2>
           <p>
-            The first design decision is where the database lives: inside your
-            process, like SQLite, rather than across a socket, like Postgres.
-            There is no server to operate, and result sets do not have to be
-            serialized across a connection, since the engine can hand columns
-            of memory to the host language, which is what makes the Arrow and
-            pandas integration close to free. The whole engine compiles into
-            an amalgamation needing only a C++ compiler, which is why the same
-            code runs on a laptop, in a lambda, and in the browser via
-            WebAssembly.
+            DuckDB is the right tool when the work is analytical, the data is
+            reachable from one process, and the consumer is code: exploring
+            and joining Parquet and CSV files, powering notebook and script
+            analytics that would otherwise strain pandas, running the
+            transform step of a local or serverless ELT job, serving as the
+            query engine inside an application (dashboards over bundled data,
+            log crunching in a CLI tool, SQL in the browser via WebAssembly),
+            and generally replacing the "spin up a warehouse to look at one
+            file" reflex. Single-digit gigabytes are trivial for it,
+            hundreds of gigabytes are workable on one good machine, and the
+            larger-than-memory story below stretches that further.
           </p>
           <p>
-            The second decision is how queries execute. Row-at-a-time
-            interpreters like SQLite and classic Postgres pay function call
-            and dispatch overhead per value, and compiling queries to machine
-            code avoids that at the cost of enormous complexity. DuckDB takes
-            the middle path worked out in the vectorized execution literature:
-            <mark>the interpreter still walks an operator tree, but each call
-            processes a vector of values, 2048 by default, so the overhead of
-            interpretation is amortized across thousands of values while the
-            inner loops stay tight, cache-friendly, and amenable to SIMD.</mark>
-            Data moves between operators as chunks of column vectors, and the
-            operators themselves are push-based: sources push chunks through
-            pipelines of operators into sinks, which is the shape that makes
-            the parallelism story below work.
-          </p>
-
-          <h2>Morsel-driven parallelism</h2>
-          <p>
-            DuckDB parallelizes queries using the approach from the
-            morsel-driven parallelism paper by Leis, Boncz, Kemper, and
-            Neumann, and the idea is worth having in your head independent of
-            DuckDB. Instead of planning up front which thread handles which
-            partition of the data, the input is divided into many small
-            fragments, morsels, and a pool of worker threads repeatedly grabs
-            the next available morsel and pushes it through the current
-            pipeline. <mark>Scheduling becomes self-balancing: a thread that
-            gets slow data or a slow core simply takes fewer morsels, and no
-            thread ever waits on a partitioning decision made before the data
-            was seen.</mark> A query plan is broken at its pipeline breakers,
-            the operators like hash join builds and aggregations that must
-            consume all input before producing output, and each pipeline is
-            then executed morsel by morsel across however many threads the
-            machine has.
-          </p>
-          <p>
-            The storage format is shaped to serve this. Tables in DuckDB's own
-            single-file format are stored column by column within row groups
-            of 122,880 rows, and the row group is the natural unit of
-            parallel scanning, so a large table presents itself as a long
-            queue of independently scannable chunks. The same chunking is why
-            checkpointing, compression choices, and scan parallelism all line
-            up on the same boundaries.
-          </p>
-
-          <h2>Querying data where it lives</h2>
-          <p>
-            The feature that made DuckDB a habit is that it treats external
-            files as first-class tables. A replacement scan turns
-            <code>'listings.parquet'</code> in a FROM clause into a table
-            function call, the Parquet reader scans with projection and filter
-            pushdown so only the referenced columns and the row groups whose
-            statistics might match are ever read, and the same works for CSV
-            with a sniffer that infers delimiters and types, and for glob
-            patterns over many files. With the httpfs extension the path can
-            be an HTTP URL or an S3 object, read with range requests rather
-            than downloaded whole, and Arrow data in the host process is
-            queried zero-copy. The practical effect is that a great deal of
-            work that used to require loading data into a warehouse becomes a
-            single process reading columns straight off files; my
+            The boundaries are equally clear. For transactional workloads,
+            many small writes with concurrent clients, you want an OLTP
+            engine: <a href="/oss/sqlite">SQLite</a> embedded, or
+            <a href="/oss/postgresql">PostgreSQL</a> as a server; DuckDB's
+            row-group columnar storage makes point updates comparatively
+            expensive by design. For a shared warehouse serving many users
+            and BI tools concurrently over tens of terabytes, server systems
+            like ClickHouse, BigQuery, or Snowflake are the category, with
+            MotherDuck as the hosted DuckDB take. For teams fully invested in
+            dataframe-native pipelines, Polars covers similar ground with a
+            dataframe API rather than SQL. My
             <a href="/software/notes/databases-for-system-design">databases
-            note</a> places this pattern among the other analytical options.
+            note</a> places these options side by side.
+          </p>
+          <p>
+            The architecture-shaped warning: <mark>DuckDB is an in-process
+            engine with a single-writer file model, not a multi-client
+            database server, and pointing a fleet of writers at one file is
+            the failure mode</mark>. The safe shapes either give each process
+            its own database, share data through immutable files, or keep one
+            writer and many read-only openers.
+          </p>
+          <pre class="flow">SAFE                                      DANGEROUS
+
+ ETL job (sole writer)                    web-1    web-2    web-3
+     |                                        \      |      /
+     v                                         v     v     v
+ analytics.db  or  parquet files          one analytics.db opened
+     |                                    read-write by every server
+     v                                    (second opener errors; retries
+ readers: notebooks, dashboards,           and NFS make it worse)
+ lambdas, each read_only or own copy</pre>
+
+          <h2>Part IV: The full life of one query</h2>
+          <p>
+            This is the core of the chapter. The canonical operation is one
+            analytical query from Python over a Parquet file:
+          </p>
+          <pre><code>import duckdb
+duckdb.sql("SELECT city, avg(price) FROM 'listings.parquet' GROUP BY city").df()</code></pre>
+          <p>
+            We follow it from the binding call to the last vector, naming the
+            directories and files under <code>src/</code> that do the work at
+            each stage.
+          </p>
+          <h3>Stage 1: The client call</h3>
+          <p>
+            The Python module is a thin binding over the C++ API in
+            <code>src/main/</code>: a <code>Connection</code>
+            (<code>connection.cpp</code>) wraps a <code>ClientContext</code>
+            (<code>client_context.cpp</code>), which owns the transaction
+            state, the settings, and the query lifecycle. <code>sql()</code>
+            produces a lazily executed relation; calling <code>.df()</code>
+            forces it, at which point the context runs the statement through
+            the stages below and streams result chunks back. Nothing crosses
+            a socket at any point; "client" and "server" are the same address
+            space, which is why handing the result to pandas at the end is a
+            columnar memory handoff rather than a wire protocol.
+          </p>
+          <h3>Stage 2: Parser</h3>
+          <p>
+            The parser in <code>src/parser/</code> is derived from Postgres's
+            grammar (a heavily adapted fork of it lives in
+            <code>third_party/libpg_query</code>), which is why DuckDB speaks
+            a thoroughly debugged SQL dialect on day one rather than a
+            homegrown subset. The Postgres parse tree is immediately
+            transformed into DuckDB's own statement classes: our query becomes
+            a <code>SelectStatement</code> whose FROM clause holds a base
+            table reference named <code>listings.parquet</code>, with parsed
+            expressions for <code>city</code> and <code>avg(price)</code>.
+            No name has been resolved yet; the parser knows syntax, not
+            schemas.
+          </p>
+          <h3>Stage 3: Binder</h3>
+          <p>
+            The binder (<code>src/planner/binder.cpp</code> and the
+            <code>binder/</code> subdirectory) resolves every name against
+            the catalog (<code>src/catalog/</code>) and assigns types. Here
+            the query's most DuckDB-specific moment happens: there is no
+            table called <code>listings.parquet</code> in the catalog, so the
+            binder consults the registered <mark>replacement scans, hooks
+            that turn an unresolved table name into a table function
+            call</mark>; the filename pattern matches, and the reference is
+            rewritten into <code>read_parquet('listings.parquet')</code>.
+            The Parquet reader (in <code>extension/parquet/</code>) opens the
+            file's footer, reports the schema, and <code>city</code> and
+            <code>price</code> bind to typed columns. The same hook is how a
+            pandas DataFrame variable becomes queryable. The binder's output
+            is a tree of logical operators: a <code>LogicalGet</code> over
+            the table function, a <code>LogicalAggregate</code> grouping by
+            city, and a projection on top.
+          </p>
+          <h3>Stage 4: Optimizer</h3>
+          <p>
+            The optimizer in <code>src/optimizer/</code> rewrites the logical
+            plan: expression rewriting rules (<code>rule/</code>), filter and
+            limit pushdown (<code>pushdown/</code>,
+            <code>filter_pushdown.cpp</code>), join-order search
+            (<code>join_order/</code>, idle for this query), and statistics
+            propagation (<code>statistics_propagator.cpp</code>), which walks
+            the plan asking each operator what it can promise about its
+            output. For our query the decisive work is projection pushdown:
+            of everything in the Parquet file, only <code>city</code> and
+            <code>price</code> are needed, and that column list is pushed
+            into the scan so other columns are never read from disk. Had
+            there been a WHERE clause, its predicate would be pushed into the
+            scan too, to be checked against per-row-group min/max statistics
+            in the Parquet metadata so non-matching row groups are skipped
+            wholesale.
+          </p>
+          <h3>Stage 5: Physical plan</h3>
+          <p>
+            <code>src/execution/physical_plan_generator.cpp</code> maps each
+            logical operator to a physical one from
+            <code>src/execution/operator/</code>: the get becomes a
+            <code>TABLE_SCAN</code> over the Parquet function, the aggregate
+            becomes a <code>HASH_GROUP_BY</code> backed by the
+            radix-partitioned aggregate hash table
+            (<code>radix_partitioned_hashtable.cpp</code>,
+            <code>aggregate_hashtable.cpp</code>), and the projection becomes
+            a <code>PROJECTION</code> evaluating expressions through the
+            vectorized <code>ExpressionExecutor</code>. This is the tree
+            <code>EXPLAIN</code> prints.
+          </p>
+          <h3>Stage 6: Pipelines and scheduling</h3>
+          <p>
+            The executor in <code>src/parallel/</code>
+            (<code>executor.cpp</code>, <code>meta_pipeline.cpp</code>,
+            <code>pipeline.cpp</code>) breaks the physical tree at its
+            pipeline breakers, the operators that must consume all input
+            before producing any output. A hash aggregate is one, so our plan
+            becomes two pipelines: pipeline 1 runs the Parquet scan as source
+            and the aggregate's build side as sink; pipeline 2, dependent on
+            pipeline 1 finishing, reads the finished hash table as a source
+            and streams groups through the projection into the result
+            collector. Dependencies between pipelines are tracked as events
+            (<code>event.cpp</code>), and the
+            <code>TaskScheduler</code> (<code>task_scheduler.cpp</code>) hands
+            tasks to a pool of worker threads, by default one per core. Each
+            task processes a morsel of input, in DuckDB's case row-group-sized
+            slices of the scan, so <mark>threads that finish their slice
+            simply take the next one, and skew balances itself without any
+            up-front partitioning decision</mark>.
+          </p>
+          <h3>Stage 7: Vectors through the pipeline</h3>
+          <p>
+            Within a task, <code>pipeline_executor.cpp</code> drives the
+            actual data movement: the Parquet reader decodes a slice of a row
+            group into a <code>DataChunk</code>, one <code>Vector</code> per
+            column (<code>src/common/types/data_chunk.cpp</code>,
+            <code>vector.cpp</code>), holding up to 2048 values each, with a
+            validity bitmask for NULLs. The chunk is pushed through the
+            pipeline's operators in one virtual call per operator per chunk,
+            2048 values amortizing every dispatch. Vectors keep compressed
+            shapes where possible: a dictionary-encoded Parquet column can
+            flow as a dictionary vector without materializing repeated
+            strings, and a constant column costs one value. The aggregate
+            sink hashes the <code>city</code> vector, partitions groups by
+            hash radix into thread-local tables, and updates running sums and
+            counts for <code>avg(price)</code>.
+          </p>
+          <h3>Stage 8: Finalize and hand back</h3>
+          <p>
+            When the scan is exhausted, pipeline 1's finish event fires: the
+            thread-local partitioned tables are merged, finalizing one hash
+            table containing every city with its sum and count. Pipeline 2
+            then scans it, computes the averages, and pushes result chunks
+            into the collector; <code>.df()</code> receives those columnar
+            chunks and builds the DataFrame directly from them. One detail
+            worth noticing at the end of the journey: at no stage did a row
+            exist as an object anywhere. The row is a fiction maintained by
+            aligned positions in column vectors, from the file footer to the
+            DataFrame.
           </p>
 
-          <h2>Reading the repository</h2>
+          <h2>Part V: Internals deep dives</h2>
+          <h3>Deep dive: columnar-vectorized execution</h3>
           <p>
-            The C++ source under <code>src/</code> is organized as the
-            textbook pipeline, and you can read it in query order:
-            <code>parser</code>, <code>planner</code>, <code>optimizer</code>,
-            <code>execution</code>, with <code>storage</code>,
-            <code>catalog</code>, <code>transaction</code>, and
-            <code>function</code> supporting them and <code>main</code>
-            holding the connection and client context that tie it together.
-            The parser is derived from Postgres's grammar, so DuckDB speaks a
-            thoroughly debugged SQL dialect; the planner's Binder resolves
-            names against the catalog and produces logical operators, the
-            optimizer rewrites them, and the execution layer turns them into
-            the physical operators that do the work.
+            The classic interpreted engine (Postgres's executor, SQLite's
+            VM) is tuple-at-a-time: each operator's "give me the next row"
+            call cascades down the tree, paying function dispatch, branchy
+            interpretation, and cache misses per row. At the other extreme,
+            whole-column engines and naive dataframe code materialize each
+            intermediate as a full column in memory, so
+            <code>(price * 0.9) &gt; 100</code> allocates gigabyte-sized
+            temporaries that blow past every cache on their way to RAM and
+            back. Vectorized execution, worked out in the MonetDB/X100
+            research that DuckDB descends from, is the deliberate middle:
+            <mark>interpret the plan, but per chunk of 2048 values, so
+            dispatch cost is amortized three orders of magnitude while every
+            intermediate stays small enough to live in the CPU caches</mark>.
+          </p>
+          <pre class="flow">DataChunk (up to 2048 rows)
+  city:  Vector VARCHAR  [ams|ams|nyc|ams|...]   validity: 1111...
+  price: Vector DOUBLE   [ 90|110|250| 85|...]   validity: 1111...
+
+vector shapes: FLAT (plain array)
+               CONSTANT (one value stands for all rows)
+               DICTIONARY (indices into a small distinct-value array)
+               + selection vectors filter rows without copying them</pre>
+          <p>
+            The vector size is a compile-time constant
+            (<code>STANDARD_VECTOR_SIZE</code>, 2048 by default), chosen so a
+            handful of double vectors plus working state fit comfortably in
+            L1/L2; the operators in <code>src/execution/</code> and the
+            function implementations are all written against chunks of this
+            shape, with tight loops over arrays plus a validity mask check.
+            Two corrections worth making explicitly. First, "vectorized"
+            here primarily means amortized interpretation and cache locality,
+            not SIMD; the tight loops are written so compilers can
+            auto-vectorize, and that helps, but the big win is architectural.
+            Second, vectorization is also why row-at-a-time escape hatches
+            hurt so much: a per-row Python UDF forces the engine to
+            deconstruct vectors into objects and back, and tends to erase the
+            engine's entire advantage; if you must apply Python, Arrow-level
+            batch UDFs keep the columnar contract.
+          </p>
+          <h3>Deep dive: morsel-driven parallelism</h3>
+          <p>
+            DuckDB's parallelism follows the morsel-driven design from Leis,
+            Boncz, Kemper, and Neumann's HyPer paper, adapted to DuckDB's
+            push-based pipelines. The plan is factored into pipelines at its
+            breakers, each pipeline is a source, a chain of streaming
+            operators, and a sink, and the sink is the only place threads
+            meet:
+          </p>
+          <pre class="flow">SELECT city, avg(price) FROM 'listings.parquet' GROUP BY city
+
+pipeline 1:  parquet scan  -&gt; hash-aggregate SINK (build groups)
+                 morsel queue: [rg0][rg1][rg2][rg3][rg4]...
+                 thread A takes rg0, then rg3, ...
+                 thread B takes rg1, then rg2, ...   (self-balancing)
+
+pipeline 2 (after 1 finishes):
+             aggregate scan -&gt; projection -&gt; result SINK</pre>
+          <p>
+            Sinks are built for this: the aggregate keeps thread-local,
+            radix-partitioned hash tables so workers rarely contend, and a
+            finalize step merges partitions when the pipeline completes. The
+            scheduling consequence is the one to internalize: no thread is
+            ever assigned a fixed share of the data, so a slow disk region, a
+            skewed group, or a busy core just shifts morsels to whoever is
+            free, the work-stealing effect without explicit stealing. The
+            unit of parallel work over storage is the row group, 122,880
+            rows, and that quantum has a visible consequence:
+            <mark>a table smaller than a couple of row groups cannot use many
+            threads, no matter how many cores you have</mark>, which is the
+            answer to "why is my 50,000-row query not parallel". The knobs
+            are few and honest: <code>SET threads = N</code> caps the pool,
+            and <code>EXPLAIN ANALYZE</code> shows what each operator cost.
+            One more trap: because a pipeline breaker must finish before
+            anything downstream starts, a GROUP BY produces no first row
+            early; time-to-first-row and time-to-last-row are nearly the same,
+            unlike streaming operators.
+          </p>
+          <h3>Deep dive: the storage story</h3>
+          <p>
+            DuckDB has one foot in its own format and one foot in everyone
+            else's, and the design treats both as first class. Its own format
+            (<code>src/storage/</code>) is a single file holding all tables,
+            organized column by column within row groups of 122,880 rows;
+            within a row group each column is stored in compressed blocks,
+            with the compression scheme chosen per block by inspecting the
+            data (dictionary and run-length encoding, bit-packing, FSST for
+            strings, ALP for floats, described here at concept level since
+            schemes keep being added). Changes go through a write-ahead log
+            and are folded into the file at checkpoints, and MVCC gives
+            readers snapshots while a writer works. The format has been
+            backward-compatible since 1.0, which ended the era when upgrading
+            DuckDB meant exporting and reimporting your database.
           </p>
           <p>
-            The two most instructive corners are <code>common/types/</code>,
-            where the Vector and DataChunk types define the unit of data every
-            operator consumes and produces, including the compressed vector
-            representations that let constant and dictionary data flow through
-            without expansion, and <code>parallel/</code>, where pipelines,
-            events, and the task scheduler implement the morsel-driven design
-            from the previous section. The Parquet reader lives in the
-            <code>extension/</code> tree along with JSON, httpfs, and the
-            other bundled extensions, which is a deliberate statement that
-            even core features go through the public extension interface. A
-            good first session is to build the shell, run a GROUP BY over a
-            Parquet file under <code>EXPLAIN</code> and then
-            <code>EXPLAIN ANALYZE</code>, and match the printed pipelines and
-            operator timings to the operator classes in
-            <code>src/execution/operator/</code>; the push-based pipeline
-            model becomes concrete as soon as you see a plan split at its hash
-            aggregate.
+            The other foot: external data is queried in place, not imported.
+            Replacement scans map file paths and host-language objects into
+            table functions; the Parquet reader scans with projection and
+            filter pushdown so only referenced columns and row groups whose
+            min/max statistics might match are read; the CSV reader's sniffer
+            infers delimiters and types; Arrow data in the host process is
+            scanned zero-copy; and with the httpfs extension (now developed
+            in its own repository, <code>duckdb/duckdb-httpfs</code>, and
+            autoloaded on first use) a path can be an HTTP URL or S3 object
+            read via range requests, fetching footer and needed column chunks
+            rather than the whole file. Two traps: the DuckDB file format is
+            not Parquet, and neither replaces the other (Parquet is the
+            interchange format, DuckDB's format is the queryable working
+            store with ACID updates); and external scans re-decode on every
+            query, so repeated analysis of one file justifies
+            <code>CREATE TABLE ... AS</code> once.
           </p>
+          <h3>Deep dive: larger than memory</h3>
+          <p>
+            DuckDB defaults to a memory budget of 80% of physical RAM
+            (<code>SET memory_limit = '...'</code> to change it), and the
+            blocking operators, hash aggregation, hash join, sorting, are
+            written to degrade gracefully rather than die when the budget is
+            hit: working state spills to temporary files (in the database's
+            <code>.tmp</code> directory, or <code>SET temp_directory</code>
+            for in-memory connections), processed partition by partition, and
+            the query completes slower instead of failing. This is
+            concept-level by design here; which operators spill and how well
+            improves release by release. The practical guidance is stable
+            though: larger-than-memory aggregation and sorting work; do watch
+            the difference between the query and the result, because a query
+            can run in bounded memory and then explode at the end when a
+            hundred-million-row result is materialized into a DataFrame. If
+            you hit memory errors from Python, check whether it is the
+            <code>.df()</code> at the end, not the engine, and stream or
+            aggregate further instead.
+          </p>
+
+          <h2>Part VI: Reading the repository</h2>
+          <p>
+            The C++ source under <code>src/</code> is the pipeline in
+            directory form: <code>parser</code>, <code>planner</code>,
+            <code>optimizer</code>, <code>execution</code>,
+            <code>parallel</code>, with <code>storage</code>,
+            <code>catalog</code>, <code>transaction</code>,
+            <code>function</code>, and <code>common</code> supporting them
+            and <code>main</code> holding connections and the client context.
+            Headers live apart under <code>src/include/duckdb/</code>,
+            mirroring the source tree. Read it as a syllabus:
+          </p>
+          <p>
+            <strong>Stage 0, run it.</strong> Build the shell
+            (<code>make</code> in the repo root, or just install the binary)
+            and run our canonical query under <code>EXPLAIN</code> and
+            <code>EXPLAIN ANALYZE</code>. You should be able to answer: which
+            operators appear, and which of them is the pipeline breaker?
+          </p>
+          <p>
+            <strong>Stage 1, the frontend.</strong> Skim
+            <code>src/parser/</code> (the transformer that turns the
+            Postgres-derived parse tree into DuckDB statements) and read
+            <code>src/planner/binder.cpp</code> plus a couple of binders in
+            <code>src/planner/binder/</code>. Questions: why does reusing
+            Postgres's grammar buy more than saved effort? Where exactly does
+            a Parquet path become a table function, and where would a
+            DataFrame?
+          </p>
+          <p>
+            <strong>Stage 2, plans.</strong> Read
+            <code>src/planner/operator/</code> for the logical operators,
+            then in <code>src/optimizer/</code>:
+            <code>filter_pushdown.cpp</code>,
+            <code>statistics_propagator.cpp</code>, and a look at
+            <code>join_order/</code>. Questions: what information does
+            statistics propagation move, and which optimizations does it
+            unlock? What can be pushed into a scan, and what cannot?
+          </p>
+          <p>
+            <strong>Stage 3, execution.</strong> Read
+            <code>src/execution/physical_plan_generator.cpp</code>, one
+            simple operator in <code>src/execution/operator/</code>
+            (projection or filter), then
+            <code>src/common/types/vector.cpp</code> and
+            <code>data_chunk.cpp</code>, then
+            <code>radix_partitioned_hashtable.cpp</code>. Questions: what are
+            the vector shapes and why do dictionary vectors matter? Why is
+            the aggregate hash table radix-partitioned?
+          </p>
+          <p>
+            <strong>Stage 4, parallelism.</strong> Read
+            <code>src/parallel/</code>: <code>meta_pipeline.cpp</code>,
+            <code>pipeline.cpp</code>, <code>pipeline_executor.cpp</code>,
+            <code>event.cpp</code>, <code>task_scheduler.cpp</code>.
+            Questions: how does a plan become pipelines and events? Where is
+            the morsel-driven behavior actually implemented, and what is the
+            unit of a task?
+          </p>
+          <p>
+            <strong>Stage 5, storage and extensions.</strong> Read
+            <code>src/storage/</code> at skim depth (row groups, WAL,
+            checkpointing) and <code>extension/parquet/</code> for a real
+            pushdown-capable reader; note that parquet and json living in
+            <code>extension/</code> even though they ship with every build is
+            a deliberate statement that core features go through the public
+            extension interface. Questions: what happens on checkpoint? How
+            does the Parquet reader use row-group statistics?
+          </p>
+          <p>
+            <strong>Where not to start:</strong> not
+            <code>src/include/</code> (a mirror maze without behavior), not
+            <code>src/function/</code> (an enormous library of
+            implementations that teaches breadth, not architecture), and not
+            the join-order optimizer, which is the hardest math in the tree.
+            Start at the shell with EXPLAIN output in one window and
+            <code>src/execution/operator/</code> in the other.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            <strong>Lab 1: DuckDB versus pandas on one group-by.</strong>
+            Generate a Parquet file with DuckDB itself, then time the same
+            aggregation both ways:
+          </p>
+          <pre><code>import duckdb, pandas as pd, time
+
+duckdb.sql("""
+  COPY (SELECT (random()*200)::INT AS city, random()*500 AS price
+        FROM range(20_000_000))
+  TO 'listings.parquet' (FORMAT parquet)
+""")
+
+t = time.time()
+pd.read_parquet('listings.parquet').groupby('city').price.mean()
+print("pandas:", time.time() - t)
+
+t = time.time()
+duckdb.sql("SELECT city, avg(price) FROM 'listings.parquet' GROUP BY city").df()
+print("duckdb:", time.time() - t)</code></pre>
+          <p>
+            Expect DuckDB to win by a healthy multiple on a multi-core
+            machine; the exact factor varies with cores, disk, and versions,
+            so measure rather than quote. Then explain the gap with this
+            chapter: pandas materializes the whole file into memory first and
+            aggregates single-threaded; DuckDB streams two columns through a
+            parallel pipeline. Note the file has enough rows for many row
+            groups; rerun with 100,000 rows and watch the gap shrink, which
+            is the parallelism quantum from the deep dive.
+          </p>
+          <p>
+            <strong>Lab 2: read EXPLAIN, then EXPLAIN ANALYZE.</strong>
+          </p>
+          <pre><code>EXPLAIN SELECT city, avg(price) FROM 'listings.parquet' GROUP BY city;
+EXPLAIN ANALYZE SELECT city, avg(price) FROM 'listings.parquet' GROUP BY city;</code></pre>
+          <p>
+            <code>EXPLAIN</code> prints the physical operator tree
+            (TABLE_SCAN, HASH_GROUP_BY, PROJECTION, formatting varies by
+            version); check that the scan lists only <code>city</code> and
+            <code>price</code> as projections, which is pushdown made
+            visible. <code>EXPLAIN ANALYZE</code> runs the query and adds per
+            operator timings and row counts; find where the time goes (scan
+            versus aggregate) and match each printed operator to a class
+            under <code>src/execution/operator/</code>.
+          </p>
+          <p>
+            <strong>Lab 3: query a remote Parquet file over HTTP.</strong>
+            The httpfs extension autoloads on first use in current builds
+            (run <code>INSTALL httpfs; LOAD httpfs;</code> manually if your
+            environment blocks autoinstall):
+          </p>
+          <pre><code>SELECT count(*) FROM 'https://blobs.duckdb.org/data/taxi_2019_04.parquet';
+SELECT count(*) FROM 'https://blobs.duckdb.org/data/taxi_2019_04.parquet'
+WHERE pickup_at BETWEEN '2019-04-15' AND '2019-04-20';</code></pre>
+          <p>
+            The first query returns in far less time than downloading the
+            file would take, because <code>count(*)</code> is answered mostly
+            from the Parquet footer metadata via range requests; the second
+            reads only the <code>pickup_at</code> column chunks, plus skips
+            row groups whose min/max cannot match. This is pushdown crossing
+            the network.
+          </p>
+          <p>
+            <strong>Lab 4: see projection pushdown in the wall clock.</strong>
+            Write a wide Parquet file (say 50 columns via a generated
+            SELECT), then time <code>SELECT avg(col1) FROM ...</code> against
+            <code>SELECT avg(col1) FROM (SELECT * FROM ...)</code> style
+            full-width reads, and compare EXPLAIN's projection lists. The
+            narrow query should be dramatically cheaper, and the plan shows
+            why before the clock does.
+          </p>
+          <p>
+            <strong>Lab 5: threads and the row-group quantum.</strong>
+          </p>
+          <pre><code>SET threads = 1;
+EXPLAIN ANALYZE SELECT city, avg(price) FROM 'listings.parquet' GROUP BY city;
+SET threads = 8;
+EXPLAIN ANALYZE SELECT city, avg(price) FROM 'listings.parquet' GROUP BY city;</code></pre>
+          <p>
+            Compare total times on the 20M-row file (near-linear scaling up
+            to your core count is typical), then repeat on a 100,000-row
+            table and observe scaling flatten, because fewer than two row
+            groups cannot feed eight workers.
+          </p>
+          <p>
+            <strong>Lab 6: watch a query spill.</strong> In a fresh shell,
+            set <code>SET memory_limit = '500MB';</code> and
+            <code>SET temp_directory = '/tmp/duck_spill';</code>, then run a
+            big <code>ORDER BY</code> over the 20M-row file while watching
+            <code>ls /tmp/duck_spill</code> from another terminal: temporary
+            files appear as sort runs spill, and the query completes anyway.
+            Remove the limit and rerun to compare times; that difference is
+            the price of out-of-core execution, and its existence is the
+            feature.
+          </p>
+
+          <h2>Part VIII: Check your understanding</h2>
+          <p><strong>What is DuckDB in one sentence, and how is it unlike both SQLite and Postgres?</strong>
+          A complete analytical SQL engine packaged as an in-process library:
+          like SQLite in deployment (linked into your process, single-file
+          storage) but columnar, vectorized, and parallel where SQLite is
+          row-oriented and OLTP-shaped; like Postgres in SQL maturity but with
+          no server, no clients, and no cross-process write concurrency.</p>
+          <p><strong>Walk the life of a query in one breath.</strong>
+          Parser turns SQL text into statements; binder resolves names against
+          the catalog (or replacement scans for files and DataFrames) and
+          types the logical plan; the optimizer pushes projections and filters
+          and propagates statistics; the physical planner picks operators;
+          the executor breaks the plan into pipelines at breakers and worker
+          threads pull morsels through them as 2048-value column chunks into
+          sinks, whose finalized state feeds the next pipeline and finally
+          the result.</p>
+          <p><strong>Why vectors of about 2048 values rather than one row or one column?</strong>
+          One row pays interpretation overhead per value; one whole column
+          creates intermediates that overflow the caches and hammer RAM. A
+          2048-value chunk amortizes dispatch by three orders of magnitude
+          while keeping every intermediate cache-resident, which is the
+          vectorized middle path DuckDB inherits from the MonetDB/X100 line
+          of research.</p>
+          <p><strong>What is a pipeline breaker and what does it imply for latency?</strong>
+          An operator that must consume its entire input before emitting
+          anything, like a hash aggregate build or sort. The plan is split
+          into pipelines at breakers, and nothing downstream starts until the
+          breaker finalizes, so a GROUP BY has no early first row; its
+          time-to-first-row is essentially its total time.</p>
+          <p><strong>Explain morsel-driven parallelism without the paper.</strong>
+          Do not pre-assign data to threads; queue small fragments of input
+          and let workers repeatedly grab the next one and push it through
+          the current pipeline into a thread-friendly sink. Skew, slow cores,
+          and slow storage self-balance because a slow worker simply takes
+          fewer morsels, and the only merge point is the sink's finalize.</p>
+          <p><strong>Why can a small table fail to use all your cores?</strong>
+          The unit of parallel scan work is the row group of 122,880 rows,
+          so a table spanning one or two row groups offers one or two units
+          of work; parallelism is capped by available morsels, not by
+          cores.</p>
+          <p><strong>What is a replacement scan?</strong>
+          A binder hook that fires when a table name resolves to nothing in
+          the catalog, giving registered handlers a chance to turn the name
+          into a table function: file paths become Parquet or CSV scans, and
+          in Python a variable name can become a scan of the DataFrame it
+          refers to. It is the mechanism behind "just FROM the file".</p>
+          <p><strong>What do projection and filter pushdown save on a Parquet scan?</strong>
+          Projection pushdown reads only referenced columns, which in a wide
+          file is most of the I/O; filter pushdown checks predicates against
+          per-row-group min/max statistics in the metadata and skips whole
+          row groups, and over httpfs both translate into fewer HTTP range
+          requests rather than fewer disk reads.</p>
+          <p><strong>How does DuckDB behave when data exceeds memory?</strong>
+          It works under a budget, by default 80% of RAM: blocking operators
+          spill partitions of their working state to temporary files and
+          proceed, trading speed for completion instead of failing. The
+          common surprise is that the crash people do see is often the final
+          materialization into a DataFrame, not the query itself.</p>
+          <p><strong>DuckDB file format versus Parquet: when each?</strong>
+          Parquet is the compressed interchange and lake format everything
+          reads; DuckDB's own file is the working store, with ACID updates,
+          a WAL, checkpoints, all tables in one file, and per-block adaptive
+          compression, backward-compatible since 1.0. Query Parquet in place
+          for one-shot work; load into DuckDB's format when you will query
+          or mutate repeatedly.</p>
+          <p><strong>What are the concurrency rules?</strong>
+          Inside one process: many connections and threads, with MVCC
+          isolating transactions. Across processes: one read-write opener
+          per database file, or many read-only openers; there is no lock
+          queue like a server database, so multi-writer designs must go
+          through a single owning process or a server-shaped system
+          instead.</p>
+          <p><strong>Why did DuckDB reuse the Postgres grammar?</strong>
+          A SQL dialect is decades of parsing edge cases and user
+          expectations; forking a battle-tested grammar bought compatibility
+          and correctness on day one and let the team spend novelty where it
+          pays, in execution and storage, rather than in inventing another
+          dialect.</p>
+          <p><strong>A query is slow. What is the first diagnostic move?</strong>
+          EXPLAIN ANALYZE, then read it against the pipeline model: check the
+          scan's projected columns (pushdown working?), see which operator
+          dominates time, check row counts for surprises (a join exploding),
+          and check whether the table is large enough in row groups for the
+          thread count to matter.</p>
+          <p><strong>When is DuckDB the wrong choice even though it would run?</strong>
+          Many concurrent writers (an app backend's OLTP store), a shared
+          always-on warehouse serving many users and tools, and
+          point-lookup-update workloads where row stores shine; the honest
+          statement is that DuckDB replaces the analytical uses of a server
+          database, not the server database.</p>
+          <p><strong>What does it mean that Parquet support lives in extension/?</strong>
+          Even always-shipped features are built against the public extension
+          interface, which keeps that interface honest and complete, keeps
+          the core small, and means third-party extensions are not
+          second-class citizens; httpfs even graduated to its own repository
+          while remaining a one-line install.</p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Choose your quantum per resource, and choose two if you
+            need two.</strong> DuckDB has a cache quantum (2048-value
+            vectors) and a parallelism quantum (122,880-row groups), each
+            sized for its bottleneck, deliberately not the same number. The
+            general lesson, batch size is a resource-specific design
+            variable, recurs in GPU warps versus grid blocks, TCP segments
+            versus windows, and page sizes versus extents.
+          </p>
+          <p>
+            <strong>Amortize interpretation instead of eliminating it.</strong>
+            Query compilation to machine code beats interpretation per value,
+            but vectorization gets most of the win for a fraction of the
+            complexity, keeping the engine debuggable and portable. The same
+            economics justify batching in RPC layers, ML inference servers,
+            and syscall batching interfaces like io_uring.
+          </p>
+          <p>
+            <strong>Move the engine to the data's address space.</strong>
+            In-process means no wire serialization, zero-copy interchange
+            with Arrow and pandas, and deployment reduced to an import; the
+            lesson SQLite taught for OLTP, DuckDB re-taught for analytics.
+            The recurring form: when the consumer is code rather than many
+            humans, a library beats a server.
+          </p>
+          <p>
+            <strong>Adopt boring frontends, spend novelty on the core.</strong>
+            The Postgres-derived parser is a deliberate refusal to innovate
+            where innovation is waste, funding the innovative executor. The
+            same allocation shows up in LLVM frontends versus its optimizer,
+            and in systems that adopt SQL, S3's API, or POSIX as compatibility
+            surfaces.
+          </p>
+          <p>
+            <strong>Dogfood your plugin interface.</strong> Shipping Parquet,
+            JSON, and httpfs through the extension mechanism forces that
+            mechanism to be powerful enough for real features, the same
+            discipline that made VS Code's extension API good (its built-in
+            features use it) and keeps Postgres's extension ecosystem viable.
+          </p>
+          <p>
+            <strong>Degrade, don't die.</strong> Spilling operators turn
+            memory exhaustion from a failure mode into a performance mode,
+            which is what makes the tool trustworthy at the edge of its
+            envelope. The pattern generalizes: backpressure instead of OOM,
+            load shedding instead of collapse, graceful degradation as a
+            first-class requirement.
+          </p>
+
+          <h2>Part X: The memorization framework</h2>
+          <p>
+            One sentence: DuckDB parses SQL with a Postgres-derived grammar,
+            binds it against a catalog extended by replacement scans, optimizes
+            with pushdown and statistics, and executes physical plans as
+            morsel-parallel pipelines pushing 2048-value column vectors into
+            sinks, over its own row-grouped columnar file or straight over
+            Parquet, CSV, and Arrow.
+          </p>
+          <pre class="flow">SQL -&gt; Parser -&gt; Binder -&gt; Logical plan -&gt; Optimizer -&gt; Physical plan
+    -&gt; Pipelines (breakers) -&gt; morsels x threads -&gt; Vectors(2048) -&gt; Sink -&gt; Result</pre>
+          <pre class="flow">Parser         src/parser (grammar from third_party/libpg_query)
+Binder         src/planner/binder.cpp, binder/, replacement scans
+Optimizer      src/optimizer (filter_pushdown.cpp, statistics_propagator.cpp)
+Physical plan  src/execution/physical_plan_generator.cpp, operator/
+Pipelines      src/parallel (meta_pipeline.cpp, pipeline_executor.cpp,
+               task_scheduler.cpp, event.cpp)
+Vectors        src/common/types (vector.cpp, data_chunk.cpp)
+Storage        src/storage; readers in extension/parquet, extension/json;
+               httpfs in duckdb/duckdb-httpfs</pre>
+          <p>Memorize these blocks:</p>
+          <ul>
+            <li><strong>Numbers:</strong> vectors hold up to 2048 values
+            (compile-time <code>STANDARD_VECTOR_SIZE</code>); row groups hold
+            122,880 rows (60 vectors); default memory budget is 80% of RAM;
+            default thread count is your core count.</li>
+            <li><strong>Invariants:</strong> in-process, no server; one
+            read-write process per file, or many read-only; storage format
+            backward-compatible since 1.0; pipeline breakers gate
+            downstream work.</li>
+            <li><strong>Mechanisms:</strong> replacement scans turn paths and
+            DataFrames into table functions; projection and filter pushdown
+            reach into Parquet row groups and across HTTP; sinks hold the
+            thread-shared state and finalize once.</li>
+            <li><strong>Positioning:</strong> SQLite is the embedded row
+            store, Postgres the OLTP server, ClickHouse and the warehouses
+            the shared serving tier; DuckDB is the analytical engine that
+            lives where the code lives.</li>
+          </ul>
+
           <div class="takeaway">
             <strong>Key takeaway:</strong> DuckDB is what happens when the
             last two decades of analytical database research, columnar

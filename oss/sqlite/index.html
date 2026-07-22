@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>SQLite walkthrough · Stanley Jacob</title>
-    <meta name="description" content="A walkthrough of the SQLite source: how to use it in five minutes, how the VDBE bytecode engine, the B-tree layer, and the pager with WAL fit together, and a guided reading path through the amalgamation's hundred-odd source files." />
+    <meta name="description" content="A full chapter on SQLite: a practical tutorial, the complete life of one SELECT from sqlite3_prepare_v2 through the tokenizer, Lemon parser, planner, VDBE bytecode, B-tree, pager, WAL, and VFS, deep dives into the on-disk format and journaling, a staged reading guide to the source, and hands-on labs." />
     <link rel="stylesheet" href="/style.css" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
   </head>
@@ -37,10 +37,12 @@
           every browser, and most operating systems. Development happens in
           Fossil at sqlite.org rather than on GitHub, with a read-only
           <a href="https://github.com/sqlite/sqlite" target="_blank" rel="noreferrer">mirror at github.com/sqlite/sqlite</a>
-          that does not accept pull requests. This walkthrough covers how to use
-          it in five minutes, the layered design that makes the code readable
-          (bytecode engine, B-tree, pager and WAL), and the testing culture that
-          makes the project trustworthy.
+          that does not accept pull requests. This page is a full chapter, not a
+          summary: a practical tutorial, then the complete life of one query
+          from <code>sqlite3_prepare_v2</code> down to <code>pread()</code> and
+          back, deep dives into the on-disk B-tree format, the pager, WAL mode,
+          and the query planner, a staged guide to reading the source, and
+          hands-on labs you can run in an afternoon.
         </p>
       </div>
     </header>
@@ -48,13 +50,76 @@
     <section class="soft">
       <div class="wrap">
         <article class="prose article">
-          <h2>Using it in five minutes</h2>
+
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">SQL text
+   │  tokenize.c        (SQL → tokens)
+   ▼
+Lemon parser            (parse.y → grammar actions)
+   │
+   ▼
+code generator + planner
+   │  select.c, where.c (choose scan vs seek, pick indexes)
+   ▼
+VDBE bytecode program   (vdbe.c: a register machine)
+   │
+   ▼
+B-tree cursors          (btree.c: tables and indexes as B-trees)
+   │
+   ▼
+pager                   (pager.c: page cache + transactions)
+   │
+   ▼
+journal / WAL           (pager.c, wal.c: atomicity + durability)
+   │
+   ▼
+VFS                     (os_unix.c, os_win.c: open/read/write/lock)
+   │
+   ▼
+one ordinary file on disk</pre>
+          <p>
+            The one-sentence identity: <mark>SQLite is a SQL compiler stacked
+            on a transactional storage engine, shipped as a C library that
+            lives inside your process and keeps the whole database in one
+            ordinary file.</mark> There is no server, no socket, no
+            configuration. Your application calls a function; the function
+            eventually calls <code>read()</code> and <code>write()</code> on
+            one file.
+          </p>
+          <p>
+            The stack above is not a diagram invented for teaching; it is the
+            literal module structure of the source. The top half is a compiler:
+            SQL text becomes tokens, tokens become a parse tree, the tree
+            becomes a program for a bytecode virtual machine called the VDBE,
+            the Virtual Database Engine. The bottom half is a storage engine:
+            the VDBE manipulates B-tree cursors, the B-tree layer asks the
+            pager for fixed-size pages, and the pager is where atomicity and
+            durability live, either through a rollback journal or a write-ahead
+            log. At the very bottom, the VFS layer abstracts the operating
+            system, which is a large part of why SQLite runs everywhere from
+            phones to aircraft.
+          </p>
+          <p>
+            Every layer talks only to the layer below it through a small,
+            stable interface. The VDBE never touches a file; the B-tree never
+            calls the OS; the pager does not know what a B-tree is. Hold this
+            picture and the rest of the chapter is just filling in the boxes.
+            If you want the same territory approached from requirements rather
+            than code, my
+            <a href="/software/notes/databases-for-system-design">databases
+            note</a> and the
+            <a href="/systems/key-value-store">key-value store design
+            write-up</a> pair well with this page.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <h3>Install and first session</h3>
           <p>
             You almost certainly have it already, and if not it is one package
-            away. There is no server to start and no configuration to write; a
-            database is a single ordinary file:
+            away:
           </p>
-          <pre><code>sudo apt install sqlite3     # or: brew install sqlite
+          <pre><code>sudo apt install sqlite3     # Debian/Ubuntu
+brew install sqlite          # macOS (Apple also ships one at /usr/bin/sqlite3)
 sqlite3 app.db</code></pre>
           <pre><code>sqlite&gt; CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT);
 sqlite&gt; INSERT INTO notes(body) VALUES ('hello');
@@ -62,9 +127,19 @@ sqlite&gt; SELECT * FROM notes;
 1|hello
 sqlite&gt; .quit</code></pre>
           <p>
-            From application code the story is the same because the engine is a
-            library linked into your process, which Python ships in its standard
-            library:
+            That created a real database. <code>ls -la app.db</code> shows a
+            small file, 8192 bytes on my machine: two 4096-byte pages, one for
+            the header and schema, one for the table's B-tree root. If you want
+            to feel how self-contained the project is, download the
+            amalgamation from sqlite.org and build the whole engine plus its
+            command-line shell with one compiler invocation:
+          </p>
+          <pre><code>gcc shell.c sqlite3.c -lpthread -ldl -lm -o sqlite3</code></pre>
+          <h3>From code</h3>
+          <p>
+            The natural language here is Python, because the standard library
+            ships the engine; <code>import sqlite3</code> works on a fresh
+            interpreter with no install step:
           </p>
           <pre><code>import sqlite3
 
@@ -73,117 +148,944 @@ con.execute("INSERT INTO notes(body) VALUES (?)", ("from python",))
 con.commit()
 for row in con.execute("SELECT id, body FROM notes"):
     print(row)</code></pre>
+          <h3>The mistakes everyone makes first</h3>
           <p>
-            And if you want to feel how self-contained the project is, download
-            the amalgamation from sqlite.org and build the whole engine plus its
-            command-line shell with one compiler invocation:
+            <strong>Mistake one: committing every row.</strong> Each committed
+            transaction must reach durable storage before SQLite returns, which
+            means an <code>fsync</code> per commit, and an fsync costs
+            milliseconds. Inserting rows one commit at a time is therefore
+            slower by two to three orders of magnitude than batching them; Lab
+            1 below measures a 400x difference on my machine. Wrong versus
+            right:
           </p>
-          <pre><code>gcc shell.c sqlite3.c -lpthread -ldl -lm -o sqlite3</code></pre>
+          <pre><code># wrong: one fsync per row
+for i in range(10_000):
+    con.execute("INSERT INTO t VALUES (?)", (i,))
+    con.commit()
 
-          <h2>Idea one: SQL compiles to bytecode</h2>
+# right: one transaction, one fsync
+with con:                       # opens a transaction, commits on exit
+    con.executemany("INSERT INTO t VALUES (?)", ((i,) for i in range(10_000)))</code></pre>
           <p>
-            When you call <code>sqlite3_prepare</code>, SQLite does not build a
-            tree of iterators the way most databases do. The tokenizer in
-            <code>tokenize.c</code> and a parser generated by Lemon, SQLite's
-            own parser generator, from the grammar in <code>parse.y</code> feed
-            a code generator, and the output is a small program for a register
-            machine called the VDBE, the Virtual Database Engine.
-            <mark>A prepared statement in SQLite is literally a compiled
-            bytecode program, and executing a query means running that program
-            in the interpreter loop in <code>vdbe.c</code>.</mark> You can see
-            this directly: prefix any statement with <code>EXPLAIN</code> and
-            the shell prints the opcodes, with instructions like
-            <code>OpenRead</code>, <code>Column</code>, <code>Next</code>, and
-            <code>ResultRow</code> that read like a story of the query. The
-            design buys a clean separation between the front half of the system
-            that decides what to do and the back half that touches storage, and
-            it makes query behavior inspectable in a way few engines match.
+            <strong>Mistake two: building SQL with string formatting.</strong>
+            Beyond the injection risk, formatted literals defeat statement
+            reuse; the <code>?</code> placeholder lets one compiled statement
+            serve every value:
           </p>
-
-          <h2>Idea two: a B-tree on a pager, with a WAL underneath</h2>
+          <pre><code># wrong
+con.execute(f"SELECT * FROM notes WHERE body = '{user_input}'")
+# right
+con.execute("SELECT * FROM notes WHERE body = ?", (user_input,))</code></pre>
           <p>
-            Below the bytecode engine the layering continues. The VDBE never
-            touches the file; it talks to cursors provided by
-            <code>btree.c</code>, which implements the one on-disk format
-            SQLite has: tables are B-trees keyed by rowid with the row data in
-            the leaves, and indexes are B-trees keyed by the indexed columns.
-            The B-tree in turn never calls the operating system; it requests
-            fixed-size pages from the pager in <code>pager.c</code>, and the
-            pager is where the ACID story lives. In the classic mode it copies
-            each page about to be modified into a rollback journal so a crash
-            mid-transaction can be undone, and in the newer mode implemented in
-            <code>wal.c</code> it does the opposite: <mark>committed changes are
-            appended to a write-ahead log while the main database file stays
-            untouched, which is what lets readers proceed concurrently with a
-            writer</mark>, with a checkpoint step later folding the log back
-            into the database. At the very bottom sits the VFS abstraction in
-            <code>os_unix.c</code> and <code>os_win.c</code>, the porting layer
-            that is a large part of why SQLite runs everywhere from phones to
-            aircraft. If you want the comparison view of when an embedded
-            single-file engine is the right tool against a server database,
-            my <a href="/software/notes/databases-for-system-design">databases
-            note</a> covers that trade-off.
+            <strong>Mistake three: assuming declared types are enforced.</strong>
+            SQLite columns have type <em>affinity</em>, not rigid types: unless
+            you created the table with <code>STRICT</code> (available since
+            3.37), inserting the string <code>'42'</code> into an INTEGER
+            column stores the integer 42, and inserting <code>'banana'</code>
+            stores the text <code>'banana'</code> without complaint. This
+            flexibility is by design, but it surprises people arriving from
+            PostgreSQL.
           </p>
-
-          <h2>Idea three: the amalgamation and the testing culture</h2>
           <p>
-            Two habits of the project matter as much as its architecture. The
-            first is the amalgamation: for release, over a hundred separate
-            source files are concatenated into one big <code>sqlite3.c</code>
-            of roughly a quarter million lines, which sounds like a joke until
-            you see the effect, since a whole database engine becomes two files
-            you drop into any build system, and the project measures the
-            single-translation-unit build as five to ten percent faster because
-            the compiler can inline across module boundaries. The second is the
-            testing culture, which is the real moat. The project reports
-            hundreds of times more test code than library code, and the
-            proprietary TH3 harness achieves one hundred percent branch
-            coverage and one hundred percent MC/DC coverage of the deployed
-            configuration, the standard used for avionics software. On top of
-            that sit the public TCL test suite, the SQL Logic Test runs that
-            compare results against other databases across millions of queries,
-            and continuous fuzzing on the order of a billion mutations per day.
-            The lesson generalizes: SQLite can afford aggressive internal
-            change, and users can afford blind upgrades, because the tests are
-            the specification.
+            <strong>Mistake four: expecting foreign keys to work.</strong> For
+            historical compatibility, foreign key enforcement is off by default
+            and must be enabled per connection with
+            <code>PRAGMA foreign_keys = ON;</code>. Silent orphan rows in a
+            fresh project are almost always this.
+          </p>
+          <p>
+            <strong>Mistake five: fearing the file.</strong> Beginners treat
+            the database file as fragile. It is the opposite: the format is
+            stable, documented byte by byte, and the project pledges support
+            through 2050. Copy it, back it up with
+            <code>.backup</code> or <code>VACUUM INTO</code>, ship it to users
+            as an application file format. What you must not do is copy it
+            <em>while a write transaction is in flight</em> without using the
+            backup API, or put it on a network filesystem, which Part III
+            covers.
           </p>
 
-          <h2>Reading the repository</h2>
+          <h2>Part III: When it is the right tool</h2>
           <p>
-            Read the tree, not the amalgamation: clone the
-            <a href="https://github.com/sqlite/sqlite" target="_blank" rel="noreferrer">GitHub mirror</a>
-            and work in <code>src/</code>, which holds around a hundred C files
-            with the architecture document at sqlite.org/arch.html as your map.
-            The layering above is also the reading order. Start with
-            <code>main.c</code> and <code>prepare.c</code> to see the public
-            API and how a statement becomes a VDBE program, glance at
-            <code>tokenize.c</code> and the grammar in <code>parse.y</code>,
-            then look at the code generators, <code>build.c</code> for DDL,
-            <code>select.c</code> and <code>where.c</code> for queries, where
-            the query planner's index selection logic lives. Then read the
-            heart of the machine, the giant opcode switch in
-            <code>vdbe.c</code>, with the opcode documentation generated
-            straight from its comments. Descend into <code>btree.c</code> next,
-            which rewards reading alongside the file format documentation, and
-            finish with <code>pager.c</code> and <code>wal.c</code>, where
-            commit, rollback, and checkpointing actually happen. The
-            command-line shell is <code>shell.c.in</code>, a surprisingly good
-            single-file example of using the API.
+            SQLite's own documentation says it best: it does not compete with
+            client/server databases, it competes with <code>fopen()</code>.
+            It is the right tool when the database and the application live on
+            the same machine: application state on phones and desktops, edge
+            and IoT devices, embedded caches, test fixtures, data analysis on
+            files you can email, and, increasingly, small-to-medium websites,
+            since a single WAL-mode SQLite database comfortably serves sites
+            with many thousands of requests per day when reads dominate.
           </p>
           <p>
-            A good first session is an evening with the shell and
-            <code>EXPLAIN</code>: write a join, read its bytecode, add an
-            index, and watch the program change shape. Because every layer has
-            a stable interface and a matching document on sqlite.org, SQLite is
-            arguably the best codebase in the world for learning how a database
-            actually works.
+            The named alternatives, and when they win: <a href="/oss/postgresql">PostgreSQL</a>
+            when many machines or many concurrent <em>writers</em> need the
+            data, when you need user management and network access control, or
+            when you want rich types and extensions; SQLite has exactly one
+            writer at a time, and that is a hard design boundary.
+            <a href="/oss/duckdb">DuckDB</a> when the workload is analytical:
+            it deliberately mirrors SQLite's embedded, single-file ergonomics
+            but stores columns rather than rows, so aggregations over millions
+            of rows run orders of magnitude faster.
+            <a href="/oss/rocksdb">RocksDB</a> when you need a raw key-value
+            store with extreme write throughput and no SQL at all; its
+            LSM-tree makes the opposite trade from SQLite's B-tree, favoring
+            writes over reads.
           </p>
+          <p>
+            The architecture-shaped warning is the classic one, and for SQLite
+            it is not an analogy, it is the literal rule:
+            <mark>do not put a writable SQLite database on a network
+            filesystem</mark>. SQLite's locking depends on POSIX advisory
+            locks, which many NFS implementations get wrong, and WAL mode
+            additionally requires genuinely shared memory between all
+            connections, which is impossible across machines. The failure mode
+            is not an error message; it is silent corruption under concurrent
+            writes.
+          </p>
+          <pre class="flow">SAFE                                DANGEROUS
+app ──▶ sqlite3.so ──▶ local disk   app on host A ─┐
+        (same machine,              app on host B ─┼─▶ NFS ──▶ file
+         locks work)                app on host C ─┘
+                                    (broken locks, shared-memory
+                                     WAL impossible, corruption)</pre>
+          <p>
+            If several machines need the same data, that is the signal you
+            have outgrown the embedded model: put the data behind a server
+            database, or replicate SQLite explicitly with a tool built for it
+            (LiteFS and Litestream exist for exactly this niche).
+          </p>
+
+          <h2>Part IV: The full life of one query</h2>
+          <p>
+            The canonical operation for this chapter is the simplest useful
+            query in the schema we already made:
+          </p>
+          <pre><code>SELECT body FROM notes WHERE id = ?</code></pre>
+          <p>
+            We will follow it through every layer, naming the actual source
+            files. Everything below was checked against the current source
+            tree and the outputs against SQLite 3.51.0.
+          </p>
+
+          <h3>Stage 1: sqlite3_prepare_v2, the front door</h3>
+          <p>
+            Your language binding, whatever it is, ends up calling
+            <code>sqlite3_prepare_v2()</code>, implemented in
+            <code>src/prepare.c</code> (the public API surface lives largely in
+            <code>src/main.c</code>). Preparing means compiling: the function
+            takes SQL text and returns a <code>sqlite3_stmt</code>, which is
+            not a handle to a plan tree but a fully compiled bytecode program.
+            The <code>_v2</code> suffix matters: unlike the original
+            <code>sqlite3_prepare()</code>, it retains the SQL text so the
+            statement can be transparently recompiled if the schema changes
+            underneath it, and it reports errors from the statement itself
+            rather than only from the connection. New code should always use
+            <code>_v2</code> (or <code>_v3</code>, which adds flags such as
+            <code>SQLITE_PREPARE_PERSISTENT</code> for statements you intend
+            to cache).
+          </p>
+
+          <h3>Stage 2: the tokenizer, tokenize.c</h3>
+          <p>
+            <code>src/tokenize.c</code> is a hand-written scanner, not
+            generated, because the authors found a hand-rolled one faster and
+            smaller than lex output. It walks the text and produces a stream
+            of tokens: <code>TK_SELECT</code>, an identifier
+            <code>body</code>, <code>TK_FROM</code>, an identifier
+            <code>notes</code>, <code>TK_WHERE</code>, <code>id</code>,
+            <code>TK_EQ</code>, and <code>TK_VARIABLE</code> for the
+            <code>?</code>. An unusual inversion worth noticing: in most
+            systems the parser calls the tokenizer for the next token; in
+            SQLite the tokenizer drives, pushing tokens into the parser one at
+            a time.
+          </p>
+
+          <h3>Stage 3: the Lemon parser, parse.y</h3>
+          <p>
+            The grammar lives in <code>src/parse.y</code>, processed not by
+            yacc or bison but by Lemon, SQLite's own parser generator, whose
+            source is <code>tool/lemon.c</code>. Lemon exists because the
+            project wanted a push parser (which is what lets the tokenizer
+            drive), better memory behavior, and a grammar syntax less prone to
+            the classic yacc mistakes. The parser's reduce actions build an
+            abstract syntax tree of C structs: our statement becomes a
+            <code>Select</code> object holding an expression list
+            (<code>body</code>), a source list (<code>notes</code>), and a
+            WHERE expression tree (<code>id = ?</code>) built from
+            <code>Expr</code> nodes defined in <code>src/expr.c</code>.
+          </p>
+
+          <h3>Stage 4: planner and code generation, select.c and where.c</h3>
+          <p>
+            There is no separate "optimizer pass" producing a plan data
+            structure that a later pass consumes; planning and code generation
+            are interleaved. <code>sqlite3Select()</code> in
+            <code>src/select.c</code> orchestrates, and for the FROM/WHERE part
+            it calls into the WHERE-clause processor: <code>src/where.c</code>
+            (analysis and cost-based choice of strategy, the heart of the
+            query planner), <code>src/whereexpr.c</code> (breaking the WHERE
+            clause into terms usable by indexes), and
+            <code>src/wherecode.c</code> (emitting the loop bytecode). For our
+            query the analysis is short: the WHERE term is an equality on
+            <code>id</code>, and because <code>id</code> was declared
+            <code>INTEGER PRIMARY KEY</code> it <em>is</em> the rowid, the
+            B-tree key itself. The planner therefore skips index
+            consideration entirely and emits a direct rowid seek, the cheapest
+            lookup SQLite has.
+          </p>
+
+          <h3>Stage 5: the VDBE program</h3>
+          <p>
+            You can see the compiled program yourself. SQLite has two related
+            introspection commands and the distinction is worth being precise
+            about: <mark><code>EXPLAIN</code> prints the actual VDBE bytecode,
+            instruction by instruction, while <code>EXPLAIN QUERY PLAN</code>
+            prints a short human-level summary of the planner's strategy
+            choices.</mark> You read <code>EXPLAIN QUERY PLAN</code> daily to
+            check whether an index is used; you read full
+            <code>EXPLAIN</code> when you want to understand the machine.
+            Here is the real output on 3.51.0:
+          </p>
+          <pre><code>sqlite&gt; EXPLAIN QUERY PLAN SELECT body FROM notes WHERE id = ?;
+QUERY PLAN
+`--SEARCH notes USING INTEGER PRIMARY KEY (rowid=?)
+
+sqlite&gt; EXPLAIN SELECT body FROM notes WHERE id = ?;
+addr  opcode         p1    p2    p3    p4             p5  comment
+----  -------------  ----  ----  ----  -------------  --  -------------
+0     Init           0     7     0                    0   Start at 7
+1     OpenRead       0     2     0     2              0   root=2 iDb=0; notes
+2     Variable       1     1     0                    0   r[1]=parameter(1)
+3     SeekRowid      0     6     1                    0   intkey=r[1]
+4     Column         0     1     2                    0   r[2]= cursor 0 column 1
+5     ResultRow      2     1     0                    0   output=r[2]
+6     Halt           0     0     0                    0
+7     Transaction    0     0     1     0              1   usesStmtJournal=0
+8     Goto           0     1     0                    0</code></pre>
+          <p>
+            Reading it as a story: <code>Init</code> jumps to address 7, where
+            <code>Transaction</code> starts a read transaction and
+            <code>Goto</code> jumps back to address 1 (prologue at the end is
+            a VDBE convention). <code>OpenRead</code> opens read cursor 0 on
+            the B-tree whose root is page 2, the <code>notes</code> table.
+            <code>Variable</code> copies bound parameter 1 into register 1.
+            <code>SeekRowid</code> positions cursor 0 on the row whose rowid
+            equals register 1, jumping to address 6 (<code>Halt</code>) if no
+            such row exists. <code>Column</code> extracts column 1
+            (<code>body</code>) into register 2, and <code>ResultRow</code>
+            yields registers 2 through 2 as one result row, suspending the
+            program and returning <code>SQLITE_ROW</code> to the caller. There
+            is no loop: an equality on the primary key can match at most one
+            row, and the bytecode shows it. The opcode reference generated
+            from the comments in the source is at sqlite.org/opcode.html.
+          </p>
+
+          <h3>Stage 6: sqlite3_step and the interpreter loop, vdbe.c</h3>
+          <p>
+            Execution begins when you call <code>sqlite3_step()</code>
+            (API side in <code>src/vdbeapi.c</code>). The engine's heart is
+            <code>sqlite3VdbeExec()</code> in <code>src/vdbe.c</code>, one
+            giant switch statement over opcodes inside a for loop, tens of
+            thousands of lines long and among the most readable big functions
+            in systems programming because every opcode's documentation is a
+            comment right above its case. The VDBE is a register machine (an
+            array of <code>Mem</code> cells), not a stack machine; earlier
+            SQLite versions were stack-based and the project rewrote it,
+            reason enough to trust that the design is deliberate.
+          </p>
+
+          <h3>Stage 7: the B-tree cursor, btree.c</h3>
+          <p>
+            <code>SeekRowid</code> calls into <code>src/btree.c</code>, about
+            eleven thousand lines implementing the one on-disk structure
+            SQLite has. Tables are B-trees keyed by 64-bit rowid with row data
+            in the leaves; indexes are B-trees whose keys are records of the
+            indexed columns. The cursor descends from the root page: binary
+            search among the cells of each interior page chooses a child
+            pointer, repeat until a leaf, then binary search the leaf for the
+            rowid. For a table of a few thousand rows this is one or two page
+            touches; for millions, three or four, which is the whole point of
+            B-trees: fanout in the hundreds keeps trees shallow. The internal
+            data structures are declared in <code>src/btreeInt.h</code>, which
+            opens with an excellent long comment on the file format.
+          </p>
+
+          <h3>Stage 8: the pager, pager.c</h3>
+          <p>
+            When the B-tree needs page 2, it does not read the file; it asks
+            the pager (<code>src/pager.c</code>) via
+            <code>sqlite3PagerGet()</code>. The pager maintains the page
+            cache (default around 2 MB, tunable with
+            <code>PRAGMA cache_size</code>), enforces the locking protocol,
+            and decides whether the page's current truth lives in the main
+            database file or, in WAL mode, in the write-ahead log. On a cache
+            hit, the read touches no I/O at all, and steady-state point
+            queries on a hot database run entirely from memory.
+          </p>
+
+          <h3>Stage 9: journal and WAL involvement in a read</h3>
+          <p>
+            Even a pure read participates in the transaction machinery. In
+            rollback-journal mode the pager takes a SHARED lock on the file,
+            which blocks any writer from committing while we read, and checks
+            for a leftover "hot journal" from a crashed writer, rolling it
+            back first if found. In WAL mode (<code>src/wal.c</code>) the
+            reader instead records an end mark, the last committed frame in
+            the <code>-wal</code> file at the moment the read began, and for
+            every page consults the wal-index in the <code>-shm</code> file:
+            if the page has a committed copy in the WAL at or before the end
+            mark, read it from there; otherwise read the main file. That end
+            mark is a snapshot, and it is why WAL readers never block writers.
+            Part V returns to this in depth.
+          </p>
+
+          <h3>Stage 10: the VFS, os_unix.c</h3>
+          <p>
+            The pager's file operations go through the VFS, a struct of
+            function pointers (<code>xOpen</code>, <code>xRead</code>,
+            <code>xWrite</code>, <code>xSync</code>, <code>xLock</code>)
+            implemented for POSIX in <code>src/os_unix.c</code> and for
+            Windows in <code>src/os_win.c</code>. On Linux,
+            <code>xRead</code> is ultimately a <code>pread()</code> of one
+            4096-byte page. This thin seam is what porting SQLite means:
+            implement one struct and the entire engine runs on your RTOS,
+            your flash controller, your browser's WASM sandbox.
+          </p>
+
+          <h3>Stage 11: the way back up</h3>
+          <p>
+            The page's bytes flow up: the pager hands the B-tree a pointer
+            into its cache; the cursor locates the cell for our rowid;
+            <code>Column</code> decodes the record format (a header of serial
+            types, then the values; SQLite computes the offset of column 1 and
+            decodes only what it needs); <code>ResultRow</code> makes the
+            value available; <code>sqlite3_step()</code> returns
+            <code>SQLITE_ROW</code>; your binding calls
+            <code>sqlite3_column_text()</code> and hands you
+            <code>'hello'</code>. The next <code>sqlite3_step()</code> resumes
+            the program at <code>Halt</code> and returns
+            <code>SQLITE_DONE</code>. One query, ten layers, and every one of
+            them a file you can open and read.
+          </p>
+
+          <h2>Part V: Internals deep dives</h2>
+
+          <h3>Deep dive 1: B-trees and the on-disk format</h3>
+          <p>
+            The file format (documented exhaustively at
+            sqlite.org/fileformat2.html) begins with a
+            <mark>100-byte database header</mark>. The first 16 bytes are the
+            magic string <code>"SQLite format 3\000"</code>; a big-endian
+            2-byte page size lives at offset 16 (a power of two from 512 to
+            32768, with the value 1 meaning 65536; 4096 is the default);
+            offsets 18 and 19 hold the write and read format versions (1 for
+            rollback journaling, 2 for WAL); offset 28 holds the database size
+            in pages; offsets 32 and 36 describe the freelist of unused pages.
+            Lab 6 reads this header with <code>xxd</code>.
+          </p>
+          <p>
+            After the header, the file is nothing but fixed-size pages, and
+            almost every page is a B-tree page of one of exactly four types,
+            identified by its first byte:
+          </p>
+          <pre class="flow">0x02  interior index page   (keys + child pointers)
+0x05  interior table page   (rowids + child pointers, no data)
+0x0a  leaf index page       (keys only)
+0x0d  leaf table page       (rowid + full row record per cell)
+
+table "notes"                     index on notes(body)
+        [0x05 interior]                  [0x02 interior]
+       /       |       \                /       |       \
+ [0x0d]     [0x0d]    [0x0d]       [0x0a]    [0x0a]    [0x0a]
+ rows       rows      rows         (body,rowid) keys only</pre>
+          <p>
+            A rowid table stores each row as a record in a table B-tree leaf,
+            keyed by the 64-bit rowid; an index stores records of the indexed
+            columns <em>plus the rowid</em> in an index B-tree, so every index
+            lookup that needs other columns must do a second descent into the
+            table B-tree. A <code>WITHOUT ROWID</code> table skips the rowid
+            entirely and stores the whole row in an index-type B-tree keyed by
+            the declared PRIMARY KEY, which is a real win when the natural key
+            is not an integer and you would otherwise pay for both trees.
+            Values inside records are encoded with variable-length integers
+            and serial types, so a NULL costs zero body bytes and small
+            integers cost one or two.
+          </p>
+          <p>
+            Now the famous trap. <mark>In a rowid table,
+            <code>INTEGER PRIMARY KEY</code>, spelled exactly that way, makes
+            the column an alias for the rowid: it is the B-tree key, lookups
+            on it are direct seeks, and it costs nothing extra. Any other
+            spelling, including <code>INT PRIMARY KEY</code>, does not.</mark>
+            <code>INT PRIMARY KEY</code> creates an ordinary column plus a
+            separate unique index B-tree, so every lookup pays the
+            two-descent price, and thanks to a historical quirk preserved for
+            file-format compatibility, that primary key column can even
+            contain NULLs unless you also declare it <code>NOT NULL</code>.
+            One keyword of difference changes the physical layout of the
+            table.
+          </p>
+
+          <h3>Deep dive 2: the pager and rollback journaling</h3>
+          <p>
+            The pager's contract to the B-tree is simple: give me page N, let
+            me modify pages inside a transaction, and guarantee that a crash
+            at any instant leaves the database as if the transaction either
+            fully happened or never happened. The classic mechanism is the
+            rollback journal. Before the first modification to any page, the
+            pager copies that page's <em>original</em> content into
+            <code>app.db-journal</code>. Commit then proceeds in a strict
+            dance:
+          </p>
+          <pre class="flow">write original pages ──▶ journal file
+fsync journal                    (undo log is now durable)
+write modified pages ──▶ database file
+fsync database
+delete journal                   ◀── THIS is the commit point</pre>
+          <p>
+            The deletion of the journal is the atomic commit: if power fails
+            before it, the next process to open the database finds a "hot
+            journal" and rolls the original pages back; after it, the
+            transaction is simply done. Alongside this the pager runs a
+            locking ladder (SHARED for readers, RESERVED for a writer that
+            intends to commit, EXCLUSIVE during the actual write-back), which
+            is why in rollback mode a writer eventually blocks all readers
+            for a moment. Two fsyncs per commit is also the mode's
+            performance signature, and the main thing WAL improves.
+          </p>
+
+          <h3>Deep dive 3: WAL mode</h3>
+          <p>
+            <code>PRAGMA journal_mode=WAL;</code> inverts the scheme,
+            following sqlite.org/wal.html: instead of preserving old content
+            in a journal and updating the database in place, <mark>committed
+            changes are appended as page frames to <code>app.db-wal</code>
+            and the main database file is not touched at all</mark>. A commit
+            is one append plus one fsync. Two auxiliary files appear next to
+            the database: <code>-wal</code> holds the frames, and
+            <code>-shm</code> holds the wal-index, a shared-memory hash table
+            that lets readers find "the newest committed copy of page N at or
+            before my snapshot" without scanning the log.
+          </p>
+          <p>
+            Readers get snapshots for free: each read transaction remembers
+            its end mark in the WAL and simply ignores every frame after it,
+            which is why a long-running reader sees a frozen, consistent view
+            while writers keep committing (Lab 4 demonstrates this in ten
+            lines of Python). The WAL cannot grow forever, so a checkpoint
+            periodically copies frames back into the main database; by
+            default SQLite auto-checkpoints when the WAL passes 1000 pages,
+            about 4 MB at the default page size, and a checkpoint can only
+            reclaim frames no active reader still needs, which is why leaving
+            a read transaction open indefinitely makes the <code>-wal</code>
+            file grow without bound. When the last connection closes cleanly,
+            it runs a final checkpoint and deletes the <code>-wal</code> and
+            <code>-shm</code> files, a detail that confuses everyone the
+            first time the files "disappear" (Lab 3).
+          </p>
+          <p>
+            And the correction that belongs in bold:
+            <mark>WAL does not mean multiple writers. SQLite in every mode
+            allows exactly one writer at a time; WAL means readers and the
+            one writer no longer block each other.</mark> A second connection
+            trying to write while a write transaction is open still gets
+            <code>SQLITE_BUSY</code> (Lab 5), and the standard treatment is
+            <code>PRAGMA busy_timeout</code> plus keeping write transactions
+            short. WAL also does not work over network filesystems, since the
+            wal-index genuinely requires shared memory among all connecting
+            processes.
+          </p>
+
+          <h3>Deep dive 4: indexes and the query planner</h3>
+          <p>
+            The planner in <code>where.c</code> is cost-based: for each table
+            in a query it enumerates the ways to access it (full scan, rowid
+            seek, each usable index) and picks the cheapest combination.
+            Three rules cover most practical situations.
+          </p>
+          <p>
+            <strong>The left-to-right rule.</strong> A composite index on
+            <code>(a, b, c)</code> is a B-tree sorted by <code>a</code>, then
+            <code>b</code>, then <code>c</code>. The planner can use a prefix
+            of equality constraints followed by at most one range:
+            <code>WHERE a=? AND b=? AND c&gt;?</code> uses all three columns,
+            but <code>WHERE b=?</code> alone cannot use the index at all, and
+            <code>WHERE a&gt;? AND b=?</code> uses it only for
+            <code>a</code>, filtering <code>b</code> row by row. Column order
+            in a composite index is a design decision, not a formality.
+          </p>
+          <p>
+            <strong>Covering indexes.</strong> If every column a query needs
+            is present in the index (remembering that a rowid-table index
+            implicitly contains the rowid), SQLite skips the second descent
+            into the table B-tree entirely, and
+            <code>EXPLAIN QUERY PLAN</code> says so:
+            <code>SEARCH notes USING COVERING INDEX idx_notes_body
+            (body=?)</code> is real output from Lab 2. Adding one or two
+            trailing columns to an index purely to make hot queries covering
+            is a legitimate, common optimization.
+          </p>
+          <p>
+            <strong>ANALYZE feeds the cost model.</strong> Running
+            <code>ANALYZE</code> writes table and index statistics into
+            <code>sqlite_stat1</code> (row counts and average selectivity per
+            index), which the planner reads to choose between plausible
+            plans. Without statistics it falls back on fixed assumptions that
+            can misfire on skewed data. The pragmatic modern habit is
+            <code>PRAGMA optimize;</code> when closing connections, which
+            runs ANALYZE as needed. When the planner still picks wrong, read
+            the plan, check <code>sqlite_stat1</code>, and remember that the
+            planner can only use what the schema gives it; the "Next
+            Generation Query Planner" writeup at sqlite.org/queryplanner-ng.html
+            is the definitive tour.
+          </p>
+
+          <h3>A note on the amalgamation and the testing culture</h3>
+          <p>
+            Two project habits explain how a database this widely deployed
+            changes so confidently. The amalgamation: for release, the
+            hundred-odd files of <code>src/</code> are concatenated into one
+            <code>sqlite3.c</code> of roughly a quarter million lines, turning
+            the entire engine into two files that drop into any build, with
+            the single-translation-unit build measured by the project as
+            five to ten percent faster thanks to cross-module inlining. The
+            testing: per sqlite.org/testing.html, the project maintains about
+            590 times as much test code as library code across four
+            independent harnesses; the proprietary TH3 harness achieves 100%
+            branch and <mark>100% MC/DC coverage</mark> of the core library,
+            the standard used for avionics; the SQL Logic Test suite runs 7.2
+            million queries cross-checked against PostgreSQL, MySQL, SQL
+            Server, and Oracle; and the dbsqlfuzz fuzzer performs about one
+            billion test mutations per day. The tests are the specification,
+            which is what makes both aggressive internal change and blind
+            user upgrades safe.
+          </p>
+
+          <h2>Part VI: Reading the repository</h2>
+          <p>
+            Read the tree, not the amalgamation: clone the GitHub mirror and
+            work in <code>src/</code>, about a hundred C files, with the
+            architecture document at sqlite.org/arch.html as your map. Every
+            file named below was verified to exist in the current tree.
+          </p>
+          <p>
+            <strong>Stage 0, no code yet.</strong> Read sqlite.org/arch.html,
+            sqlite.org/fileformat2.html (at least the header and B-tree
+            sections), and sqlite.org/opcode.html. Questions you should be
+            able to answer: what are the seven or so layers of the stack, in
+            order? What are the four B-tree page types? What is the difference
+            between EXPLAIN and EXPLAIN QUERY PLAN?
+          </p>
+          <p>
+            <strong>Stage 1, the front door.</strong> Read
+            <code>src/main.c</code> (skim, it is the API surface),
+            <code>src/prepare.c</code>, <code>src/tokenize.c</code>, and the
+            grammar in <code>src/parse.y</code>. Questions: what does
+            <code>sqlite3_prepare_v2</code> return and why is
+            <code>_v2</code> preferred? Who calls whom between tokenizer and
+            parser in SQLite, and why is that unusual? What does Lemon
+            generate from <code>parse.y</code>?
+          </p>
+          <p>
+            <strong>Stage 2, planning and code generation.</strong> Read
+            <code>src/select.c</code>, then <code>src/where.c</code> with
+            <code>src/whereInt.h</code> beside it, then
+            <code>src/wherecode.c</code> and <code>src/whereexpr.c</code>, and
+            <code>src/build.c</code> for how DDL creates the schema objects
+            the planner consults. Questions: where does the planner decide
+            between SCAN and SEARCH? How does a WHERE clause become loop
+            bytecode? What statistics does the cost model consult and where do
+            they come from (<code>src/analyze.c</code>)?
+          </p>
+          <p>
+            <strong>Stage 3, the machine.</strong> Read the opcode switch in
+            <code>src/vdbe.c</code> with sqlite.org/opcode.html open, plus
+            <code>src/vdbeaux.c</code> (program construction) and
+            <code>src/vdbeapi.c</code> (the step/column/bind API). Questions:
+            is the VDBE a stack or register machine? What happens across two
+            consecutive <code>sqlite3_step()</code> calls on a
+            multi-row query? How does <code>ResultRow</code> suspend the
+            program?
+          </p>
+          <p>
+            <strong>Stage 4, storage.</strong> Read the big comment at the top
+            of <code>src/btreeInt.h</code>, then <code>src/btree.c</code>
+            alongside the file format document. Questions: how does a cursor
+            descend to a rowid? What happens on a page split? How do overflow
+            pages work for large rows?
+          </p>
+          <p>
+            <strong>Stage 5, transactions.</strong> Read
+            <code>src/pager.c</code>, then <code>src/wal.c</code>, then
+            <code>src/os_unix.c</code>. Questions: what exact operation is
+            the commit point in rollback mode and in WAL mode? What is in the
+            wal-index? What does the VFS interface abstract, and what would
+            you implement to port SQLite?
+          </p>
+          <p>
+            Where <em>not</em> to start: the amalgamation
+            (<code>sqlite3.c</code> is a release artifact, not a reading
+            text), <code>src/vdbe.c</code> cold (without Stage 1 and 2 you
+            have no idea why the programs look like they do), and the test
+            corpus (fascinating, but it is millions of lines). The
+            command-line shell, built from <code>src/shell.c.in</code>, is a
+            good side read: one large file exercising the public API the way
+            your own code would.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            Each lab is a few minutes, uses only the shell and Python, and
+            pins one concept from the deep dives. Outputs shown are from my
+            Linux machine with SQLite 3.51.0; your numbers will differ but
+            the shape will not.
+          </p>
+
+          <h3>Lab 1: fsync is the unit of cost (transaction batching)</h3>
+          <pre><code>import sqlite3, time
+con = sqlite3.connect("bench.db")
+con.execute("CREATE TABLE t(x)")
+
+t0 = time.time()
+for i in range(500):
+    con.execute("INSERT INTO t VALUES (?)", (i,))
+    con.commit()                       # one fsync per row
+t1 = time.time()
+
+con.execute("BEGIN")
+for i in range(500):
+    con.execute("INSERT INTO t VALUES (?)", (i,))
+con.commit()                           # one fsync total
+t2 = time.time()
+print(f"per-row commits: {t1-t0:.2f}s   one txn: {t2-t1:.4f}s")</code></pre>
+          <p>
+            My run: <code>per-row commits: 3.69s   one txn: 0.0085s</code>,
+            a factor of about 400. Observe: the work is identical; only the
+            number of durable commit points changed. This is Deep dive 2 made
+            visible, and it is the single most common SQLite performance bug
+            in the wild.
+          </p>
+
+          <h3>Lab 2: watch the plan change shape</h3>
+          <pre><code>sqlite&gt; EXPLAIN QUERY PLAN SELECT id FROM notes WHERE body='hello';
+QUERY PLAN
+`--SCAN notes
+sqlite&gt; CREATE INDEX idx_notes_body ON notes(body);
+sqlite&gt; EXPLAIN QUERY PLAN SELECT id FROM notes WHERE body='hello';
+QUERY PLAN
+`--SEARCH notes USING COVERING INDEX idx_notes_body (body=?)</code></pre>
+          <p>
+            Observe two things: SCAN became SEARCH, and the index is
+            COVERING because the query needs only <code>body</code> (the key)
+            and <code>id</code> (the rowid, stored in every index entry), so
+            the table B-tree is never touched. Then run full
+            <code>EXPLAIN</code> before and after and watch
+            <code>SeekRowid</code>-style seeking replace a
+            <code>Rewind</code>/<code>Next</code> loop.
+          </p>
+
+          <h3>Lab 3: see the WAL files, and see them vanish</h3>
+          <pre><code>sqlite3 app.db "PRAGMA journal_mode=WAL; INSERT INTO notes(body) VALUES('walrow');"
+ls app.db*        # run this from a SECOND terminal while a connection is open
+# app.db  app.db-shm  app.db-wal</code></pre>
+          <p>
+            Keep one shell connection open and list the directory: the
+            <code>-wal</code> and <code>-shm</code> files sit beside the
+            database. Close the last connection and list again: gone, because
+            the final connection checkpoints and deletes them. If you only
+            ever look after your process exits, you will wrongly conclude WAL
+            "isn't on". Also try <code>PRAGMA wal_checkpoint(TRUNCATE);</code>
+            and watch the <code>-wal</code> file drop to zero bytes.
+          </p>
+
+          <h3>Lab 4: hold a read snapshot while another connection writes</h3>
+          <pre><code>import sqlite3
+r = sqlite3.connect("bench.db"); w = sqlite3.connect("bench.db")
+r.execute("PRAGMA journal_mode=WAL")
+r.execute("BEGIN")
+print("reader sees:", r.execute("SELECT count(*) FROM t").fetchone()[0])
+w.execute("INSERT INTO t VALUES (999)"); w.commit()
+print("reader still sees:", r.execute("SELECT count(*) FROM t").fetchone()[0])
+r.commit()
+print("after ending txn:", r.execute("SELECT count(*) FROM t").fetchone()[0])</code></pre>
+          <p>
+            My output: <code>1000</code>, <code>1000</code>,
+            <code>1001</code>. The reader's end mark froze its view of the
+            WAL; the writer committed anyway; ending the read transaction
+            moved the mark. That is snapshot isolation in three prints.
+          </p>
+
+          <h3>Lab 5: produce SQLITE_BUSY on purpose</h3>
+          <pre><code>import sqlite3
+a = sqlite3.connect("bench.db", timeout=0)
+b = sqlite3.connect("bench.db", timeout=0)
+a.execute("BEGIN IMMEDIATE")           # a takes the write lock
+try:
+    b.execute("BEGIN IMMEDIATE")       # b wants it too
+except sqlite3.OperationalError as e:
+    print("second writer got:", e)     # -&gt; database is locked</code></pre>
+          <p>
+            One writer at a time, WAL or not. Now set
+            <code>timeout=5</code> (Python's spelling of
+            <code>busy_timeout</code>) on connection <code>b</code>, commit
+            on <code>a</code> from another thread, and watch <code>b</code>
+            proceed instead of failing: the production fix is short write
+            transactions plus a busy timeout, not retry loops around every
+            statement.
+          </p>
+
+          <h3>Lab 6: read the file header with xxd</h3>
+          <pre><code>$ xxd -l 100 app.db
+00000000: 5351 4c69 7465 2066 6f72 6d61 7420 3300  SQLite format 3.
+00000010: 1000 0101 0040 2020 0000 0002 0000 0002  .....@  ........
+00000020: 0000 0000 0000 0000 0000 0001 0000 0004  ................
+...</code></pre>
+          <p>
+            Decode it against Deep dive 1: bytes 0-15 are the magic string;
+            bytes 16-17 are <code>0x1000</code> = 4096, the page size; bytes
+            18-19 are <code>01 01</code> here, meaning rollback-journal
+            format (they read <code>02 02</code> after
+            <code>PRAGMA journal_mode=WAL</code> on a fresh database); bytes
+            28-31 give the page count. You have now read a database file
+            with your eyes, which permanently changes your relationship with
+            the phrase "binary format".
+          </p>
+
+          <h2>Part VIII: Questions and model answers</h2>
+          <p>
+            Understanding checks. Try to answer before reading; each answer
+            is the short version a working engineer should be able to give.
+          </p>
+          <p>
+            <strong>1. What actually is a prepared statement in SQLite?</strong>
+            A compiled bytecode program for the VDBE register machine.
+            <code>sqlite3_prepare_v2</code> runs tokenizer, parser, planner,
+            and code generator; <code>sqlite3_step</code> runs the resulting
+            program in the interpreter loop in <code>vdbe.c</code>. EXPLAIN
+            prints that program verbatim.
+          </p>
+          <p>
+            <strong>2. Why is SQLite's tokenizer/parser relationship
+            unusual?</strong> The tokenizer drives: it pushes tokens into a
+            push parser generated by Lemon, SQLite's own parser generator,
+            rather than the parser pulling tokens as with yacc. Lemon also
+            gives the project a grammar format and memory behavior it
+            controls completely.
+          </p>
+          <p>
+            <strong>3. What is the difference between EXPLAIN and EXPLAIN
+            QUERY PLAN?</strong> EXPLAIN dumps the full VDBE opcode program;
+            EXPLAIN QUERY PLAN prints a summary of planner strategy per table
+            (SCAN vs SEARCH, which index, covering or not). Use the plan
+            summary for daily index work and the bytecode when you need
+            ground truth about execution.
+          </p>
+          <p>
+            <strong>4. Why is INTEGER PRIMARY KEY special and INT PRIMARY KEY
+            not?</strong> In a rowid table, INTEGER PRIMARY KEY (that exact
+            type name) aliases the rowid, the actual B-tree key, so lookups
+            are single-descent seeks. INT PRIMARY KEY creates an ordinary
+            column with a separate unique index B-tree, costing a second
+            descent per lookup, and by historical quirk the column may even
+            hold NULLs unless declared NOT NULL.
+          </p>
+          <p>
+            <strong>5. When should a table be WITHOUT ROWID?</strong> When
+            its natural primary key is not a single integer (composite keys,
+            text keys) and rows are not huge: the row data moves into the
+            primary-key B-tree itself, eliminating the hidden rowid tree and
+            one descent per primary-key lookup.
+          </p>
+          <p>
+            <strong>6. Walk through commit in rollback-journal mode. Where is
+            the commit point?</strong> Original page images are written and
+            fsynced to the journal, changed pages are written and fsynced to
+            the database, then the journal is deleted. The journal deletion
+            is the commit point: a crash before it triggers rollback from the
+            hot journal; after it, the transaction is durable.
+          </p>
+          <p>
+            <strong>7. What does WAL mode change, and what does it not
+            change?</strong> It changes where committed data goes: appended
+            to the -wal file instead of written into the database, so commits
+            are one sequential append plus one fsync, and readers, pinned to
+            an end-mark snapshot, no longer block or get blocked by the
+            writer. It does not change the writer count: still exactly one at
+            a time.
+          </p>
+          <p>
+            <strong>8. Why does a long-lived read transaction make the -wal
+            file grow?</strong> A checkpoint may only fold frames into the
+            database once no active reader's snapshot still depends on the
+            prior state, so an open reader pins the WAL and checkpoints
+            cannot fully complete until it ends.
+          </p>
+          <p>
+            <strong>9. What is the -shm file?</strong> The wal-index: a
+            shared-memory hash structure that maps page numbers to their
+            newest committed frames in the WAL so readers avoid scanning the
+            log. It requires true shared memory among all connections, which
+            is one reason WAL cannot work across a network filesystem.
+          </p>
+          <p>
+            <strong>10. Your app intermittently throws "database is locked".
+            Diagnose it.</strong> Two writers are colliding, or a writer is
+            colliding with rollback-mode readers. Check journal mode (move
+            to WAL if readers are involved), set
+            <code>PRAGMA busy_timeout</code> so contenders wait instead of
+            failing instantly, and hunt for long write transactions or
+            connections left in an open transaction by a framework.
+          </p>
+          <p>
+            <strong>11. A query ignores your new composite index on (a, b).
+            Why might that be correct?</strong> If the query constrains only
+            <code>b</code>, the left-to-right rule makes the index unusable.
+            If it constrains <code>a</code> loosely, the planner's statistics
+            (from ANALYZE, in sqlite_stat1) may price a full scan cheaper
+            than a seek plus many table descents. Read EXPLAIN QUERY PLAN
+            before assuming a bug.
+          </p>
+          <p>
+            <strong>12. What is a covering index and how do you spot one in
+            use?</strong> An index containing every column a query touches
+            (including the implicit rowid), letting SQLite answer from the
+            index B-tree alone. EXPLAIN QUERY PLAN says
+            <code>USING COVERING INDEX</code>.
+          </p>
+          <p>
+            <strong>13. When is PostgreSQL the right call instead of
+            SQLite?</strong> Whenever more than one machine needs the data,
+            when sustained concurrent writes matter (SQLite serializes
+            writers), or when you need network access control, roles, and
+            server-side extensions. SQLite's own line is that it competes
+            with fopen(), not with client/server databases.
+          </p>
+          <p>
+            <strong>14. When is DuckDB the right call instead of
+            SQLite?</strong> Analytical scans and aggregations: DuckDB keeps
+            SQLite's embedded ergonomics but is columnar and vectorized, so
+            OLAP queries over millions of rows are dramatically faster, while
+            SQLite remains better for transactional point reads and writes.
+          </p>
+          <p>
+            <strong>15. Why is putting a writable SQLite file on NFS
+            dangerous?</strong> SQLite's transaction safety leans on POSIX
+            advisory locks that network filesystems frequently implement
+            incorrectly, and WAL additionally needs shared memory across
+            processes, impossible across machines. The failure mode is silent
+            corruption, not an error.
+          </p>
+          <p>
+            <strong>16. How can a database engine this widely deployed change
+            its internals so freely?</strong> Because the tests are the
+            specification: roughly 590 times as much test code as library
+            code, TH3 with 100% branch and MC/DC coverage, millions of
+            cross-engine logic-test queries, and about a billion fuzzer
+            mutations daily. Any refactor that survives that battery is,
+            operationally, correct.
+          </p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Lesson 1: a bytecode boundary decouples deciding from
+            doing.</strong> Compiling SQL to VDBE programs cleanly splits the
+            half of the system that chooses what to do from the half that
+            touches storage, and makes execution inspectable (EXPLAIN) and
+            cacheable (prepared statements). The same move appears in the
+            JVM and CPython, in eBPF, in regex engines, and in every system
+            that compiles a plan once and runs it many times.
+          </p>
+          <p>
+            <strong>Lesson 2: strict layering with one-way interfaces is what
+            makes a codebase readable decades later.</strong> VDBE to B-tree
+            to pager to VFS, each speaking only downward through a small
+            interface, is why individual files here are readable in
+            isolation. This is the storage-engine shape everywhere: compare
+            <a href="/oss/rocksdb">RocksDB's</a> memtable/SST/env layering.
+          </p>
+          <p>
+            <strong>Lesson 3: make the OS boundary a data structure.</strong>
+            The VFS is a struct of function pointers, so "porting SQLite"
+            means implementing one struct, and testing can inject a
+            crash-simulating VFS. Any system that must run on hardware you
+            have never seen should steal this: JDBC drivers, LLVM targets,
+            and network abstraction layers are the same idea.
+          </p>
+          <p>
+            <strong>Lesson 4: tests are what purchase the freedom to
+            change.</strong> SQLite's 100% MC/DC harness and daily
+            billion-mutation fuzzing are not bureaucracy; they are the asset
+            that lets a three-person team rewrite the query planner under
+            billions of devices. The transferable rule: your rate of safe
+            change is bounded by the strength of your verification, not the
+            skill of your reviewers.
+          </p>
+          <p>
+            <strong>Lesson 5: distribution format is a feature.</strong> The
+            amalgamation reduces "adopt a database engine" to "add two files
+            to the build", and that friction removal, more than any
+            benchmark, is why SQLite is in everything. The single-header
+            library culture in C and C++ and the static-binary culture in Go
+            learned the same lesson.
+          </p>
+          <p>
+            <strong>Lesson 6: stable file formats compound.</strong> A
+            documented on-disk format, unchanged in essentials since 2004 and
+            pledged readable to 2050, made SQLite a de facto archival
+            standard (the US Library of Congress lists it as a recommended
+            storage format). Formats outlive code; design them like it.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            The one-sentence summary: <mark>SQLite compiles SQL into bytecode
+            for a virtual machine whose cursors walk B-trees, which ride on a
+            transactional pager, which journals or WAL-logs pages through a
+            portable VFS into a single file.</mark>
+          </p>
+          <pre class="flow">SQL → Parse → Plan → VDBE → B-tree → Pager → WAL/Journal → VFS → OS</pre>
+          <p>The chain mapped to source files:</p>
+          <pre class="flow">Parse        tokenize.c, parse.y (Lemon)
+Plan         select.c, where.c, wherecode.c, analyze.c
+VDBE         vdbe.c, vdbeaux.c, vdbeapi.c
+B-tree       btree.c, btreeInt.h
+Pager        pager.c
+WAL/Journal  wal.c (+ journal logic in pager.c)
+VFS          os_unix.c, os_win.c</pre>
+          <p>Memorize these blocks:</p>
+          <p>
+            <strong>File format:</strong> 100-byte header starting
+            <code>"SQLite format 3\0"</code>; page size at offset 16, default
+            4096; four B-tree page types 0x02, 0x05, 0x0a, 0x0d; tables keyed
+            by rowid, indexes keyed by columns plus rowid; INTEGER PRIMARY
+            KEY aliases the rowid, INT PRIMARY KEY does not.
+          </p>
+          <p>
+            <strong>Transactions:</strong> rollback journal saves old pages,
+            commit point is journal deletion, two fsyncs; WAL appends new
+            pages, commit is one append plus fsync, readers snapshot at an
+            end mark, auto-checkpoint at 1000 pages, one writer always.
+          </p>
+          <p>
+            <strong>Planner:</strong> composite indexes work left to right,
+            equalities then one range; covering index means no table descent;
+            ANALYZE fills sqlite_stat1 for the cost model.
+          </p>
+          <p>
+            <strong>Trust:</strong> ~590x test-to-library code ratio, TH3 at
+            100% branch and MC/DC coverage, ~1 billion fuzz mutations per
+            day, SLT cross-checks 7.2 million queries against four other
+            engines (all per sqlite.org/testing.html).
+          </p>
+
           <div class="takeaway">
             <strong>Key takeaway:</strong> SQLite is a compiler stacked on a
             storage engine: SQL becomes bytecode, bytecode drives B-tree
             cursors, the B-tree rides on a transactional pager, and a
             once-in-an-industry testing regime is what lets that little stack
-            run unattended on billions of devices.
+            run unattended on billions of devices. If you internalize one
+            artifact from this chapter, make it the EXPLAIN output of a
+            one-row seek: nine opcodes that contain the whole design.
           </div>
         </article>
       </div>

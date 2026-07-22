@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Lucene walkthrough · Stanley Jacob</title>
-    <meta name="description" content="A walkthrough of the Apache Lucene repository: how to index and search in five minutes, how the inverted index and immutable segments work, what codecs and BM25 scoring do, and a guided reading path through the core module." />
+    <meta name="description" content="A full chapter on Apache Lucene: a practical tutorial, the complete life of one indexed document and one TermQuery through analysis, segments, codecs, and BM25 scoring, four internals deep dives, a staged plan for reading the repository, and hands-on labs." />
     <link rel="stylesheet" href="/style.css" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
   </head>
@@ -32,13 +32,14 @@
         <p class="lead">
           <a href="https://github.com/apache/lucene" target="_blank" rel="noreferrer">Apache Lucene</a>
           is a full-text search engine library written in Java, started by Doug
-          Cutting in 1999 and an Apache project since the early 2000s, and it
-          sits under nearly every open source search deployment you have used:
-          Elasticsearch, OpenSearch, and Solr are all distribution, APIs, and
-          operations wrapped around a Lucene core. This walkthrough covers how
-          to index and search in five minutes, the inverted index and segment
-          model that make it work, how postings and scoring are implemented,
-          and a guided path for reading the repository. It pairs with my
+          Cutting in 1999, and it sits under nearly every open source search
+          deployment you have used: Elasticsearch, OpenSearch, and Solr are all
+          distribution, APIs, and operations wrapped around a Lucene core. This
+          is a full chapter, not a tour: a practical tutorial, then the complete
+          life of one document going in and one TermQuery coming back out, stage
+          by stage through the actual classes, then deep dives into segments,
+          codecs, and BM25, a staged plan for reading the repository, labs to
+          run, and understanding checks at the end. It pairs with my
           <a href="/systems/search-service">search service design write-up</a>,
           which builds the same inverted index from requirements instead of
           from code.
@@ -49,24 +50,95 @@
     <section class="soft">
       <div class="wrap">
         <article class="prose article">
-          <h2>Using it in five minutes</h2>
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">        WRITE PATH                              READ PATH
+
+  Document + Fields                      TermQuery("body", "search")
+        |                                          |
+     Analyzer                                IndexSearcher
+  (tokenizer + filters)                   (one loop per segment)
+        |                                          |
+   IndexWriter                          term dictionary lookup
+  (in-memory buffers,                  (FST index -&gt; .tip -&gt; .tim)
+   one per thread)                                 |
+        | flush                          postings iteration
+        v                              (.doc blocks of 128 ids)
+  Segment (immutable files:                        |
+  .tim .tip .doc .pos .fdt ...)          BM25 scoring (norms)
+        | background merges                        |
+        v                                 top-k collection (heap)
+  fewer, larger segments                           |
+        | commit                                   v
+        v                                       TopDocs
+  segments_N file names the live set
+        |
+        v
+  Directory (FSDirectory / MMapDirectory) -&gt; OS page cache -&gt; disk</pre>
           <p>
-            Lucene is a library with no server and no query language of its
-            own beyond what you opt into; you add one dependency and call Java
-            APIs. The core artifact is all you need to start:
+            The one-sentence identity: <mark>Lucene is a library that turns
+            documents into immutable segment files containing an inverted
+            index, and turns queries into ranked document ids by walking those
+            files</mark>. There is no server, no query REPL, no schema store.
+            You link a jar, you hand it documents, and it writes a directory of
+            oddly named files; later you hand it a query and it hands you back
+            scored integers. Everything Elasticsearch and Solr add, HTTP APIs,
+            JSON documents, sharding, replication, is layered on top of exactly
+            this contract.
+          </p>
+          <p>
+            The two columns of the diagram never touch a shared mutable
+            structure. The write path accumulates postings in memory and
+            periodically freezes them into a segment, a self-contained
+            mini-index that will never change again. The read path opens a
+            point-in-time view over whichever segments existed at open time and
+            searches each independently. The only coordination between the two
+            sides is the <code>segments_N</code> file, a tiny manifest naming
+            the current segment set, swapped atomically at commit. Hold that
+            picture and most of Lucene's behavior, lock-free reads, near
+            real-time refresh, background merges, deletes as bitmasks, follows
+            by necessity rather than by memorization.
+          </p>
+          <p>
+            A useful frame from the database world: Lucene is structurally an
+            LSM system, buffered writes flushed to immutable sorted runs that
+            are compacted in the background, except the sorted runs are
+            inverted indexes rather than key-value tables, and the read
+            amplification is paid per segment rather than per level.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <h3>Install</h3>
+          <p>
+            Lucene is a plain Maven artifact; there is nothing to install
+            system-wide beyond a JDK. The 10.x line requires Java 21 or newer.
+            On Linux and macOS the fastest route to a working toolchain is a
+            JDK from your package manager (<code>sudo apt install
+            openjdk-21-jdk</code>, or <code>brew install openjdk@21</code>)
+            plus the dependency:
           </p>
           <pre><code>&lt;dependency&gt;
   &lt;groupId&gt;org.apache.lucene&lt;/groupId&gt;
   &lt;artifactId&gt;lucene-core&lt;/artifactId&gt;
-  &lt;version&gt;10.1.0&lt;/version&gt;
+  &lt;version&gt;10.4.0&lt;/version&gt;
 &lt;/dependency&gt;</code></pre>
+          <p>
+            (10.4.0 is the release I verified this chapter against; anything in
+            the 10.x line behaves as described.) Two sibling artifacts show up
+            almost immediately in real code: <code>lucene-queryparser</code>
+            for parsing query strings and <code>lucene-analysis-common</code>
+            for the language-specific analyzers. For poking at indexes without
+            writing Java, download the binary distribution from
+            lucene.apache.org; it ships every module jar under
+            <code>modules/</code> and the Luke GUI under <code>bin/</code>.
+          </p>
+          <h3>First session</h3>
           <p>
             The front-page example from Lucene's own documentation is worth
             typing out once, because the whole library is visible in it.
             Indexing is an analyzer, a directory, and a writer:
           </p>
           <pre><code>Analyzer analyzer = new StandardAnalyzer();
-Directory directory = FSDirectory.open(indexPath);
+Directory directory = FSDirectory.open(Path.of("idx"));
 IndexWriter writer = new IndexWriter(directory, new IndexWriterConfig(analyzer));
 
 Document doc = new Document();
@@ -75,137 +147,732 @@ writer.addDocument(doc);
 writer.close();</code></pre>
           <p>
             Searching opens a point-in-time reader over the same directory,
-            parses a query against the same analyzer, and asks for the top
-            hits:
+            parses a query with the same analyzer, and asks for the top hits:
           </p>
           <pre><code>DirectoryReader reader = DirectoryReader.open(directory);
 IndexSearcher searcher = new IndexSearcher(reader);
 Query query = new QueryParser("body", analyzer).parse("text");
 ScoreDoc[] hits = searcher.search(query, 10).scoreDocs;
 StoredFields stored = searcher.storedFields();
-for (int i = 0; i &lt; hits.length; i++) {
-  Document hit = stored.document(hits[i].doc);
+for (ScoreDoc hit : hits) {
+  System.out.println(hit.score + "  " + stored.document(hit.doc).get("body"));
 }</code></pre>
           <p>
-            The query parser lives in the separate <code>lucene-queryparser</code>
-            module and most real analyzers in <code>lucene-analysis-common</code>;
-            the repository's demo module contains complete IndexFiles and
-            SearchFiles programs that index a directory of text files and
-            search it interactively, which is the fastest way to get a real
-            index on disk to look at.
+            Run it and you get one hit with a small positive score. If you want
+            a real index to explore before writing any code, the demo module in
+            the binary distribution indexes a directory of files and searches
+            it interactively:
+          </p>
+          <pre><code>cd lucene-10.4.0
+java -cp "modules/*" org.apache.lucene.demo.IndexFiles -index ./idx -docs ./docs
+java -cp "modules/*" org.apache.lucene.demo.SearchFiles -index ./idx</code></pre>
+          <h3>Mistakes beginners make</h3>
+          <p>
+            <strong>Analyzed field, unanalyzed expectations.</strong> The most
+            common first bug is indexing an identifier with
+            <code>TextField</code> and then wondering why exact matches
+            misbehave, or the reverse, indexing with <code>StringField</code>
+            and wondering why nothing matches a lowercased query.
+            <code>TextField</code> runs the analyzer (tokenized, lowercased);
+            <code>StringField</code> indexes the exact bytes as a single term:
+          </p>
+          <pre><code>// wrong: "ORD-1234" becomes tokens [ord, 1234]; TermQuery("id", "ORD-1234") finds nothing
+doc.add(new TextField("id", "ORD-1234", Field.Store.YES));
+
+// right: one untouched term, matched with TermQuery, never with an analyzed parse
+doc.add(new StringField("id", "ORD-1234", Field.Store.YES));</code></pre>
+          <p>
+            <strong>Different analyzers at index and query time.</strong> The
+            index only contains what the indexing analyzer produced, so the
+            query side must produce the same tokens. Indexing with
+            <code>EnglishAnalyzer</code> (which stems "running" to "run") and
+            querying through <code>StandardAnalyzer</code> (which does not)
+            silently misses documents. Keep one analyzer instance, or one
+            factory, shared by both sides.
+          </p>
+          <p>
+            <strong>Opening a writer per document.</strong>
+            <code>IndexWriter</code> is heavyweight and thread-safe; it is
+            meant to live for the life of the process and absorb
+            <code>addDocument</code> calls from many threads. Opening and
+            closing one per document is both slow and a great way to hit
+            <code>LockObtainFailedException</code>, because each index
+            directory admits exactly one open writer, enforced by
+            <code>write.lock</code>.
+          </p>
+          <p>
+            <strong>Updating by adding.</strong> There is no update in place.
+            <code>updateDocument(new Term("id", "ORD-1234"), doc)</code> is the
+            supported idiom, an atomic delete-by-term plus add; calling
+            <code>addDocument</code> for a changed record leaves both versions
+            searchable.
+          </p>
+          <p>
+            <strong>Expecting a new reader to see new writes.</strong> A
+            <code>DirectoryReader</code> is a snapshot. Writes after it opened
+            are invisible to it forever; you reopen with
+            <code>DirectoryReader.openIfChanged(reader)</code>, or use the
+            near-real-time form <code>DirectoryReader.open(writer)</code>,
+            which sees flushed but not-yet-committed segments. This is not a
+            bug, it is the visibility model, and it is exactly what
+            Elasticsearch's refresh interval is made of.
           </p>
 
-          <h2>The inverted index, made of immutable segments</h2>
+          <h2>Part III: When it is the right tool</h2>
           <p>
-            The data structure is the classic one: instead of storing documents
-            and scanning them, Lucene analyzes each document into terms and
-            stores, for every term, the list of documents that contain it,
-            along with frequencies and positions. A query then becomes an
-            intersection or union of these postings lists rather than a scan,
-            which is why searching a hundred million documents for two words
-            is cheap.
+            Lucene the library is the right tool when search lives inside your
+            application: an embedded product-catalog search, a desktop mail
+            client, a log viewer, a single-node service where you want
+            millisecond queries over tens of millions of documents without
+            operating a search cluster. It is also the right tool when you are
+            building your own search service and want the hard parts, postings
+            encoding, ranking, segment lifecycle, solved while you own the
+            distribution story yourself. And it is the substrate you study to
+            understand the systems above it.
           </p>
           <p>
-            What makes Lucene distinctive is how that index reaches disk.
-            IndexWriter buffers documents in memory and periodically flushes
-            them as a segment, a self-contained mini-index in its own set of
-            files, and <mark>a segment, once written, is never modified;
-            updates are a delete plus a reinsert, and deletes themselves are
-            just a bitmask of live documents consulted at search time.</mark>
-            Background merges fold small segments into larger ones and drop the
-            dead documents for real. Immutability is the decision the rest of
-            the design falls out of: readers need no locks and can rely on the
-            OS page cache aggressively, a commit is just an atomic update of
-            the file naming the current segments, and a searcher sees a
-            perfectly consistent point-in-time snapshot for as long as it holds
-            its reader open. It also explains the operational behavior of the
-            systems built on top: an Elasticsearch shard is exactly one Lucene
-            index, and its refresh interval is the cadence at which new
-            segments become visible to searches, a mechanism I go into in my
-            <a href="/software/notes/elasticsearch">Elasticsearch note</a>.
+            The alternatives are mostly Lucene wearing operational clothing.
+            <a href="/software/notes/elasticsearch">Elasticsearch</a> and
+            OpenSearch are the answer when you need sharding, replication,
+            JSON APIs, and a team-shared service; Solr is the same trade with
+            different ergonomics. Outside the family, PostgreSQL full-text
+            search is enough when the data already lives in Postgres and the
+            requirements stop at "find rows containing these words";
+            SQLite's FTS5 fills the same niche in embedded settings; and
+            Tantivy is the Lucene-shaped library if your process is Rust
+            rather than Java.
+          </p>
+          <p>
+            The architecture-shaped warning: <mark>a Lucene index has exactly
+            one writer, and the index directory is not a shared database</mark>.
+            The safe shape is one process that owns the writer, with any number
+            of reader processes or replicas consuming copies of the immutable
+            segment files. The dangerous shape is multiple app instances
+            pointing at one directory on shared storage and all expecting to
+            write, which fails fast on <code>write.lock</code> if you are
+            lucky and corrupts subtly on NFS-style filesystems (broken locking,
+            broken mmap semantics) if you are not.
+          </p>
+          <pre class="flow">SAFE                                    DANGEROUS
+
+ indexer process                        app-1   app-2   app-3
+   IndexWriter                            \       |       /
+       |                                   v      v      v
+   local disk index                     one index dir on NFS
+       |  ship immutable segments        (three would-be writers,
+       v                                  remote locks, remote mmap)
+ searcher replicas (read-only copies)</pre>
+
+          <h2>Part IV: The full life of one document and one query</h2>
+          <p>
+            This is the core of the chapter. We index one document into the
+            field <code>body</code> and then serve one
+            <code>TermQuery("body", "search")</code>, naming the classes doing
+            the work at every stage. Everything below lives in
+            <code>lucene/core</code> under <code>org.apache.lucene</code>
+            unless said otherwise.
+          </p>
+          <h3>Stage 1: Document and Field</h3>
+          <p>
+            A <code>Document</code> (package <code>document</code>) is nothing
+            but a list of <code>Field</code> objects, and a field is a name, a
+            value, and an <code>IndexableFieldType</code> that answers three
+            independent questions: is it inverted into the index (and with what
+            detail: docs only, plus frequencies, plus positions), is the
+            original value stored for retrieval, and does it carry doc values
+            for sorting and faceting. <code>TextField</code>,
+            <code>StringField</code>, <code>StoredField</code>, and friends are
+            just presets over those flags. Nothing here touches disk; a
+            Document is a description of intent that is consumed once by the
+            writer and then garbage.
+          </p>
+          <h3>Stage 2: IndexWriter accepts the document</h3>
+          <p>
+            <code>IndexWriter.addDocument</code> (package <code>index</code>)
+            does not index anything itself. It delegates to a
+            <code>DocumentsWriter</code>, which hands the document to a
+            <code>DocumentsWriterPerThread</code> (DWPT), one in-memory
+            indexing buffer per active indexing thread. This is the trick that
+            makes indexing scale across threads with almost no contention:
+            <mark>each thread builds its own private mini-index, and threads
+            only synchronize at flush time</mark>. A DWPT that fills up is
+            flushed as its own segment, which is why a heavily threaded
+            indexing job produces many small segments.
+          </p>
+          <h3>Stage 3: The analysis chain</h3>
+          <p>
+            Inside the DWPT, the <code>IndexingChain</code> runs each analyzed
+            field through the <code>Analyzer</code>. An analyzer builds a
+            <code>TokenStream</code>: a <code>Tokenizer</code> that splits the
+            input, followed by <code>TokenFilter</code>s that transform it.
+            <code>StandardAnalyzer</code> (in core, package
+            <code>analysis.standard</code>) tokenizes on Unicode word
+            boundaries and lowercases, so "This is the text to be indexed."
+            becomes the terms <code>[this, is, the, text, to, be, indexed]</code>,
+            each carrying a position. The stream API is deliberately
+            allocation-free: filters share attribute objects
+            (<code>CharTermAttribute</code>,
+            <code>PositionIncrementAttribute</code>) that are mutated in place
+            as the stream advances, one of many places where Lucene's age shows
+            up as ruthless mechanical sympathy.
+          </p>
+          <h3>Stage 4: In-memory inverted index</h3>
+          <p>
+            For every term the chain emits, <code>TermsHashPerField</code> and
+            <code>FreqProxTermsWriter</code> update an in-memory hash keyed by
+            term bytes, appending doc ids, frequencies, and positions into
+            shared byte pools. This is a real inverted index, just a
+            write-optimized one: hash table rather than sorted structure,
+            append-only byte slices rather than compressed blocks. The
+            writer's RAM accounting watches these pools, and when the buffer
+            crosses <code>IndexWriterConfig.setRAMBufferSizeMB</code> (default
+            16 MB) or an explicit document count, the DWPT is scheduled for
+            flush.
+          </p>
+          <h3>Stage 5: Flush, a segment is born</h3>
+          <p>
+            Flush is where the codec takes over (package <code>codecs</code>).
+            The in-memory hash is sorted into term order and streamed through
+            the current codec's writers into a new segment: the blocktree
+            terms writer produces the term dictionary (<code>.tim</code>) and
+            its FST-based index (<code>.tip</code>), the postings writer
+            produces doc ids and frequencies (<code>.doc</code>) and positions
+            (<code>.pos</code>), the stored fields writer produces
+            <code>.fdt</code>/<code>.fdx</code>, norms go to
+            <code>.nvd</code>/<code>.nvm</code>, and a <code>.si</code> file
+            describes the segment. The segment is now durable bytes but not
+            yet part of "the index": searchers cannot see it until a reader
+            reopen (near real-time) and it does not survive crashes until
+            <code>commit()</code>, which fsyncs the files and atomically
+            writes a new <code>segments_N</code> manifest via
+            <code>SegmentInfos</code>. That two-step visibility (flush for
+            searchability, commit for durability) is the exact mechanism under
+            Elasticsearch's refresh versus flush distinction.
+          </p>
+          <h3>Stage 6: A searcher opens the index</h3>
+          <p>
+            On the read side, <code>DirectoryReader.open(directory)</code>
+            reads <code>segments_N</code>, opens a <code>SegmentReader</code>
+            per segment, and freezes that list as a point-in-time snapshot.
+            <code>IndexSearcher</code> (package <code>search</code>) wraps the
+            reader and treats the index as what it really is, a list of
+            independent leaves: every search below is a loop over segments
+            whose per-segment results are merged at the end. With
+            <code>MMapDirectory</code> (the default on 64-bit platforms,
+            package <code>store</code>) all file access is memory-mapped, so a
+            warm index is served almost entirely from the OS page cache.
+          </p>
+          <h3>Stage 7: Query, Weight, Scorer</h3>
+          <p>
+            <code>searcher.search(query, 10)</code> compiles the query in
+            three steps that mirror plan-then-execute in a database. The
+            <code>Query</code> is immutable and reusable. From it the searcher
+            creates a <code>Weight</code>, the per-search compiled form that
+            has seen index-wide statistics (this is where BM25's idf is
+            computed, once). From the weight, one <code>Scorer</code> is
+            created per segment; the scorer is the iterator that actually
+            walks postings and produces scores.
+          </p>
+          <h3>Stage 8: Term dictionary lookup</h3>
+          <p>
+            The scorer's first job is finding the term. The blocktree reader
+            walks a finite state transducer, the <code>.tip</code> index held
+            in memory (built on <code>util.fst</code>), which maps term
+            prefixes to on-disk blocks in <code>.tim</code>. One FST walk plus
+            one block read yields the term's metadata: its document frequency,
+            total occurrences, and file pointers into the postings files. If
+            the term does not exist in this segment, the search of that leaf
+            ends here at almost zero cost.
+          </p>
+          <h3>Stage 9: Postings iteration</h3>
+          <p>
+            The <code>PostingsEnum</code> then iterates the term's documents
+            from <code>.doc</code>: doc ids delta-encoded and bit-packed in
+            blocks of 128, with skip data and per-block score upper bounds
+            (impacts) interleaved. For a single TermQuery this is a straight
+            scan; for conjunctions, the skip data lets one clause leapfrog the
+            other without decoding the blocks in between; and the impacts let
+            top-k search skip whole blocks that provably cannot beat the
+            current worst hit, the block-max WAND family that landed in
+            Lucene 8.
+          </p>
+          <h3>Stage 10: Scoring and top-k collection</h3>
+          <p>
+            For each doc id the postings produce, the BM25
+            <code>SimScorer</code> combines the precomputed idf, the term
+            frequency from the postings, and the document's length norm (one
+            byte per document, read from <code>.nvd</code>) into a score, and
+            a <code>TopScoreDocCollector</code> keeps the ten best in a small
+            priority queue. The collector feeds its worst-score-so-far back to
+            the scorer via <code>setMinCompetitiveScore</code>, which is what
+            arms the block skipping in stage 9. Per-segment top tens are
+            merged, doc ids are rebased from segment-local to global, and the
+            <code>TopDocs</code> you get back is just scored integers; a
+            second, separate trip through <code>StoredFields</code> turns ids
+            into stored documents.
           </p>
 
-          <h2>Postings and codecs: how the index is encoded</h2>
+          <h2>Part V: Internals deep dives</h2>
+          <h3>Deep dive: immutable segments and the index lifecycle</h3>
           <p>
-            Within a segment, the term dictionary is stored as blocks of terms
-            on disk with a compact in-memory index over it, built on Lucene's
-            finite state transducer implementation, so looking up a term costs
-            a small in-memory walk plus one block read, and prefix and range
-            queries fall out naturally from the ordered structure. The
-            postings themselves store document ids delta-encoded and
-            bit-packed in fixed-size blocks with embedded skip data, so a
-            conjunction can leapfrog through two lists without decoding
-            everything in between. Alongside postings, segments carry doc
-            values, a column-oriented store per field that serves sorting,
-            faceting, and aggregations, which is a useful reminder that Lucene
-            has been a hybrid row and column store for a long time.
+            <mark>A segment, once written, is never modified. Updates are a
+            delete plus a reinsert, and a delete does not touch the segment at
+            all; it flips a bit in a per-segment live-docs bitmask that
+            scorers consult at search time.</mark> This one constraint buys
+            the properties that make Lucene pleasant to operate: readers need
+            no locks because nothing they read can change; snapshots are free
+            because a reader just holds a list of segments; commits are cheap
+            because only the tiny manifest is swapped; caches (both Lucene's
+            and the OS page cache) never need invalidation, only eviction.
+          </p>
+          <pre class="flow">segments_5 -&gt; [ seg_0 (500k docs, 3% deleted) ]
+              [ seg_1 (120k docs)             ]
+              [ seg_2 (8k docs)               ]      &lt;- recent flushes
+              [ seg_3 (8k docs)               ]
+
+  merge(seg_2, seg_3, ...) runs in background, writes seg_4,
+  then segments_6 -&gt; [ seg_0, seg_1, seg_4 ] and old files are deleted
+  once no open reader still references them.</pre>
+          <p>
+            The price is merging. Small segments multiply per-query overhead
+            (every segment pays its own term lookup), and deleted documents
+            occupy space and skew statistics until merged away, so
+            <code>TieredMergePolicy</code> continuously folds segments into
+            larger ones on background threads
+            (<code>ConcurrentMergeScheduler</code>), rewriting live documents
+            and dropping dead ones. This is write amplification, exactly as in
+            LSM storage engines, and it is the knob-rich part of the system:
+            merge policy settings trade indexing throughput against search
+            latency against disk churn. Two traps worth correcting explicitly.
+            First, deleting documents does not free space or even reduce hit
+            counts' denominator immediately; <code>maxDoc</code> still counts
+            them and only merges reclaim them. Second, the old advice to
+            "optimize" an index with <code>forceMerge(1)</code> is a trap for
+            actively written indexes: it creates one giant segment that the
+            merge policy then must rewrite wholesale forever after; it is only
+            sensible for indexes that have become read-only.
+          </p>
+          <h3>Deep dive: the codec layer and the postings format</h3>
+          <p>
+            Every on-disk structure in a segment is written and read through
+            the codec API (<code>codecs</code> package): a codec is a
+            versioned bundle of formats, one per structure, and
+            <mark>each segment records which codec wrote it, so one index can
+            contain segments written by different Lucene versions</mark>, with
+            the backward-codecs module keeping old generations readable and
+            merges naturally rewriting them into the current one. Format
+            generations are named for the release that introduced them
+            (<code>Lucene90StoredFieldsFormat</code>,
+            <code>Lucene101PostingsFormat</code>, with newer generations on
+            the main branch), which makes the file extensions in an index
+            directory unusually legible:
+          </p>
+          <table>
+            <thead><tr><th>Files</th><th>What they hold</th></tr></thead>
+            <tbody>
+              <tr><td><code>.tim</code> / <code>.tip</code></td><td>term dictionary blocks / FST index over them</td></tr>
+              <tr><td><code>.doc</code> / <code>.pos</code> / <code>.pay</code></td><td>postings: doc ids and freqs / positions / offsets-payloads</td></tr>
+              <tr><td><code>.fdt</code> / <code>.fdx</code></td><td>stored field data / index into it</td></tr>
+              <tr><td><code>.nvd</code> / <code>.nvm</code></td><td>norms (length factors) data / metadata</td></tr>
+              <tr><td><code>.dvd</code> / <code>.dvm</code></td><td>doc values (columnar per-field storage)</td></tr>
+              <tr><td><code>.fnm</code>, <code>.si</code>, <code>segments_N</code></td><td>field infos, segment metadata, the commit manifest</td></tr>
+              <tr><td><code>.cfs</code> / <code>.cfe</code></td><td>optional compound file wrapping small segments</td></tr>
+            </tbody>
+          </table>
+          <p>
+            Two encodings carry most of the weight. The term dictionary uses a
+            finite state transducer as its index: think of a trie whose shared
+            prefixes and shared suffixes are both collapsed, with outputs
+            (file offsets) distributed along the arcs, giving a memory
+            footprint small enough to hold the index of hundreds of millions
+            of terms in RAM; ordered iteration also falls out, which is what
+            prefix, wildcard, and range queries are built on. The postings use
+            delta encoding plus bit-packing in fixed blocks of 128 doc ids, so
+            a block whose deltas all fit in 5 bits costs 5 bits per document,
+            and skip data plus impacts ride alongside. And beside the inverted
+            structures sit doc values, a column store per field serving
+            sorting, faceting, and aggregations: Lucene has quietly been a
+            hybrid row and column store for over a decade. The misconception
+            to kill here: Lucene is not a B-tree database with a text frontend
+            and it does not "store your documents" in the index structures;
+            stored fields are a separate, unrelated row store, and the
+            inverted index knows only terms and integers.
+          </p>
+          <h3>Deep dive: BM25, worked numerically</h3>
+          <p>
+            Ranking is factored behind the <code>Similarity</code> class
+            (package <code>search.similarities</code>); BM25 has been the
+            default since Lucene 6.0, with defaults <code>k1 = 1.2</code> and
+            <code>b = 0.75</code>. Lucene computes, per matching document:
+          </p>
+          <pre class="flow">score = idf * tf_part
+
+idf     = ln( 1 + (N - df + 0.5) / (df + 0.5) )
+tf_part = freq / ( freq + k1 * (1 - b + b * dl / avgdl) )
+
+N = docs in index   df = docs containing term
+freq = occurrences in this doc   dl = this field's length   avgdl = average length</pre>
+          <p>
+            (Textbook BM25 multiplies by a constant <code>(k1 + 1)</code>;
+            Lucene dropped it in 8.0 because a constant factor cannot change
+            ranking, so Lucene's absolute scores run lower than the textbook's.)
+            Work it on a toy corpus: N = 4 documents, the term appears in
+            df = 2 of them, average body length avgdl = 5. Then
+            idf = ln(1 + 2.5/2.5) = ln 2 ≈ 0.693. Document A has freq = 2 in a
+            4-term body: tf_part = 2 / (2 + 1.2 × (0.25 + 0.75 × 4/5)) =
+            2 / 3.02 ≈ 0.662, score ≈ 0.459. Document B has freq = 1 in a
+            10-term body: tf_part = 1 / (1 + 1.2 × (0.25 + 1.5)) = 1 / 3.1 ≈
+            0.323, score ≈ 0.224. Now watch the two behaviors that make BM25
+            better than raw TF-IDF. Saturation: give document B freq = 5 in
+            the same 10-term body and tf_part = 5 / 7.1 ≈ 0.704; five times
+            the occurrences bought barely double the contribution, and as freq
+            grows the tf_part approaches 1, so <mark>a term can never
+            contribute more than its idf</mark>. Length normalization: A and B
+            both mentioning the term once would not tie; the shorter document
+            wins, because a mention is stronger evidence in four terms than in
+            ten.
           </p>
           <p>
-            All of this lives behind the codec API, which is the part of the
-            design that makes evolution possible. <mark>A codec is a versioned,
-            pluggable specification of every on-disk structure in a segment,
-            and each segment records which codec wrote it</mark>, so a single
-            index can contain segments written by different Lucene versions and
-            the backward-codecs module keeps old ones readable. When the
-            project improves compression or postings layout, it ships a new
-            codec generation and old segments simply get rewritten at merge
-            time. The file extensions you see in an index directory, the terms
-            dictionary and its index, the postings, the doc values, map one to
-            one onto codec formats, which makes the format unusually
-            inspectable for a storage engine.
+            Two implementation details matter in practice. Document length is
+            not stored exactly: it is squeezed into a single byte per document
+            (the norm), so lengths are bucketed and two slightly different
+            lengths can score identically; <code>searcher.explain(query,
+            docId)</code> prints the exact numbers Lucene used, and reading an
+            explain tree is the fastest way to debug a surprising ranking.
+            And the whole thing is pluggable: <code>ClassicSimilarity</code>
+            keeps the old TF-IDF behavior, <code>BooleanSimilarity</code>
+            makes scores degenerate to boosts, and a custom
+            <code>Similarity</code> is the sanctioned way to change ranking
+            without touching the index format, though changing similarity may
+            require reindexing when it changes how norms are encoded.
+          </p>
+          <h3>Deep dive: Lucene under Elasticsearch, OpenSearch, and Solr</h3>
+          <p>
+            The fastest way to demystify the search servers is a dictionary.
+            An Elasticsearch or OpenSearch <em>shard</em> is exactly one
+            Lucene index; a Solr core likewise. <em>Refresh</em> is a
+            near-real-time reader reopen, which is why the default 1-second
+            refresh interval is the staleness bound of search results.
+            <em>Flush</em> in Elasticsearch is a Lucene commit, and because
+            commits are too expensive to do per write, the server layers a
+            translog (write-ahead log) on top so acknowledged writes survive
+            crashes between commits, a structure Lucene itself deliberately
+            does not provide. <em>Force merge</em> is
+            <code>forceMerge</code>, with the same read-only-indices-only
+            caveat. Segment replication (copying immutable segment files to
+            replicas, rather than re-executing writes on each) is only
+            possible because segments never change. The mapping layer,
+            analyzers per field, doc values on by default for keywords and
+            numerics, is configuration compiled down to the Field flags from
+            Stage 1. When an Elasticsearch behavior seems mysterious, the
+            productive question is almost always "what is the Lucene
+            mechanism under this", and my
+            <a href="/software/notes/elasticsearch">Elasticsearch note</a>
+            walks that dictionary in the other direction.
           </p>
 
-          <h2>Scoring: BM25 and the Similarity abstraction</h2>
+          <h2>Part VI: Reading the repository</h2>
           <p>
-            Ranking is factored out behind the Similarity class, and since
-            Lucene 6.0 the default has been BM25, with the old TF-IDF scoring
-            kept available under the name ClassicSimilarity. BM25 keeps the
-            same signals, how often the term occurs, how rare it is across the
-            corpus, how long the field is, but shapes them better: term
-            frequency saturates, so the twentieth occurrence of a word adds
-            almost nothing, and length normalization is relative to the average
-            field length rather than absolute. At execution time a Query is
-            compiled into a Weight and then per-segment Scorers, and modern
-            Lucene stores per-block score upper bounds so that top-k search
-            can skip whole blocks of documents that cannot make the current
-            top ten, the block-max WAND family of optimizations that arrived
-            with Lucene 8. The practical consequence is that fetching the top
-            ten results does not require scoring every matching document.
-          </p>
-
-          <h2>Reading the repository</h2>
-          <p>
-            The repository is a Gradle build with everything under the
-            <code>lucene/</code> directory, one module per artifact:
-            <code>core</code>, <code>analysis</code>, <code>queryparser</code>,
-            <code>codecs</code>, <code>facet</code>, <code>suggest</code>,
-            <code>highlighter</code>, <code>demo</code>, and friends. Almost
-            everything in this walkthrough lives in <code>lucene/core</code>
-            under the <code>org.apache.lucene</code> namespace, and the
-            packages map cleanly onto the concepts: <code>document</code> and
+            The repository is a Gradle build with one module per artifact
+            under <code>lucene/</code>: <code>core</code>,
+            <code>analysis</code>, <code>queryparser</code>,
+            <code>codecs</code>, <code>backward-codecs</code>,
+            <code>facet</code>, <code>suggest</code>,
+            <code>highlighter</code>, <code>luke</code>, <code>demo</code>,
+            and friends. Nearly everything that matters first lives in
+            <code>lucene/core/src/java/org/apache/lucene/</code>, whose
+            packages map cleanly onto this chapter: <code>document</code> and
             <code>analysis</code> for what goes in, <code>index</code> for the
             write side, <code>search</code> for the read side,
-            <code>store</code> for the Directory abstraction over files, and
-            <code>codecs</code> for the formats.
+            <code>store</code> for the Directory abstraction,
+            <code>codecs</code> for formats, <code>util</code> for the data
+            structures. Read it as a syllabus:
           </p>
           <p>
-            Read the demo programs first, then follow an addDocument call into
-            IndexWriter, which is the largest and most instructive class in
-            the project: it owns the in-memory buffering, the flush that
-            creates a segment, the merge policy and scheduler, and the commit
-            protocol. On the read side, start at IndexSearcher and follow one
-            search through Query, Weight, and Scorer down to a postings
-            enumeration over a single segment, noticing that every search is
-            really a loop over independent per-segment searches whose results
-            are merged. The store package rewards a short visit for
-            MMapDirectory, which is why Lucene leans so hard on the page
-            cache, and the util package hides the two famous data structures,
-            the FST behind the term index and the BKD tree behind numeric and
-            geo points. A good first session is to index a few hundred
-            documents with the demo, list the index directory, and match each
-            file extension to the codec format that wrote it; the index stops
-            being a black box the moment the files have names you recognize.
+            <strong>Stage 0, the demo.</strong> Read
+            <code>lucene/demo</code>'s IndexFiles and SearchFiles top to
+            bottom and run them. You should be able to answer: what five
+            objects does every indexing program construct, and what three does
+            every search program construct? Which analyzer is used on each
+            side?
           </p>
+          <p>
+            <strong>Stage 1, what goes in.</strong> Read
+            <code>document/Document.java</code>, <code>Field.java</code>, the
+            field-type presets, then <code>analysis/TokenStream.java</code>
+            and one concrete analyzer. Questions: what three independent
+            decisions does a field type encode? Why are token attributes
+            mutated in place rather than allocated per token?
+          </p>
+          <p>
+            <strong>Stage 2, the write path.</strong> In <code>index/</code>,
+            read <code>IndexWriter.java</code> selectively (it is the largest
+            class in the project; follow only addDocument, flush, and commit),
+            then <code>DocumentsWriter.java</code>,
+            <code>DocumentsWriterPerThread.java</code>,
+            <code>IndexingChain.java</code>, and skim
+            <code>FreqProxTermsWriter.java</code>. Questions: why does
+            per-thread buffering remove contention, and what does it cost in
+            segment count? What exactly makes a commit atomic? What does a
+            delete physically write?
+          </p>
+          <p>
+            <strong>Stage 3, the read path.</strong> In <code>search/</code>,
+            read <code>IndexSearcher.java</code>, then the Query, Weight,
+            Scorer triple for TermQuery, then
+            <code>TopScoreDocCollector.java</code> and
+            <code>similarities/BM25Similarity.java</code>. Questions: which of
+            Query, Weight, Scorer is per-search and which is per-segment, and
+            why must idf be computed at the Weight level? How does the
+            collector's minimum competitive score reach the scorer?
+          </p>
+          <p>
+            <strong>Stage 4, bytes and structures.</strong> Read
+            <code>store/MMapDirectory.java</code> for why Lucene leans on the
+            page cache, then in <code>codecs/</code> the current postings
+            format package and the blocktree reader, then
+            <code>util/fst/</code> at skim depth and
+            <code>util/bkd/</code> if you care about numeric and geo points.
+            Questions: what is stored in <code>.tip</code> versus
+            <code>.tim</code>? Why blocks of 128?
+          </p>
+          <p>
+            <strong>Where not to start:</strong> not
+            <code>IndexWriter.java</code> cold (thousands of lines of
+            concurrency and lifecycle before any insight), not the FST
+            construction code (the hardest code in the repository), and not
+            the facet or join modules, which presume the core model. Start at
+            the demo and let one document pull you inward.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            <strong>Lab 1: name every file in an index.</strong> Index a few
+            hundred files with the demo, then list the directory:
+          </p>
+          <pre><code>java -cp "modules/*" org.apache.lucene.demo.IndexFiles -index ./idx -docs ./some-text-dir
+ls -la ./idx
+# expect: _0.cfs _0.cfe _0.si segments_1 write.lock  (small flushes use compound files)</code></pre>
+          <p>
+            Match each extension to the table in the codec deep dive. If you
+            only see <code>.cfs</code>, you have learned that small segments
+            get wrapped in a compound file to save file handles; index more
+            documents until plain <code>.tim</code>/<code>.doc</code> files
+            appear.
+          </p>
+          <p>
+            <strong>Lab 2: inspect the index with Luke.</strong> From the
+            binary distribution run <code>bin/luke.sh</code>, open
+            <code>./idx</code>, and browse: the term list per field with
+            document frequencies, the postings for one term, the stored
+            fields of one document, and the Search tab's explain output. This
+            makes stages 8 through 10 concrete in ten minutes.
+          </p>
+          <p>
+            <strong>Lab 3: watch segments get born and die.</strong> In a
+            small Java program, set
+            <code>config.setMaxBufferedDocs(100)</code>, index 1,000 tiny
+            documents, and run <code>watch -n 0.5 ls ./idx</code> in another
+            terminal: a new segment appears roughly every hundred documents,
+            then the merge scheduler folds them together and the old files
+            vanish. Finish with <code>writer.forceMerge(1)</code> and watch
+            the directory collapse to one segment. You have now seen the
+            entire lifecycle from the deep dive on disk.
+          </p>
+          <p>
+            <strong>Lab 4: make BM25 move.</strong> Index three documents:
+            "duck", repeated twice in a 4-word body, once in a 10-word body,
+            and five times in a 10-word body. Search for it and print
+            <code>searcher.explain(query, hit.doc)</code> for each hit. Check
+            the printed idf, freq, and norm-derived length against the worked
+            example above; then reindex the freq = 5 body as freq = 50 and
+            confirm the score creeps toward the idf ceiling instead of growing
+            linearly.
+          </p>
+          <p>
+            <strong>Lab 5: deletes are bitmasks.</strong> Index 1,000
+            documents with a <code>StringField("id", ...)</code>, delete half
+            by term, and print <code>reader.numDocs()</code> versus
+            <code>reader.maxDoc()</code> after reopening: 500 versus 1,000,
+            and a <code>.liv</code>-suffixed file appears next to the segment
+            instead of the segment shrinking. Then <code>forceMerge(1)</code>
+            and check both numbers read 500.
+          </p>
+          <p>
+            <strong>Lab 6: the visibility model.</strong> With one writer
+            open, add a document, then open reader A with
+            <code>DirectoryReader.open(writer)</code> (sees it, no commit
+            needed), and reader B with
+            <code>DirectoryReader.open(directory)</code> (does not see it
+            until <code>commit()</code>). Add another document and confirm A
+            still does not see it until
+            <code>openIfChanged</code>. This is Elasticsearch's refresh and
+            flush, reproduced in fifteen lines.
+          </p>
+
+          <h2>Part VIII: Check your understanding</h2>
+          <p><strong>What is Lucene in one sentence, and what is it not?</strong>
+          A Java library that maintains an inverted index as immutable segment
+          files and answers queries with ranked document ids; it is not a
+          server, not a distributed system, and not a document database, which
+          is precisely the surface Elasticsearch, OpenSearch, and Solr sell.</p>
+          <p><strong>Why are segments immutable, really?</strong>
+          Immutability converts the hardest concurrency problem (readers
+          racing writers over shared structures) into a garbage collection
+          problem (when may old files be deleted). Readers get lock-free
+          access and free snapshots, commits reduce to swapping a manifest,
+          and the cost is deferred into background merges, which are
+          schedulable and cancellable in a way that fine-grained locking never
+          is.</p>
+          <p><strong>Walk the write path of one document in five steps.</strong>
+          Document with typed Fields; IndexWriter routes it to a per-thread
+          DocumentsWriterPerThread; the analyzer tokenizes each indexed field;
+          the terms hash accumulates postings in memory byte pools; flush
+          sorts and streams it all through the codec into an immutable
+          segment, made durable by a later commit of segments_N.</p>
+          <p><strong>What happens between typing a term and getting a score?</strong>
+          Per segment: the FST index in memory locates a term block in .tim,
+          which yields postings file pointers; the postings enum walks 128-doc
+          packed blocks from .doc; per doc id, the BM25 SimScorer combines
+          precomputed idf, freq, and the one-byte length norm; a collector
+          heap keeps top-k and feeds its threshold back to enable block
+          skipping.</p>
+          <p><strong>Why does Lucene search each segment separately?</strong>
+          Because segments are independent mini-indexes, per-segment search
+          needs no global structures, parallelizes naturally, lets caches key
+          on immutable segment identity, and makes adding new data as cheap as
+          adding one more leaf to the loop; the only global work is merging k
+          small top-k lists.</p>
+          <p><strong>What is a codec and why does the design pay for one?</strong>
+          A versioned, pluggable specification of every on-disk structure in a
+          segment, recorded per segment. It buys forward evolution: the
+          project can ship better compression or postings layouts as a new
+          generation while backward-codecs keeps old segments readable and
+          merges migrate them incrementally, with no offline index conversion
+          step ever required.</p>
+          <p><strong>Why is the term dictionary index an FST rather than a hash or B-tree?</strong>
+          The FST shares both prefixes and suffixes, so an index over hundreds
+          of millions of terms fits in a few hundred megabytes of RAM or less,
+          and it preserves order, which hash tables do not, so prefix, range,
+          and wildcard iteration come for free; the trade-off is expensive
+          construction, which is fine for write-once segments.</p>
+          <p><strong>How does BM25 differ from raw TF-IDF, in behavior?</strong>
+          Term frequency saturates toward a ceiling (in Lucene's form, the
+          idf itself), so keyword stuffing stops paying quickly, and document
+          length normalizes relative to the corpus average, so short fields
+          are not unfairly dominated by long ones; both are governed by k1 and
+          b rather than hard-coded.</p>
+          <p><strong>Why do hit counts and disk usage not drop after deletes?</strong>
+          A delete only sets a bit in the live-docs mask; the postings, stored
+          fields, and statistics of the deleted document remain physically
+          present and maxDoc still counts it. Space and statistics are
+          reclaimed only when a merge rewrites the segment without its dead
+          documents.</p>
+          <p><strong>When is forceMerge(1) correct, and when is it a trap?</strong>
+          Correct for indexes that will no longer be written, where one
+          segment minimizes per-query overhead forever after. A trap for live
+          indexes, because the resulting max-sized segment must be wholly
+          rewritten to reclaim any future deletes, multiplying merge cost
+          indefinitely.</p>
+          <p><strong>What consistency does a searcher see during heavy indexing?</strong>
+          A perfect point-in-time snapshot: the segment list captured at
+          reader open, plus the deletes visible at that moment, unchanging for
+          the reader's lifetime. Freshness is obtained only by reopening,
+          which is what refresh means in the systems built on Lucene.</p>
+          <p><strong>Why does Elasticsearch need a translog when Lucene already has commits?</strong>
+          Lucene commits are fsync-heavy and too expensive per write, but
+          without them a flushed-but-uncommitted segment does not survive a
+          crash. The translog is a cheap append-only log that makes each write
+          durable immediately, so commits can be batched; on recovery the
+          translog is replayed into Lucene.</p>
+          <p><strong>A query that should match returns nothing. Debugging order?</strong>
+          First check field type: was the field indexed, and as TextField or
+          StringField? Second, analyzer parity: run the query text through the
+          index-time analyzer and compare tokens (Luke does this
+          interactively). Third, reader freshness: was the reader opened
+          before the write, or before a commit it needed? Those three cover
+          nearly all real cases.</p>
+          <p><strong>Why one IndexWriter per index, and how is it enforced?</strong>
+          Concurrent writers would race on segment naming, merges, and the
+          manifest, so the design mandates a single writer (internally
+          multi-threaded) and enforces it with the write.lock file taken at
+          writer construction; a second writer fails with
+          LockObtainFailedException rather than corrupting the index.</p>
+          <p><strong>Where would you change ranking without touching storage?</strong>
+          Implement or configure a Similarity on the IndexSearcher (and
+          IndexWriterConfig if norm encoding changes); Query boosts and query
+          rewriting sit above it, and the postings format below it never needs
+          to know.</p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Immutability converts locking problems into lifecycle
+            problems.</strong> Lucene's entire concurrency story is "never
+            mutate what a reader can see," and the residue is reference
+            counting and file deletion policy. The same move powers RocksDB's
+            SSTables, Kafka's log segments, and copy-on-write filesystems: if
+            coordination is hard, stop sharing mutable state and pay with
+            background compaction.
+          </p>
+          <p>
+            <strong>Amortize expensive maintenance in the background.</strong>
+            Merges do the deferred work (sorting, compressing, dropping
+            deletes) off the write path at a controllable pace. This is the
+            LSM bargain everywhere: fast ingest bought with background
+            rewriting, tuned by policy objects that are pluggable precisely
+            because the right trade differs per workload.
+          </p>
+          <p>
+            <strong>Version the format, not the API.</strong> The codec layer
+            lets a 25-year-old project rewrite its storage encoding
+            repeatedly, because each segment self-describes its format and
+            migration piggybacks on merges. Protocol buffers' field
+            numbering, database page format versions, and Kafka's message
+            format versions are the same discipline: durability outlives any
+            single encoding, so name your encodings.
+          </p>
+          <p>
+            <strong>Compile queries in stages scoped to their statistics.</strong>
+            Query (immutable, reusable) to Weight (per-search, sees global
+            stats) to Scorer (per-segment, does the iteration) is a clean
+            separation of when information becomes available. It is the same
+            shape as SQL's plan-then-execute split and as JIT tiering: bind
+            each decision at the latest point it is still cheap and the
+            earliest point it is informed.
+          </p>
+          <p>
+            <strong>Push thresholds down to the iterators.</strong>
+            Top-k collection feeding its minimum competitive score down into
+            block-skipping postings is predicate pushdown by another name, the
+            same idea as LIMIT pushdown in databases and early termination in
+            vector search. Senior systems move the stopping condition as close
+            to the data as it can go.
+          </p>
+
+          <h2>Part X: The memorization framework</h2>
+          <p>
+            One sentence: Lucene analyzes documents into terms, buffers
+            postings per thread, freezes them into immutable segments that
+            background merges consolidate, and serves queries by walking an
+            FST to postings to BM25 scores per segment, collecting top-k.
+          </p>
+          <pre class="flow">WRITE: Doc -&gt; Analyzer -&gt; DWPT buffers -&gt; flush -&gt; Segment -&gt; merge -&gt; commit(segments_N)
+READ:  Query -&gt; Weight -&gt; per-segment Scorer -&gt; FST(.tip) -&gt; .tim -&gt; .doc blocks -&gt; BM25 -&gt; top-k</pre>
+          <pre class="flow">Doc/Analyzer     org.apache.lucene.document, analysis
+DWPT/flush       index/DocumentsWriterPerThread.java, IndexingChain.java
+Segment files    codecs/* (current generation), store/MMapDirectory.java
+Merge/commit     index/IndexWriter.java, SegmentInfos (segments_N)
+Search           search/IndexSearcher.java, TermQuery -&gt; Weight -&gt; Scorer
+Ranking          search/similarities/BM25Similarity.java
+Structures       util/fst, util/bkd</pre>
+          <p>Memorize these blocks:</p>
+          <ul>
+            <li><strong>Defaults:</strong> 16 MB RAM buffer per writer before flush; postings packed in blocks of 128 doc ids; BM25 with k1 = 1.2, b = 0.75, default since 6.0; norms are one byte per document.</li>
+            <li><strong>Files:</strong> .tim/.tip terms, .doc/.pos postings, .fdt/.fdx stored, .nvd norms, .dvd doc values, .si + segments_N metadata, .cfs compound.</li>
+            <li><strong>Invariants:</strong> segments are immutable; one writer per index (write.lock); deletes are live-doc bits until merge; readers are point-in-time snapshots; flush makes searchable, commit makes durable.</li>
+            <li><strong>Ranking ceiling:</strong> in Lucene's BM25 the tf part is bounded by 1, so one term's contribution can never exceed its idf.</li>
+          </ul>
+
           <div class="takeaway">
             <strong>Key takeaway:</strong> Lucene is the inverted index plus
             one ruthless constraint, that segments are immutable, and from
@@ -213,7 +880,8 @@ for (int i = 0; i &lt; hits.length; i++) {
             consistency, its merge-based lifecycle, and the refresh and shard
             semantics of every system built on top of it; the codec layer and
             the Similarity abstraction are what have let a library from 1999
-            keep swapping its encoding and its ranking without breaking anyone.
+            keep swapping its encoding and its ranking without breaking
+            anyone.
           </div>
         </article>
       </div>

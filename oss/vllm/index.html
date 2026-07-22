@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>vLLM walkthrough · Stanley Jacob</title>
-    <meta name="description" content="A walkthrough of the vLLM repository: how to use it in five minutes, how PagedAttention and continuous batching work, and a guided reading path from the entry points to the scheduler and kernels." />
+    <meta name="description" content="A full chapter on vLLM: a practical tutorial, the complete life of one chat completion from HTTP to CUDA kernel and back, deep dives into PagedAttention, the KV block manager, and the continuous-batching scheduler, plus a staged plan for reading the repository." />
     <link rel="stylesheet" href="/style.css" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
   </head>
@@ -34,11 +34,13 @@
           is the reference open source engine for serving large language models,
           born from the PagedAttention paper at UC Berkeley (Kwon et al., SOSP
           2023) and now the default answer to "how do I serve this checkpoint
-          fast." This walkthrough covers how to use it in five minutes, the two
-          ideas that make it fast, and a guided path for reading the repository.
-          It pairs with my <a href="/systems/llm-inference">LLM serving platform
-          design write-up</a>, which derives the same ideas from requirements
-          instead of from code.
+          fast." This is a full chapter, not a tour: a practical tutorial, the
+          complete life of one chat completion from HTTP arrival to CUDA kernel
+          and back, deep dives into the paged KV cache and the scheduler, and a
+          staged plan for reading the repository. It pairs with my
+          <a href="/systems/llm-inference">LLM serving platform design
+          write-up</a>, which derives the same ideas from requirements instead
+          of from code. File paths were checked against release v0.25.1.
         </p>
       </div>
     </header>
@@ -46,125 +48,801 @@
     <section class="soft">
       <div class="wrap">
         <article class="prose article">
-          <h2>Using it in five minutes</h2>
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">HTTP request (OpenAI JSON)
+      │
+      ▼
+API server ──► chat template ──► token IDs        vllm/entrypoints/openai/
+      │
+      ▼
+AsyncLLM ──► Processor (validate, tokenize)       vllm/v1/engine/
+      │            (IPC to a separate process)
+      ▼
+EngineCore busy loop                              vllm/v1/engine/core.py
+      │
+      ├─► Scheduler: who runs this step?          vllm/v1/core/sched/
+      ├─► KVCacheManager: which blocks?           vllm/v1/core/
+      ▼
+GPU model runner ──► attention backend kernel     vllm/v1/worker/, vllm/v1/attention/
+      │
+      ▼
+Sampler: logits ──► one token per sequence        vllm/v1/sample/
+      │
+      ▼
+OutputProcessor ──► incremental detokenize        vllm/v1/engine/
+      │
+      ▼
+SSE chunk back to the client</pre>
           <p>
-            vLLM has two front doors. The offline one is a Python class, good
-            for batch jobs and evaluation sweeps:
+            The one-sentence identity: <mark>vLLM is a small operating system
+            for the KV cache, wrapped in an iteration-level scheduler, wrapped
+            in an OpenAI-compatible server</mark>. Everything in the diagram
+            above exists to keep one resource, GPU memory holding attention
+            keys and values, as full of useful work as possible.
           </p>
-          <pre><code>pip install vllm</code></pre>
+          <p>
+            Two ideas carry the design. The first, PagedAttention, is about
+            space: instead of allocating each request's KV cache as one
+            contiguous region sized for the worst case, the cache is carved
+            into fixed-size blocks and a per-request block table maps logical
+            token positions to physical blocks, exactly like virtual memory.
+            Fragmentation collapses to a fraction of one block per request, and
+            sharing cached prefixes between requests becomes a pointer
+            operation instead of a copy. The second idea, continuous batching,
+            is about time: the batch is rebuilt on <mark>every single forward
+            pass</mark>, so finished sequences leave immediately and waiting
+            requests join immediately, rather than the batch draining to the
+            slowest member. Paging is what makes that constant churn cheap.
+          </p>
+          <p>
+            One honest historical note before reading any code. vLLM shipped a
+            ground-up engine rewrite, called V1, which became the default
+            during 2025; the old V0 engine has since been removed. V1 moved the
+            core loop into its own process, merged prefill and decode into a
+            single token-budget scheduler (so chunked prefill is not a feature
+            but the only mode), made prefix caching on by default, and dropped
+            some V0 mechanisms, notably swap-based preemption and
+            copy-on-write forking, in favor of simpler recompute plus prefix
+            reuse. A great deal of writing about vLLM on the internet describes
+            V0. This chapter describes V1, and flags the places where the
+            famous explanation is the old one.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <h3>Installing</h3>
+          <p>
+            On Linux with an NVIDIA GPU, which is the first-class platform,
+            installation is one command into a Python 3.10+ environment (the
+            wheels bundle CUDA-enabled PyTorch, so a matching driver is the
+            only system requirement):
+          </p>
+          <pre><code>pip install vllm
+# or, faster and what the docs now recommend:
+uv pip install vllm</code></pre>
+          <p>
+            AMD ROCm and CPU targets are supported through separate build
+            paths described in the install docs. On macOS there is no GPU
+            path; Apple silicon runs only the CPU backend, built from source
+            (<code>pip install -e .</code> inside a clone selects the CPU
+            device automatically on a Mac). That build is useful for poking at
+            the API and the code under a debugger, not for real serving, and
+            for the labs below you want a Linux GPU box.
+          </p>
+          <h3>First real session</h3>
+          <p>
+            vLLM has two front doors. The online one is an OpenAI-compatible
+            server. Start it with a small model so the first run is quick:
+          </p>
+          <pre><code>vllm serve Qwen/Qwen2.5-0.5B-Instruct --max-model-len 4096</code></pre>
+          <p>
+            The startup logs walk through the whole boot sequence: config
+            resolution, weight loading, a profiling pass that measures free
+            VRAM, KV cache sizing ("GPU KV cache size: N tokens"), and CUDA
+            graph capture. When you see the Uvicorn line reporting
+            <code>http://0.0.0.0:8000</code>, the server is up. Talk to it
+            with curl:
+          </p>
+          <pre><code>curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen2.5-0.5B-Instruct",
+    "messages": [{"role": "user", "content": "Say hello in five words."}]
+  }'</code></pre>
+          <p>
+            You get back a standard chat completion object with
+            <code>choices[0].message.content</code> and a <code>usage</code>
+            block, which is why swapping a proprietary API for a self-hosted
+            model is usually a one-line base URL change in the client. The
+            offline front door is a Python class, good for batch jobs and
+            evaluation sweeps:
+          </p>
           <pre><code>from vllm import LLM, SamplingParams
 
-llm = LLM(model="Qwen/Qwen2.5-7B-Instruct")
+llm = LLM(model="Qwen/Qwen2.5-0.5B-Instruct", max_model_len=4096)
 params = SamplingParams(temperature=0.7, max_tokens=256)
 outputs = llm.generate(["Explain KV caching in one paragraph."], params)
 print(outputs[0].outputs[0].text)</code></pre>
+          <h3>Going deeper: streaming, sampling, structure</h3>
           <p>
-            The online one is an OpenAI-compatible server, which is why swapping
-            a proprietary API for a self-hosted model is usually a one-line base
-            URL change in the client:
+            Streaming is the OpenAI client's normal streaming, token deltas
+            over server-sent events:
           </p>
-          <pre><code>vllm serve Qwen/Qwen2.5-7B-Instruct</code></pre>
           <pre><code>from openai import OpenAI
 
 client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
-resp = client.chat.completions.create(
-    model="Qwen/Qwen2.5-7B-Instruct",
-    messages=[{"role": "user", "content": "Hello"}],
+stream = client.chat.completions.create(
+    model="Qwen/Qwen2.5-0.5B-Instruct",
+    messages=[{"role": "user", "content": "Count to ten slowly."}],
+    stream=True,
+)
+for chunk in stream:
+    print(chunk.choices[0].delta.content or "", end="", flush=True)</code></pre>
+          <p>
+            Sampling controls travel in the request: <code>temperature</code>,
+            <code>top_p</code>, <code>max_tokens</code>, <code>logprobs</code>,
+            <code>seed</code>, plus vLLM extensions via
+            <code>extra_body</code> such as <code>top_k</code>. Structured
+            output is exposed through the OpenAI structured-outputs surface,
+            and vLLM enforces it server-side with a grammar backend
+            (<code>vllm/v1/structured_output/</code> holds the XGrammar,
+            llguidance, and outlines integrations):
+          </p>
+          <pre><code>resp = client.chat.completions.create(
+    model="Qwen/Qwen2.5-0.5B-Instruct",
+    messages=[{"role": "user", "content": "Give me a user named Ada, age 36."}],
+    response_format={
+        "type": "json_schema",
+        "json_schema": {
+            "name": "user",
+            "schema": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
+                "required": ["name", "age"],
+            },
+        },
+    },
 )</code></pre>
+          <h3>The mistakes beginners make</h3>
           <p>
-            The flags that matter most in practice: <code>--tensor-parallel-size</code>
-            to split a model across GPUs, <code>--gpu-memory-utilization</code>
-            to set how much VRAM the KV cache may claim,
-            <code>--max-model-len</code> to cap context length, and
-            <code>--enable-prefix-caching</code> to reuse computation across
-            requests that share a prompt prefix (on by default in recent
-            versions).
+            The most common one is benchmarking the engine with a sequential
+            loop, which measures single-stream latency and concludes vLLM is
+            slow. Continuous batching only pays off under concurrency:
+          </p>
+          <pre><code># Wrong: this can never exercise batching.
+for prompt in prompts:
+    client.chat.completions.create(model=M, messages=msg(prompt))
+
+# Right: give the scheduler something to schedule.
+import asyncio
+from openai import AsyncOpenAI
+aclient = AsyncOpenAI(base_url="http://localhost:8000/v1", api_key="unused")
+
+async def main():
+    await asyncio.gather(*[
+        aclient.chat.completions.create(model=M, messages=msg(p))
+        for p in prompts
+    ])
+asyncio.run(main())</code></pre>
+          <p>
+            The second is sending raw text for an instruct model through
+            <code>/v1/completions</code> and getting rambling output: the chat
+            template never got applied, so the model saw no turn structure.
+            Use <code>/v1/chat/completions</code> with messages unless you
+            genuinely want raw continuation. The third is out-of-memory at
+            startup on a model that "should fit": by default vLLM claims 92%
+            of VRAM (<code>--gpu-memory-utilization</code>, default 0.92 as of
+            v0.25.1) and then reserves KV cache for
+            <code>--max-model-len</code> worth of context taken from the model
+            config, which for modern 128k-context checkpoints is enormous.
+            Capping <code>--max-model-len</code> to what your workload
+            actually uses is the fix, and it is the single most useful flag to
+            know. The fourth is treating <code>--tensor-parallel-size</code>
+            as a speed knob: it exists to fit models that do not fit on one
+            GPU, and for a model that already fits, running independent
+            replicas usually beats splitting it.
           </p>
 
-          <h2>Idea one: PagedAttention</h2>
+          <h2>Part III: When it is the right tool</h2>
           <p>
-            Decoding is dominated by the KV cache, the stored keys and values of
-            every token seen so far. Before vLLM, engines allocated each
-            request's cache as one contiguous region sized for the maximum
-            possible length, and the PagedAttention paper measured the
-            consequence: most of that memory was wasted, through internal
-            fragmentation (reserved but never reached) and external
-            fragmentation (free but not contiguous). Since batch size is limited
-            by KV memory, wasted cache is wasted throughput.
+            vLLM is the right default when you are serving an open-weights
+            transformer on server-class GPUs and you care about throughput
+            under concurrent traffic: product APIs, internal model gateways,
+            batch synthetic-data generation, evaluation sweeps, RLHF rollout
+            workers. Its ecosystem breadth is a real feature: day-one support
+            for most new open models, quantization formats, LoRA serving, and
+            an API surface the whole tooling world already speaks.
           </p>
           <p>
-            vLLM's answer is the operating-systems move: <mark>treat the KV
-            cache like virtual memory and page it</mark>. The cache is carved
-            into fixed-size blocks, 16 tokens by default, a sequence's blocks
-            need not be contiguous, and a per-sequence block table maps logical
-            positions to physical blocks, so waste collapses to a fraction of
-            the final block. Paging also makes sharing natural: parallel samples
-            from one prompt share prefix blocks copy-on-write, and prefix
-            caching is just looking up blocks by content hash before computing
-            them. The attention kernel pays a small indirection cost to gather
-            from the block table, which is the trade the whole design happily
-            accepts.
+            The honest alternatives: <a href="/oss/sglang">SGLang</a> overlaps
+            almost completely and tends to shine on prefix-heavy and
+            structured-output-heavy workloads, where its radix-tree cache and
+            grammar fast path are the organizing principles rather than
+            features; TensorRT-LLM trades flexibility for peak performance on
+            NVIDIA hardware with ahead-of-time engine builds; llama.cpp and
+            Ollama own the CPU, laptop, and single-user niche, where a big
+            batch scheduler is pure overhead. If your traffic is one user on a
+            MacBook, vLLM is the wrong shape.
+          </p>
+          <p>
+            The architecture-shaped warning: <mark>vLLM assumes it owns the
+            GPU</mark>. It profiles free VRAM at startup and claims a fixed
+            fraction of the whole device for weights plus KV cache. Co-locating
+            two engines, or an engine plus a training job, on one GPU with
+            default settings is the "writable SQLite file on NFS" of this
+            system: it may boot, and then one process OOMs the other at peak
+            load, or the KV caches get sized so small that both engines thrash
+            through preemption.
+          </p>
+          <pre class="flow">Safe:                          Dangerous:
+GPU 0 ── vllm A (0.92)         GPU 0 ── vllm A (0.92)
+GPU 1 ── vllm B (0.92)                └─ vllm B (0.92)  ← both profiled
+                                          the same free memory at boot;
+                                          OOM or preemption thrash later</pre>
+          <p>
+            If you must share a device, lower
+            <code>--gpu-memory-utilization</code> on both sides so the claims
+            sum below 1.0, and accept that both engines will preempt more. The
+            multi-replica version of the same warning appears in the SGLang
+            chapter: a cache-blind load balancer in front of replicas quietly
+            destroys prefix-cache hit rates.
           </p>
 
-          <h2>Idea two: continuous batching</h2>
+          <h2>Part IV: The full life of one request</h2>
           <p>
-            The second idea governs time rather than memory. Static batching
-            runs a batch until every sequence finishes, so one long generation
-            holds hostages. Continuous batching, which vLLM inherits from the
-            Orca paper, reschedules <mark>every iteration</mark>: after each
-            model step, finished sequences leave, waiting requests join, and the
-            batch is rebuilt. Together with paging this is why vLLM sustains
-            high GPU utilization under ragged real-world traffic, and the
-            combination is worth internalizing: iteration-level scheduling
-            creates constant churn in batch membership, and paged memory is what
-            makes that churn cheap. When memory does run out, the scheduler
-            preempts a sequence and either recomputes its cache later or swaps
-            it out, a policy you can read directly in the scheduler code.
+            The canonical operation is one streaming chat completion. Follow
+            it end to end and you touch every load-bearing module in the
+            repository. Paths below are the V1 engine tree as of v0.25.1.
+          </p>
+          <h3>Stage 1: HTTP arrival and the chat template</h3>
+          <p>
+            <code>vllm serve</code> boots a FastAPI app defined in
+            <code>vllm/entrypoints/openai/api_server.py</code>; the chat route
+            and its request/response models live in
+            <code>vllm/entrypoints/openai/chat_completion/</code> (older
+            releases called this file <code>serving_chat.py</code>). The
+            serving layer validates the JSON against the OpenAI protocol
+            models, then renders the <code>messages</code> array through the
+            model's chat template (a Jinja template shipped in the tokenizer
+            config) into one flat prompt string with the model's role markers.
+            This stage is deliberately thin: no scheduling decisions, no GPU
+            state, just protocol translation.
+          </p>
+          <h3>Stage 2: AsyncLLM and the Processor</h3>
+          <p>
+            The serving layer hands the prompt to <code>AsyncLLM</code>
+            (<code>vllm/v1/engine/async_llm.py</code>), the asyncio-friendly
+            engine facade that both the server and the offline
+            <code>LLM</code> class (<code>vllm/entrypoints/llm.py</code>) sit
+            on. Its input processor
+            (<code>vllm/v1/engine/input_processor.py</code>) tokenizes the
+            prompt with the Hugging Face tokenizer, validates lengths against
+            <code>max_model_len</code>, resolves sampling parameters into an
+            engine request, and registers the request so output can be routed
+            back to the right coroutine later.
+          </p>
+          <h3>Stage 3: Crossing into EngineCore</h3>
+          <p>
+            Here V1 differs visibly from V0: the core engine runs in its own
+            process. <code>vllm/v1/engine/core_client.py</code> serializes the
+            new request over a message-queue IPC channel to
+            <code>EngineCore</code> (<code>vllm/v1/engine/core.py</code>),
+            which runs a tight busy loop: pull inputs, call
+            <code>step()</code>, push outputs. The separation keeps Python
+            HTTP handling, tokenization, and detokenization off the process
+            that must launch GPU work every few milliseconds, so an expensive
+            JSON parse in the API layer cannot stall a decode step.
+          </p>
+          <h3>Stage 4: The scheduler decides the step</h3>
+          <p>
+            Each iteration, <code>EngineCore</code> asks the scheduler
+            (<code>vllm/v1/core/sched/scheduler.py</code>) what to run. The V1
+            scheduler has no prefill/decode dichotomy: every request simply
+            has <code>num_computed_tokens</code> and a total it needs, and the
+            scheduler hands out tokens from a per-step budget
+            (<code>max_num_batched_tokens</code>) across running requests
+            first, then admits waiting ones. Our new request gets admitted;
+            if its prompt is long, it receives only a chunk of the budget this
+            step and continues next step, which is chunked prefill happening
+            not as a feature but as the natural consequence of the design.
+            Decoding requests in the same step each get one token of budget,
+            so prefill and decode mix freely in a single batch.
+          </p>
+          <h3>Stage 5: Paging the KV cache</h3>
+          <p>
+            Before scheduling tokens, the scheduler asks the
+            <code>KVCacheManager</code>
+            (<code>vllm/v1/core/kv_cache_manager.py</code>) for memory. The
+            manager first checks the prefix cache: prompt blocks are hashed by
+            content, and any full block whose hash chain matches an already
+            cached block is reused rather than recomputed, which is why a
+            shared system prompt costs its prefill once per server, not once
+            per request. Fresh blocks come from the <code>BlockPool</code>
+            (<code>vllm/v1/core/block_pool.py</code>), and the request's block
+            table, the logical-to-physical map, grows accordingly. If the pool
+            is empty, this is where preemption happens (Part V).
+          </p>
+          <h3>Stage 6: The forward pass</h3>
+          <p>
+            The scheduler's output goes to the model executor and lands in the
+            GPU worker (<code>vllm/v1/worker/gpu_worker.py</code>) and model
+            runner (<code>vllm/v1/worker/gpu_model_runner.py</code>). The
+            runner maintains persistent GPU-side input buffers and block
+            tables (<code>vllm/v1/worker/block_table.py</code>) and applies
+            the scheduler's diff to them, rather than rebuilding tensors from
+            scratch each step; decode steps replay pre-captured CUDA graphs to
+            erase Python launch overhead. The model itself, in
+            <code>vllm/model_executor/models/</code>, is deliberately plain
+            PyTorch; all the cleverness is injected at the attention layer,
+            which dispatches to a backend (<code>vllm/v1/attention/backends/</code>)
+            that reads and writes the paged KV cache via the block table. For
+            why that kernel can stream through a sequence it never holds in
+            one piece, see the online-softmax derivation on the
+            <a href="/ml/softmax">softmax page</a> and the
+            <a href="/oss/flash-attention">FlashAttention chapter</a>.
+          </p>
+          <h3>Stage 7: Sampling</h3>
+          <p>
+            The forward pass produces one logits row per scheduled sequence.
+            The sampler (<code>vllm/v1/sample/sampler.py</code>) applies
+            penalties, temperature, top-k/top-p, and any structured-output
+            bitmask, then samples one token ID per sequence on the GPU;
+            speculative decoding routes through the rejection sampler
+            (<code>vllm/v1/sample/rejection_sampler.py</code>) instead. The
+            chosen token is appended to the request's state, and its KV entry
+            was already written into the request's current block during the
+            forward pass.
+          </p>
+          <h3>Stage 8: Detokenization and the stream back</h3>
+          <p>
+            Token IDs return over IPC to the API process, where the
+            <code>OutputProcessor</code>
+            (<code>vllm/v1/engine/output_processor.py</code>) and the
+            incremental detokenizer (<code>vllm/v1/engine/detokenizer.py</code>)
+            turn them into text. Detokenization is stateful on purpose: BPE
+            pieces do not map one-to-one to characters, so the detokenizer
+            buffers until it can emit clean UTF-8, checks stop strings, and
+            yields a delta. <code>AsyncLLM</code> routes the delta to the
+            waiting coroutine, and the serving layer wraps it in an SSE
+            <code>chat.completion.chunk</code>. This loop, stages 4 through 8,
+            repeats every iteration until EOS, a stop string, or
+            <code>max_tokens</code>.
+          </p>
+          <h3>Stage 9: Finish and free</h3>
+          <p>
+            On completion the scheduler frees the request's blocks back to the
+            pool. Freed does not mean erased: blocks keep their content hashes
+            and sit in the free list still indexed by the prefix cache, so a
+            follow-up turn of the same conversation can reclaim them. They are
+            only actually recycled when allocation pressure evicts them, LRU
+            from the free queue.
           </p>
 
-          <h2>Reading the repository</h2>
+          <h2>Part V: Internals deep dives</h2>
+          <h3>PagedAttention and the KV block manager</h3>
           <p>
-            The repo is large, but one request's life touches everything worth
-            reading, so follow a single generate call. Note that vLLM went
-            through a V1 engine rewrite (the <code>vllm/v1/</code> tree), which
-            is the default in current releases; the module names below are
-            stable concepts even where exact paths have moved between versions.
+            The memory problem it solves is worth restating with the paper's
+            numbers: pre-vLLM engines allocated each request's KV cache
+            contiguously at maximum length, and the SOSP paper measured that
+            existing systems wasted most of their KV memory to fragmentation
+            and over-reservation, directly capping batch size and therefore
+            throughput. The fix is virtual memory: fixed-size blocks (16
+            tokens is the classic CUDA default; the exact value is resolved
+            per platform and attention backend in current releases), a block
+            table per request, and an attention kernel that follows the table.
+          </p>
+          <pre class="flow">Request A: "The cat sat on the mat and then ..."
+logical blocks:   [0] [1] [2]
+block table A:    0→7  1→2  2→9
+
+Request B: same system prompt, different question
+block table B:    0→7  1→2  2→4     ← blocks 7,2 shared, ref_cnt=2
+
+Physical pool:  blk2 blk4 blk7 blk9 ...   free queue: 5,8,1,...</pre>
+          <p>
+            Sharing is reference counting. In the original paper and the V0
+            engine, parallel sampling and beam search forked sequences that
+            shared blocks copy-on-write: a shared block was duplicated only
+            when one branch tried to append into it. <mark>The V1 engine
+            dropped explicit fork/copy-on-write; parallel sampling
+            (<code>n&gt;1</code>) is handled as sibling requests
+            (<code>vllm/v1/engine/parallel_sampling.py</code>) whose common
+            prompt is shared through the prefix cache instead</mark>, which is
+            the same memory win with far simpler bookkeeping. If you read the
+            paper's copy-on-write section and then look for it in V1, this is
+            why you cannot find it.
           </p>
           <p>
-            Start at the entry points in <code>vllm/entrypoints/</code>: the
-            <code>LLM</code> class and the OpenAI server both funnel into the
-            engine, so the API layer is thin and readable. The engine loop is
-            the heartbeat: each step asks the scheduler what to run, executes
-            one forward pass, samples, and streams results back. From there read
-            the scheduler, which owns admission, preemption, and chunked
-            prefill (splitting long prompt processing across steps so decode
-            latency stays flat), and the KV cache manager beside it, which is
-            PagedAttention's bookkeeping half: block allocation, reference
-            counts, copy-on-write, and the prefix-cache hash table. The
-            compute half lives in the model runner and the attention backends,
-            where vLLM dispatches to FlashAttention, FlashInfer, or its own
-            kernels, and the custom CUDA lives under <code>csrc/</code>, paged
-            attention and the fused ops. Model definitions in
-            <code>vllm/model_executor/models/</code> are surprisingly plain
-            PyTorch, which is the point: architecture code stays legible because
-            the cleverness is concentrated in memory and scheduling.
+            Prefix caching is the block manager's second job. Every full block
+            gets a hash of its tokens chained with its prefix's hash, stored
+            in a map from hash to physical block. Because the hash covers the
+            entire prefix, a hit at block <em>k</em> guarantees the whole
+            prefix matches, and lookup is per-block, so a 10,000-token shared
+            prefix is recovered in a few hundred hash probes. It is on by
+            default (<code>enable_prefix_caching</code> defaults to true in
+            V1) precisely because it is nearly free: cached blocks live in the
+            free list, so an idle cache costs no capacity. The famous
+            misconception to correct: <mark>prefix caching does not "use
+            extra memory"; it indexes memory that would otherwise sit free,
+            and eviction reclaims it the moment allocation needs it</mark>.
+            The real trade-offs are the hashing overhead on very
+            low-reuse workloads, and block granularity: only whole matched
+            blocks are reused, so a shared prefix's tail partial block is
+            recomputed.
+          </p>
+          <h3>Continuous batching and the scheduler</h3>
+          <p>
+            Static batching runs a batch until every member finishes, so one
+            long generation holds hostages. Continuous batching, inherited
+            from the Orca paper, reschedules every iteration. The V1 scheduler
+            implements it with one mechanism, the token budget:
+          </p>
+          <pre class="flow">step N   budget = 8192 tokens
+  running decodes: 300 reqs × 1 token          =  300
+  running chunked prefill: 1 req               = 4096 (its next chunk)
+  admit from waiting: new req, 3796-token chunk = 3796
+  ──────────────────────────────────────────────  8192  → launch one batch</pre>
+          <p>
+            The knobs are exactly the quantities in the diagram:
+            <code>--max-num-batched-tokens</code> is the budget,
+            <code>--max-num-seqs</code> caps concurrent requests, and
+            <code>--long-prefill-token-threshold</code> tunes how aggressively
+            long prompts are chunked. Chunked prefill exists because a
+            monolithic 100k-token prefill would occupy the GPU for whole
+            seconds, stalling every decoding request's next token; slicing it
+            keeps inter-token latency flat for everyone else at a small cost
+            in prefill completion time. In V1 this is always on, one
+            scheduling path for everything.
           </p>
           <p>
-            A good first session is ninety minutes: run the offline example
-            under a debugger, break inside the engine step, and watch one
-            iteration of schedule, forward, sample. The block table indirection
-            and the batch churn stop being abstract the first time you inspect
-            them live. If you want the kernel-level view of why attention can
-            stream through memory it never holds at once, the
-            <a href="/ml/softmax">softmax page</a> derives the online-softmax
-            trick that paged and flash attention kernels are built on.
+            Preemption is the pressure valve. When the block pool cannot
+            supply a running request's next block, the scheduler preempts the
+            lowest-priority (in FCFS, the most recently arrived) running
+            request: <code>_preempt_request</code> in
+            <code>vllm/v1/core/sched/scheduler.py</code> frees its blocks,
+            resets <code>num_computed_tokens</code> to zero, and requeues it.
+            <mark>V1 preemption is recompute-only; the V0 option of swapping
+            KV blocks to CPU RAM is gone from the scheduler</mark>, on the
+            argument that recompute is simpler, prefix caching often recovers
+            much of the work anyway, and KV offload to other tiers is better
+            handled by the separate connector/offload machinery
+            (<code>vllm/v1/kv_offload/</code>). Preemption shows up in logs
+            and in the <code>vllm:num_preemptions</code> counter; if you see
+            it steadily under normal load, your KV cache is undersized:
+            lower <code>--max-model-len</code>, raise
+            <code>--gpu-memory-utilization</code>, or shrink
+            <code>--max-num-seqs</code>.
+          </p>
+          <p>
+            The misconception to correct here: continuous batching does not
+            mean your request shares a batch with others "at the same
+            position". Sequences in one forward pass are at wildly different
+            lengths and phases, which is precisely why attention must be
+            computed per-sequence against per-sequence block tables, and why
+            the naive picture of a rectangular batch tensor stops applying
+            the moment you understand this engine.
+          </p>
+          <h3>The attention backend dispatch layer</h3>
+          <p>
+            vLLM does not have one attention kernel; it has a dispatch layer.
+            <code>vllm/v1/attention/backends/</code> contains, among others,
+            <code>flash_attn.py</code> (FlashAttention with paged KV, the
+            default on modern NVIDIA GPUs), <code>flashinfer.py</code>,
+            <code>triton_attn.py</code> (the portable Triton fallback), ROCm
+            backends, and an <code>mla/</code> family for DeepSeek-style
+            multi-head latent attention; <code>registry.py</code> maps names
+            to implementations and selection weighs platform, model
+            architecture, head size, and dtype, with the
+            <code>VLLM_ATTENTION_BACKEND</code> environment variable as the
+            manual override. The interface each backend implements is narrow:
+            build per-step metadata from the scheduler's output, then run
+            attention given query tensors, the paged KV pool, and block
+            tables. That narrowness is what let the project ride kernel
+            progress for three years without touching the scheduler.
+          </p>
+          <p>
+            A historical note that trips up repo readers: the original
+            hand-written <code>paged_attention_v1/v2</code> CUDA kernels from
+            the paper era no longer dominate; in the current tree
+            <code>csrc/</code> is mostly cache ops, quantization, MoE, and
+            fused kernels, while paged attention itself typically executes
+            inside FlashAttention or FlashInfer, both of which grew native
+            paged-KV support. The idea outlived its original kernel, which is
+            the healthiest possible outcome. The kernel math these backends
+            share, tiling plus online softmax, is derived on the
+            <a href="/oss/flash-attention">FlashAttention page</a>.
+          </p>
+
+          <h2>Part VI: Reading the repository</h2>
+          <p>
+            The repo is big (thousands of files), but one request's life
+            touches everything worth reading first. A staged plan, verified
+            against v0.25.1:
+          </p>
+          <p>
+            <strong>Stage 0, orientation (one evening).</strong> Read the
+            PagedAttention paper (Kwon et al., SOSP 2023) and skim the V1
+            blog post in the project docs. Questions you should be able to
+            answer: why does KV memory cap batch size? What are internal and
+            external fragmentation in this context? What did V1 change and
+            why?
+          </p>
+          <p>
+            <strong>Stage 1, the front doors.</strong> Read
+            <code>vllm/entrypoints/llm.py</code>, then
+            <code>vllm/entrypoints/openai/api_server.py</code> and
+            <code>vllm/entrypoints/openai/chat_completion/</code>. Questions:
+            where does the chat template get applied? What does the serving
+            layer know about the GPU (answer: nothing)?
+          </p>
+          <p>
+            <strong>Stage 2, the engine spine.</strong> Read
+            <code>vllm/v1/engine/async_llm.py</code>,
+            <code>input_processor.py</code>, <code>core_client.py</code>,
+            <code>core.py</code>, then <code>output_processor.py</code> and
+            <code>detokenizer.py</code>. Questions: which process does
+            tokenization run in? What exactly crosses the IPC boundary in
+            each direction? Why is detokenization stateful?
+          </p>
+          <p>
+            <strong>Stage 3, the brain.</strong> Read
+            <code>vllm/v1/core/sched/scheduler.py</code> top to bottom, then
+            <code>vllm/v1/core/kv_cache_manager.py</code>,
+            <code>block_pool.py</code>, and <code>kv_cache_utils.py</code>
+            (the hashing lives there). Questions: what is the token budget
+            and who spends it? Walk through a preemption. How does a prefix
+            cache hit change what the scheduler asks the runner to compute?
+          </p>
+          <p>
+            <strong>Stage 4, the muscle.</strong> Read
+            <code>vllm/v1/worker/gpu_model_runner.py</code> (it is long; read
+            for structure), <code>block_table.py</code>, one model file such
+            as <code>vllm/model_executor/models/llama.py</code>, and one
+            backend, <code>vllm/v1/attention/backends/flash_attn.py</code>.
+            Questions: what state persists on the GPU across steps? Where
+            does the block table actually get consumed? Why are model files
+            so plain?
+          </p>
+          <p>
+            <strong>Where not to start:</strong> <code>csrc/</code>, the
+            quantization layers, speculative decoding, and the distributed
+            executor. All are deep specialties that make sense only once the
+            single-GPU request path is solid, and none of them will teach you
+            what vLLM is.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            All labs assume a Linux GPU box with
+            <code>vllm serve Qwen/Qwen2.5-0.5B-Instruct --max-model-len 4096</code>
+            running unless stated. Exact log wording and metric names shift
+            between releases; the quantities do not.
+          </p>
+          <p>
+            <strong>Lab 1: watch continuous batching happen.</strong> Fire 50
+            concurrent requests with the async client from Part II while
+            watching the periodic engine log line, which reports running and
+            waiting request counts and KV cache usage. Observe requests
+            joining and leaving between iterations, and confirm with
+            <code>curl -s localhost:8000/metrics | grep num_requests</code>.
+            Concept taught: iteration-level scheduling.
+          </p>
+          <p>
+            <strong>Lab 2: measure prefix caching.</strong> Send a request
+            with a 2,000-token system prompt, then send it again with a
+            different final question. Compare the two time-to-first-token
+            values, and check
+            <code>curl -s localhost:8000/metrics | grep prefix_cache</code>
+            (V1 exposes query and hit counters). Then restart with
+            <code>--no-enable-prefix-caching</code> and repeat. Concept
+            taught: block hashing and reuse.
+          </p>
+          <p>
+            <strong>Lab 3: force preemption.</strong> Restart with
+            <code>--gpu-memory-utilization 0.35 --max-model-len 4096</code>
+            and send 100 concurrent requests each asking for
+            <code>max_tokens=1500</code> of output. Watch for preemption
+            warnings and the <code>num_preemptions</code> counter, and note
+            that every preempted request still completes correctly. Concept
+            taught: recompute preemption as the pressure valve.
+          </p>
+          <p>
+            <strong>Lab 4: chunked prefill and interference.</strong> Restart
+            with <code>--max-num-batched-tokens 1024</code>. Stream a short
+            chat while a second client sends a maximally long prompt, and
+            watch the streaming cadence of the short chat stay smooth; then
+            raise the budget to 8192 and watch the long prefill visibly
+            stutter the stream. Concept taught: the token budget trades
+            prefill throughput against decode latency.
+          </p>
+          <p>
+            <strong>Lab 5: swap attention backends.</strong> Run
+            <code>VLLM_ATTENTION_BACKEND=TRITON_ATTN vllm serve ...</code>,
+            then benchmark both backends with the bundled harness (recent
+            releases ship <code>vllm bench serve</code>, plus
+            <code>latency</code> and <code>throughput</code> subcommands) and
+            compare. Setting a nonsense backend name is a legitimate trick:
+            the error lists the valid names for your version. Concept taught:
+            the dispatch layer is a real seam you can operate.
+          </p>
+          <p>
+            <strong>Lab 6: one step under a debugger.</strong> Run the
+            offline <code>LLM</code> example under <code>pdb</code> with
+            <code>VLLM_ENABLE_V1_MULTIPROCESSING=0</code> so the engine stays
+            in-process, break inside the scheduler's <code>schedule()</code>,
+            and inspect a request's block table and
+            <code>num_computed_tokens</code> across three iterations. Concept
+            taught: everything in Part IV, made concrete.
+          </p>
+
+          <h2>Part VIII: Understanding checks</h2>
+          <p><strong>What problem does PagedAttention actually solve?</strong>
+          KV cache memory waste. Contiguous per-request allocation at maximum
+          length wastes most of KV memory to internal and external
+          fragmentation, and since KV memory caps batch size, wasted memory is
+          wasted throughput. Paging bounds waste to a fraction of one block
+          per request and makes sharing a pointer operation.</p>
+          <p><strong>Why does batch size control throughput in LLM serving?</strong>
+          Decode is memory-bandwidth-bound: each step streams all weights from
+          HBM regardless of batch size, so tokens per second scales almost
+          linearly with batch until compute or memory runs out. More resident
+          sequences amortize the same weight traffic over more tokens.</p>
+          <p><strong>What is the difference between continuous and static batching?</strong>
+          Static batching admits and releases requests only at batch
+          boundaries, so the batch drains to its slowest member. Continuous
+          batching rebuilds membership every forward pass: finished sequences
+          exit and waiting ones join at iteration granularity.</p>
+          <p><strong>What is a block table?</strong> The per-request map from
+          logical block index to physical block ID in the KV pool, the exact
+          analogue of a page table. The attention kernel follows it to gather
+          a sequence's keys and values from non-contiguous memory.</p>
+          <p><strong>How does prefix caching find a reusable prefix?</strong>
+          Each full block is hashed over its own tokens chained with its
+          prefix block's hash, and the hash maps to a physical block. The
+          chaining means a hit at block k certifies the entire prefix, so
+          matching is a per-block lookup, not a tree search.</p>
+          <p><strong>What happens when the block pool runs dry mid-generation?</strong>
+          The V1 scheduler preempts a running request: frees its blocks,
+          zeroes its computed-token count, and requeues it for later
+          recomputation, which prefix caching often makes partial rather than
+          total. V0 additionally offered swapping blocks to CPU; V1 removed
+          that mode from the scheduler.</p>
+          <p><strong>Why chunk long prefills?</strong> A monolithic long
+          prefill monopolizes the GPU for many milliseconds to seconds,
+          freezing inter-token latency for every decoding request. Chunking
+          slices the prompt across steps so each batch mixes a prefill chunk
+          with everyone's decodes, trading a little prefill completion time
+          for flat decode latency.</p>
+          <p><strong>Why is detokenization incremental and stateful?</strong>
+          BPE token boundaries do not align with character boundaries, so a
+          token can be an unfinished UTF-8 fragment or the middle of a stop
+          string. The detokenizer buffers per request and only emits deltas it
+          knows are final text.</p>
+          <p><strong>What did the V1 rewrite change architecturally?</strong>
+          The engine core moved to its own process behind an IPC boundary, the
+          scheduler collapsed prefill and decode into one token-budget
+          mechanism with chunked prefill always on, prefix caching became the
+          default, and swap preemption and copy-on-write forking were dropped
+          in favor of recompute plus prefix reuse.</p>
+          <p><strong>Where did copy-on-write go?</strong> It existed in V0 for
+          beam search and parallel sampling forks. V1 implements
+          <code>n&gt;1</code> as sibling requests sharing their prompt through
+          the prefix cache, achieving the sharing without fork bookkeeping in
+          the block manager.</p>
+          <p><strong>When would you pick SGLang or TensorRT-LLM instead?</strong>
+          SGLang for workloads dominated by shared prefixes or grammar-
+          constrained output, where its radix cache and jump-forward decoding
+          are structural advantages; TensorRT-LLM when you can pay an
+          ahead-of-time build per model and GPU for peak NVIDIA performance.
+          For single-user local inference, llama.cpp-family tools beat both.</p>
+          <p><strong>A model "fits in VRAM" but vLLM OOMs at startup. Why?</strong>
+          vLLM pre-reserves KV cache sized by
+          <code>gpu-memory-utilization</code> and <code>max-model-len</code>
+          on top of weights, and profiles at boot. A 128k default context can
+          demand tens of gigabytes of KV alone; capping
+          <code>--max-model-len</code> or lowering utilization fixes it.</p>
+          <p><strong>Your p99 latency spikes but average throughput looks fine.
+          What do you check first?</strong> Preemption counters and KV cache
+          usage in <code>/metrics</code>: preemption recompute shows up
+          exactly as tail latency. Second, long-prompt interference: if
+          <code>max-num-batched-tokens</code> is large, one giant prefill
+          chunk can stall a step for everyone.</p>
+          <p><strong>Does the attention kernel pay for paging?</strong> Yes, a
+          small indirection cost: it gathers KV through the block table
+          instead of striding contiguous memory. The design accepts single-
+          digit-percent kernel overhead to multiply achievable batch size,
+          which is a spectacular trade at the system level.</p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Old ideas port to new resources.</strong> vLLM's core
+            insight is literally paged virtual memory applied to a new scarce
+            resource. The same move recurs everywhere: databases paging
+            buffers, GC generations, network buffer pools. When a new resource
+            is scarce and fragmented, check whether the OS already solved it
+            in 1970.
+          </p>
+          <p>
+            <strong>Separate the control plane from the data plane.</strong>
+            The scheduler decides in Python at microsecond scale what the
+            kernels execute at millisecond scale, connected by a narrow
+            description (block tables, token budgets). Routers versus
+            forwarding ASICs, query planners versus executors, Kubernetes
+            versus kubelets: same shape, and it is why vLLM can evolve policy
+            without touching CUDA.
+          </p>
+          <p>
+            <strong>Make the fast path the only path.</strong> V0 accumulated
+            modes: chunked prefill optional, prefix caching optional, two
+            preemption strategies. V1's bet is that one always-on mechanism,
+            tuned well, beats a matrix of flags, because every optional path
+            is a path that rots untested. The same argument shows up in
+            storage engines that delete their non-WAL modes.
+          </p>
+          <p>
+            <strong>Keep the extension surface narrow and boring.</strong>
+            Hundreds of model architectures integrate as plain PyTorch because
+            all the cleverness is concentrated behind the attention interface
+            and the block manager. Cleverness that must be reimplemented per
+            integration kills an ecosystem; vLLM's model zoo is large
+            precisely because contributing a model is dull.
+          </p>
+          <p>
+            <strong>Rewrites are honest when they delete.</strong> V1 did not
+            just refactor; it removed swap preemption, copy-on-write, and the
+            prefill/decode split, accepting temporary feature regressions to
+            get a simpler invariant set. The willingness to shrink the design
+            is what distinguishes a real second system from second-system
+            syndrome.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            One sentence: vLLM pages the KV cache so memory is never wasted
+            and rebuilds the batch every iteration so time is never wasted,
+            and the rest of the repository is what those two ideas need to
+            survive real models, real GPUs, and real traffic.
+          </p>
+          <pre class="flow">HTTP → Template → Tokenize → IPC → Schedule → Blocks → Forward → Sample → Detok → SSE</pre>
+          <p>The chain mapped to files (V1, verified at v0.25.1):</p>
+          <pre class="flow">HTTP/Template  entrypoints/openai/api_server.py, chat_completion/
+Tokenize       v1/engine/input_processor.py  (in AsyncLLM's process)
+IPC            v1/engine/core_client.py ⇄ core.py  (EngineCore process)
+Schedule       v1/core/sched/scheduler.py    (token budget, preemption)
+Blocks         v1/core/kv_cache_manager.py, block_pool.py
+Forward        v1/worker/gpu_model_runner.py + v1/attention/backends/
+Sample         v1/sample/sampler.py
+Detok/SSE      v1/engine/output_processor.py, detokenizer.py</pre>
+          <p>Memorize these:</p>
+          <p>
+            <strong>The memory fact:</strong> KV blocks of ~16 tokens, block
+            table per request, waste bounded by one partial block, sharing by
+            refcount, prefix reuse by chained content hash, eviction LRU from
+            the free queue.
+          </p>
+          <p>
+            <strong>The time fact:</strong> one token budget per step
+            (<code>max-num-batched-tokens</code>) spent on running requests
+            first; prefill is just a request that wants many tokens, decode
+            one that wants one, so chunked prefill is free structurally.
+          </p>
+          <p>
+            <strong>The pressure fact:</strong> out of blocks means preempt
+            latest, free, zero the computed count, requeue, recompute; V1 has
+            no scheduler swap mode.
+          </p>
+          <p>
+            <strong>The version fact:</strong> V0 versus V1: separate core
+            process, unified scheduler, prefix caching default on, CoW and
+            swap gone. Most old blog posts describe V0.
           </p>
           <div class="takeaway">
             <strong>Key takeaway:</strong> vLLM is two ideas executed
             thoroughly. Page the KV cache so memory stops being wasted, and
             reschedule every iteration so time stops being wasted; everything
-            else in the repository is the engineering that lets those two ideas
-            survive contact with real models, real GPUs, and real traffic.
+            else in the repository, the engine processes, the block hashing,
+            the backend dispatch, the V1 rewrite itself, is the engineering
+            that lets those two ideas survive contact with real models, real
+            GPUs, and real traffic.
           </div>
         </article>
       </div>

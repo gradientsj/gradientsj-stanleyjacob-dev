@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Kubernetes walkthrough · Stanley Jacob</title>
-    <meta name="description" content="A walkthrough of the Kubernetes repository: how to use it in five minutes, the reconcile loop as the one design pattern, the API server and etcd as the source of truth, informers and watch, and where to actually start reading an enormous codebase." />
+    <meta name="description" content="A full chapter on Kubernetes: a practical kind-based tutorial, the complete life of one kubectl apply from the API server through etcd, controllers, the scheduler, and the kubelet, deep dives on reconcile loops, API machinery, informers, and the scheduler framework, plus a staged reading plan for one of the largest codebases in open source." />
     <link rel="stylesheet" href="/style.css" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
   </head>
@@ -34,10 +34,13 @@
           is the container orchestrator that came out of Google's decade of
           running Borg, was open sourced in 2014, and became the founding
           project of the Cloud Native Computing Foundation and the de facto
-          operating system of the cloud. This walkthrough covers how to get a
-          cluster running in five minutes, the small set of ideas that the
-          entire enormous codebase repeats, and an honest reading path that
-          starts at the readable cores instead of the front door.
+          operating system of the cloud. This chapter is three things at once:
+          a practical tutorial that gets you a real cluster and real workloads,
+          an internals walkthrough that follows one <code>kubectl apply</code>
+          from your terminal through the API server, etcd, three controllers,
+          the scheduler, and the kubelet all the way to a running container,
+          and a reading guide for one of the largest codebases in open source,
+          starting at the readable cores instead of the front door.
         </p>
       </div>
     </header>
@@ -45,145 +48,1079 @@
     <section class="soft">
       <div class="wrap">
         <article class="prose article">
-          <h2>Using it in five minutes</h2>
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">kubectl apply (desired state, YAML)
+        │
+        ▼
+API server ── authn → authz → admission → validation
+        │
+        ▼
+etcd (the only state that exists)
+        │  watch streams fan out to everyone
+        ├──────────────┬────────────────┬───────────────┐
+        ▼              ▼                ▼               ▼
+ deployment ctrl   replicaset ctrl   scheduler       kubelet (per node)
+ Deployment→RS     RS→Pods           Pod→Node        Pod→containers
+        │              │                │               │
+        └──── every arrow is a write BACK through ──────┘
+              the API server, never a direct call
+                                                        │
+                                                        ▼
+                                          CRI → containerd → Linux</pre>
           <p>
-            You do not install the repository; you run a distribution of it.
-            The fastest local option is kind, which boots a conformant cluster
-            inside a Docker container, with minikube as the equally standard
-            alternative:
+            Kubernetes is a database with opinions. Every object you have ever
+            typed into YAML, pods, deployments, nodes, secrets, services, is a
+            record persisted in etcd, a Raft-based consistent key-value store,
+            and the API server is the sole process allowed to touch it.
+            Everything else in the system, the controllers, the scheduler, the
+            kubelet on every node, even <code>kubectl</code>, is a client of
+            that one REST API. <mark>No Kubernetes component ever talks to
+            another component directly; all coordination happens by reading
+            and writing shared state through the API server.</mark> That single
+            sentence is the architecture.
           </p>
-          <pre><code>go install sigs.k8s.io/kind@latest   # or: brew install kind
-kind create cluster</code></pre>
-          <pre><code>kubectl create deployment web --image=nginx --replicas=3
-kubectl get pods</code></pre>
           <p>
-            The five-minute experiment that teaches the most is to fight the
-            system and lose. Delete a pod and watch the deployment's
-            replacement appear within seconds; scale the deployment and watch
-            the pod count follow:
+            The second half of the identity is what the clients do with that
+            state. Each controller runs a reconcile loop: watch the desired
+            state written in objects' <code>spec</code> fields, observe the
+            actual state of the world, and act to converge one toward the
+            other, recording observations in <code>status</code>. The
+            deployment controller reconciles Deployments into ReplicaSets, the
+            replicaset controller reconciles ReplicaSets into Pods, the
+            scheduler reconciles "pods with no node" into "pods bound to a
+            node," and the kubelet reconciles "pods bound to my node" into
+            running containers. Four different programs, one identical shape.
           </p>
-          <pre><code>kubectl delete pod &lt;one-of-the-pod-names&gt;
-kubectl get pods          # three pods again, one very young
-kubectl scale deployment web --replicas=5</code></pre>
           <p>
-            Nothing you did was a command to start or stop containers; every
-            command edited a record of desired state, and something else made
-            reality match. That "something else" is the entire subject of this
-            walkthrough.
-          </p>
-
-          <h2>The one design pattern: the reconcile loop</h2>
-          <p>
-            Kubernetes has essentially one design pattern, applied at every
-            scale. A controller watches two things, the desired state written
-            in an object's <code>spec</code> and the observed state of the
-            world, and repeatedly acts to converge one toward the other,
-            recording what it sees in the object's <code>status</code>. The
-            deployment controller reconciles deployments into replica sets,
-            the replica set controller reconciles those into pods, the
-            scheduler is a controller that reconciles "pods with no node" into
-            "pods bound to a node," and the kubelet on each machine is a
-            controller that reconciles "pods bound to my node" into running
-            containers. <mark>The loops are level-triggered rather than
-            edge-triggered: each iteration compares full desired state against
-            full observed state, so a controller that crashes, restarts, or
-            misses an event simply converges on the next pass.</mark> That is
-            the property that makes the system self-healing without any
-            component being responsible for healing, and it is why deleting a
-            pod above was so uneventful: no alarm fired, the replica set
-            controller just noticed two is less than three. Once you see this
-            pattern you see it everywhere, and the codebase stops being ten
-            systems and becomes one idea with many instances.
-          </p>
-
-          <h2>The API server and etcd as the source of truth</h2>
-          <p>
-            The pattern only works because there is exactly one place state
-            lives. Every object, pods, deployments, nodes, secrets, is a
-            record persisted in etcd, the Raft-based consistent key-value
-            store, and the API server is the sole component allowed to touch
-            it. <mark>No Kubernetes component talks to another directly;
-            controllers, the scheduler, the kubelet, and kubectl all read and
-            write objects through the API server's REST interface, and
-            coordination happens entirely through this shared state.</mark>
-            This hub-and-spoke design buys enormous simplifications: there is
-            one place to enforce authentication, authorization, admission
-            policy, and validation; components can be restarted or upgraded
-            independently because none of them holds state that matters; and
-            extending the system means registering a new object type, which is
-            what custom resources are, rather than teaching processes new
-            protocols. Optimistic concurrency via resource versions replaces
-            distributed locking, and the API server's watch mechanism streams
-            changes to anyone interested, which turns the "poll the world"
-            picture of the reconcile loop into something that reacts in
-            milliseconds. If you have read my <a href="/systems">systems
-            design write-ups</a>, this is the rare production system that is
-            genuinely architected the way the whiteboard version says.
+            So the one-sentence identity: Kubernetes is a strongly consistent
+            database of desired state plus a swarm of level-triggered
+            reconcile loops that independently push reality toward it. The
+            codebase is enormous, but it is enormous the way a crystal is
+            large: the same structure repeated. Learn the write path once and
+            the loop shape once, and you have learned the whole design. That
+            is exactly what Parts IV and V do.
           </p>
 
-          <h2>Informers: making a thousand watchers cheap</h2>
+          <h2>Part II: Using it</h2>
           <p>
-            A naive controller polling the API server would melt it, and a
-            naive watcher still pays a network round trip per read. The
-            client-go library's informer machinery is the load-bearing
-            optimization: an informer opens one watch per resource type,
-            maintains a local in-memory cache that the watch stream keeps
-            current, and hands the controller events plus a read-only lens
-            over the cache, so a controller's reads cost nothing and the API
-            server serves one stream instead of a thousand queries. Shared
-            informer factories let every controller in a process share the
-            same caches, and the standard shape of a controller, informer
-            events feeding keys into a rate-limited work queue drained by
-            reconcile workers that read from the cache, is repeated so
-            uniformly across the ecosystem that reading one controller
-            teaches you all of them. The design also explains a famous
-            Kubernetes behavior: because caches are eventually consistent,
-            controllers are written to tolerate stale reads, which is the
-            level-triggered philosophy again, pushed down into the client
-            library.
+            You do not install the kubernetes/kubernetes repository; you run a
+            distribution of it. For a laptop, the standard choice is
+            <a href="https://kind.sigs.k8s.io/" target="_blank" rel="noreferrer">kind</a>,
+            which boots a fully conformant cluster inside Docker containers
+            (minikube is the equally standard alternative). You also need
+            <code>kubectl</code>, the CLI client. On Linux:
+          </p>
+          <pre><code># kind (check kind.sigs.k8s.io for the current release; v0.32.0 as I write this)
+curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.32.0/kind-linux-amd64
+chmod +x ./kind &amp;&amp; sudo mv ./kind /usr/local/bin/kind
+
+# kubectl
+curl -LO "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+chmod +x kubectl &amp;&amp; sudo mv kubectl /usr/local/bin/kubectl</code></pre>
+          <p>On macOS both come from Homebrew:</p>
+          <pre><code>brew install kind kubectl</code></pre>
+          <p>
+            Creating a cluster takes about a minute. The default cluster is a
+            single Docker container named <code>kind-control-plane</code>
+            running the API server, etcd, the controller manager, the
+            scheduler, and a kubelet all at once:
+          </p>
+          <pre><code>$ kind create cluster
+Creating cluster "kind" ...
+ ✓ Ensuring node image (kindest/node:v1.xx.y) ...
+ ✓ Preparing nodes 📦
+ ✓ Writing configuration 📜
+ ✓ Starting control-plane 🕹️
+ ...
+$ kubectl get nodes
+NAME                 STATUS   ROLES           AGE   VERSION
+kind-control-plane   Ready    control-plane   40s   v1.xx.y</code></pre>
+          <p>
+            (Versions in output vary with your kind release; everything in
+            this chapter is version-stable behavior.) Now the first real
+            workload. Write this to <code>web.yaml</code>:
+          </p>
+          <pre><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.27
+        resources:
+          requests:
+            cpu: 100m
+            memory: 64Mi
+        ports:
+        - containerPort: 80</code></pre>
+          <pre><code>$ kubectl apply -f web.yaml
+deployment.apps/web created
+$ kubectl get pods
+NAME                   READY   STATUS    RESTARTS   AGE
+web-5b7f9c86d4-8kx2p   1/1     Running   0          15s
+web-5b7f9c86d4-m4tqz   1/1     Running   0          15s
+web-5b7f9c86d4-vw6r8   1/1     Running   0          15s</code></pre>
+          <p>
+            The random-looking middle segment (<code>5b7f9c86d4</code>, yours
+            will differ) is the pod-template hash: the Deployment created a
+            ReplicaSet named <code>web-&lt;hash&gt;</code>, and the ReplicaSet
+            created pods named after itself. That naming chain is the object
+            ownership chain, and Part IV follows it in the source.
+          </p>
+          <p>
+            From code, the natural language is Go, because the official client
+            library, client-go, is the same one every controller in the
+            ecosystem is built on. Listing pods takes ten lines:
+          </p>
+          <pre><code>config, err := clientcmd.BuildConfigFromFlags("",
+    filepath.Join(homedir.HomeDir(), ".kube", "config"))
+clientset, err := kubernetes.NewForConfig(config)
+
+pods, err := clientset.CoreV1().Pods("default").
+    List(context.Background(), metav1.ListOptions{})
+for _, p := range pods.Items {
+    fmt.Println(p.Name, p.Status.Phase)
+}</code></pre>
+          <p>
+            Now the mistakes everyone makes at the start, because each one
+            teaches a piece of the model. <strong>Mistake one: creating bare
+            pods.</strong> <code>kubectl run mypod --image=nginx</code>
+            creates a Pod with no controller above it. Delete it and it is
+            gone forever; the self-healing you came for lives in the
+            controller, not the pod:
+          </p>
+          <pre><code># wrong: nothing will ever recreate this
+kubectl run mypod --image=nginx
+
+# right: a Deployment owns and replaces its pods
+kubectl create deployment mypod --image=nginx</code></pre>
+          <p>
+            <strong>Mistake two: fighting the controller by editing its
+            children.</strong> If you edit or delete a pod that a ReplicaSet
+            owns, the ReplicaSet puts it back the way the spec says. Beginners
+            read this as the cluster being haunted. It is the reconcile loop
+            doing its one job, and the fix is always to edit the object at the
+            top of the ownership chain, the Deployment.
+          </p>
+          <p>
+            <strong>Mistake three: the selector and the labels must
+            match.</strong> In hand-written YAML, <code>spec.selector</code>
+            is how the Deployment finds its pods and
+            <code>spec.template.metadata.labels</code> is what the pods are
+            stamped with. If they disagree, the API server rejects the object
+            at validation time with <code>selector does not match template
+            labels</code>, which is your first sighting of the validation
+            stage from Part IV.
+          </p>
+          <p>
+            <strong>Mistake four: expecting <code>latest</code> to roll
+            out.</strong> A Deployment only acts when its pod template
+            changes. If your image tag is <code>latest</code> and you push a
+            new image, the template text is identical, so nothing happens.
+            Use immutable tags and change them explicitly:
+          </p>
+          <pre><code># wrong: template unchanged, no rollout, and running pods
+# silently diverge in version from future pods
+image: myapp:latest
+
+# right: every release is a visible spec change
+kubectl set image deployment/web nginx=nginx:1.28</code></pre>
+          <p>
+            <strong>Mistake five: omitting resource requests.</strong> The
+            scheduler places pods by comparing requests against node capacity.
+            A pod with no requests fits anywhere on paper, so nodes overcommit
+            until real memory runs out and the kernel OOM-kills whatever is
+            largest. Requests are not optional metadata; they are the
+            scheduler's input data.
           </p>
 
-          <h2>Reading the repository</h2>
+          <h2>Part III: When it is the right tool</h2>
+          <p>
+            Kubernetes earns its complexity when you have many services, more
+            than one team, more than a handful of machines, and a need for the
+            things it makes uniform: declarative deploys and rollbacks,
+            self-healing, horizontal scaling, service discovery, and one API
+            that every tool in the ecosystem (Helm, Argo, Prometheus,
+            operators) can build on. It is also the right substrate when you
+            want extensibility: CRDs and controllers let you make the platform
+            manage databases, ML training jobs, or certificates with the same
+            machinery that manages pods. If you serve a
+            <a href="/oss/fastapi">FastAPI application</a> behind an
+            <a href="/oss/nginx">nginx</a> ingress, Kubernetes is the layer
+            that decides where those processes run and keeps them running.
+          </p>
+          <p>
+            The honest alternatives. For a single small app, a VM with Docker
+            Compose and a reverse proxy is simpler and fine. For "just run my
+            container, bill me per request," serverless platforms like Cloud
+            Run or AWS Fargate remove the cluster entirely and are the better
+            default for small teams. HashiCorp Nomad is the credible
+            orchestrator for shops that want scheduling without the Kubernetes
+            API surface, and Amazon ECS is the pragmatic choice if you are
+            all-in on AWS and want less to operate. The pattern in all four:
+            they trade away the extensible API machinery, which is precisely
+            the thing you should not pay for until you need it.
+          </p>
+          <p>
+            The architecture-shaped warning, this system's "writable SQLite on
+            NFS": <mark>never build a second source of truth beside etcd, and
+            never mutate cluster state out of band.</mark> The reconcile loops
+            assume the API server's view is the truth. The moment a deploy
+            script SSHes into nodes to restart containers, or an external
+            system holds "the real list of what should be running" and pushes
+            imperative commands, you have two authorities, and the controllers
+            will fight the other one forever, reverting its changes on every
+            sync. The correct integration direction is always to write desired
+            state into the API (a GitOps tool like Argo CD does exactly this)
+            and let the loops do the acting.
+          </p>
+          <pre class="flow">SAFE                                DANGEROUS
+git repo ──► Argo CD ──► API server   deploy script ──ssh──► node
+                          │  ▲                                 │
+                    controllers        controllers see drift ◄─┘
+                     converge          and revert it, forever</pre>
+
+          <h2>Part IV: The full life of one request</h2>
+          <p>
+            The canonical operation is the one you already ran:
+            <code>kubectl apply -f web.yaml</code> creating a Deployment. It
+            is the best single thread through the codebase because it visits
+            every component. All file paths below are real paths in
+            kubernetes/kubernetes, verified against the master branch as of
+            mid-2026; the architecture they implement has been stable for a
+            decade.
+          </p>
+
+          <h3>Stage 1: kubectl builds an HTTP request</h3>
+          <p>
+            <code>kubectl</code> is a thin client; its code lives in the main
+            repo under <code>staging/src/k8s.io/kubectl/</code> (published
+            separately as kubernetes/kubectl). Apply parses your YAML, asks
+            the API server's discovery endpoints what "apps/v1, Deployment"
+            maps to as a REST path, and sends the object to
+            <code>/apis/apps/v1/namespaces/default/deployments</code>. Modern
+            apply is server-side apply: the server, not the client, merges
+            your fields with the live object and records which manager owns
+            which fields (<code>managedFields</code>), so two tools can
+            co-own one object without clobbering each other. The key point:
+            after this stage, kubectl's job is done. Nothing downstream knows
+            or cares that a human was involved.
+          </p>
+
+          <h3>Stage 2: the API server gatekeeps: authn, authz, admission</h3>
+          <p>
+            The generic request machinery lives in
+            <code>staging/src/k8s.io/apiserver/</code>. Every request passes a
+            fixed gauntlet. Authentication establishes who you are (client
+            certificates, bearer tokens, OIDC). Authorization asks whether
+            that identity may perform this verb on this resource, almost
+            always answered by RBAC rules, which are themselves just objects
+            in etcd. Then admission: a chain of plugins that may mutate the
+            object (fill defaults, inject sidecars) and then validate it
+            against policy (quotas, security restrictions). The built-in
+            plugins are readable under <code>plugin/pkg/admission/</code>,
+            with <code>resourcequota</code> and <code>limitranger</code> as
+            good first reads, and the same interface is exposed to you as
+            mutating and validating webhooks, which is how tools like Istio
+            and cert-manager hook the write path without forking Kubernetes.
+          </p>
+
+          <h3>Stage 3: validation and the registry</h3>
+          <p>
+            Each resource type has a strategy object defining its lifecycle
+            rules: schema validation, field defaulting, what may change on
+            update. For Deployments this is
+            <code>pkg/registry/apps/deployment/strategy.go</code>, and the
+            selector-mismatch error from Part II is thrown here. The registry
+            layer (<code>pkg/registry/</code>) is the bridge between the
+            generic REST handlers in
+            <code>staging/src/k8s.io/apiserver/pkg/endpoints/handlers/</code>
+            (<code>create.go</code>, <code>update.go</code>,
+            <code>patch.go</code>, <code>watch.go</code>) and typed storage:
+            the handlers are the same for every resource, and the strategy is
+            the per-type personality.
+          </p>
+
+          <h3>Stage 4: the etcd write</h3>
+          <p>
+            The storage backend is
+            <code>staging/src/k8s.io/apiserver/pkg/storage/etcd3/store.go</code>.
+            The Deployment is serialized (as protobuf, not JSON) and written
+            to a key like <code>/registry/deployments/default/web</code>
+            inside etcd, guarded by a transaction so concurrent writers
+            cannot silently overwrite each other. etcd's revision counter for
+            the key becomes the object's <code>resourceVersion</code>, which
+            is Kubernetes' entire concurrency story: every update must
+            present the version it read, and a stale version gets a 409
+            Conflict instead of a lock. Once etcd's Raft quorum commits the
+            write, the request is durable and the API server returns 201.
+            <mark>At this instant, zero containers exist. "Created" in
+            Kubernetes means "recorded," and everything after this stage is
+            asynchronous convergence.</mark>
+          </p>
+
+          <h3>Stage 5: the watch fan-out</h3>
+          <p>
+            Everything downstream is driven by watches. etcd streams key
+            changes to the API server
+            (<code>staging/src/k8s.io/apiserver/pkg/storage/etcd3/watcher.go</code>),
+            and the API server's watch cache
+            (<code>staging/src/k8s.io/apiserver/pkg/storage/cacher/</code>)
+            maintains one in-memory copy per resource type and fans events out
+            to every client watch, so a thousand watchers cost etcd one
+            stream. A watch is just a long-lived HTTP request whose response
+            body is a stream of <code>{type: ADDED|MODIFIED|DELETED, object}</code>
+            events; you can see it raw with
+            <code>kubectl get deployments --watch -o yaml</code>. The
+            deployment controller has such a watch open, and our new object
+            arrives on it within milliseconds.
+          </p>
+
+          <h3>Stage 6: the deployment controller creates a ReplicaSet</h3>
+          <p>
+            All the workload controllers run inside one binary, the
+            kube-controller-manager. The deployment controller lives in
+            <code>pkg/controller/deployment/</code>:
+            <code>deployment_controller.go</code> wires informer events into
+            a workqueue, <code>sync.go</code> holds the reconcile logic, and
+            <code>rolling.go</code> and <code>rollback.go</code> implement
+            rolling updates and rollbacks. Its reconcile compares the
+            Deployment's pod template against existing ReplicaSets, finds
+            none matching, and creates one named
+            <code>web-&lt;pod-template-hash&gt;</code> with an
+            <code>ownerReference</code> pointing back at the Deployment. On a
+            later image change, the same code creates a second ReplicaSet and
+            walks replicas between old and new under the
+            <code>maxSurge</code>/<code>maxUnavailable</code> budget; a
+            rollback is just re-inflating an old ReplicaSet, which is why
+            revision history is stored as scaled-to-zero ReplicaSets. Note
+            what "creates" means: another POST through the full gauntlet of
+            stages 2 to 4. Controllers get no back door.
+          </p>
+
+          <h3>Stage 7: the replicaset controller creates Pods</h3>
+          <p>
+            The new ReplicaSet arrives on the replicaset controller's watch.
+            <code>pkg/controller/replicaset/replica_set.go</code> is the
+            single best controller to read in the whole repository: its job
+            statement is one sentence (make the number of pods matching the
+            selector equal <code>spec.replicas</code>), and its reconcile is
+            literally a count, a subtraction, and a batch of creates or
+            deletes. Two production details are worth noticing in the code:
+            it creates pods in growing batches (1, then 2, then 4...) so a
+            typo asking for ten thousand pods fails fast, and it tracks
+            in-flight creations in an "expectations" cache so it does not
+            double-create while its own watch events are still catching up to
+            what it just did. Our three pods are now objects in etcd with
+            <code>spec.nodeName</code> empty.
+          </p>
+
+          <h3>Stage 8: the scheduler binds each Pod to a node</h3>
+          <p>
+            The scheduler watches for exactly that shape: pods with no node.
+            Its loop lives in <code>pkg/scheduler/schedule_one.go</code>, and
+            each pod goes through the scheduling framework, a pipeline of
+            plugin extension points: PreFilter and Filter plugins eliminate
+            nodes that cannot host the pod (insufficient resources, taints,
+            affinity violations), Score plugins rank the survivors (spread
+            across nodes, prefer nodes that already have the image), and the
+            highest scorer wins. The plugins are self-contained and readable
+            under <code>pkg/scheduler/framework/plugins/</code>:
+            <code>noderesources</code>, <code>nodeaffinity</code>,
+            <code>tainttoleration</code>, <code>interpodaffinity</code>,
+            <code>podtopologyspread</code>. Binding is, once again, just an
+            API write: the scheduler POSTs a Binding to the pod's
+            <code>binding</code> subresource, which sets
+            <code>spec.nodeName</code>. The scheduler never contacts a node
+            in its life. Part V returns to the framework in detail.
+          </p>
+
+          <h3>Stage 9: the kubelet makes it real</h3>
+          <p>
+            The kubelet on the chosen node watches the API server for pods
+            with <code>spec.nodeName</code> equal to its own name, the only
+            filtered watch in the story. <code>pkg/kubelet/kubelet.go</code>
+            contains <code>syncLoop</code>, the node-level reconcile loop,
+            which dispatches each pod to a per-pod worker
+            (<code>pod_workers.go</code>). The worker drives the Container
+            Runtime Interface, a gRPC API defined in
+            <code>staging/src/k8s.io/cri-api/</code> and implemented by
+            containerd or CRI-O: create the pod sandbox (network namespace,
+            IP address via CNI), pull <code>nginx:1.27</code> through the
+            ImageService if not present, then CreateContainer and
+            StartContainer through the RuntimeService, with the translation
+            logic in <code>pkg/kubelet/kuberuntime/</code>. The kubelet is
+            the first and only component in this entire story that touches a
+            container runtime.
+          </p>
+
+          <h3>Stage 10: status flows back up the same channels</h3>
+          <p>
+            Convergence is only half the loop; observation is the other half.
+            The kubelet's PLEG (pod lifecycle event generator,
+            <code>pkg/kubelet/pleg/</code>) notices container state changes
+            and the status manager (<code>pkg/kubelet/status/</code>) writes
+            <code>status.phase: Running</code> and the pod's IP back to the
+            API server. That write lands in etcd, fans out on watches, and
+            climbs the ownership chain in reverse: the replicaset controller
+            sees three ready pods and sets the ReplicaSet's
+            <code>status.readyReplicas</code>, the deployment controller sees
+            that and marks the Deployment available. When you run
+            <code>kubectl rollout status</code>, you are simply watching
+            <code>status</code> fields that were populated bottom-up through
+            the exact same API-server-and-watch machinery that carried the
+            spec top-down. One store, one write path, both directions.
+          </p>
+
+          <h2>Part V: Internals deep dives</h2>
+
+          <h3>The reconcile loop, properly understood</h3>
+          <p>
+            The pattern deserves precision, because its adjectives carry the
+            design. A controller is <em>level-triggered</em>: it acts on the
+            current state (the level), not on the event that announced the
+            change (the edge). Events are treated only as hints about when to
+            look. The workqueue enforces this physically: informer handlers
+            enqueue just a key like <code>default/web</code>, never the event
+            payload, and the reconcile function re-reads the object fresh
+            from cache and recomputes everything from scratch. Duplicate
+            hints coalesce in the queue, and a missed hint costs nothing but
+            latency, because periodic resyncs re-deliver every key anyway.
+          </p>
+          <pre class="flow">edge-triggered:  "pod X was deleted"  → handler must not miss it, ever
+level-triggered: "something about default/web changed, go look"
+                 → recompute: want 3, have 2 → create 1
+                 (crash anywhere, restart, re-look: still correct)</pre>
+          <p>
+            This is why reconcile must be <em>idempotent</em>: it will run
+            many times for one logical change, after crashes, after resyncs,
+            after spurious wakeups, and running it twice must be harmless.
+            And it is why controllers re-list on restart: a freshly started
+            controller lists everything once, rebuilds its view of the level,
+            and converges, with no replay log and no missed-event recovery
+            protocol, because there is nothing to miss. <mark>The famous trap
+            is writing an edge-triggered controller anyway, one that acts on
+            event payloads ("on delete, do X"), which works in the demo and
+            then silently corrupts state the first time a watch reconnects
+            and events are compacted away.</mark> The correction is
+            mechanical: reconcile reads only the key, and desired-vs-observed
+            is recomputed every single time.
+          </p>
+
+          <h3>API machinery: group/version/kind and CRDs</h3>
+          <p>
+            Every object in the system is identified by a
+            group/version/kind: our Deployment is
+            <code>apps/v1, Kind=Deployment</code>; pods live in the original
+            "core" group whose name is the empty string, which is why their
+            URLs start with <code>/api/v1</code> while everything else is
+            under <code>/apis/&lt;group&gt;/&lt;version&gt;</code>. Versions
+            are presentation, not storage: the server converts every version
+            through an internal representation, so <code>v1</code> and a
+            hypothetical <code>v2</code> of a type are two lenses on one
+            stored object, which is how Kubernetes evolves APIs without
+            migrations. The type system, schemes, and conversion machinery
+            live in <code>staging/src/k8s.io/apimachinery/</code>, and the
+            server publishes an OpenAPI schema of every type at
+            <code>/openapi/v3</code>, which is what powers
+            <code>kubectl explain</code> and client validation.
+          </p>
+          <p>
+            The payoff of all this indirection is that extension is
+            first-class. A CustomResourceDefinition is an object that, when
+            written, causes the API server (via the apiextensions-apiserver,
+            <code>staging/src/k8s.io/apiextensions-apiserver/</code>) to start
+            serving a brand-new REST resource, with the same storage,
+            validation-by-schema, RBAC, and watch support as built-in types.
+            Pair a CRD with a controller and you have an operator: the
+            pattern of the entire cloud-native ecosystem, and the reason
+            "extending Kubernetes" means adding nouns to the database rather
+            than patching any binary. The misconception to correct:
+            <mark>a CRD gives you an API and storage, and nothing else
+            happens until you write the controller</mark>; the definition is
+            inert data, the loop is the behavior.
+          </p>
+
+          <h3>Informers: why a thousand controllers do not crush the API server</h3>
+          <p>
+            If every reconcile re-fetched objects over the network, the API
+            server would be the hottest path in the cluster. client-go's
+            informer machinery, under
+            <code>staging/src/k8s.io/client-go/tools/cache/</code>, is the
+            load-bearing optimization, and its pipeline is worth memorizing:
+          </p>
+          <pre class="flow">API server
+   │  one LIST, then one WATCH per resource type
+   ▼
+Reflector (reflector.go)          pulls the stream
+   ▼
+DeltaFIFO (delta_fifo.go)         orders the changes
+   ▼
+Indexer (store.go, thread_safe_store.go)   the local cache
+   ▼
+event handlers ──► workqueue ──► reconcile workers
+                                  (which READ from the Indexer)</pre>
+          <p>
+            The reflector lists once, then watches from the returned
+            <code>resourceVersion</code>, keeping the local cache current for
+            the cost of one open stream. A SharedInformerFactory lets every
+            controller in a process share one cache per type, so the
+            controller manager, hosting dozens of controllers, holds one copy
+            of the world. Reads during reconcile hit local memory and cost
+            nothing. Two traps live here. First, <mark>the informer's
+            "resync" does not contact the API server</mark>: it replays the
+            local cache's contents into the handlers, a periodic
+            level-trigger nudge; a true re-list happens only when a watch
+            breaks and cannot resume (the "too old resource version" error,
+            because etcd compacts history). Second, the cache is eventually
+            consistent, so a controller may read a version of the world
+            slightly older than its own last write; correct controllers
+            tolerate stale reads, which is the level-triggered philosophy
+            pushed into the client library, and sloppy ones double-create,
+            which is exactly what the replicaset controller's expectations
+            cache defends against.
+          </p>
+
+          <h3>The scheduler framework</h3>
+          <p>
+            Since the scheduling framework rewrite, the scheduler is a thin
+            loop around ordered extension points, and every policy is a
+            plugin implementing some of them:
+          </p>
+          <pre class="flow">scheduling cycle (serial, one pod at a time)
+  PreEnqueue → QueueSort → PreFilter → Filter → PostFilter
+             → PreScore → Score → NormalizeScore → Reserve → Permit
+binding cycle (concurrent, per pod)
+  PreBind → Bind → PostBind</pre>
+          <p>
+            Filter answers "can this pod run on this node" per node, and is
+            where resources, taints, node affinity, and volume constraints
+            live; PostFilter runs only when no node fits and is where
+            preemption (evicting lower-priority pods) is implemented; Score
+            ranks feasible nodes from 0 to 100 and weighted sums pick the
+            winner; Reserve pessimistically accounts the pod's resources in
+            the scheduler's cache before the (asynchronous) binding cycle
+            confirms it, so the next pod in the serial scheduling cycle sees
+            correct capacity. On large clusters the scheduler does not even
+            score every feasible node; it samples a percentage, trading
+            marginally better placement for throughput. The plugin registry
+            is <code>pkg/scheduler/framework/plugins/registry.go</code>, and
+            each subdirectory there is a small, testable answer to one
+            placement question, which is why Part VI recommends them as an
+            entry point. The trap to correct: the scheduler only ever places
+            <em>pending</em> pods. It does not rebalance running pods when a
+            better node appears or when you uncordon a node; if you want
+            that, a separate component (the descheduler) must evict pods so
+            they get scheduled again.
+          </p>
+
+          <h2>Part VI: Reading the repository</h2>
           <p>
             Honesty first: kubernetes/kubernetes is millions of lines of Go,
-            and trying to read it front to back, or starting from
-            <code>cmd/kube-apiserver/</code>, is how most attempts die. The
-            repo's shape is worth knowing, <code>cmd/</code> for the binaries'
-            entry points, <code>pkg/</code> for their implementations,
-            <code>api/</code> for API specifications, and
-            <code>staging/src/k8s.io/</code> for the code published as
-            separate libraries, including client-go, but the right strategy
-            is to read the small readable cores that the ideas above live in.
-            Start outside the main repo entirely with
-            <a href="https://github.com/kubernetes/sample-controller" target="_blank" rel="noreferrer">kubernetes/sample-controller</a>,
-            the official minimal controller, a few hundred lines that wire an
-            informer to a work queue to a reconcile function with nothing
-            else in the way. Then read one real controller,
-            <code>pkg/controller/replicaset/</code> being the classic choice
-            because its job fits in one sentence, and compare it with its
-            siblings under <code>pkg/controller/</code> to watch the same
-            skeleton repeat. For the scheduler, the readable core is the
-            plugins under <code>pkg/scheduler/framework/plugins/</code>,
-            where what were historically called the fit predicates live:
-            <code>noderesources</code>, <code>nodeaffinity</code>,
-            <code>tainttoleration</code>, and <code>interpodaffinity</code>
-            are each a self-contained answer to "can this pod go on this
-            node, and how good a fit is it." The informer machinery itself is
-            in client-go under <code>staging/src/k8s.io/client-go/tools/cache/</code>,
-            worth reading once to demystify the reflector, the store, and the
-            event distribution. The kubelet under <code>pkg/kubelet/</code>
-            is the hardest of these, but grepping for its sync loop shows the
-            reconcile pattern one more time, now against a container
-            runtime instead of etcd.
+            one of the largest codebases in open source, and reading it front
+            to back is how attempts die. The shape to hold in your head:
+            <code>cmd/</code> has the binaries' entry points,
+            <code>pkg/</code> their implementations, <code>api/</code> the
+            API specifications, and <code>staging/src/k8s.io/</code> the code
+            developed in-repo but published as separate libraries (client-go,
+            apimachinery, apiserver, kubectl, cri-api). Then read it in
+            stages, each of which is genuinely small.
           </p>
+          <p>
+            <strong>Stage 0: sample-controller.</strong> Start outside the
+            main repo with
+            <a href="https://github.com/kubernetes/sample-controller" target="_blank" rel="noreferrer">kubernetes/sample-controller</a>,
+            the official minimal controller: <code>main.go</code> and
+            <code>controller.go</code>, a few hundred lines wiring an
+            informer to a workqueue to a reconcile function for a toy CRD.
+            After: you can draw the informer pipeline from memory and explain
+            why handlers enqueue keys, not objects.
+          </p>
+          <p>
+            <strong>Stage 1: one real controller.</strong>
+            <code>pkg/controller/replicaset/replica_set.go</code>, then skim
+            <code>pkg/controller/deployment/</code>
+            (<code>sync.go</code>, <code>rolling.go</code>) to watch the same
+            skeleton carry a harder policy. After: you can explain
+            expectations, batch creation, ownerReferences, and how a rolling
+            update is two ReplicaSets and a budget.
+          </p>
+          <p>
+            <strong>Stage 2: the informer machinery itself.</strong>
+            <code>staging/src/k8s.io/client-go/tools/cache/</code>, in this
+            order: <code>listwatch.go</code>, <code>reflector.go</code>,
+            <code>delta_fifo.go</code>, <code>shared_informer.go</code>.
+            After: you can say precisely what resync does, what happens on
+            watch failure, and where a stale read can come from.
+          </p>
+          <p>
+            <strong>Stage 3: the scheduler.</strong>
+            <code>pkg/scheduler/schedule_one.go</code> for the cycle, then
+            three plugins: <code>noderesources</code>,
+            <code>tainttoleration</code>, <code>interpodaffinity</code> under
+            <code>pkg/scheduler/framework/plugins/</code>. After: you can
+            name the extension points in order and explain Reserve's role in
+            keeping the serial cycle correct beside concurrent binding.
+          </p>
+          <p>
+            <strong>Stage 4: the API server's storage path.</strong>
+            <code>pkg/registry/apps/deployment/strategy.go</code> for one
+            type's personality, then
+            <code>staging/src/k8s.io/apiserver/pkg/endpoints/handlers/create.go</code>
+            and <code>storage/etcd3/store.go</code>. After: you can trace a
+            POST from HTTP handler to etcd transaction and explain
+            resourceVersion end to end.
+          </p>
+          <p>
+            <strong>Stage 5 (optional): the kubelet.</strong> The hardest
+            component, a decade of production hardening around one loop. Read
+            <code>pkg/kubelet/kubelet.go</code> only for
+            <code>syncLoop</code>, then <code>pkg/kubelet/kuberuntime/</code>
+            for the CRI translation. After: you can describe a pod start as
+            CRI calls in order.
+          </p>
+          <p>
+            Where <em>not</em> to start: <code>cmd/kube-apiserver/</code> and
+            the generic apiserver's construction code, which is layers of
+            configuration plumbing; anything named
+            <code>zz_generated*.go</code>, which is machine-written;
+            and apimachinery's conversion and serialization internals, which
+            are best learned lazily, when a specific question forces you in.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            <strong>Lab 1: a cluster, and losing a fight with a
+            controller.</strong> Teaches: reconcile beats imperative action.
+            Create the default cluster and the <code>web</code> Deployment
+            from Part II, then, with a watch running in a second terminal,
+            delete a pod:
+          </p>
+          <pre><code># terminal 1
+kubectl get pods --watch
+# terminal 2
+kubectl delete pod $(kubectl get pods -l app=web -o jsonpath='{.items[0].metadata.name}')</code></pre>
+          <p>
+            Observe: the deleted pod goes <code>Terminating</code> and a
+            replacement appears within roughly a second, before the old one
+            is even gone. Nothing "restarted" your pod; the replicaset
+            controller counted two, wanted three, and created. Then try
+            <code>kubectl delete rs -l app=web</code> and watch the
+            deployment controller recreate the entire ReplicaSet: the same
+            loop, one level up.
+          </p>
+          <p>
+            <strong>Lab 2: watch a rolling update happen.</strong> Teaches:
+            a rollout is two ReplicaSets and a budget (Part IV stage 6). With
+            <code>kubectl get pods --watch</code> running:
+          </p>
+          <pre><code>kubectl set image deployment/web nginx=nginx:1.28
+kubectl get rs      # run during and after</code></pre>
+          <p>
+            Observe: new-hash pods are created one or two at a time as
+            old-hash pods terminate, never dropping below the availability
+            budget; afterward <code>kubectl get rs</code> shows the old
+            ReplicaSet retained at 0 replicas. Run
+            <code>kubectl rollout undo deployment/web</code> and watch the
+            zero-scaled ReplicaSet re-inflate: rollback is not a special
+            mechanism, it is the same reconcile toward an older template.
+          </p>
+          <p>
+            <strong>Lab 3: a 50-line client-go watcher.</strong> Teaches: the
+            watch stream from Part IV stage 5 is just an API you can consume.
+          </p>
+          <pre><code>mkdir podwatch &amp;&amp; cd podwatch &amp;&amp; go mod init podwatch
+go get k8s.io/client-go@latest</code></pre>
+          <pre><code>package main
+
+import (
+    "context"
+    "flag"
+    "fmt"
+    "path/filepath"
+
+    corev1 "k8s.io/api/core/v1"
+    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+    "k8s.io/client-go/kubernetes"
+    "k8s.io/client-go/tools/clientcmd"
+    "k8s.io/client-go/util/homedir"
+)
+
+func main() {
+    kubeconfig := flag.String("kubeconfig",
+        filepath.Join(homedir.HomeDir(), ".kube", "config"), "")
+    flag.Parse()
+
+    config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
+    if err != nil {
+        panic(err)
+    }
+    clientset, err := kubernetes.NewForConfig(config)
+    if err != nil {
+        panic(err)
+    }
+
+    w, err := clientset.CoreV1().Pods("default").
+        Watch(context.Background(), metav1.ListOptions{})
+    if err != nil {
+        panic(err)
+    }
+    defer w.Stop()
+
+    for event := range w.ResultChan() {
+        pod, ok := event.Object.(*corev1.Pod)
+        if !ok {
+            continue
+        }
+        fmt.Printf("%-9s %-42s phase=%-9s node=%s\n",
+            event.Type, pod.Name, pod.Status.Phase, pod.Spec.NodeName)
+    }
+}</code></pre>
+          <p>
+            Run it, then delete a pod in another terminal. Observe: the
+            deletion arrives as several <code>MODIFIED</code> events (the
+            deletion timestamp, status updates) before the final
+            <code>DELETED</code>, and the replacement's life arrives as
+            <code>ADDED</code> with an empty node, then <code>MODIFIED</code>
+            with a node name (the scheduler's bind), then
+            <code>MODIFIED</code> to <code>Running</code> (the kubelet's
+            status write). You are watching Part IV's stages 5 through 10 as
+            raw events. A raw watch like this drops events on reconnect;
+            production code uses an informer, which is this plus the cache
+            and re-list machinery from Part V.
+          </p>
+          <p>
+            <strong>Lab 4: read etcd directly.</strong> Teaches: etcd is the
+            only state there is. kind's control plane runs etcd as a static
+            pod that ships <code>etcdctl</code>, so exec into it, presenting
+            etcd's client certificates:
+          </p>
+          <pre><code>kubectl exec -n kube-system etcd-kind-control-plane -- sh -c \
+  "ETCDCTL_API=3 etcdctl \
+     --cacert /etc/kubernetes/pki/etcd/ca.crt \
+     --cert   /etc/kubernetes/pki/etcd/server.crt \
+     --key    /etc/kubernetes/pki/etcd/server.key \
+     get /registry/deployments/default/web --prefix --keys-only"</code></pre>
+          <p>
+            Observe: the key exists; drop <code>--keys-only</code> and the
+            value is mostly unreadable, because objects are stored as
+            protobuf. List <code>/registry/pods/default --prefix
+            --keys-only</code> and see one key per pod. Now delete a pod and
+            immediately re-list: the old key vanishes and a new one appears,
+            confirming that every step of lab 1 was, physically, key writes
+            in this store.
+          </p>
+          <p>
+            <strong>Lab 5: drain a node.</strong> Teaches: cordon/evict
+            semantics, and that the scheduler never moves running pods. This
+            needs a multi-node cluster; put this in
+            <code>kind-3node.yaml</code>:
+          </p>
+          <pre><code>kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+- role: worker
+- role: worker</code></pre>
+          <pre><code>kind create cluster --name lab --config kind-3node.yaml
+kubectl apply -f web.yaml
+kubectl scale deployment web --replicas=6
+kubectl get pods -o wide          # pods spread across lab-worker, lab-worker2
+kubectl drain lab-worker --ignore-daemonsets
+kubectl get pods -o wide          # all six now on lab-worker2
+kubectl uncordon lab-worker
+kubectl get pods -o wide          # still all on lab-worker2</code></pre>
+          <p>
+            Observe: drain cordons the node (marks it unschedulable) and
+            evicts its pods; the controllers replace them, and the scheduler,
+            filtering out the cordoned node, lands every replacement on the
+            other worker. The final step is the real lesson: after uncordon,
+            <mark>nothing rebalances</mark>, because scheduling is a one-time
+            decision for pending pods (Part V). Delete a pod and its
+            replacement may now land on <code>lab-worker</code>. Clean up
+            with <code>kind delete cluster --name lab</code>.
+          </p>
+          <p>
+            <strong>Lab 6: watch the control plane converge after a
+            partition.</strong> Teaches: level-triggering survives missed
+            events. Stop the controller manager by moving its static pod
+            manifest aside inside the kind node, delete a pod (nothing
+            replaces it, and the Deployment does not notice), then restore
+            the manifest:
+          </p>
+          <pre><code>docker exec kind-control-plane sh -c \
+  "mv /etc/kubernetes/manifests/kube-controller-manager.yaml /root/"
+kubectl delete pod -l app=web --wait=false   # pods die, none return
+kubectl get pods                             # fewer than 3, indefinitely
+docker exec kind-control-plane sh -c \
+  "mv /root/kube-controller-manager.yaml /etc/kubernetes/manifests/"
+kubectl get pods --watch                     # replacements appear</code></pre>
+          <p>
+            Observe: when the controller manager returns, it does not need a
+            log of what it missed. It lists current state, compares against
+            desired state, and creates the missing pods. That is
+            level-triggered reconciliation demonstrated with a hole blown in
+            the event stream.
+          </p>
+
+          <h2>Part VIII: Questions and model answers</h2>
+          <h3>Q1. What actually happens, synchronously, when kubectl apply creates a Deployment?</h3>
+          <p>
+            Only stages 1 to 4: the request is authenticated, authorized,
+            admitted, validated against the Deployment strategy, and written
+            to etcd, and the server returns 201. No ReplicaSet, no pods, no
+            containers exist yet; everything else is asynchronous controllers
+            reacting to the watch event. "Created" means "recorded."
+          </p>
+          <h3>Q2. Why is level-triggered reconciliation the right choice over edge-triggered event handling?</h3>
+          <p>
+            Because correctness stops depending on delivery. An edge-triggered
+            system must never miss an event, so crashes, reconnects, and etcd
+            history compaction all become correctness hazards requiring
+            replay protocols. A level-triggered controller recomputes
+            desired-vs-observed from current state every pass, so a missed
+            event costs only latency, and restart recovery is just "list and
+            reconcile," the same code as normal operation.
+          </p>
+          <h3>Q3. How do components coordinate if none of them talk to each other?</h3>
+          <p>
+            Through shared state: every component reads and writes objects via
+            the API server and reacts to changes via watches. The deployment
+            controller does not call the replicaset controller; it writes a
+            ReplicaSet object, and the replicaset controller notices. This
+            hub-and-spoke design centralizes security and validation, lets
+            components restart independently, and makes extension a matter of
+            adding object types.
+          </p>
+          <h3>Q4. What is resourceVersion and how does Kubernetes handle concurrent writes?</h3>
+          <p>
+            resourceVersion is the object's etcd modification revision.
+            Updates are optimistically concurrent: a write must carry the
+            version it read, and if the object changed meanwhile, the API
+            server returns 409 Conflict and the client re-reads and retries.
+            There are no distributed locks anywhere in the write path.
+          </p>
+          <h3>Q5. Walk through what an informer does and why it exists.</h3>
+          <p>
+            An informer lists a resource once, then watches from that
+            resourceVersion, maintaining a local in-memory cache (the
+            Indexer) and delivering events to handlers, which typically
+            enqueue object keys into a workqueue drained by reconcile
+            workers reading from the cache. It exists so that thousands of
+            controllers can each do unlimited reads at memory cost, with the
+            API server serving one watch stream per informer instead of a
+            query per read.
+          </p>
+          <h3>Q6. What does informer "resync" actually do?</h3>
+          <p>
+            It replays the local cache's contents into the event handlers on
+            a timer; it does not contact the API server. It is a periodic
+            level-trigger nudge that re-delivers every key so reconcile gets
+            another chance at anything stuck. A true re-list against the
+            server happens only when a watch breaks and cannot resume from
+            its resourceVersion because etcd has compacted that history.
+          </p>
+          <h3>Q7. Why must reconcile functions be idempotent, and how is that typically achieved?</h3>
+          <p>
+            Because one logical change triggers many reconcile runs: coalesced
+            queue hints, resyncs, restarts. The standard techniques are
+            recomputing everything from current state rather than applying
+            deltas, checking before creating (or using deterministic names so
+            duplicate creates fail), and tracking in-flight actions, as the
+            replicaset controller's expectations cache does, so the loop does
+            not act again before its own effects are visible.
+          </p>
+          <h3>Q8. What are the scheduler framework's main extension points and what runs where?</h3>
+          <p>
+            The scheduling cycle runs serially per pod: PreFilter and Filter
+            eliminate infeasible nodes, PostFilter handles the no-fit case
+            (preemption), PreScore/Score/NormalizeScore rank survivors, and
+            Reserve accounts resources in the scheduler cache before Permit.
+            The binding cycle (PreBind, Bind, PostBind) runs concurrently and
+            performs the actual API write to the pod's binding subresource.
+            Reserve is what keeps the serial cycle correct while binds are
+            still in flight.
+          </p>
+          <h3>Q9. Why does the scheduler never touch a node, and why does it never move a running pod?</h3>
+          <p>
+            Its entire output is one field, spec.nodeName, written through the
+            API; the kubelet does all node-local work. And it only considers
+            pending pods, so placement is a one-time decision: uncordoning a
+            node or adding capacity rebalances nothing until pods are
+            recreated, which is why the descheduler exists as a separate
+            evict-to-reschedule component.
+          </p>
+          <h3>Q10. What is the CRI and why does it exist?</h3>
+          <p>
+            The Container Runtime Interface is the gRPC API (RuntimeService
+            and ImageService, defined in staging/src/k8s.io/cri-api/) between
+            the kubelet and container runtimes like containerd and CRI-O. It
+            exists so the kubelet is runtime-agnostic; Docker-specific
+            integration was removed once the interface fully decoupled
+            Kubernetes from any one runtime.
+          </p>
+          <h3>Q11. What is stored in etcd, in what format, and who may access it?</h3>
+          <p>
+            Every API object, serialized as protobuf under keys like
+            /registry/pods/&lt;namespace&gt;/&lt;name&gt;. Only the API
+            server talks to etcd; all other components go through the API.
+            That discipline is what makes authn, authz, admission, and
+            validation universally enforceable, and it is why etcd access is
+            equivalent to root on the cluster.
+          </p>
+          <h3>Q12. How does a rolling update work mechanically, and what is a rollback?</h3>
+          <p>
+            The deployment controller keeps one ReplicaSet per pod-template
+            hash. On a template change it creates a new ReplicaSet and shifts
+            replica counts between old and new within the
+            maxSurge/maxUnavailable budget, driven by status flowing back up
+            as pods become ready. Old ReplicaSets are retained at zero
+            replicas as revision history, so rollback is just scaling an old
+            ReplicaSet back up via the same reconcile.
+          </p>
+          <h3>Q13. When would you recommend against Kubernetes?</h3>
+          <p>
+            A single application with a small team is better served by a VM
+            with Docker Compose, or by serverless container platforms like
+            Cloud Run or Fargate that remove cluster operations entirely.
+            Nomad suits teams that want scheduling without the API machinery;
+            ECS suits AWS-only shops. Kubernetes pays off with many services,
+            many teams, and the need for its extensible API, and not before.
+          </p>
+          <h3>Q14. A pod is stuck Pending. How do you debug it?</h3>
+          <p>
+            <code>kubectl describe pod</code> and read the Events: a
+            scheduling failure names the filter that rejected each node
+            (insufficient cpu/memory, untolerated taints, affinity or volume
+            constraints). If there is no scheduling event at all, check that
+            the scheduler is running and the pod has no schedulingGates. If
+            it is bound but not starting, the problem has moved to the
+            kubelet: image pulls, volume mounts, or the runtime, all visible
+            in the same events stream.
+          </p>
+          <h3>Q15. Why is writing status into the same object as spec, through the same API, a good design?</h3>
+          <p>
+            It gives one consistent channel for both directions: desired
+            state flows down and observations flow up through identical
+            storage, watch, and access-control machinery, so any client can
+            observe convergence by watching status fields. Separating status
+            as a subresource keeps ownership clean: users write spec,
+            controllers write status, and RBAC can enforce exactly that.
+          </p>
+          <h3>Q16. What breaks if an external system also manages "what should be running"?</h3>
+          <p>
+            You get two sources of truth, and the controllers, which treat
+            the API server's state as authoritative, revert the external
+            system's out-of-band changes on every reconcile. The system
+            appears haunted and drifts forever. The fix is to make the
+            external system write desired state into the API (the GitOps
+            pattern) so there is exactly one authority and the loops work for
+            you instead of against you.
+          </p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>1. Make the store the interface.</strong> Components
+            coordinate through one consistent database instead of calling
+            each other, which decouples their lifecycles and centralizes
+            policy. You see the same move in event-sourced architectures and
+            in the blackboard pattern; the <a href="/systems">systems design
+            write-ups</a> reach for it whenever "N components must agree"
+            threatens to become N² protocols.
+          </p>
+          <p>
+            <strong>2. Level-triggered beats edge-triggered when you can
+            afford to re-look.</strong> Recomputing from current state turns
+            missed events, crashes, and races from correctness bugs into
+            latency. The same principle underlies retry-until-converged
+            configuration management (Terraform plan/apply, Puppet runs) and
+            React's render model: describe the target, re-derive from
+            scratch, diff.
+          </p>
+          <p>
+            <strong>3. Optimistic concurrency scales where locks do not.</strong>
+            A version number and a 409 replaced every distributed lock in
+            this system. The identical mechanism appears as compare-and-swap
+            in CPUs, conditional writes in object stores and DynamoDB, and
+            ETags in HTTP.
+          </p>
+          <p>
+            <strong>4. Extend by adding nouns, not by patching verbs.</strong>
+            CRDs let third parties add resource types that inherit storage,
+            validation, RBAC, and watches for free, which is why the operator
+            ecosystem could grow without forking the core. Compare Postgres
+            extensions and LSP: a stable, generic core protocol plus
+            first-class user-defined types is how platforms outlive their
+            authors' imaginations.
+          </p>
+          <p>
+            <strong>5. Spend complexity where it buys leverage, and make the
+            leaf nodes boring.</strong> The cleverness concentrates in the
+            API machinery, informers, and scheduler; an individual controller
+            is a readable count-and-converge loop, and that boringness is
+            what lets thousands of people write correct ones. vLLM makes the
+            same trade in the opposite domain, keeping model code plain while
+            memory and scheduling carry the cleverness; it is a hallmark of
+            infrastructure that intends to be extended.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            The one-sentence summary: <mark>Kubernetes is a consistent
+            database of desired state behind one API server, converged into
+            reality by independent level-triggered reconcile loops.</mark>
+            The chain to hold:
+          </p>
+          <pre class="flow">apply → authn → authz → admit → validate → etcd
+      → watch → deploy-ctrl → RS-ctrl → sched(filter→score→bind)
+      → kubelet → CRI → containerd → status flows back ↑</pre>
+          <p>Mapped to source:</p>
+          <pre class="flow">apply .......... staging/src/k8s.io/kubectl/
+gauntlet ....... staging/src/k8s.io/apiserver/ + plugin/pkg/admission/
+validate ....... pkg/registry/apps/deployment/strategy.go
+etcd write ..... staging/src/k8s.io/apiserver/pkg/storage/etcd3/store.go
+deploy-ctrl .... pkg/controller/deployment/sync.go, rolling.go
+RS-ctrl ........ pkg/controller/replicaset/replica_set.go
+scheduler ...... pkg/scheduler/schedule_one.go + framework/plugins/
+kubelet ........ pkg/kubelet/kubelet.go (syncLoop) + kuberuntime/
+CRI ............ staging/src/k8s.io/cri-api/
+informers ...... staging/src/k8s.io/client-go/tools/cache/</pre>
+          <p>Memorize these:</p>
+          <ul>
+            <li><strong>The controller shape:</strong> ListWatch → Reflector →
+              DeltaFIFO → Indexer → handlers → workqueue (keys only) →
+              reconcile reading from cache. Every controller, everywhere.</li>
+            <li><strong>The scheduler pipeline:</strong> PreFilter → Filter →
+              PostFilter → Score → Reserve → Permit, then PreBind → Bind →
+              PostBind; scheduling serial, binding concurrent, pending pods
+              only.</li>
+            <li><strong>Three invariants:</strong> only the API server
+              touches etcd; controllers never call each other; users write
+              spec, controllers write status.</li>
+            <li><strong>Two corrected traps:</strong> resync replays the
+              cache, it does not re-list; a CRD is inert data until a
+              controller gives it behavior.</li>
+          </ul>
+
           <div class="takeaway">
             <strong>Key takeaway:</strong> Kubernetes is one pattern and one
             place: level-triggered reconcile loops converging the world
             toward desired state, and a single API server over etcd where
-            that state lives. The repository is enormous, but it is enormous
-            the way a crystal is large, the same structure repeated, so read
-            one controller, one scheduler plugin, and the informer machinery,
-            and you have read the whole design.
+            that state lives. Follow one <code>kubectl apply</code> down
+            through the gauntlet, the store, three controllers, the
+            scheduler, and the kubelet, and back up through status, and you
+            have traced the entire architecture; everything else in those
+            millions of lines is that same trip, hardened.
           </div>
         </article>
       </div>

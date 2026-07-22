@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>TensorRT-LLM walkthrough · Stanley Jacob</title>
-    <meta name="description" content="A walkthrough of the TensorRT-LLM repository: how to serve a model in five minutes, what ahead-of-time engine building and in-flight batching mean, how NVIDIA co-designs quantization with its GPUs, and a guided reading path through the Python and C++ layers." />
+    <meta name="description" content="A full chapter on TensorRT-LLM: a practical tutorial, the complete life of one request through trtllm-serve and the PyTorch-backend executor, deep dives into ahead-of-time compilation, in-flight batching in the C++ batch manager, and FP8/NVFP4 quantization co-designed with Hopper and Blackwell, plus a staged reading plan." />
     <link rel="stylesheet" href="/style.css" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
   </head>
@@ -32,14 +32,18 @@
         <p class="lead">
           <a href="https://github.com/NVIDIA/TensorRT-LLM" target="_blank" rel="noreferrer">TensorRT-LLM</a>
           is NVIDIA's open source LLM inference library, the successor to
-          FasterTransformer and the vendor's own answer to how far its GPUs can
-          be pushed, which makes it the engine to study when the question is
-          peak performance on NVIDIA hardware rather than portability. This
-          walkthrough covers how to serve a model in five minutes, the
-          compile-ahead-of-time philosophy and its recent PyTorch-shaped
-          revision, in-flight batching, quantization co-designed with the
-          silicon, and a guided path for reading a repository that spans Python
-          and a large C++ core.
+          FasterTransformer and the vendor's own answer to how far its GPUs
+          can be pushed, which makes it the engine to study when the question
+          is peak performance on NVIDIA hardware rather than portability.
+          This is a full chapter, not a tour: a practical tutorial, the
+          complete life of one request through <code>trtllm-serve</code> and
+          the PyTorch-backend executor, the story of the ahead-of-time engine
+          era and why it ended, deep dives into in-flight batching in the C++
+          batch manager and quantization co-designed with Hopper and
+          Blackwell, and a staged plan for reading a repository that spans
+          Python and a large C++ core. Everything here was verified against
+          the main branch (a 1.3.0 pre-release) in July 2026; the file names
+          are real, and where the project moves fast I say so.
         </p>
       </div>
     </header>
@@ -47,134 +51,913 @@
     <section class="soft">
       <div class="wrap">
         <article class="prose article">
-          <h2>Using it in five minutes</h2>
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">OpenAI-style HTTP request
+   │
+   ▼
+trtllm-serve, FastAPI layer        (tensorrt_llm/serve/)      protocol, chat template
+   │
+   ▼
+LLM API                            (tensorrt_llm/llmapi/)     config, tokenizer, lifecycle
+   │
+   ▼
+GenerationExecutor proxy ⇄ worker  (tensorrt_llm/executor/)   IPC across processes
+   │
+   ▼
+PyExecutor loop                    (tensorrt_llm/_torch/pyexecutor/)  the serving heartbeat
+   │
+   ├──► schedulers ────────────────► C++ batch_manager algorithms (via bindings)
+   ├──► KV cache manager ──────────► C++ paged block pools
+   ▼
+model engine                       (_torch/models, modules)   PyTorch modules, CUDA graphs
+   │
+   ▼
+kernels                            (cpp/tensorrt_llm/kernels, cutlass_extensions)
+   │
+   ▼
+tensor cores: FP16 / FP8 / NVFP4   (Hopper, Blackwell)</pre>
           <p>
-            TensorRT-LLM is Linux-plus-NVIDIA-GPU software with real system
-            prerequisites (matching CUDA toolkit, a specific PyTorch build, and
-            OpenMPI), which is why the docs steer many users toward the
-            prebuilt NGC container; on a machine that meets them, installation
-            is a pip command:
+            One sentence of identity: TensorRT-LLM is a PyTorch-fronted,
+            C++-cored serving engine whose entire reason to exist is
+            extracting the last factor of performance from NVIDIA silicon,
+            including the numeric formats that silicon was designed around.
+            The diagram has an unusual shape compared with other engines:
+            Python owns the definition of the model and the orchestration of
+            the loop, while C++ owns the decisions made millions of times per
+            second, scheduling, KV cache block management, and the kernels.
+            The boundary between the two is crossed through generated
+            bindings (the <code>cpp/tensorrt_llm/nanobind/</code> tree), and
+            learning where that boundary sits is most of learning the
+            repository.
           </p>
-          <pre><code>pip3 install tensorrt_llm</code></pre>
           <p>
-            The front door is the LLM API, which loads a Hugging Face
-            checkpoint directly:
+            The historical shape matters too. For its first two years the
+            project was a compiler: you translated a checkpoint into a
+            TensorRT engine, a serialized, fused, kernel-selected execution
+            plan, and the runtime replayed it. Since the 1.0 release the
+            default is a PyTorch-native backend, where models are ordinary
+            <code>torch.nn.Module</code> code calling hand-tuned kernels, and
+            on current main the engine-building CLI no longer even ships.
+            <mark>The compile-ahead-of-time philosophy did not die; it
+            retreated into the kernels, the CUDA graphs, and the autotuner,
+            which is exactly where it still pays</mark>. Part IV tells the
+            live flow, then the legacy flow as the history that explains the
+            architecture's scars.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <h3>Installing</h3>
+          <p>
+            This is Linux-plus-NVIDIA software with real prerequisites, which
+            is why the container is the path of least pain. The prebuilt
+            images on NGC come in a release flavor (ready to serve) and a
+            devel flavor (for building from source):
+          </p>
+          <pre><code>docker pull nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc21
+
+docker run --rm -it --gpus all --ipc=host \
+  --ulimit memlock=-1 --ulimit stack=67108864 \
+  nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc21</code></pre>
+          <p>
+            The <code>--ipc=host</code> flag is not optional decoration; the
+            docs call it out because the multi-process executor shares memory
+            between processes and dies with a bus error without it. Bare
+            metal installation works on a machine that already has the CUDA
+            toolkit (13.1 for current releases), a matching PyTorch build,
+            and OpenMPI development headers:
+          </p>
+          <pre><code>pip3 install torch==2.10.0 torchvision --index-url https://download.pytorch.org/whl/cu130
+sudo apt-get -y install libopenmpi-dev
+pip3 install tensorrt_llm</code></pre>
+          <p>
+            Python 3.10 or newer is required; the docs test against Ubuntu
+            24.04 with Python 3.12. There is no macOS story and no
+            non-NVIDIA story, by design. If those version pins already feel
+            fragile to you, that instinct is correct and is the strongest
+            argument for the container.
+          </p>
+          <h3>First session</h3>
+          <p>
+            The offline front door is the LLM API, which takes a Hugging Face
+            model id and just runs it, no build step:
           </p>
           <pre><code>from tensorrt_llm import LLM, SamplingParams
 
 llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-params = SamplingParams(temperature=0.8, top_p=0.95)
+prompts = ["Hello, my name is", "The capital of France is"]
+sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
 
-for output in llm.generate(["The capital of France is"], params):
+for output in llm.generate(prompts, sampling_params):
     print(output.outputs[0].text)</code></pre>
           <p>
-            The online equivalent is an OpenAI-compatible server, with
-            <code>trtllm-bench</code> and <code>trtllm-eval</code> beside it
-            for benchmarking and accuracy checks:
+            First run downloads the checkpoint and spends a noticeable warmup
+            period capturing CUDA graphs and tuning kernels; subsequent
+            generations are fast. The online equivalent is an
+            OpenAI-compatible server:
           </p>
           <pre><code>trtllm-serve "TinyLlama/TinyLlama-1.1B-Chat-v1.0"</code></pre>
-          <pre><code>curl http://localhost:8000/v1/chat/completions \
+          <pre><code>curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-       "messages": [{"role": "user", "content": "Hello"}]}'</code></pre>
-
-          <h2>Idea one: ahead-of-time engine building, and its revision</h2>
+       "messages": [{"role": "user", "content": "Where is New York?"}],
+       "max_tokens": 32}'</code></pre>
           <p>
-            TensorRT-LLM inherits its worldview from TensorRT, NVIDIA's
-            general inference compiler: instead of interpreting a model graph
-            at runtime, you compile it once into an engine, a serialized plan
-            in which layers have been fused, precisions decided, and kernels
-            selected and tuned for one specific GPU architecture. The classic
-            workflow made this explicit, convert the checkpoint, run
-            <code>trtllm-build</code>, deploy the resulting engine file, and
-            the payoff is real: <mark>work that other engines do on every
-            forward pass, choosing kernels, fusing operations, planning memory,
-            is done once at build time, so the runtime simply replays an
-            optimized plan</mark>. The cost is rigidity, since every new model
-            architecture and every attention variant had to be expressible in
-            the compiler before it could run at all. That cost is why the 1.0
-            release rebuilt the project around a PyTorch-native backend, now
-            the default, in which models are ordinary PyTorch modules calling
-            into the same hand-tuned kernels, and the engine-building path
-            survives as a legacy workflow. The lesson generalizes beyond this
-            repo: in a field where model architectures change monthly,
-            flexibility won, and the compile-time philosophy retreated into the
-            kernels, where it belongs.
+            Beside <code>trtllm-serve</code> the wheel installs exactly two
+            other commands, <code>trtllm-bench</code> for standardized
+            throughput and latency runs and <code>trtllm-eval</code> for
+            accuracy checks. Configuration beyond flags goes in a YAML file
+            passed as <code>--extra_llm_api_options</code>, whose keys mirror
+            the LLM API arguments; this one file is where KV cache sizing,
+            scheduler policy, and parallelism live:
+          </p>
+          <pre><code># extra.yaml
+kv_cache_config:
+  free_gpu_memory_fraction: 0.85
+  enable_block_reuse: true
+
+trtllm-serve meta-llama/Llama-3.1-8B-Instruct \
+  --tp_size 2 --extra_llm_api_options extra.yaml</code></pre>
+          <h3>The mistakes beginners make</h3>
+          <p>
+            The most common one in 2026 is following a 2024 tutorial. Wrong
+            and right:
+          </p>
+          <pre><code># wrong (the old three-step engine workflow; trtllm-build
+# no longer ships in current releases)
+python convert_checkpoint.py --model_dir ... --output_dir ckpt/
+trtllm-build --checkpoint_dir ckpt/ --output_dir engine/
+trtllm-serve engine/
+
+# right: the PyTorch backend loads the HF checkpoint directly
+trtllm-serve "meta-llama/Llama-3.1-8B-Instruct"</code></pre>
+          <p>
+            Second, treating out-of-memory at startup as a model-size
+            problem. The KV cache manager claims a large fraction of the GPU
+            memory left after weights by design, so a healthy server runs
+            near full memory; if startup fails, the knob is
+            <code>free_gpu_memory_fraction</code>, not a smaller model.
+            Third, benchmarking with one request at a time and concluding
+            the engine is unimpressive: the entire architecture is built for
+            concurrent load, and single-stream latency is the one metric
+            where the heavyweight machinery shows the least. Use
+            <code>trtllm-bench</code> with a realistic request rate before
+            judging.
           </p>
 
-          <h2>Idea two: in-flight batching in a C++ runtime</h2>
+          <h2>Part III: When it is the right tool</h2>
           <p>
-            In-flight batching is NVIDIA's name for continuous batching, the
-            iteration-level scheduling that <a href="/oss/vllm">vLLM</a>
-            popularized: finished sequences leave the batch after each step,
-            waiting requests join immediately, and prefill and decode for
-            different requests share the same iterations, so the GPU never
-            idles while work is queued. TensorRT-LLM pairs it with a paged KV
-            cache and chunked prefill, the same trio found in every serious
-            engine, but what distinguishes the implementation is where it
-            lives: the batch manager and executor are C++, sitting under
-            <code>cpp/tensorrt_llm/</code>, with Python bindings above them.
-            <mark>The scheduling loop runs in C++ precisely because at high
-            request rates the scheduler itself becomes the bottleneck</mark>,
-            and keeping it out of Python is part of how the engine sustains
-            throughput at production request rates. The same executor API is
-            what Triton Inference Server drives when TensorRT-LLM is deployed
-            behind it in a datacenter.
+            Choose TensorRT-LLM when the hardware is NVIDIA, the workload is
+            production-scale, and you intend to use what the silicon vendor
+            knows: FP8 on Hopper, NVFP4 on Blackwell, the fastest attention
+            and GEMM kernels NVIDIA writes for its own chips, and features
+            like disaggregated prefill/decode and wide parallelism that are
+            developed against NVIDIA's own datacenter deployments. It is
+            also the natural choice when you are already inside the NVIDIA
+            stack, serving behind Triton Inference Server (the
+            <code>triton_backend/</code> tree ships in-repo) or consuming
+            NVIDIA's pre-quantized checkpoints from Hugging Face.
+          </p>
+          <p>
+            The main alternative is <a href="/oss/vllm">vLLM</a>, which runs
+            on more hardware, has the larger open ecosystem, and is usually
+            simpler to operate; for many teams its performance is close
+            enough that operability wins. SGLang competes at the same
+            performance tier with a strength in structured generation and
+            multi-turn caching. llama.cpp is the answer when the deployment
+            is a laptop rather than a fleet. The honest framing is that
+            TensorRT-LLM buys peak performance and earliest access to new
+            NVIDIA hardware features at the cost of a heavier dependency
+            stack and a single-vendor commitment.
+          </p>
+          <p>
+            The architecture-shaped warning is inherited from the compiler
+            era but still bites wherever engines linger:
+            <mark>a TensorRT engine is not a model, it is a compiled artifact
+            pinned to a GPU architecture and library version</mark>. Teams
+            that stored engine files in a registry and deployed them across
+            a mixed fleet learned that an engine built on H100 will not run
+            on A100, and an upgrade of TensorRT could invalidate the whole
+            shelf. The PyTorch backend dissolves most of this by compiling
+            nothing ahead of time, but the same shape reappears wherever you
+            cache tuned artifacts across heterogeneous machines:
+          </p>
+          <pre class="flow">safe:      checkpoint registry ──► per-SKU build/warmup at deploy ──► H100 fleet
+                                            └────────────────────────► A100 fleet
+dangerous: one engine/tuning artifact ──► copied across mixed SKUs ──► crashes,
+           silent slow paths, or version-invalidated caches</pre>
+
+          <h2>Part IV: The full life of one request</h2>
+          <p>
+            The canonical operation: a chat completion POSTed to
+            <code>trtllm-serve</code>, followed through the default PyTorch
+            backend to the tensor cores and back. Every stage names real
+            modules from the tree.
+          </p>
+          <h3>Stage 1: the command</h3>
+          <p>
+            <code>trtllm-serve</code> is a console script mapping to
+            <code>tensorrt_llm/commands/serve.py</code>. It assembles LLM API
+            arguments from flags plus the <code>--extra_llm_api_options</code>
+            YAML, selects the backend (<code>pytorch</code> by default, with
+            an experimental AutoDeploy variant), constructs the
+            <code>LLM</code> object, and hands it to the OpenAI server in
+            <code>tensorrt_llm/serve/openai_server.py</code>, a FastAPI
+            application.
+          </p>
+          <h3>Stage 2: the OpenAI protocol layer</h3>
+          <p>
+            <code>serve/openai_protocol.py</code> defines the request models;
+            the server validates your JSON, applies the model's chat template
+            through the tokenizer to turn messages into one prompt string,
+            and submits the prompt to the LLM API, getting back an async
+            stream of results that it will re-encode as SSE chunks. This
+            layer is deliberately thin and is the right place to read first,
+            because everything below it is engine-agnostic: the same code
+            path serves both backends.
+          </p>
+          <h3>Stage 3: the LLM API</h3>
+          <p>
+            <code>tensorrt_llm/llmapi/llm.py</code> is the stable public
+            face (exported at the package root, so
+            <code>from tensorrt_llm import LLM</code>), and
+            <code>llmapi/llm_args.py</code> is the configuration monster
+            where every knob in the system is declared as a typed field,
+            KV cache config, scheduler config, parallel mapping,
+            speculative decoding, quantization. Tokenization happens here
+            (<code>llmapi/tokenizer.py</code> wraps the Hugging Face
+            tokenizer), so what travels further down is token ids plus
+            sampling parameters.
+          </p>
+          <h3>Stage 4: the executor boundary, and a process hop</h3>
+          <p>
+            The LLM API does not run the model in your process. The
+            <code>tensorrt_llm/executor/</code> package implements a
+            GenerationExecutor split into a proxy (<code>proxy.py</code>) in
+            the API process and one or more workers
+            (<code>worker.py</code>, <code>base_worker.py</code>) holding the
+            GPU, launched under MPI for multi-rank runs, with requests and
+            results crossing over ZeroMQ-based IPC (<code>ipc.py</code>) and
+            responses post-processed in dedicated processes
+            (<code>postproc_worker.py</code>). The isolation is deliberate:
+            the GIL-holding web frontend and detokenization work cannot stall
+            the process that must keep the GPU fed. Your request becomes a
+            <code>GenerationRequest</code> (<code>request.py</code>), is
+            serialized across, and registers a
+            <code>GenerationResult</code> (<code>result.py</code>) that will
+            stream tokens back the other way.
+          </p>
+          <h3>Stage 5: the PyExecutor loop</h3>
+          <p>
+            Inside the worker lives the heartbeat:
+            <code>tensorrt_llm/_torch/pyexecutor/py_executor.py</code>. New
+            requests land in an <code>executor_request_queue</code> and
+            become <code>LlmRequest</code> objects
+            (<code>llm_request.py</code>), each carrying its lifecycle state
+            (context phase, generation phase, finished). The loop body runs
+            once per model step: fetch new requests, schedule, allocate KV
+            blocks, run the model, sample, stream results, free finished
+            requests. By default the engine runs the overlap variant,
+            <code>_executor_loop_overlap</code>, which prepares and schedules
+            step N+1 while the GPU still executes step N, hiding CPU
+            bookkeeping behind GPU time.
+          </p>
+          <h3>Stage 6: scheduling, in C++ even here</h3>
+          <p>
+            Each iteration, the scheduler decides which requests run.
+            <code>pyexecutor/scheduler/scheduler.py</code> defines the
+            interfaces, but the default implementations,
+            <code>BindCapacityScheduler</code> and
+            <code>BindMicroBatchScheduler</code>, are thin wrappers over the
+            C++ algorithms in
+            <code>cpp/tensorrt_llm/batch_manager/capacityScheduler.cpp</code>
+            and <code>microBatchScheduler.cpp</code>, reached through the
+            nanobind bindings. The capacity scheduler answers "which requests
+            may occupy the engine given KV memory," under a policy
+            (<code>GUARANTEED_NO_EVICT</code> by default,
+            <code>MAX_UTILIZATION</code> or <code>STATIC_BATCH</code> as
+            alternatives); the micro-batch scheduler then packs the chosen
+            requests' context chunks and generation steps into this
+            iteration's batch under the token budget. This stage is the deep
+            dive in Part V.
+          </p>
+          <h3>Stage 7: KV cache blocks</h3>
+          <p>
+            The <code>resource_manager.py</code> layer asks the KV cache
+            manager, again C++ underneath
+            (<code>batch_manager/kvCacheManager.cpp</code>), to allocate
+            blocks for every scheduled request. The cache is paged, 32
+            tokens per block by default
+            (<code>KvCacheConfig.tokens_per_block</code>), with reuse of
+            blocks across requests that share prefixes and an eviction
+            policy (<code>evictionPolicy.cpp</code>) governing the block
+            pool. If your prompt shares a system prefix with earlier
+            requests and block reuse is enabled, this is the stage where
+            most of its "prefill" silently vanishes.
+          </p>
+          <h3>Stage 8: the model engine</h3>
+          <p>
+            <code>pyexecutor/model_engine.py</code> owns the forward pass. The
+            model is genuine PyTorch: architecture classes in
+            <code>_torch/models/</code> composed from optimized modules in
+            <code>_torch/modules/</code>, with attention dispatched through
+            <code>_torch/attention_backend/</code> to the TRT-LLM fused
+            attention kernels (or FlashInfer), and custom ops registered in
+            <code>_torch/custom_ops/</code> so torch sees the hand-written
+            kernels as ordinary operators. Two compile-era survivors do the
+            performance work here: CUDA graphs
+            (<code>cuda_graph_runner.py</code>) capture whole decode
+            iterations at standard batch sizes so a step replays with almost
+            no launch overhead, and the autotuner
+            (<code>_torch/autotuner.py</code>) picks the best kernel variant
+            per shape at warmup, which is why the first requests after
+            startup are slower.
+          </p>
+          <h3>Stage 9: kernels and tensor cores</h3>
+          <p>
+            The bottom of the stack is
+            <code>cpp/tensorrt_llm/kernels/</code> plus
+            <code>cutlass_extensions/</code>, with specialized trees vendored
+            beside them (<code>deep_gemm</code>, <code>flash_mla</code>,
+            <code>deep_ep</code> for expert parallelism). These are the
+            CUTLASS-based GEMMs and fused attention kernels that know about
+            FP8 and NVFP4 tensor-core datapaths, exported back to Python
+            through the torch-op layer in <code>cpp/tensorrt_llm/thop/</code>.
+            For one decode step of one request in a batch of hundreds, the
+            GPU runs a handful of fused kernels per layer, most of them
+            reading quantized weights the chip natively understands.
+          </p>
+          <h3>Stage 10: sampling and the way back</h3>
+          <p>
+            Logits return to <code>pyexecutor/sampler/</code>, which applies
+            temperature, top-k/top-p and friends batch-wide (with
+            <code>guided_decoder.py</code> constraining tokens to a grammar
+            when structured output was requested; the softmax being sampled
+            from is the same one derived on my
+            <a href="/ml/softmax">softmax page</a>). New token ids update
+            each <code>LlmRequest</code>; finished requests release their KV
+            blocks; responses stream through the IPC layer to the
+            post-processing workers for detokenization, then to the FastAPI
+            layer, which emits your SSE chunk. The loop, meanwhile, has
+            already started the next iteration with a slightly different
+            batch, which is the whole point of Part V's deep dive.
+          </p>
+          <h3>The legacy flow, as history</h3>
+          <p>
+            Until the 1.0 release (September 2025) the primary path was
+            different in kind. You ran a per-model
+            <code>convert_checkpoint.py</code>, then
+            <code>trtllm-build</code>, which traced the model through
+            TensorRT: layers fused, precisions fixed, one kernel tactic
+            chosen per op by measuring candidates on your GPU, memory
+            statically planned, everything serialized into engine files plus
+            a <code>config.json</code>. The C++ runtime then loaded and
+            replayed that plan. The payoff was real, work done once instead
+            of per step; the cost was that every new architecture, every new
+            attention trick, and every dynamic behavior had to be expressible
+            in the compiler first, and in a field shipping novel models
+            monthly that became the bottleneck. The 1.0 release made the
+            PyTorch backend the default and stabilized the LLM API on top of
+            it, and on current main the engine-building CLI is gone from the
+            shipped entry points. Reading the C++ <code>runtime/</code> tree
+            today is reading well-organized history that still explains why
+            the executor, batch manager, and kernel layers have the shapes
+            they do.
           </p>
 
-          <h2>Idea three: quantization co-designed with the hardware</h2>
+          <h2>Part V: Deep dive: ahead-of-time compilation, and what an engine was</h2>
           <p>
-            Every inference engine quantizes; TensorRT-LLM is where
-            quantization meets the silicon first, because the formats are
-            NVIDIA's own. FP8 arrived with Hopper's transformer engine and
-            FP4 with Blackwell, each backed by dedicated tensor-core
-            datapaths, and this library carries the kernels that exploit them,
-            from fused attention through the CUTLASS-based GEMM extensions in
-            the C++ tree. The checkpoints themselves typically come from the
+            The idea TensorRT-LLM inherited from TensorRT is that inference
+            is a compiler problem: if the graph, shapes, precisions, and
+            target chip are known ahead of time, you can make every expensive
+            decision offline. Concretely an engine bakes in three classes of
+            decision. Fusion: chains like GEMM + bias + activation, or an
+            entire attention block, become single kernels, eliminating
+            memory round-trips between ops. Tactic selection: for each
+            fused op, TensorRT times competing kernel implementations on the
+            actual GPU and records the winner. Static planning: activation
+            memory is laid out once, so execution is a replay with no
+            allocator in the loop.
+          </p>
+          <pre class="flow">AOT era:   checkpoint ─► trace ─► fuse ─► time tactics ─► serialize engine
+           runtime: replay plan            (fast, rigid, per-GPU artifact)
+
+JIT era:   checkpoint ─► PyTorch modules ─► custom fused kernels
+           + autotune at warmup + CUDA graph capture per batch size
+           (flexible, and the compile-time wins are re-earned piecemeal)</pre>
+          <p>
+            Why did the flexible side win? Because the rigid side taxed
+            exactly the thing the field optimizes for: time-to-new-model.
+            Each architecture needed compiler support before it could run at
+            all; dynamic control flow (mixture-of-experts routing,
+            speculative decoding trees) fought the static-graph worldview;
+            and the artifact pinning from Part III made operations brittle.
+            The revealing part is what the PyTorch backend kept.
+            <mark>CUDA graph capture is a miniature engine: a recorded,
+            replayable execution plan for the decode step, minus the
+            portability problems</mark>. The autotuner is tactic selection
+            moved to warmup. The fused kernels are the fusion pass, written
+            by hand where it matters instead of derived for every op. The
+            trade-offs did not disappear, they were re-priced: warmup time
+            and hand-kernel engineering instead of build steps and per-SKU
+            artifacts.
+          </p>
+          <p>
+            Two misconceptions to correct explicitly. "TensorRT-LLM requires
+            building an engine" has been false since 1.0 and is unbuildable
+            on current main; the name now describes ancestry more than
+            mechanism. And "a PyTorch backend means Python-speed serving" is
+            wrong twice over: the hot loop's decisions run in C++ behind
+            bindings, and the GPU-side work runs as captured graphs and fused
+            kernels, so Python remains on the control plane, not the data
+            plane.
+          </p>
+
+          <h2>Part V continued: Deep dive: in-flight batching and the C++ executor machinery</h2>
+          <p>
+            In-flight batching is NVIDIA's name for continuous batching,
+            iteration-level scheduling of the kind
+            <a href="/oss/vllm">vLLM</a> popularized: batch membership is
+            reconsidered every model step, so finished sequences leave
+            immediately, waiting requests join immediately, and context
+            (prefill) work for new requests shares iterations with
+            generation (decode) work for old ones.
+          </p>
+          <pre class="flow">iteration N:    [A:decode] [B:decode] [C:context chunk 2/3] [D:context chunk 1/4]
+B finishes, E arrives
+iteration N+1:  [A:decode] [C:context chunk 3/3] [D:context 2/4] [E:context 1/1]
+iteration N+2:  [A:decode] [C:decode] [D:context 3/4] [E:decode]</pre>
+          <p>
+            The decision is factored into two cooperating schedulers, and the
+            factoring is worth memorizing because it recurs in every serious
+            engine. The capacity scheduler
+            (<code>batch_manager/capacityScheduler.cpp</code>) answers the
+            memory question: which requests may be in flight at all, given
+            KV cache blocks. Its policy enum
+            (<code>cpp/include/tensorrt_llm/executor/types.h</code>) has
+            three values: <code>kGUARANTEED_NO_EVICT</code>, the default,
+            admits a request only if it can run to completion without
+            eviction; <code>kMAX_UTILIZATION</code> packs more aggressively
+            and accepts that peak memory pressure may force pausing requests
+            (<code>pauseRequests.cpp</code> exists precisely for this);
+            <code>kSTATIC_BATCH</code> reproduces old-style batch-at-a-time
+            behavior for comparison. The micro-batch scheduler
+            (<code>microBatchScheduler.cpp</code>) then answers the compute
+            question: of the admitted requests, what fits this iteration
+            under the token budget, chunking long prompts
+            (<code>ContextChunkingPolicy</code>, first-come-first-served by
+            default) so a 30k-token prefill cannot freeze everyone's decode
+            latency.
+          </p>
+          <p>
+            Around these two sit the supporting cast, all in
+            <code>cpp/tensorrt_llm/batch_manager/</code>:
+            <code>llmRequest.cpp</code> (request state machine),
+            <code>kvCacheManager.cpp</code> with
+            <code>evictionPolicy.cpp</code> (paged block pool, 32 tokens per
+            block by default, prefix reuse),
+            <code>sequenceSlotManager.cpp</code> (seat assignment), and the
+            cache transceiver files that ship KV blocks between nodes for
+            disaggregated prefill/decode serving. The famous trap:
+            <mark>MAX_UTILIZATION is not a free throughput switch</mark>;
+            under memory pressure it pauses running requests, which shows up
+            as mid-stream latency spikes, so the default policy's
+            conservatism is a latency guarantee, not timidity. A second
+            trap: the token budget means scheduling is not FIFO fairness;
+            a stream of short requests can interleave ahead of a long
+            prompt's later chunks, which is by design, and tail-latency
+            SLOs are tuned with the scheduler and chunking knobs in the
+            YAML, not by code changes. For the requirements-first version of
+            these ideas, my
+            <a href="/systems/llm-inference">LLM serving design write-up</a>
+            derives the same trio, continuous batching, paged KV, chunked
+            prefill, from first principles.
+          </p>
+
+          <h2>Part V continued: Deep dive: quantization co-designed with the hardware</h2>
+          <p>
+            Every engine quantizes; what makes TensorRT-LLM distinctive is
+            that here the format, the kernels, and the silicon are designed
+            by the same company, usually in that order reversed. FP8 arrived
+            with Hopper: the H100's tensor cores execute 8-bit floating
+            point (E4M3 for weights and activations, E5M2 where range
+            matters) natively, so FP8 halves weight memory and roughly
+            doubles matmul throughput relative to FP16 while behaving, from
+            the model's perspective, like a slightly noisier float. Because
+            floats carry exponents, FP8 needs only light per-tensor or
+            per-block scaling rather than the delicate calibration that
+            INT8 required, which is why FP8 became the default serving
+            precision on Hopper almost immediately.
+          </p>
+          <p>
+            Blackwell extends the bet to four bits with NVFP4. The format:
+            weights are stored as E2M1 (one sign, two exponent, one mantissa
+            bit, representable magnitudes up to 6), in blocks of 16 values
+            that share an FP8 (E4M3) scale, with one FP32 scale per tensor
+            on top. A block is 16 times 4 bits plus 8 bits of scale, 72 bits
+            per 16 values, so about 4.5 bits per weight effective, the same
+            overhead ratio as llama.cpp's Q4 blocks but with a
+            floating-point scale hierarchy the tensor cores consume
+            directly. Compared with the OCP MXFP4 standard (32-value blocks,
+            power-of-two E8M0 scales), NVFP4's smaller blocks and
+            higher-precision scales measurably reduce quantization error at
+            the cost of double the scale overhead, a trade NVIDIA could make
+            unilaterally because it also builds the datapath.
+            <mark>On this hardware, low-precision floating point is not an
+            accuracy compromise bolted on afterwards; it is the operating
+            point the chips were designed around</mark>, and this repository
+            is where that intent becomes runnable kernels, in the FP4 GEMMs
+            and fused attention under <code>cpp/tensorrt_llm/kernels/</code>
+            and <code>cutlass_extensions/</code>.
+          </p>
+          <table>
+            <thead>
+              <tr><th>Format</th><th>Hardware</th><th>Element</th><th>Scaling</th><th>Effective bits</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>FP16/BF16</td><td>everything</td><td>16-bit float</td><td>none</td><td>16</td></tr>
+              <tr><td>FP8</td><td>Hopper onward</td><td>E4M3 / E5M2</td><td>per-tensor or per-block</td><td>~8</td></tr>
+              <tr><td>NVFP4</td><td>Blackwell</td><td>E2M1</td><td>E4M3 per 16 values + FP32 per tensor</td><td>~4.5</td></tr>
+              <tr><td>MXFP4 (contrast)</td><td>OCP standard</td><td>E2M1</td><td>E8M0 per 32 values</td><td>~4.25</td></tr>
+            </tbody>
+          </table>
+          <p>
+            Operationally, quantized checkpoints usually come from the
             TensorRT Model Optimizer toolkit, and NVIDIA publishes
             pre-quantized FP8 and FP4 versions of popular open models on
-            Hugging Face so that serving them is a model-name change rather
-            than a calibration project. The practical takeaway is that on
-            recent NVIDIA hardware, low-precision floating point is not an
-            accuracy compromise bolted on afterwards but the intended operating
-            point the chips were designed around, and this repository is where
-            that intent becomes runnable code.
+            Hugging Face, so serving one is a model-name change rather than
+            a calibration project; the loading side lives in
+            <code>tensorrt_llm/quantization/</code> and the per-model quant
+            configs in the PyTorch backend. The KV cache can be quantized to
+            FP8 as well, which matters because at high concurrency the cache,
+            not the weights, dominates memory. The trap to correct: 4-bit
+            weights do not mean the whole computation is 4-bit, activations
+            flow at higher precision with scaling at the boundaries; and the
+            gains are architecture-gated, so an FP4 checkpoint does nothing
+            for you on Ampere. Check what your GPU generation actually
+            accelerates before choosing a checkpoint.
           </p>
 
-          <h2>Reading the repository</h2>
+          <h2>Part VI: Reading the repository</h2>
           <p>
-            The repo is two codebases sharing a roof: the Python package in
-            <code>tensorrt_llm/</code> and the C++ core in
-            <code>cpp/tensorrt_llm/</code>. Start on the Python side with the
-            LLM API under <code>llmapi/</code>, the class from the quickstart,
-            and the CLI entry points under <code>commands/</code>, which show
-            how <code>trtllm-serve</code> assembles the same pieces. The
-            PyTorch backend lives under <code>_torch/</code>, and it is the
-            most instructive read in the project: model definitions, attention
-            backends, and the glue that swaps standard modules for optimized
-            kernels, with the model zoo in <code>models/</code> and the
-            quantization interfaces in <code>quantization/</code> beside it.
-            The <code>executor/</code> package is the bridge downward into
-            C++, where <code>batch_manager/</code> owns request scheduling and
-            the KV cache, <code>runtime/</code> owns engine and buffer
-            management, and <code>kernels/</code> with
-            <code>cutlass_extensions/</code> holds the attention and GEMM
-            code, bound back to Python through the torch ops in
-            <code>thop/</code>. The <code>examples/</code> tree keeps
-            per-model scripts including the legacy engine-build flow. A good
-            first session is to run the LLM API example, then trace one
-            generate call from <code>llmapi/</code> through the executor
-            bindings until you cross the C++ boundary; my
-            <a href="/systems/llm-inference">LLM serving design write-up</a>
-            is a useful companion for why each layer you pass through exists.
+            Two codebases share the roof: the Python package
+            <code>tensorrt_llm/</code> and the C++ core
+            <code>cpp/tensorrt_llm/</code>. All paths verified on main,
+            July 2026; this repo moves fast, so trust the layering over the
+            exact file names.
           </p>
+          <h3>Stage 0: orientation (one evening)</h3>
+          <p>
+            Read the README and the quick start in <code>docs/</code>, then
+            run the LLM API example in the release container. Questions you
+            should answer: what are the two backends and which is default?
+            What three commands does the wheel install? Why does the first
+            generation take so long?
+          </p>
+          <h3>Stage 1: the public surface</h3>
+          <p>
+            Read <code>tensorrt_llm/llmapi/llm.py</code>, skim
+            <code>llmapi/llm_args.py</code> (do not read it linearly; search
+            it when you meet a knob), then
+            <code>commands/serve.py</code> and
+            <code>serve/openai_server.py</code> with
+            <code>openai_protocol.py</code>. Questions: where does the chat
+            template get applied? How does a YAML options file become LLM
+            arguments? What does the server hand downward, text or tokens?
+          </p>
+          <h3>Stage 2: the executor boundary</h3>
+          <p>
+            Read <code>tensorrt_llm/executor/</code>: <code>executor.py</code>,
+            <code>proxy.py</code>, <code>worker.py</code>, <code>ipc.py</code>,
+            <code>request.py</code>, <code>result.py</code>,
+            <code>postproc_worker.py</code>. Questions: which process owns
+            the GPU? What crosses the IPC boundary and in which direction?
+            Why do detokenization and streaming live in separate worker
+            processes?
+          </p>
+          <h3>Stage 3: the PyExecutor</h3>
+          <p>
+            The heart. In <code>tensorrt_llm/_torch/pyexecutor/</code> read
+            <code>py_executor.py</code> (find the loop variants),
+            <code>executor_request_queue.py</code>,
+            <code>llm_request.py</code>, <code>scheduler/scheduler.py</code>,
+            <code>resource_manager.py</code>, <code>model_engine.py</code>,
+            <code>cuda_graph_runner.py</code>, and <code>sampler/</code>.
+            Questions: what happens in one iteration, in order? What does
+            the overlap loop overlap? Which decisions are delegated to C++
+            and through what?
+          </p>
+          <h3>Stage 4: the C++ core</h3>
+          <p>
+            In <code>cpp/tensorrt_llm/batch_manager/</code> read
+            <code>capacityScheduler.cpp</code>,
+            <code>microBatchScheduler.cpp</code>,
+            <code>kvCacheManager.cpp</code>, <code>llmRequest.cpp</code>, and
+            <code>evictionPolicy.cpp</code>, with the executor API types in
+            <code>cpp/include/tensorrt_llm/executor/</code> beside them, and
+            glance at <code>cpp/tensorrt_llm/nanobind/</code> to see how
+            Python reaches all of it. Questions: how do the three capacity
+            policies differ in code? How is a KV block found for reuse?
+            What exactly does <code>ScheduledRequests</code> contain when it
+            returns to Python?
+          </p>
+          <h3>Stage 5: models and kernels</h3>
+          <p>
+            Read one architecture in <code>_torch/models/</code> and the
+            modules it uses in <code>_torch/modules/</code> and
+            <code>_torch/attention_backend/</code>, then descend into
+            <code>cpp/tensorrt_llm/thop/</code> to see kernel registration
+            and sample a kernel family in
+            <code>cpp/tensorrt_llm/kernels/</code>. Questions: how does a
+            plain-looking PyTorch module end up calling a CUTLASS FP8 GEMM?
+            Where do quantization scales live at runtime?
+          </p>
+          <p>
+            Where not to start: <code>cutlass_extensions/</code> and the
+            vendored kernel trees (<code>deep_gemm</code>,
+            <code>flash_mla</code>, <code>deep_ep</code>), which assume
+            fluency in CUTLASS; <code>3rdparty/</code>;
+            <code>triton_backend/</code>; the <code>_torch/auto_deploy/</code>
+            experimental compiler; and the C++ <code>runtime/</code>
+            engine-loading tree, which is best read last, as history, the
+            way Part IV frames it.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            All labs assume an NVIDIA GPU and the release container. Numbers
+            vary with GPU, model, and version; treat them as shapes.
+          </p>
+          <p><strong>Lab 1: watch warmup earn its keep.</strong> Run the LLM
+            API quickstart with logging raised:</p>
+          <pre><code>TLLM_LOG_LEVEL=INFO python quickstart.py</code></pre>
+          <p>
+            Observe the startup sequence in the logs: weight loading, KV
+            cache pool sizing, autotuning, CUDA graph capture per batch
+            size, and then how much faster the second
+            <code>llm.generate()</code> call is than the first. This is the
+            Part V argument, compile-time work re-priced as warmup, visible
+            in timestamps.
+          </p>
+          <p><strong>Lab 2: in-flight batching under load.</strong> Serve a
+            small model, then hit it with many concurrent streams:</p>
+          <pre><code>trtllm-serve "TinyLlama/TinyLlama-1.1B-Chat-v1.0" &amp;
+for i in $(seq 1 16); do
+  curl -s http://localhost:8000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model":"TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+         "messages":[{"role":"user","content":"Write 100 words about oceans."}]}' \
+    &gt; /dev/null &amp;
+done; wait</code></pre>
+          <p>
+            Watch <code>nvidia-smi</code> utilization and the iteration
+            statistics in the server log. Then repeat the 16 requests
+            serially and compare wall-clock totals: the concurrent run
+            finishing in a small multiple of the serial single-request time,
+            rather than 16 times it, is continuous batching measured.
+          </p>
+          <p><strong>Lab 3: scheduler policy as an observable.</strong>
+            Create two YAML files differing only in
+            <code>scheduler_config</code> capacity policy
+            (<code>GUARANTEED_NO_EVICT</code> vs
+            <code>MAX_UTILIZATION</code>), constrain KV memory with a low
+            <code>free_gpu_memory_fraction</code>, and drive both with
+            <code>trtllm-bench</code> at a request rate high enough to
+            saturate. Measure throughput and per-request latency percentiles.
+            Expect the aggressive policy to gain throughput and pay for it
+            in tail latency when pausing kicks in, the exact trade-off from
+            the deep dive.
+          </p>
+          <p><strong>Lab 4: prefix reuse.</strong> With
+            <code>enable_block_reuse: true</code>, send a request with a
+            2,000-token system prompt, then a second request sharing that
+            system prompt with a different question, and compare
+            time-to-first-token in the responses' timing (or the perf
+            metrics endpoint if enabled). The second request's prefill
+            should shrink dramatically: KV blocks from stage 7 being found
+            instead of computed.
+          </p>
+          <p><strong>Lab 5: what FP8 buys (Hopper or newer required).</strong>
+            Serve the same model twice, once from the standard BF16
+            checkpoint and once from NVIDIA's pre-quantized FP8 variant on
+            Hugging Face, and run identical
+            <code>trtllm-bench</code> sweeps. Record weight memory
+            (<code>nvidia-smi</code> after load), max sustainable request
+            rate, and an accuracy spot-check with <code>trtllm-eval</code>.
+            You are measuring the co-design claim rather than taking it on
+            faith; on pre-Hopper hardware this lab intentionally fails,
+            which is itself the lesson about architecture-gated formats.
+          </p>
+          <p><strong>Lab 6: find the boundary.</strong> No GPU needed. In
+            the repo, start from
+            <code>pyexecutor/scheduler/scheduler.py</code>'s
+            <code>BindCapacityScheduler</code>, find the binding it
+            constructs, locate the C++ implementation in
+            <code>batch_manager/capacityScheduler.cpp</code>, and read one
+            policy's admission loop end to end. Write down, in one
+            paragraph, what crosses the language boundary per iteration.
+            This is the single most clarifying exercise in the codebase.
+          </p>
+
+          <h2>Part VIII: Questions and model answers</h2>
+          <p><strong>1. What is TensorRT-LLM in one sentence?</strong>
+            NVIDIA's open source serving engine for its own GPUs: a PyTorch
+            front half defining models and orchestration, a C++ back half
+            making per-iteration scheduling and memory decisions, and
+            kernels that exploit NVIDIA-specific numeric formats like FP8
+            and NVFP4.</p>
+          <p><strong>2. What changed at the 1.0 release?</strong>
+            The PyTorch-native backend became the stable default and the
+            LLM API became the stable surface, displacing the classic
+            convert-then-<code>trtllm-build</code> engine workflow, which
+            was subsequently removed from the shipped tooling. Models now
+            load directly from Hugging Face checkpoints with no offline
+            compile step.</p>
+          <p><strong>3. What exactly was a TensorRT engine?</strong>
+            A serialized execution plan produced ahead of time: operator
+            fusion decided, one measured-best kernel tactic recorded per op,
+            precisions fixed, memory statically planned, all specific to one
+            GPU architecture and library version. The runtime replayed it
+            rather than interpreting a graph.</p>
+          <p><strong>4. If the compiler flow was removed, where did its ideas go?</strong>
+            Into three surviving mechanisms: CUDA graph capture, which
+            records replayable decode iterations; the warmup autotuner,
+            which is tactic selection deferred to startup; and hand-fused
+            kernels, which are the fusion pass applied where it pays. The
+            trade moved from build-time rigidity to warmup cost.</p>
+          <p><strong>5. Trace a chat request through the layers.</strong>
+            FastAPI protocol layer applies the chat template and calls the
+            LLM API; the generation executor proxies the request over IPC to
+            a worker process owning the GPU; the PyExecutor loop schedules
+            it via the C++ capacity and micro-batch schedulers, allocates
+            paged KV blocks, runs the PyTorch model engine under CUDA
+            graphs, samples, and streams tokens back through post-processing
+            workers to the SSE response.</p>
+          <p><strong>6. Why is the serving loop split across processes?</strong>
+            To keep the GPU-feeding process isolated from Python-side stalls:
+            the API frontend, detokenization, and result post-processing run
+            in their own processes, connected by ZeroMQ-based IPC, so GIL
+            contention and slow clients cannot starve the iteration loop.
+            Multi-GPU ranks additionally run under MPI.</p>
+          <p><strong>7. What are the two schedulers and why two?</strong>
+            The capacity scheduler decides which requests may be in flight
+            given KV memory (a per-request admission question), and the
+            micro-batch scheduler decides what work from those requests runs
+            this iteration under the token budget (a per-step packing
+            question). Separating memory admission from compute packing lets
+            each policy vary independently.</p>
+          <p><strong>8. Compare GUARANTEED_NO_EVICT and MAX_UTILIZATION.</strong>
+            The default admits a request only when its worst-case KV usage
+            can be satisfied to completion, so latency is predictable and
+            nothing is paused. MAX_UTILIZATION packs more requests and
+            accepts that memory pressure may pause running requests
+            mid-stream, buying throughput with tail latency. STATIC_BATCH
+            exists mainly as a baseline.</p>
+          <p><strong>9. How does the KV cache work here?</strong>
+            It is paged: fixed-size blocks of 32 tokens by default, drawn
+            from a pool sized as a fraction of post-load free GPU memory,
+            with prefix-matched block reuse across requests and an eviction
+            policy over the pool. The bookkeeping is C++
+            (<code>kvCacheManager.cpp</code>), reached from Python through
+            bindings.</p>
+          <p><strong>10. What makes FP8 easier to deploy than INT8 was?</strong>
+            Floats carry per-value exponents, so FP8 tolerates the dynamic
+            range of transformer activations with only light scaling, where
+            INT8 needed careful calibration and often per-channel tricks to
+            avoid outlier damage. With Hopper executing FP8 natively in
+            tensor cores, it halves weight memory and raises matmul
+            throughput at near-baseline accuracy.</p>
+          <p><strong>11. Describe NVFP4 precisely.</strong>
+            Elements are E2M1 four-bit floats; every 16 elements share an
+            FP8 E4M3 scale, and each tensor carries an FP32 scale on top,
+            totaling about 4.5 bits per weight. Against MXFP4's 32-element
+            blocks with power-of-two scales, the finer blocks and richer
+            scales cut quantization error, and Blackwell tensor cores
+            consume the format natively.</p>
+          <p><strong>12. When is vLLM the better choice?</strong>
+            When portability across hardware, ecosystem breadth, or
+            operational simplicity outweigh the last measure of NVIDIA-side
+            performance, which is often. TensorRT-LLM earns its complexity
+            when you are committed to NVIDIA fleets, want FP8/FP4 at day
+            one on new silicon, or deploy behind Triton with NVIDIA's
+            supported path.</p>
+          <p><strong>13. A server OOMs at startup though the model fits in
+            VRAM. What is happening?</strong>
+            The KV cache manager pre-allocates a large fraction of post-load
+            free memory by design, and other consumers (CUDA graphs,
+            fragmentation, another process) can push the total over. Lower
+            <code>kv_cache_config.free_gpu_memory_fraction</code> or reduce
+            max batch/sequence limits; do not conclude the model is too
+            large.</p>
+          <p><strong>14. Throughput is fine but p99 latency spikes
+            mid-generation. Where do you look first?</strong>
+            Scheduler policy and memory pressure: under MAX_UTILIZATION,
+            paused-and-resumed requests manifest exactly this way. Check
+            iteration stats for paused requests, then either move to the
+            no-evict policy or give the KV pool more headroom, and check
+            whether giant prompts are being chunked sensibly.</p>
+          <p><strong>15. Why does the first request after deploy take so
+            long, and what do you do about it?</strong>
+            Warmup: kernel autotuning and CUDA graph capture happen lazily
+            at startup and on first shapes. It is expected, and production
+            deployments absorb it by warming the server with representative
+            traffic before adding it to the load balancer, not by disabling
+            the optimizations.</p>
+          <p><strong>16. What runs in Python and what runs in C++ in the
+            default backend?</strong>
+            Python: the API surface, the executor loop's orchestration, model
+            definition, and configuration. C++: capacity and micro-batch
+            scheduling algorithms, KV block management, and all kernels,
+            exposed through nanobind bindings and torch custom ops. Python
+            steers; C++ and the GPU do everything counted per token.</p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Compile-ahead loses to libraries when the workload
+            outruns the compiler.</strong> Whole-model AOT compilation was
+            the right call when architectures changed yearly and the wrong
+            one when they changed monthly; the durable wins (fusion, tuned
+            kernel choice, replayable plans) survived by being repackaged
+            at smaller granularity. The same arc played out in databases
+            (whole-query codegen vs vectorized interpreters) and graphics
+            (monolithic shaders vs pipeline caches).
+          </p>
+          <p>
+            <strong>Keep Python on the control plane, never the data
+            plane.</strong> The engine's answer to "Python is slow" is not
+            rewriting in C++ wholesale but drawing the boundary carefully:
+            per-iteration decisions and kernels below the bindings,
+            orchestration above. Every high-performance Python system that
+            works, from NumPy to PyTorch itself, is this one pattern
+            applied consistently.
+          </p>
+          <p>
+            <strong>Process isolation is a scheduling tool.</strong> Proxy,
+            worker, and post-processing processes exist so the GPU never
+            waits on the GIL, a slow client, or detokenization. Nginx
+            workers, browser process models, and database background writers
+            all encode the same insight: isolate the latency-critical loop
+            from everything with unpredictable timing.
+          </p>
+          <p>
+            <strong>Co-design up and down the stack when you own it.</strong>
+            NVFP4 exists because the format designers and the tensor-core
+            designers were the same company; the software ships kernels for
+            silicon on day one, and the silicon implements formats the
+            software proved out. Apple's silicon-plus-frameworks story and
+            Google's TPU-plus-XLA story are the same play; the cost, as
+            always, is that the advantage does not travel.
+          </p>
+          <p>
+            <strong>Make policy an enum, not a fork.</strong> The capacity
+            scheduler's three policies encode a genuine latency-throughput
+            trade as a configuration value with a conservative default,
+            letting operators choose without patching code. Databases do
+            this with isolation levels, kernels with I/O schedulers; naming
+            the trade-off is half of managing it.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            One sentence to keep: TensorRT-LLM serves OpenAI-style requests
+            through a Python-orchestrated, C++-scheduled executor loop that
+            batches at iteration granularity into a PyTorch model running
+            CUDA-graphed, hand-fused kernels on NVIDIA's own low-precision
+            formats.
+          </p>
+          <pre class="flow">Request → Protocol → LLM API → IPC → PyExecutor → Scheduler(C++) → KV blocks
+        → Model engine → Kernels → Sampler → Stream</pre>
+          <p>The chain mapped to real paths:</p>
+          <pre class="flow">Protocol    tensorrt_llm/serve/openai_server.py, openai_protocol.py
+LLM API     tensorrt_llm/llmapi/llm.py, llm_args.py
+IPC         tensorrt_llm/executor/ (proxy.py, worker.py, ipc.py)
+PyExecutor  tensorrt_llm/_torch/pyexecutor/py_executor.py
+Scheduler   pyexecutor/scheduler/ → cpp/tensorrt_llm/batch_manager/
+            capacityScheduler.cpp, microBatchScheduler.cpp
+KV blocks   batch_manager/kvCacheManager.cpp (32 tokens/block default)
+Engine      _torch/pyexecutor/model_engine.py, _torch/models/, cuda_graph_runner.py
+Kernels     cpp/tensorrt_llm/kernels/, cutlass_extensions/, thop/
+Sampler     _torch/pyexecutor/sampler/
+Stream      executor/result.py, postproc_worker.py → SSE</pre>
+          <p>Memorize these:</p>
+          <ul>
+            <li>Since 1.0: PyTorch backend default, LLM API stable, no engine build step; <code>trtllm-serve</code>, <code>trtllm-bench</code>, <code>trtllm-eval</code> are the three shipped commands.</li>
+            <li>Two schedulers: capacity (memory admission; NO_EVICT default) then micro-batch (per-iteration packing with chunked context).</li>
+            <li>In-flight batching = continuous batching: membership reconsidered every iteration; prefill and decode share iterations.</li>
+            <li>FP8 = Hopper, E4M3, light scaling. NVFP4 = Blackwell, E2M1 in 16-value blocks with E4M3 scales plus FP32 per tensor, ~4.5 bits effective.</li>
+            <li>The compiler survives as: CUDA graphs (plan replay), autotuner (tactic selection at warmup), hand-fused kernels (the fusion pass).</li>
+          </ul>
+
+          <h2>Part XI: Final takeaway</h2>
           <div class="takeaway">
             <strong>Key takeaway:</strong> TensorRT-LLM shows what inference
             looks like when the engine and the silicon come from the same
-            company: compile-time optimization pushed as far as it can go, then
-            deliberately pulled back into the kernels when model velocity made
-            whole-graph compilation a liability, wrapped around a C++ runtime
-            and quantization formats the GPUs themselves were designed to run.
+            company: compile-time optimization pushed as far as it could go,
+            then deliberately pulled back into kernels, CUDA graphs, and a
+            warmup autotuner when model velocity made whole-graph
+            compilation a liability, wrapped around a C++ scheduling core
+            that Python only steers, and quantization formats the GPUs
+            themselves were designed to run. Read the executor loop once and
+            the boundary once, and the rest of the repository is detail.
           </div>
         </article>
       </div>

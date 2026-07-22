@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>llama.cpp walkthrough · Stanley Jacob</title>
-    <meta name="description" content="A walkthrough of the llama.cpp repository: how to run a model in five minutes, how ggml, GGUF, and block-wise quantization make local inference work, and a guided reading path from the CLI tools down to the kernels." />
+    <meta name="description" content="A full chapter on llama.cpp: a practical tutorial, a walk through one token's life from llama-cli to the SIMD and CUDA kernels, deep dives into ggml, GGUF, block-wise quantization, and the server, plus a staged plan for reading the repository." />
     <link rel="stylesheet" href="/style.css" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
   </head>
@@ -35,10 +35,13 @@
           on your own hardware normal. Georgi Gerganov started it in early 2023
           as a weekend port of LLaMA to plain C, and it has since grown, under
           the ggml-org organization, into the substrate for most local AI
-          tooling, from Ollama to the GGUF ecosystem on Hugging Face. This
-          walkthrough covers how to run a model in five minutes, the three ideas
-          that make local inference practical, and a guided path for reading the
-          repository.
+          tooling, from Ollama to the GGUF ecosystem on Hugging Face. This is a
+          full chapter, not a tour: a practical tutorial, the complete life of
+          one generated token from the CLI down to the SIMD and CUDA kernels
+          and back, deep dives into ggml, GGUF, quantization, and the server,
+          and a staged plan for reading the repository yourself. Everything
+          here was verified against the master branch in July 2026; the file
+          names below are real, and where the project moves fast I say so.
         </p>
       </div>
     </header>
@@ -46,28 +49,105 @@
     <section class="soft">
       <div class="wrap">
         <article class="prose article">
-          <h2>Using it in five minutes</h2>
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">prompt text
+   │
+   ▼
+llama-cli / llama-server        (tools/)        HTTP, chat templates, slots
+   │
+   ▼
+libllama                        (src/)          tokenize, build graph, sample
+   │
+   ▼
+ggml compute graph              (ggml/)         tensors + ops as explicit DAG
+   │
+   ▼
+backend scheduler               (ggml-backend)  split graph across devices
+   │
+   ├──► CPU backend             (ggml-cpu/)     SIMD kernels, quantized dot products
+   ├──► CUDA backend            (ggml-cuda/)    one .cu file per op family
+   └──► Metal / Vulkan / SYCL   (ggml-*/)       same ops, different chips
+   │
+   ▼
+GGUF file, memory-mapped        (gguf)          weights live in page cache</pre>
           <p>
-            You can install prebuilt binaries from a package manager, or build
-            from source, which takes about a minute on a laptop because the
-            project has essentially no dependencies:
+            One sentence of identity: llama.cpp is a dependency-free C/C++
+            stack that loads a single-file model format, expresses a
+            transformer's forward pass as an explicit computation graph, and
+            executes that graph on whatever mix of CPU and GPU hardware you
+            happen to own. Every layer of the diagram is in one repository,
+            which is rare and is the reason the project is such a good read:
+            you can start at a printed character and end at a hand-written
+            AVX2 dot product without ever leaving the tree.
           </p>
-          <pre><code>brew install llama.cpp</code></pre>
+          <p>
+            The layers matter because they are also the module boundaries.
+            The tools in <code>tools/</code> only speak the public API in
+            <code>include/llama.h</code>. The library in <code>src/</code>
+            knows about vocabularies, KV caches, and model architectures, but
+            does no arithmetic; it only builds graphs. The tensor library in
+            <code>ggml/</code> knows nothing about language models at all; it
+            executes graphs of generic operations on generic tensors, and its
+            backends compete to implement the same small operation set on
+            every chip that matters. <mark>The point of ggml is not to be the
+            fastest tensor library on any one chip but to make the same model
+            file run on nearly every chip</mark>, and the rest of this chapter
+            is the story of how that decision plays out.
+          </p>
+          <p>
+            One recent structural fact is worth absorbing before anything
+            else, because it changed the shape of the code paths described
+            below: <code>llama-cli</code> was rewritten as a thin interactive
+            client. On current master it spawns a local
+            <code>llama-server</code> child process (or connects to an
+            existing one via <code>--server-base</code>) and talks to it over
+            HTTP, so the CLI, the web UI, and your OpenAI-client scripts all
+            exercise exactly the same serving code. The classic single-process
+            loop, tokenize, decode, sample, print, still exists verbatim in
+            <code>tools/completion/</code> as <code>llama-completion</code>,
+            and it remains the best place to step through the core API in a
+            debugger.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <h3>Installing</h3>
+          <p>
+            Prebuilt packages exist for every platform. Homebrew covers both
+            macOS and Linux, winget covers Windows, and conda-forge covers all
+            three (with CUDA and Vulkan variants on Linux and Windows):
+          </p>
+          <pre><code>brew install llama.cpp        # macOS and Linux
+winget install llama.cpp      # Windows
+conda install -c conda-forge llama-cpp</code></pre>
+          <p>
+            Building from source takes about a minute because the project has
+            essentially no dependencies beyond a C/C++ toolchain and CMake:
+          </p>
           <pre><code>git clone https://github.com/ggml-org/llama.cpp
 cd llama.cpp
 cmake -B build
-cmake --build build --config Release</code></pre>
+cmake --build build --config Release -j</code></pre>
           <p>
-            Add <code>-DGGML_CUDA=ON</code> (or the Vulkan, SYCL, or HIP
-            equivalent) to the first cmake call to build a GPU backend; on Apple
-            Silicon the Metal backend is on by default. The fastest way to try a
-            model is the <code>-hf</code> flag, which downloads a GGUF file
-            straight from Hugging Face and drops you into an interactive chat:
+            Binaries land in <code>build/bin/</code>. On Apple Silicon the
+            Metal backend is enabled by default; on Linux add
+            <code>-DGGML_CUDA=ON</code> to the first cmake invocation for
+            NVIDIA GPUs, or the Vulkan, SYCL, or HIP equivalents
+            (<code>-DGGML_VULKAN=ON</code> and so on) for everything else.
+            A CUDA build takes considerably longer than a CPU build because
+            it compiles kernels for several GPU architectures.
+          </p>
+          <h3>First session</h3>
+          <p>
+            The fastest first run uses the <code>-hf</code> flag, which pulls
+            a GGUF file straight from Hugging Face into a local cache and
+            drops you into an interactive chat:
           </p>
           <pre><code>llama-cli -hf ggml-org/gemma-3-1b-it-GGUF</code></pre>
           <p>
-            The same flag works for the server, which speaks the OpenAI API and
-            ships a built-in web UI:
+            You will see the model download once, then a chat prompt. Type a
+            message, get streamed tokens back, press Ctrl+C twice to leave.
+            The same flag works for the server, which speaks the OpenAI API
+            on port 8080 by default and ships a built-in web UI:
           </p>
           <pre><code>llama-server -hf ggml-org/gemma-3-1b-it-GGUF --port 8080</code></pre>
           <pre><code>from openai import OpenAI
@@ -76,113 +156,846 @@ client = OpenAI(base_url="http://localhost:8080/v1", api_key="unused")
 resp = client.chat.completions.create(
     model="gemma-3-1b-it",
     messages=[{"role": "user", "content": "Hello"}],
-)</code></pre>
+)
+print(resp.choices[0].message.content)</code></pre>
           <p>
-            The flags worth knowing first: <code>-m</code> points at a local
-            GGUF file instead of a Hugging Face repo, <code>-ngl</code> sets how
-            many layers to offload to the GPU (a large value like 99 means all
-            of them), <code>-c</code> sets the context size, and
-            <code>-t</code> sets CPU threads. Partial offload is the
-            distinctive one: a model that does not fit in VRAM can put some
-            layers on the GPU and run the rest on the CPU.
+            The flags worth learning first, with their current defaults:
+            <code>-m</code> points at a local GGUF file instead of a Hugging
+            Face repo; <code>-ngl</code> controls how many layers go to the
+            GPU and now defaults to <code>auto</code>, which measures free
+            VRAM and fits as many layers as possible (the old advice of
+            passing 99 still works, spelled <code>-ngl all</code>);
+            <code>-c</code> sets context size and defaults to 0, meaning
+            "use the model's own training context length";
+            <code>-t</code> sets CPU threads; and <code>--jinja</code> chat
+            templating is on by default. Partial offload remains the
+            distinctive trick: a model that does not fit in VRAM can put some
+            layers on the GPU and run the rest on the CPU, and with
+            <code>auto</code> you no longer even have to compute the split
+            yourself.
+          </p>
+          <h3>Making your own GGUF</h3>
+          <p>
+            The workflow that turns a Hugging Face checkpoint into a local
+            model has three steps: convert, quantize, run.
+          </p>
+          <pre><code># 1. convert safetensors to a full-precision GGUF
+pip install -r requirements.txt
+python convert_hf_to_gguf.py /path/to/hf-model --outfile model-f16.gguf
+
+# 2. shrink it (Q4_K_M is the usual sweet spot)
+llama-quantize model-f16.gguf model-Q4_K_M.gguf Q4_K_M
+
+# 3. run it
+llama-cli -m model-Q4_K_M.gguf</code></pre>
+          <p>
+            Two beginner mistakes cluster here. The first is quantizing from
+            an already-quantized file. <code>llama-quantize</code> will refuse
+            unless you pass <code>--allow-requantize</code>, and it refuses
+            for a reason: requantizing compounds rounding error, so quality is
+            strictly worse than quantizing from the f16 or bf16 original.
+            Wrong and right:
+          </p>
+          <pre><code># wrong: Q8_0 -&gt; Q4_K_M loses more than f16 -&gt; Q4_K_M
+llama-quantize --allow-requantize model-Q8_0.gguf model-Q4_K_M.gguf Q4_K_M
+
+# right: always quantize from the highest precision you have
+llama-quantize model-f16.gguf model-Q4_K_M.gguf Q4_K_M</code></pre>
+          <p>
+            The second is feeding a chat model raw text without its template.
+            <code>llama-cli</code> applies the model's chat template
+            automatically, but <code>llama-completion</code> and the
+            <code>/completion</code> endpoint do not; an instruction-tuned
+            model given a bare string will often ramble or answer as if
+            autocompleting a document. If you use the raw completion path with
+            a chat model, you must format the prompt with the model's own
+            special tokens yourself, which is exactly the job the template
+            exists to do for you.
+          </p>
+          <h3>Going lower than 4 bits</h3>
+          <p>
+            Below roughly 3 bits per weight you should use an importance
+            matrix, which tells the quantizer which weights the model is most
+            sensitive to. You generate one by running calibration text
+            through the full-precision model, then hand it to the quantizer:
+          </p>
+          <pre><code>llama-imatrix -m model-f16.gguf -f calibration.txt -o imatrix.gguf -ngl all
+llama-quantize --imatrix imatrix.gguf model-f16.gguf model-IQ2_M.gguf IQ2_M</code></pre>
+          <p>
+            The imatrix run takes minutes because it is real inference over
+            the calibration corpus. Skipping it for IQ-series quants produces
+            files that run fine but degrade noticeably; the community GGUFs on
+            Hugging Face that people find "surprisingly good at 2 bits" were
+            almost all made with one.
           </p>
 
-          <h2>Idea one: ggml, the tensor library underneath</h2>
+          <h2>Part III: When it is the right tool</h2>
           <p>
-            Everything in llama.cpp sits on ggml, a C tensor library that lives
-            in-tree under <code>ggml/</code> and is developed alongside it. ggml
-            has no third-party dependencies, builds anywhere a C compiler runs,
-            and represents a model's forward pass as an explicit static
-            computation graph that is constructed first and executed afterwards.
-            That sounds austere next to PyTorch, but it is the design decision
-            the whole project flows from: because the graph is explicit and the
-            runtime is tiny, backends for CUDA, Metal, Vulkan, SYCL, and plain
-            CPU with SIMD can each implement the same small set of operations,
-            and the scheduler can split one graph across several of them at
-            once. <mark>The point of ggml is not to be the fastest tensor
-            library on any one chip but to make the same model file run on
-            nearly every chip</mark>, which is why the <code>-ngl</code> flag
-            can slide a model between CPU and GPU layer by layer instead of
-            demanding all-or-nothing.
+            llama.cpp wins whenever the hardware is yours and the user count
+            is small. Laptops, workstations, phones, single-GPU homelabs,
+            air-gapped machines, CPU-only servers, and edge devices are its
+            home turf, and it is the only serious engine where "no GPU at
+            all" is a fully supported configuration rather than a fallback.
+            It also wins on model availability: the GGUF ecosystem means
+            nearly every open model appears in quantized form within days of
+            release, often within hours.
+          </p>
+          <p>
+            The alternatives divide by deployment. <a href="/oss/vllm">vLLM</a>
+            and SGLang assume datacenter GPUs and optimize aggregate
+            throughput across many concurrent users; if you are serving a
+            product to hundreds of simultaneous requests on A100s or H100s,
+            they are the right tools and llama.cpp is not. MLX is worth a look
+            if you are exclusively on Apple Silicon and want a Python-native
+            research workflow. Ollama and LM Studio are not alternatives so
+            much as packaging: both run llama.cpp (or its ggml lineage)
+            underneath and trade flexibility for convenience.
+          </p>
+          <p>
+            The architecture-shaped warning: <mark>do not put a bare
+            llama-server on the public internet, and do not build a
+            multi-tenant product on the assumption that it will behave like a
+            datacenter serving engine</mark>. The server ships with no
+            authentication by default (there is an <code>--api-key</code>
+            flag, but that is a shared secret, not a user system), and its
+            slot-based scheduler is designed for a handful of concurrent
+            users, not thousands. The safe shapes look like this:
+          </p>
+          <pre class="flow">safe:      you ──► llama-server on localhost
+safe:      team ──► reverse proxy (TLS + auth) ──► llama-server on private net
+dangerous: internet ──► llama-server :8080 (no auth, no rate limit)
+dangerous: 10k users ──► one llama-server (slot scheduler is not a fleet scheduler)</pre>
+          <p>
+            If traffic outgrows a box, the answer is not a bigger llama-server
+            but a different engine class; my
+            <a href="/systems/llm-inference">LLM serving design write-up</a>
+            covers where that line sits and why.
           </p>
 
-          <h2>Idea two: GGUF and block-wise quantization</h2>
+          <h2>Part IV: The full life of one token</h2>
           <p>
-            A model for llama.cpp is a single GGUF file, a binary format that
-            packs the architecture metadata, the tokenizer, and every tensor
-            into one memory-mappable blob. Because the file is mmapped, loading
-            is nearly instant and the weights live in page cache rather than
-            being copied, and because the metadata is self-describing key-value
-            pairs, one file works across machines and versions with no sidecar
-            configs. You produce one with the <code>convert_hf_to_gguf.py</code>
-            script at the repo root, then shrink it with
-            <code>llama-quantize</code>.
+            This is the core of the chapter. The canonical operation is one
+            token generation step: you have typed a prompt into
+            <code>llama-cli</code>, and we follow the machinery that produces
+            the next character on your screen. Each stage names the actual
+            files involved.
           </p>
+          <h3>Stage 1: the CLI, which is a client</h3>
           <p>
-            Quantization is where most of the project's accumulated cleverness
-            sits. Weights are quantized block-wise, small groups of values
-            sharing scale factors, at rates from 8-bit down past 2-bit. The
-            K-quants (names like <code>Q4_K_M</code>) use super-blocks with
-            quantized scales and mix precision across tensor types, spending
-            more bits where errors hurt most, and the community consensus that
-            Q4_K_M is the size-to-quality sweet spot has held for a long time.
-            The IQ series pushes below 3 bits and leans on an importance matrix,
-            computed from calibration text and passed to the quantizer, to
-            protect the weights that matter. <mark>The bet behind all of it is
-            that memory bandwidth, not arithmetic, bounds local inference, so
-            every bit shaved off the weights is speed as well as space.</mark>
+            <code>llama-cli</code> lives in <code>tools/cli/</code>. Its
+            <code>cli_context</code> (in <code>cli-context.cpp</code>) either
+            spawns a local <code>llama-server</code> child, forwarding all the
+            model-relevant flags to it, or connects to an existing server if
+            you passed <code>--server-base</code>. Your typed message is
+            posted as a chat completion request by the code in
+            <code>cli-client.cpp</code>, and streamed tokens come back over
+            HTTP to be printed. This means the "real" execution path for
+            interactive chat is the server path, which is what we follow.
+          </p>
+          <h3>Stage 2: HTTP, tasks, and a slot</h3>
+          <p>
+            Inside <code>tools/server/</code>, <code>server-http.cpp</code>
+            parses the request and <code>server-task.cpp</code> wraps it as a
+            task on the queue in <code>server-queue.cpp</code>. The scheduler
+            heart is <code>server-context.cpp</code>: a free
+            <code>server_slot</code> is claimed by
+            <code>launch_slot_with_task()</code>, and from then on the slot
+            owns this conversation's share of the KV cache. Each iteration of
+            the server loop calls <code>update_slots()</code>, which gathers
+            work from every active slot into one batch, which is how a chat
+            you are having and a request from the web UI can share a single
+            forward pass.
+          </p>
+          <h3>Stage 3: templating and tokenization</h3>
+          <p>
+            The chat messages are rendered into one prompt string by the
+            template code in <code>common/chat.cpp</code> (a Jinja subset
+            engine, on by default). Tokenization is
+            <code>common_tokenize()</code>, a thin wrapper over
+            <code>llama_tokenize()</code>, implemented in
+            <code>src/llama-vocab.cpp</code>. That file contains real
+            implementations of SentencePiece-style and BPE tokenizers plus
+            the per-model pretokenization quirks, which is why a GGUF file
+            needs no external tokenizer: the vocabulary, merges, and special
+            tokens were all baked into the file's metadata at conversion time.
+            For the generation step we care about, the prompt is already in
+            the cache, so the "input" is just the single token sampled last
+            step.
+          </p>
+          <h3>Stage 4: the batch enters llama_decode</h3>
+          <p>
+            <code>update_slots()</code> adds each slot's pending token to a
+            <code>llama_batch</code> via <code>common_batch_add()</code>,
+            tagged with its position and sequence id, then calls
+            <code>llama_decode()</code>. The context object behind that call
+            lives in <code>src/llama-context.cpp</code>, with batch splitting
+            logic in <code>src/llama-batch.cpp</code>: a logical batch of up
+            to <code>n_batch</code> tokens (default 2048) is processed in
+            physical chunks of <code>n_ubatch</code> (default 512). For our
+            single decode token the batch is tiny, and that difference is the
+            whole performance story of decoding: the same graph that saturated
+            the machine during prompt processing now moves one token's worth
+            of activations past billions of weights, so it is memory-bound.
+          </p>
+          <h3>Stage 5: building the ggml graph</h3>
+          <p>
+            <code>llama_decode()</code> does no math. It builds a graph:
+            <code>src/llama-graph.cpp</code> provides the
+            <code>llm_graph_context</code> toolkit of reusable pieces
+            (attention blocks, feed-forward blocks, rope, norms), and
+            <code>src/llama-model.cpp</code> contains a per-architecture
+            build function that assembles them in the right order for LLaMA,
+            Qwen, Gemma, and the dozens of other supported families. The
+            output is a <code>ggml_cgraph</code>, an array of node tensors in
+            topological order, built with <code>ggml_build_forward_expand()</code>.
+            Nothing has executed yet; the graph is a plan.
+          </p>
+          <h3>Stage 6: KV cache views</h3>
+          <p>
+            The graph does not copy the KV cache; it references it.
+            <code>src/llama-kv-cache.cpp</code> (with the cell bookkeeping in
+            <code>llama-kv-cells.h</code>, and sibling files for
+            sliding-window and hybrid variants) owns big per-layer K and V
+            tensors and hands the graph builder two things: a view where this
+            step's new K and V vectors must be written, and views over all
+            occupied cells for attention to read. The cache update is
+            therefore not a separate phase, it is literally nodes in the
+            graph: a <code>cpy</code> into the cache view, sequenced before
+            the attention op that reads it. When the forward pass runs, the
+            cache has been extended as a side effect.
+          </p>
+          <h3>Stage 7: the backend scheduler splits the graph</h3>
+          <p>
+            Now ggml takes over. <code>ggml/src/ggml-backend.cpp</code>
+            implements <code>ggml_backend_sched</code>, which walks the graph
+            and assigns each node to a backend, primarily by asking where the
+            node's weights live: layers offloaded at load time (the
+            <code>-ngl</code> decision) have their tensors in CUDA or Metal
+            buffers, the rest sit in mmapped host memory. The scheduler cuts
+            the graph into contiguous splits per backend, inserts the copies
+            needed to move activations across boundaries, and reserves
+            intermediate memory through the graph allocator in
+            <code>ggml/src/ggml-alloc.c</code>, which reuses buffers whose
+            contents are dead, so the working memory for a whole forward pass
+            is far smaller than the sum of its tensors. Then
+            <code>ggml_backend_sched_graph_compute()</code> runs the splits in
+            order.
+          </p>
+          <h3>Stage 8: kernels, CPU and GPU</h3>
+          <p>
+            On CPU, <code>ggml/src/ggml-cpu/</code> executes nodes across a
+            thread pool. The hot path is the quantized matrix-vector product:
+            <code>quants.c</code> and the per-ISA code under <code>arch/</code>
+            (selected through <code>simd-mappings.h</code>) implement dot
+            products that unpack 4-bit blocks and multiply-accumulate them
+            with AVX2, AVX-512, or NEON intrinsics, without ever
+            materializing dequantized weights in memory. On an NVIDIA GPU,
+            <code>ggml/src/ggml-cuda/</code> provides one file per op family,
+            including dedicated quantized matmul kernels and fused
+            flash-attention kernels; Metal and Vulkan backends mirror the
+            same op set for Apple and everything-else hardware. This is the
+            payoff of the explicit graph: a backend is "just" this operation
+            set, so the same model file ran on your laptop and your GPU
+            server without either knowing.
+          </p>
+          <h3>Stage 9: logits and the sampling chain</h3>
+          <p>
+            The last graph node is the output projection; its result row for
+            our sequence is fetched with <code>llama_get_logits_ith()</code>.
+            Sampling is a chain of composable samplers, implemented in
+            <code>src/llama-sampler.cpp</code> and assembled from user flags
+            by <code>common/sampling.cpp</code>: repetition penalties first,
+            then truncation filters such as top-k, top-p, and min-p, then
+            temperature, then the final random draw. The server calls
+            <code>common_sampler_sample()</code>, gets back a token id, and
+            hands it to <code>process_token()</code>, which checks stop
+            conditions and end-of-generation tokens.
+          </p>
+          <h3>Stage 10: a piece of text, and the loop closes</h3>
+          <p>
+            The token id becomes UTF-8 bytes via the vocabulary
+            (<code>llama_token_to_piece()</code>, again
+            <code>llama-vocab.cpp</code>), is pushed to the HTTP stream by the
+            code in <code>server-stream.cpp</code>, arrives at
+            <code>llama-cli</code>'s client loop, and is printed. The sampled
+            token id is also appended to the slot's pending input, so the next
+            <code>update_slots()</code> iteration feeds it back into stage 4.
+            One token took: zero heap allocations of weights, one graph
+            build, one scheduled execution across one or more backends, one
+            cache append, one sample, a few bytes over a socket. That loop
+            runs until a stop token or your Ctrl+C.
           </p>
 
-          <h2>Idea three: the server</h2>
+          <h2>Part V: Deep dive: ggml</h2>
           <p>
-            llama-server turns the library into a self-hosted OpenAI-compatible
-            endpoint with a web UI, and it is more capable than its size
-            suggests: it handles concurrent requests with slot-based continuous
-            batching, supports speculative decoding, and serves embedding and
-            reranking models. It is worth being clear about positioning. An
-            engine like <a href="/oss/vllm">vLLM</a> assumes a datacenter GPU
-            and optimizes aggregate throughput across many users, while
-            llama-server assumes your hardware and optimizes for a handful of
-            users at the lowest possible footprint; the right choice follows
-            directly from which assumption matches your deployment.
+            ggml lives in-tree under <code>ggml/</code> and is developed in
+            lockstep with llama.cpp. Its core is startlingly small: the API in
+            <code>ggml/include/ggml.h</code>, the implementation in
+            <code>ggml/src/ggml.c</code>, and around them the allocator,
+            the backend abstraction, and the backend implementations.
+          </p>
+          <h3>Tensors and the graph</h3>
+          <p>
+            A <code>ggml_tensor</code> is a struct with up to four dimensions
+            in <code>ne[]</code>, byte strides in <code>nb[]</code>, a type
+            (f32, f16, or one of the many quantized block types), an
+            <code>op</code> code saying which operation produced it, and
+            <code>src[]</code> pointers to its operands. Tensors are created
+            inside a <code>ggml_context</code>, a bump-allocated arena, so
+            building a graph performs no per-node malloc. Because every tensor
+            remembers its producer, "building the model's forward pass" is
+            just calling functions like <code>ggml_mul_mat()</code> and
+            <code>ggml_soft_max()</code> that create result tensors, then
+            calling <code>ggml_build_forward_expand()</code> on the final one
+            to flatten the dependency DAG into an ordered
+            <code>ggml_cgraph</code> (default capacity
+            <code>GGML_DEFAULT_GRAPH_SIZE</code>, 2048 nodes).
+          </p>
+          <pre class="flow">x ──► rms_norm ──► mul(=·w_norm) ──► mul_mat(W_q) ──► rope ──┐
+                                 ├─► mul_mat(W_k) ──► rope ──┼─► cpy into KV ──► attn ...
+                                 └─► mul_mat(W_v) ───────────┘
+       (each arrow = a ggml_tensor node; the cgraph is this DAG, topologically sorted)</pre>
+          <p>
+            The graph is rebuilt for every <code>llama_decode()</code> call,
+            which surprises people who expect "static graph" to mean "built
+            once". Building is cheap (arena allocation, no kernels), and
+            rebuilding is what lets batch size, sequence positions, and cache
+            views change between steps while execution stays planned. A
+            second misconception to retire: ggml is not a training framework
+            with autograd bolted off; there is an optimizer module
+            (<code>ggml-opt.cpp</code>) used for small fine-tuning jobs, but
+            the design center is inference, and the API gives you graphs, not
+            gradients, by default.
+          </p>
+          <h3>Memory planning</h3>
+          <p>
+            <code>ggml-alloc.c</code> implements the graph allocator
+            (<code>ggml_gallocr</code>): given a topologically sorted graph,
+            it walks the nodes, tracks when each intermediate tensor's last
+            consumer has run, and assigns offsets in a shared buffer so that
+            dead tensors' memory is immediately reused, including in-place
+            reuse where an op may overwrite its input. This is why llama.cpp
+            can state its compute buffer size up front at load time, and why
+            that buffer is megabytes when the naive sum of intermediates would
+            be gigabytes. The trade-off is the classic static-planning one:
+            the plan is only valid for graphs of the shape it was measured
+            for, which the scheduler handles by reserving against a
+            worst-case graph.
+          </p>
+          <h3>Backends and the split scheduler</h3>
+          <p>
+            A backend is an implementation of the interface in
+            <code>ggml-backend.h</code>: buffer types (where can tensors
+            live), and graph computation (run these nodes). The registry in
+            <code>ggml-backend-reg.cpp</code> enumerates what was compiled
+            in, and backends can even be loaded as dynamic libraries. The
+            scheduler's split algorithm is the piece worth studying in
+            <code>ggml-backend.cpp</code>: weights pin their nodes to the
+            backend owning their buffer, unpinned nodes are absorbed into
+            neighboring splits to minimize boundary copies, and the resulting
+            plan is what makes <code>-ngl 20</code> on a 40-layer model
+            genuinely run half the network on GPU and half on CPU with two
+            activation copies per step. The famous trap here:
+            <mark>if your build has no GPU backend compiled in, -ngl silently
+            does nothing</mark>, and the model runs entirely on CPU; the load
+            log tells you which backends registered and how many layers were
+            offloaded, and reading that log is the first debugging move for
+            any "why is it slow" question.
           </p>
 
-          <h2>Reading the repository</h2>
+          <h2>Part V continued: Deep dive: GGUF and the quantization families</h2>
+          <h3>The file format</h3>
           <p>
-            The layout separates cleanly into the tensor library, the model
-            library, and the tools, and reading in that order top-down works
-            well. Start in <code>tools/</code>, where <code>llama-cli</code> and
-            the server live along with <code>quantize</code> and
-            <code>perplexity</code>; the CLI's main loop is a readable tour of
-            the public API, tokenize, decode, sample, repeat, with the shared
-            argument and chat plumbing in <code>common/</code>.
+            GGUF is a binary container defined alongside ggml
+            (implementation in <code>ggml/src/gguf.cpp</code>, Python
+            tooling in <code>gguf-py/</code>). The layout:
+          </p>
+          <pre class="flow">┌────────────────────────────────────────────────┐
+│ magic "GGUF"  │ version (3) │ tensor_count u64 │
+│ metadata_kv_count u64                          │
+├────────────────────────────────────────────────┤
+│ metadata: key → typed value                    │
+│   general.architecture = "llama"               │
+│   llama.block_count = 32 ...                   │
+│   tokenizer.ggml.tokens = [...]                │
+├────────────────────────────────────────────────┤
+│ tensor infos: name, dims, type, offset         │
+├────────────────────────────────────────────────┤
+│ tensor data (aligned, default 32 bytes)        │
+└────────────────────────────────────────────────┘</pre>
+          <p>
+            Two properties do the work. Self-description: hyperparameters,
+            tokenizer vocabulary, chat template, and quantization details are
+            key-value metadata in the file, so there are no sidecar configs
+            and old binaries can skip keys they do not know. Alignment: the
+            tensor data region is laid out so the whole file can be
+            memory-mapped (<code>src/llama-mmap.cpp</code>) and weights used
+            directly from page cache; "loading" a 40 GB model is mostly the
+            kernel faulting pages in on first touch, and a second process
+            opening the same file pays nothing.
+          </p>
+          <h3>What the bits buy</h3>
+          <p>
+            All llama.cpp quantization is block-wise: small groups of weights
+            share scale factors, and the structs are declared plainly in
+            <code>ggml/src/ggml-common.h</code>. The simplest family uses
+            32-weight blocks; <code>block_q4_0</code> is one fp16 scale plus
+            32 four-bit values, 18 bytes per 32 weights, hence 4.5 bits per
+            weight effective. The K-quants use 256-weight super-blocks with a
+            second level of quantization applied to the scales themselves:
+            <code>block_q4_K</code> holds two fp16 super-scales, twelve bytes
+            of 6-bit sub-block scales and minimums for its eight 32-weight
+            sub-blocks, and 128 bytes of nibbles, 144 bytes per 256 weights,
+            again 4.5 bits per weight but with much finer-grained scaling for
+            the same budget. The mixes you download (<code>Q4_K_M</code> and
+            friends) additionally spend more bits on the tensors where error
+            hurts most, such as attention V and feed-forward down
+            projections.
+          </p>
+          <table>
+            <thead>
+              <tr><th>Family</th><th>Example</th><th>Bits/weight</th><th>Mechanism</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Legacy blocks</td><td>Q4_0, Q8_0</td><td>4.5, 8.5</td><td>32-weight block, one fp16 scale</td></tr>
+              <tr><td>K-quants</td><td>Q2_K .. Q6_K</td><td>2.625 to 6.5625</td><td>256-weight super-block, quantized sub-scales</td></tr>
+              <tr><td>IQ series</td><td>IQ2_M, IQ3_XS</td><td>roughly 2 to 4</td><td>codebook lookups, imatrix-guided</td></tr>
+              <tr><td>Ternary</td><td>TQ1_0, TQ2_0</td><td>1.6875, 2.0625</td><td>for natively ternary models (BitNet-style)</td></tr>
+            </tbody>
+          </table>
+          <p>
+            The IQ series gets below 3 bits by replacing independent rounding
+            with small codebooks of allowed weight patterns, and it is where
+            the importance matrix stops being optional: the quantizer
+            minimizes error weighted by each weight's measured activation
+            statistics, spending its tiny bit budget on the weights the
+            calibration run proved matter. The bet underneath every family is
+            the same: <mark>local inference is bound by memory bandwidth, not
+            arithmetic, so every bit shaved off the weights is speed as well
+            as space</mark>. The arithmetic (not a benchmark): a 7B model at
+            Q4_K_M is roughly 4 GB of weights, and every generated token must
+            stream essentially all of them, so a machine with 100 GB/s of
+            memory bandwidth cannot exceed roughly 25 tokens per second no
+            matter how fast its ALUs are, while the same model at f16
+            (14 GB) caps below 8. That is why quantization doubles as the
+            project's performance strategy, and why the kernels dequantize
+            inside the dot product rather than ever writing f16 weights back
+            to memory.
           </p>
           <p>
-            The core library is the public header <code>llama.h</code> with its
-            implementation under <code>src/</code>, split into files whose names
-            are a map of the domain: <code>llama-model.cpp</code> for loading
-            and architecture definitions, <code>llama-vocab.cpp</code> for
-            tokenizers, <code>llama-kv-cache.cpp</code> for cache management,
-            <code>llama-graph.cpp</code> for building the forward graph, and
-            <code>llama-sampler.cpp</code> for the sampling chain. Below that,
-            <code>ggml/</code> holds the tensor library, with the core API in
-            one header and each backend in its own subdirectory of
-            <code>ggml/src/</code>, which is where the CUDA, Metal, and
-            SIMD-heavy CPU kernels live; the attention kernels are a good place
-            to apply the <a href="/ml/softmax">online softmax</a> ideas if you
-            want to read them closely. The GGUF side is
-            <code>gguf-py/</code> plus the conversion scripts at the root. A
-            good first session is to convert and quantize a tiny model yourself,
-            then run <code>llama-cli</code> under a debugger and step one token
-            through graph build, backend dispatch, and sampling.
+            Two corrections to popular beliefs. First, perplexity deltas are
+            a coarse instrument: a quant that adds 1 percent perplexity can
+            still visibly change style or reliability on structured tasks, so
+            evaluate on your task before standardizing on an aggressive
+            quant. Second, quantization here is weights-only: activations and
+            KV cache stay in float by default (the cache can separately be
+            quantized to save memory), so "Q4 model" does not mean the whole
+            computation happens in 4 bits.
           </p>
+
+          <h2>Part V continued: Deep dive: the server, slots, and continuous batching</h2>
+          <p>
+            <code>llama-server</code> is the most load-bearing tool in the
+            tree: the OpenAI-compatible API, the web UI, and now the CLI all
+            sit on it. Its concurrency model is slots. A slot is a
+            long-lived serving lane: an assigned share of the context, its
+            own sampling state, and its own cache region, identified by
+            sequence id inside the single shared <code>llama_context</code>.
+            The number of slots comes from <code>--parallel</code>, whose
+            default is now <code>-1</code>, meaning the server chooses
+            automatically.
+          </p>
+          <pre class="flow">requests ──► queue (server-queue.cpp)
+                 │ launch_slot_with_task()
+   ┌─────────┬─────────┬─────────┐
+   │ slot 0  │ slot 1  │ slot 2  │   each: seq id, sampler, cache share
+   └────┬────┴────┬────┴────┬────┘
+        └── update_slots(): one llama_batch with every slot's next tokens
+                 │
+                 ▼
+          llama_decode()  ── one forward pass serves all active slots</pre>
+          <p>
+            This is continuous batching in the same sense
+            <a href="/oss/vllm">vLLM</a> means it, scaled to a workstation:
+            membership in the batch is reconsidered every iteration, a slot
+            that finishes frees its lane immediately, and prompt processing
+            for a new request can share iterations with decoding for old
+            ones, with long prompts chunked by the batch limits so decode
+            latency stays flat. The server also implements prompt caching per
+            slot, so a follow-up message in a chat only processes the new
+            tokens, plus speculative decoding when you supply a draft model,
+            and endpoints for embeddings, reranking, tokenization, health,
+            and Prometheus-style metrics (which expose, among other things,
+            the count of <code>llama_decode()</code> calls and average batch
+            occupancy).
+          </p>
+          <p>
+            The trap to internalize: <mark>slots divide the context, they do
+            not multiply it</mark>. The context you configure is shared
+            across serving lanes, so raising parallelism without raising
+            <code>-c</code> gives each conversation a smaller window, and a
+            request that needs more than one slot's share will be rejected or
+            truncated depending on settings. Sizing a server is therefore one
+            multiplication: (context per user) times (concurrent users) must
+            fit in the KV memory your hardware can hold, and the KV cache,
+            not compute, is usually what runs out first.
+          </p>
+
+          <h2>Part VI: Reading the repository</h2>
+          <p>
+            A staged plan. Every path below exists on master as of July 2026;
+            the project moves fast, so expect drift in the small names but
+            not in the layering.
+          </p>
+          <h3>Stage 0: orientation (one evening)</h3>
+          <p>
+            Read <code>README.md</code>, <code>docs/build.md</code>, and
+            <code>docs/install.md</code>. Build from source and run
+            <code>llama-cli -hf ggml-org/gemma-3-1b-it-GGUF</code>. You
+            should be able to answer: what are the three layers of the tree
+            (tools, libllama, ggml)? What is a GGUF file? What does
+            <code>-ngl</code> do?
+          </p>
+          <h3>Stage 1: the public API and the classic loop</h3>
+          <p>
+            Read <code>include/llama.h</code> top to bottom (it is one file
+            and heavily commented), then
+            <code>tools/completion/completion.cpp</code>, which uses it the
+            classic way, and skim <code>tools/cli/</code> to see the
+            client-over-server rewrite. Afterwards you should be able to
+            answer: what is the difference between a model and a context?
+            What does <code>llama_decode()</code> take and return? Where do
+            logits live and who owns sampling?
+          </p>
+          <h3>Stage 2: libllama internals</h3>
+          <p>
+            In <code>src/</code>, read in this order:
+            <code>llama-model-loader.cpp</code> (GGUF to tensors),
+            <code>llama-vocab.cpp</code> (tokenizers),
+            <code>llama-context.cpp</code> and <code>llama-batch.cpp</code>
+            (the decode path), <code>llama-graph.cpp</code> plus one
+            architecture's build function in <code>llama-model.cpp</code>,
+            <code>llama-kv-cache.cpp</code> with <code>llama-kv-cells.h</code>,
+            and <code>llama-sampler.cpp</code>. Questions to answer: where
+            exactly does the KV cache get written during a forward pass? Why
+            is the graph rebuilt every call? How does a new model
+            architecture get added?
+          </p>
+          <h3>Stage 3: ggml</h3>
+          <p>
+            Read <code>ggml/include/ggml.h</code>'s long header comment, then
+            <code>ggml/src/ggml-alloc.c</code>,
+            <code>ggml/src/ggml-backend.cpp</code> (the sched code), and in
+            <code>ggml/src/ggml-cpu/</code> the files <code>quants.c</code>
+            and <code>vec.cpp</code> for one ISA. Questions: how does the
+            allocator reuse memory? How does the scheduler decide splits?
+            What does a Q4_K dot product actually do per block?
+          </p>
+          <h3>Stage 4: the format and the quantizers</h3>
+          <p>
+            Read <code>ggml/src/ggml-common.h</code> (the block structs),
+            <code>src/llama-quant.cpp</code>, <code>tools/quantize/</code>,
+            <code>tools/imatrix/</code>, and skim
+            <code>gguf-py/gguf/gguf_writer.py</code> next to
+            <code>convert_hf_to_gguf.py</code>. Questions: why do K-quants
+            quantize their own scales? What does the imatrix change in the
+            optimization objective? What decides which tensors get which
+            types in a _M mix?
+          </p>
+          <h3>Stage 5: the server</h3>
+          <p>
+            Read <code>tools/server/server-context.cpp</code> around
+            <code>launch_slot_with_task()</code>, <code>update_slots()</code>,
+            and <code>process_token()</code>, with
+            <code>server-queue.cpp</code> beside it. Questions: how do slots
+            share one context? Where does continuous batching actually
+            happen? What happens when a prompt exceeds a slot's context
+            share?
+          </p>
+          <p>
+            Where not to start: the per-op GPU kernel files under
+            <code>ggml/src/ggml-cuda/</code> (hundreds of files, meaningful
+            only once the graph layer is solid), the architecture zoo in
+            <code>src/models/</code>, <code>vendor/</code>, and the
+            multimodal tree under <code>tools/mtmd/</code>. All are
+            rewarding later and disorienting first.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            Each lab teaches one concept from the deep dives. Commands assume
+            a source build with binaries on your PATH; outputs vary by
+            hardware, so treat the numbers as shapes, not targets.
+          </p>
+          <p><strong>Lab 1: bandwidth is destiny.</strong> Run the built-in
+            benchmark on one model at two quantization levels:</p>
+          <pre><code>llama-bench -m model-Q4_K_M.gguf -m model-Q8_0.gguf</code></pre>
+          <p>
+            Observe the <code>pp</code> (prompt processing) and
+            <code>tg</code> (token generation) columns. Generation speed
+            should scale close to inversely with file size while prompt
+            speed changes much less, because generation streams the weights
+            per token (bandwidth-bound) and prompt processing amortizes them
+            over many tokens (compute-bound). This is the Part V bandwidth
+            argument made measurable.
+          </p>
+          <p><strong>Lab 2: convert and quantize your own model.</strong>
+            Take a small Hugging Face checkpoint (a 0.5B or 1B model keeps
+            this fast), run <code>convert_hf_to_gguf.py</code>, then produce
+            <code>Q8_0</code>, <code>Q4_K_M</code>, and <code>Q2_K</code>
+            files and compare sizes with <code>ls -lh</code>. Open the file
+            metadata with:</p>
+          <pre><code>python gguf-py/gguf/scripts/gguf_dump.py model-Q4_K_M.gguf | head -50</code></pre>
+          <p>
+            (path may drift; any GGUF dump tool works). Observe the
+            key-value metadata from Part V's format diagram, and that
+            different tensors in the same "Q4" file carry different types.
+          </p>
+          <p><strong>Lab 3: measure what quantization costs.</strong> Run
+            perplexity over a small text file for two quants of the same
+            model:</p>
+          <pre><code>llama-perplexity -m model-Q8_0.gguf -f wiki.test.raw
+llama-perplexity -m model-Q2_K.gguf -f wiki.test.raw</code></pre>
+          <p>
+            Expect the Q2_K perplexity to be visibly worse and Q8_0 to be
+            nearly indistinguishable from f16. Then build an imatrix with
+            <code>llama-imatrix</code> and requantize the low-bit file with
+            it, and measure again: the gap should narrow. This is the
+            imatrix objective from the deep dive doing its job.
+          </p>
+          <p><strong>Lab 4: watch the scheduler split a graph.</strong> On a
+            machine with a GPU backend, load a model three ways:</p>
+          <pre><code>llama-cli -m model.gguf -ngl 0 -p "hi" -n 8
+llama-cli -m model.gguf -ngl 10 -p "hi" -n 8
+llama-cli -m model.gguf -ngl all -p "hi" -n 8</code></pre>
+          <p>
+            Read the load logs each time: which backends registered, how many
+            layers were offloaded, and the compute buffer sizes per backend.
+            With partial offload you are seeing the ggml-backend split
+            scheduler from Part V configured before your eyes, and the
+            tokens-per-second difference between the three runs is the price
+            of the CPU-resident layers.
+          </p>
+          <p><strong>Lab 5: slots under concurrency.</strong> Start a server
+            with explicit parallelism and a fixed context, then fire
+            simultaneous requests:</p>
+          <pre><code>llama-server -m model.gguf -c 8192 --parallel 4 --metrics
+for i in 1 2 3 4; do
+  curl -s http://localhost:8080/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{"messages":[{"role":"user","content":"Count to 30 slowly."}]}' &amp; done; wait
+curl -s http://localhost:8080/metrics | grep -i slot</code></pre>
+          <p>
+            Observe in the server log that four slots activate and decode
+            interleaves, and in the metrics that batch occupancy per
+            <code>llama_decode()</code> rose above one. Then send a prompt
+            far larger than 2048 tokens (8192 divided by 4 slots) and
+            observe the failure mode from the "slots divide the context"
+            trap.
+          </p>
+          <p><strong>Lab 6: one token in the debugger.</strong> Build with
+            debug info (<code>cmake -B build -DCMAKE_BUILD_TYPE=Debug</code>)
+            and run the classic loop:</p>
+          <pre><code>gdb --args ./build/bin/llama-completion -m model.gguf -p "The capital of France is" -n 4
+(gdb) break llama_decode
+(gdb) run</code></pre>
+          <p>
+            At each stop, look at the batch size (first stop: your prompt
+            tokens; later stops: exactly one token), then step into the graph
+            build and print a few nodes of the <code>ggml_cgraph</code>.
+            This is Part IV made tangible; the moment the batch collapses
+            from N tokens to 1 is the prefill-to-decode transition.
+          </p>
+
+          <h2>Part VIII: Questions and model answers</h2>
+          <p><strong>1. What is llama.cpp in one sentence?</strong>
+            A dependency-free C/C++ inference stack that runs quantized
+            transformer models from a single memory-mappable file on nearly
+            any CPU or GPU, built on the ggml tensor library.</p>
+          <p><strong>2. What is the relationship between llama.cpp and ggml?</strong>
+            ggml is the tensor library underneath: tensors, an explicit
+            compute graph, an allocator, and pluggable backends, developed
+            in-tree under <code>ggml/</code>. libllama builds LLM-shaped
+            graphs (tokenizers, KV cache, architectures) and hands them to
+            ggml to execute; the tools sit on libllama's public header.</p>
+          <p><strong>3. Why does an explicit static graph matter?</strong>
+            Because a backend only needs to implement a fixed operation set to
+            run every model, and a scheduler that can see the whole graph can
+            split it across devices and plan memory reuse ahead of execution.
+            Portability and partial offload both fall out of that one
+            decision.</p>
+          <p><strong>4. Is the graph built once and reused?</strong>
+            No; it is rebuilt on every <code>llama_decode()</code> call.
+            Building is cheap arena allocation with no kernel launches, and
+            rebuilding lets batch contents, positions, and cache views change
+            each step while execution stays fully planned.</p>
+          <p><strong>5. Walk through one generated token at a high level.</strong>
+            The previous token enters a batch in <code>update_slots()</code>;
+            <code>llama_decode()</code> builds a ggml graph that includes
+            writes into the KV cache views; the backend scheduler splits the
+            graph between CPU and GPU by weight residency and executes it;
+            logits come back, the sampler chain picks a token id, the
+            vocabulary turns it into text, and the id is fed back as the next
+            input.</p>
+          <p><strong>6. What makes GGUF loading fast?</strong>
+            The file is designed for mmap: aligned tensor data used directly
+            from page cache, so load time is page faults rather than copies,
+            and self-describing metadata, so no external configs are parsed.
+            A warm second load or a second process is nearly free.</p>
+          <p><strong>7. What is block-wise quantization and why blocks?</strong>
+            Weights are grouped (32 or 256 at a time) and each group shares
+            scale factors, so the format adapts to local weight magnitude at
+            a cost of a fraction of a bit per weight. Per-tensor scaling
+            would lose too much precision; per-weight scaling would cost too
+            many bits; blocks are the workable middle.</p>
+          <p><strong>8. What distinguishes Q4_K from Q4_0 at the same 4.5 bits per weight?</strong>
+            Q4_0 spends its overhead on one fp16 scale per 32 weights. Q4_K
+            uses a 256-weight super-block whose eight sub-block scales and
+            minimums are themselves quantized to 6 bits under two fp16
+            super-scales, buying finer-grained scaling from the same bit
+            budget, which measurably lowers error.</p>
+          <p><strong>9. What does an importance matrix change?</strong>
+            It reweights the quantizer's error objective using activation
+            statistics gathered by running calibration text through the
+            model, so the scarce bit budget protects the weights that most
+            affect outputs. It matters increasingly as bit rates fall and is
+            effectively required below 3 bits.</p>
+          <p><strong>10. Why is decode speed bandwidth-bound, and what follows from it?</strong>
+            Each generated token must read essentially all weights while
+            doing comparatively little arithmetic, so tokens per second is
+            approximately memory bandwidth divided by model bytes. It follows
+            that halving model size roughly doubles generation speed, which
+            is why quantization is the performance strategy and not just a
+            memory strategy.</p>
+          <p><strong>11. How does partial GPU offload work?</strong>
+            At load, <code>-ngl</code> (now defaulting to auto-fit) decides
+            which layers' weights go into GPU buffers. The backend scheduler
+            then assigns graph nodes to backends by weight residency, cuts
+            the graph into per-backend splits, and inserts activation copies
+            at the boundaries, so one forward pass runs partly on each
+            device.</p>
+          <p><strong>12. How does llama-server handle concurrency?</strong>
+            Slots: each active request owns a sequence id, sampler state, and
+            a share of the shared context, and every iteration
+            <code>update_slots()</code> rebuilds one batch from all active
+            slots for a single <code>llama_decode()</code>. That is
+            continuous batching at workstation scale, with prompt caching per
+            slot on top.</p>
+          <p><strong>13. When should you reach for vLLM instead?</strong>
+            When the deployment is datacenter-shaped: many concurrent users,
+            dedicated server GPUs, throughput as the objective. vLLM's paged
+            KV cache and iteration-level scheduler are built for that regime;
+            llama.cpp optimizes reach and footprint for one machine and a
+            handful of users, and neither substitutes for the other.</p>
+          <p><strong>14. A user reports the model outputs template tags like
+            &lt;|im_start|&gt; or answers as if continuing a document. What
+            happened?</strong>
+            The chat template was not applied, typically because they used
+            the raw completion endpoint or <code>llama-completion</code> with
+            a chat-tuned model, or because template detection failed for a
+            new model. Fix by using the chat endpoint or CLI (templating is
+            on by default) or supplying the template explicitly.</p>
+          <p><strong>15. Generation is much slower than a friend's identical
+            GPU. First three checks?</strong>
+            Check the load log for which backends registered (a CPU-only
+            build ignores <code>-ngl</code> silently), how many layers were
+            actually offloaded (VRAM pressure can shrink the auto fit), and
+            whether the context or KV cache spilled layers to CPU. The
+            answer is almost always in the startup log, not the generation
+            code.</p>
+          <p><strong>16. Why does requantizing a quantized model degrade quality?</strong>
+            Quantization is lossy rounding against the original weights;
+            quantizing already-rounded values compounds two rounding errors
+            and can shift block scales chosen for the first grid. That is why
+            <code>llama-quantize</code> demands
+            <code>--allow-requantize</code> to do it at all, and why serious
+            quants start from f16 or bf16 conversions.</p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Optimize for reach, then let reach compound.</strong>
+            ggml trades peak per-chip performance for running everywhere, and
+            the payoff was an ecosystem: because every device could run GGUF,
+            every model got converted, and because every model was available,
+            every tool built on llama.cpp. The same dynamic built SQLite and
+            ffmpeg; ubiquity is a moat that benchmarks do not measure.
+          </p>
+          <p>
+            <strong>A single-file, self-describing artifact is a superpower.</strong>
+            GGUF holds weights, tokenizer, and configuration in one
+            mmappable file with forward-compatible key-value metadata. Every
+            format that wins distribution works this way, from SQLite
+            databases to container images: the artifact carries its own
+            interpretation, so tooling composes without coordination.
+          </p>
+          <p>
+            <strong>Make the expensive thing explicit.</strong> The
+            build-graph-then-execute split looks ceremonial next to eager
+            frameworks, but it is what makes memory planning, backend
+            splitting, and portability tractable. Compilers, query planners,
+            and render graphs in game engines all rediscover the same shape:
+            declare the whole computation first, and optimization becomes a
+            pass instead of a heuristic.
+          </p>
+          <p>
+            <strong>Co-locate the format with the kernels that read it.</strong>
+            Quantization formats in llama.cpp were designed with their dot
+            products, so data layout and SIMD access patterns evolved
+            together, and dequantization never round-trips through memory.
+            Columnar databases (Parquet plus vectorized readers) teach the
+            identical lesson: a storage format is only as good as the inner
+            loop it was shaped for.
+          </p>
+          <p>
+            <strong>Collapse code paths onto one battle-tested one.</strong>
+            Rewriting llama-cli as a client of llama-server meant chat,
+            web UI, and API traffic now exercise identical serving code, so
+            a fix in slot handling fixes every frontend. This is the same
+            argument as CLIs that call their own public HTTP APIs; second
+            implementations of the same behavior are where bugs live.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            One sentence to keep: llama.cpp runs a memory-mapped, block-wise
+            quantized model file through an explicitly built ggml graph that
+            a scheduler splits across CPU and GPU backends, one
+            bandwidth-bound token at a time.
+          </p>
+          <pre class="flow">Text → Token → Slot → Batch → Graph → Split → Kernel → KV → Logits → Sample → Piece</pre>
+          <p>The chain mapped to real files:</p>
+          <pre class="flow">Text    tools/cli/, tools/server/server-http.cpp
+Token   src/llama-vocab.cpp, common/chat.cpp
+Slot    tools/server/server-context.cpp
+Batch   src/llama-batch.cpp, src/llama-context.cpp
+Graph   src/llama-graph.cpp, src/llama-model.cpp
+Split   ggml/src/ggml-backend.cpp, ggml/src/ggml-alloc.c
+Kernel  ggml/src/ggml-cpu/, ggml/src/ggml-cuda/
+KV      src/llama-kv-cache.cpp
+Logits  llama_get_logits_ith (include/llama.h)
+Sample  src/llama-sampler.cpp, common/sampling.cpp
+Piece   src/llama-vocab.cpp, back over HTTP</pre>
+          <p>Memorize these:</p>
+          <ul>
+            <li>Three layers, one repo: tools → libllama (<code>src/</code>) → ggml. Tools see only <code>llama.h</code>.</li>
+            <li>Q4_0: 32 weights, fp16 scale, 18 bytes, 4.5 bpw. Q4_K: 256-weight super-block, quantized 6-bit sub-scales, 144 bytes, 4.5 bpw spent smarter.</li>
+            <li>Decode tokens/s ≈ memory bandwidth ÷ weight bytes; quantization is a speed feature.</li>
+            <li>The graph is rebuilt every decode call; the KV cache update is nodes inside it.</li>
+            <li>Slots divide the context; continuous batching happens in <code>update_slots()</code> around one shared <code>llama_decode()</code>.</li>
+          </ul>
+
+          <h2>Part XI: Final takeaway</h2>
           <div class="takeaway">
             <strong>Key takeaway:</strong> llama.cpp is what you get when you
             optimize for reach instead of peak throughput: a dependency-free
-            tensor library that runs the same graph on nearly any chip, a
-            single-file model format built for mmap, and quantization schemes
-            that trade bits for bandwidth, which together turned local LLM
-            inference from a research stunt into infrastructure.
+            tensor library that runs the same explicit graph on nearly any
+            chip, a single-file model format built for mmap, and quantization
+            schemes co-designed with their kernels to trade bits for
+            bandwidth. Follow one token from the CLI through the slot
+            scheduler, the graph builder, the backend splits, and the SIMD
+            dot products, and you have read the whole architecture, because
+            the whole architecture exists to make that one loop run
+            everywhere.
           </div>
         </article>
       </div>

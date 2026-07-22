@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>FlashAttention walkthrough · Stanley Jacob</title>
-    <meta name="description" content="A walkthrough of the Dao-AILab flash-attention repository: how to use it in five minutes, why IO-awareness and tiling with online softmax make exact attention fast, how the CUDA and CUTLASS kernels are organized, and a guided reading path." />
+    <meta name="description" content="A full chapter on the Dao-AILab flash-attention repository: a practical tutorial, the complete life of one flash_attn_func call from Python through dispatch to the CUDA kernel and back, deep dives into IO complexity, online softmax tiling, the backward pass, and the kernel generations, plus a staged reading plan, labs, and understanding checks." />
     <link rel="stylesheet" href="/style.css" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
   </head>
@@ -31,16 +31,19 @@
         <h1>flash-attention</h1>
         <p class="lead">
           <a href="https://github.com/Dao-AILab/flash-attention" target="_blank" rel="noreferrer">flash-attention</a>
-          is Tri Dao's reference implementation of FlashAttention, the
-          IO-aware exact attention algorithm from the 2022 paper and its
-          successors, and it is quietly one of the most consequential
-          repositories in ML: nearly every serious training and inference
-          stack, PyTorch and vLLM included, either links these kernels or
-          reimplements their algorithm. This walkthrough covers how to use it
-          in five minutes, the two ideas that let exact attention run without
-          ever materializing the attention matrix, how the CUDA and CUTLASS
-          code is organized, and a guided path for reading a repository that
-          is mostly kernels.
+          is Tri Dao's reference implementation of FlashAttention, the IO-aware
+          exact attention algorithm from the 2022 paper and its successors, and
+          it is quietly one of the most consequential repositories in ML: nearly
+          every serious training and inference stack, PyTorch and
+          <a href="/oss/vllm">vLLM</a> included, either links these kernels or
+          reimplements their algorithm. This is a full chapter, not a tour: a
+          practical tutorial, the complete life of one
+          <code>flash_attn_func</code> call from the Python interface down to
+          the CUDA main loop and back, deep dives into the IO argument, the
+          online-softmax tiling, the backward pass, and the kernel generations,
+          then a staged reading plan for the repository, hands-on labs, and
+          understanding checks. Facts below were verified against the
+          repository at version 2.8.4.
         </p>
       </div>
     </header>
@@ -48,19 +51,84 @@
     <section class="soft">
       <div class="wrap">
         <article class="prose article">
-          <h2>Using it in five minutes</h2>
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">flash_attn_func(q, k, v, causal=True)        Python API         flash_attn/flash_attn_interface.py
+        |
+FlashAttnFunc.apply                          autograd binding   same file, torch.autograd.Function
+        |
+torch op "flash_attn::_flash_attn_forward"   custom-op shim     same file
+        |
+flash_attn_2_cuda.fwd                        pybind11 entry     csrc/flash_attn/flash_api.cpp (mha_fwd)
+        |
+run_mha_fwd -&gt; template instantiation        static dispatch    csrc/flash_attn/src/static_switch.h
+        |
+flash_fwd_kernel, one CTA per Q tile         CUDA kernel        csrc/flash_attn/src/flash_fwd_kernel.h
+  loop over KV tiles in SRAM:                                   csrc/flash_attn/src/softmax.h
+  QK^T -&gt; mask -&gt; online softmax -&gt; PV
+        |
+O (bf16/fp16) + logsumexp LSE (fp32)         HBM write          consumed later by mha_bwd</pre>
           <p>
-            The package compiles CUDA at install time unless a prebuilt wheel
-            matches your environment, so the install line is famous for both
-            its flag and its patience requirement:
+            The one-sentence identity: flash-attention is a fused CUDA kernel
+            family that computes exact softmax attention by streaming over the
+            key/value sequence in tiles that fit in on-chip SRAM, so the N by N
+            attention matrix is never written to GPU main memory. Everything
+            else in the repository, the Python wrappers, the C++ dispatch, the
+            per-architecture rewrites, exists to deliver that one loop to as
+            many shapes, dtypes, and GPUs as possible.
           </p>
-          <pre><code>pip install flash-attn --no-build-isolation</code></pre>
           <p>
-            The core API is a single function that behaves like a fused
-            replacement for the softmax-attention computation, taking query,
-            key, and value tensors in fp16 or bf16 on an Ampere or newer GPU,
-            with shape (batch, seqlen, nheads, headdim):
+            The mental model has three layers. At the top is a thin Python
+            package, <code>flash_attn/</code>, whose job is to look like a
+            normal PyTorch function: it validates tensors, binds forward and
+            backward into autograd, and calls into a compiled extension. In the
+            middle is one C++ translation unit per kernel family,
+            <code>csrc/flash_attn/flash_api.cpp</code> for FlashAttention-2,
+            which owns the contract: what layouts are accepted, what gets
+            padded, which of the hundred-plus precompiled kernel
+            instantiations to launch. At the bottom are the kernels themselves,
+            written against NVIDIA's CUTLASS and its CuTe layout algebra, where
+            the algorithm finally meets the memory hierarchy.
           </p>
+          <p>
+            Two facts make the whole design make sense. First, attention on
+            real hardware is limited by memory traffic, not arithmetic, so the
+            win comes from never touching slow memory with the quadratic
+            intermediate. Second, softmax can be computed incrementally, one
+            block of scores at a time, by carrying a running maximum and a
+            running sum and rescaling past work when the maximum moves. The
+            first fact says what to optimize; the second says the optimization
+            is possible without approximating anything.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <h3>Installing</h3>
+          <p>
+            On Linux with an NVIDIA GPU (Ampere, Ada, or Hopper for the main
+            package; Turing has a community fork), the install is one line, and
+            the flag matters because the build reads your already-installed
+            torch:
+          </p>
+          <pre><code>pip install ninja
+pip install flash-attn --no-build-isolation</code></pre>
+          <p>
+            If no prebuilt wheel matches your Python, torch, and CUDA
+            combination, pip compiles the CUDA sources, which takes a few
+            minutes on a large machine with <code>ninja</code> and hours
+            without it. On machines with many cores but modest RAM the parallel
+            compile can exhaust memory, and the README's fix is to cap the job
+            count:
+          </p>
+          <pre><code>MAX_JOBS=4 pip install flash-attn --no-build-isolation</code></pre>
+          <p>
+            There is no macOS build and cannot be one, because the package is
+            CUDA: on a Mac you study the code and use PyTorch's built-in
+            <code>scaled_dot_product_attention</code>, which implements the
+            same algorithm on its supported backends. The honest macOS setup
+            for this chapter is a clone for reading plus a rented Linux GPU
+            for the labs:
+          </p>
+          <pre><code>git clone https://github.com/Dao-AILab/flash-attention.git</code></pre>
+          <h3>First session</h3>
           <pre><code>import torch
 from flash_attn import flash_attn_func
 
@@ -68,159 +136,927 @@ q = torch.randn(2, 4096, 16, 64, dtype=torch.bfloat16, device="cuda")
 k = torch.randn(2, 4096, 16, 64, dtype=torch.bfloat16, device="cuda")
 v = torch.randn(2, 4096, 16, 64, dtype=torch.bfloat16, device="cuda")
 
-out = flash_attn_func(q, k, v, causal=True)</code></pre>
+out = flash_attn_func(q, k, v, causal=True)
+print(out.shape, out.dtype)   # torch.Size([2, 4096, 16, 64]) torch.bfloat16</code></pre>
           <p>
-            Variants cover the shapes real systems need:
-            <code>flash_attn_varlen_func</code> takes packed
-            variable-length sequences with cumulative-length offsets so
-            padding tokens are never computed,
-            <code>flash_attn_qkvpacked_func</code> takes a fused QKV tensor,
-            and <code>flash_attn_with_kvcache</code> serves incremental
-            decoding against a KV cache. In practice, though, most people
-            never import the package directly; PyTorch exposes the algorithm
-            through <code>torch.nn.functional.scaled_dot_product_attention</code>,
-            and Hugging Face models take
+            Note the layout: <mark>flash-attention takes (batch, seqlen,
+            nheads, headdim), while PyTorch's own attention APIs take (batch,
+            nheads, seqlen, headdim)</mark>. Mixing these up is the single most
+            common beginner failure, and it often does not crash, because both
+            layouts have four dimensions; it silently computes attention over
+            the wrong axis when shapes happen to be compatible. The wrong and
+            right versions side by side:
+          </p>
+          <pre><code># WRONG: PyTorch SDPA layout fed to flash_attn_func
+q = torch.randn(2, 16, 4096, 64, ...)   # (B, H, S, D)
+out = flash_attn_func(q, k, v)          # treats 16 as seqlen, 4096 as nheads
+
+# RIGHT: flash-attn layout, or transpose explicitly
+q = torch.randn(2, 4096, 16, 64, ...)   # (B, S, H, D)
+out = flash_attn_func(q, k, v)</code></pre>
+          <p>
+            The second classic mistake is dtype. The kernels support fp16 and
+            bf16 only (FlashAttention-3 adds an fp8 forward), so a float32
+            tensor raises a runtime error; cast at the boundary and keep your
+            master weights in whatever precision your training recipe wants.
+          </p>
+          <h3>Grouped-query attention comes for free</h3>
+          <p>
+            If K and V have fewer heads than Q, the kernel broadcasts them:
+            with 16 query heads and 2 KV heads, query heads 0 through 7 attend
+            to KV head 0 and the rest to KV head 1. This is how MQA and GQA
+            models run without any reshaping:
+          </p>
+          <pre><code>q = torch.randn(2, 4096, 16, 64, dtype=torch.bfloat16, device="cuda")
+k = torch.randn(2, 4096, 2, 64, dtype=torch.bfloat16, device="cuda")
+v = torch.randn(2, 4096, 2, 64, dtype=torch.bfloat16, device="cuda")
+out = flash_attn_func(q, k, v, causal=True)   # works, no repeat_interleave</code></pre>
+          <h3>Variable-length batches: stop padding</h3>
+          <p>
+            Real batches are ragged, and the naive treatment pads every
+            sequence to the longest one, then computes attention over the
+            padding. flash-attention's answer is
+            <code>flash_attn_varlen_func</code>: concatenate all sequences into
+            one long packed tensor with no batch dimension, and pass
+            cumulative-length offsets so the kernel knows where each sequence
+            begins:
+          </p>
+          <pre><code>import torch
+from flash_attn import flash_attn_varlen_func
+
+lens = [512, 37, 1024]
+total = sum(lens)
+q = torch.randn(total, 16, 64, dtype=torch.bfloat16, device="cuda")
+k, v = q.clone(), q.clone()
+cu = torch.tensor([0, 512, 549, 1573], dtype=torch.int32, device="cuda")
+
+out = flash_attn_varlen_func(
+    q, k, v,
+    cu_seqlens_q=cu, cu_seqlens_k=cu,
+    max_seqlen_q=max(lens), max_seqlen_k=max(lens),
+    causal=True,
+)</code></pre>
+          <p>
+            Padding tokens are simply never computed, which for realistic
+            length distributions is a large fraction of the batch's FLOPs.
+            There is deliberately no boolean attention-mask argument anywhere
+            in the API; if you find yourself building one, the library is
+            telling you to pack instead.
+          </p>
+          <h3>Decoding against a KV cache</h3>
+          <p>
+            <code>flash_attn_with_kvcache</code> serves the inference shape:
+            one or a few new query tokens attending to a long cache, with
+            optional in-place cache append, rotary embedding application, and a
+            paged cache via a <code>block_table</code> argument, which is
+            exactly the shape vLLM-style paged serving needs. Most people
+            consume all of this indirectly: PyTorch routes
+            <code>torch.nn.functional.scaled_dot_product_attention</code> to a
+            flash backend when it can, and Hugging Face models accept
             <code>attn_implementation="flash_attention_2"</code> in
             <code>from_pretrained</code>, so the repository's reach is far
             larger than its import count.
           </p>
 
-          <h2>Idea one: attention is bound by memory traffic, not math</h2>
+          <h2>Part III: When it is the right tool</h2>
           <p>
-            The starting observation is about hardware, not algorithms. A GPU
-            has a small amount of very fast on-chip SRAM per streaming
-            multiprocessor and a large pool of high-bandwidth memory that is,
-            relative to the compute units, painfully slow, so for operations
-            that do little arithmetic per byte the runtime is set by memory
-            traffic rather than FLOPs. Standard attention is the worst
-            offender: it computes the full N by N score matrix, writes it to
-            HBM, reads it back to take a softmax, writes the result again,
-            and reads it once more to multiply by V, moving quadratically
-            much data through the slow memory for what is fundamentally two
-            matrix multiplies and a normalization.
+            Use the package directly when you are writing model code and need
+            the full contract: varlen packing, KV-cache decoding, sliding
+            windows (<code>window_size</code>), soft capping
+            (<code>softcap</code>), ALiBi slopes, or determinism control in the
+            backward. Training frameworks and long-context finetuning are the
+            core audience, and any transformer with head dimension up to 256 in
+            fp16 or bf16 on Ampere or newer qualifies.
           </p>
           <p>
-            <mark>FlashAttention's reframing is that attention should be
-            counted in memory accesses, and an exact algorithm that never
-            writes the score matrix to HBM will beat a mathematically
-            identical one that does, without any approximation.</mark> That
-            is the meaning of IO-aware in the paper's title, and it is why
-            the speedup came as a surprise: the community had spent years on
-            sparse and low-rank approximations to reduce FLOPs, when the
-            dominant cost for realistic sequence lengths was the quadratic
-            memory traffic, which tiling removes while keeping the answer
-            bit-for-bit exact in exact arithmetic. Memory use for the
-            attention computation drops from quadratic to linear in sequence
-            length as a corollary, since the N by N matrix simply never
-            exists.
-          </p>
-
-          <h2>Idea two: tiling with online softmax, and recomputation</h2>
-          <p>
-            The obstacle to tiling attention was always the softmax, because
-            its denominator sums over a full row of scores, which seems to
-            require having the whole row before any output can be produced.
-            The escape is the online softmax recurrence: process the row in
-            blocks, and for each new block update a running maximum and a
-            running sum of exponentials, rescaling the partial output
-            accumulated so far by the factor the new maximum implies. Each
-            key/value block can then be loaded into SRAM, multiplied against
-            the query block, folded into the running statistics, and
-            discarded, so <mark>the kernel streams over a matrix it never
-            holds, keeping one tile and three running quantities where the
-            naive algorithm kept N squared scores</mark>. I derive this
-            recurrence step by step, with kernels, on my
-            <a href="/ml/softmax">softmax page</a>, and it is worth working
-            through once by hand because the whole repository is this one
-            identity plus engineering.
+            The main alternative for everyday work is not another repository,
+            it is PyTorch itself: <code>scaled_dot_product_attention</code>
+            ships flash-style kernels with zero extra dependencies, and if you
+            do not need varlen or kvcache specifics it is the right default.
+            xFormers offers <code>memory_efficient_attention</code> with a
+            similar CUTLASS lineage. For inference serving, FlashInfer
+            specializes in paged KV and decode-shaped workloads, and cuDNN
+            ships its own fused attention that compilers like torch.compile
+            can pick. On AMD, this same repository builds a ROCm backend from
+            <code>csrc/flash_attn_ck</code> (Composable Kernel) or a Triton
+            path.
           </p>
           <p>
-            The backward pass adds a second trade. Backpropagating through
-            attention normally needs the score matrix that forward refused to
-            store, so FlashAttention recomputes the tiles during the backward
-            pass instead, keeping only the output and the per-row softmax
-            statistics from forward. That spends extra FLOPs to avoid
-            quadratic reads and writes, and on memory-bound hardware the
-            recomputation is the cheaper side of the ledger, which is the
-            same compute-for-memory exchange as activation checkpointing but
-            applied inside a single operator. FlashAttention-2, the 2023
-            follow-up that is the repository's current mainline, kept the
-            algorithm and reworked the parallelization: it splits work across
-            the sequence-length dimension as well as batch and heads, so long
-            sequences at small batch sizes still fill the GPU, and it
-            rebalances the work between warps to cut shared-memory traffic
-            within a thread block.
+            The architecture-shaped warning is about the build, not the math.
+            flash-attn compiles against the C++ ABI of one specific torch
+            build, so <mark>treating it as a loosely-pinned dependency is how
+            production images die at import time</mark> with undefined-symbol
+            errors: a base image upgrades torch, the cached flash-attn wheel
+            was compiled against the old one, and nothing fails until runtime.
+            Pin torch and flash-attn as a pair, build wheels once in CI,
+            and never let two versions of that pair drift independently.
+          </p>
+          <pre class="flow">SAFE                                      DANGEROUS
+torch==X and flash-attn wheel             requirements.txt: torch (floating)
+built against X, shipped together,        + pip cache with flash-attn built
+upgraded together in one commit           against last month's torch
+                                          -&gt; ImportError: undefined symbol
+                                             ...c10...
+</pre>
+          <p>
+            A second, quieter version of the same warning: padded rectangular
+            batches. A serving or training system that pads everything to
+            <code>max_seqlen</code> and masks is architecturally simple and
+            quadratically wasteful, and because flash-attention makes attention
+            fast, the waste hides in the profile. Packed varlen batches are the
+            safe architecture; the padded rectangle is the NFS-mounted SQLite
+            file of this chapter.
           </p>
 
-          <h2>Idea three: what the kernels are made of</h2>
+          <h2>Part IV: The full life of one call</h2>
           <p>
-            The CUDA under <code>csrc/</code> is written against NVIDIA's
-            CUTLASS, vendored as a submodule, and mostly against CuTe, its
-            layout-algebra layer, in which tensors carry their shapes and
-            strides in the type system and the partitioning of a tile across
-            warps and threads is expressed algebraically rather than with
-            hand-written index arithmetic. This is what keeps a kernel family
-            covering multiple head dimensions, dtypes, causal and
-            non-causal masking, and forward and backward passes maintainable:
-            the algorithm is written once over abstract layouts, and C++
-            templates instantiate the concrete variants. It also explains the
-            repository's generational structure, because each GPU
-            architecture changes what the fastest kernel looks like. The
-            FlashAttention-2 kernels target Ampere and Ada, while
-            FlashAttention-3, which lives separately under
-            <code>hopper/</code> with its own build, rewrites the pipeline
-            around Hopper's asynchronous hardware, using warp specialization
-            so some warps move data while others compute, overlapping the
-            matrix multiplies with softmax, and adding an FP8 forward path.
-            Same mathematics, new choreography per chip, which is the clearest
-            illustration in open source of how short the shelf life of a
-            state-of-the-art kernel is.
+            The canonical operation: <code>flash_attn_func(q, k, v,
+            causal=True)</code> on a (2, 4096, 16, 64) bf16 tensor on an A100,
+            forward and then backward. Every stage below names the file that
+            owns it, all under the repository root.
+          </p>
+          <h3>Stage 1: the Python entry point</h3>
+          <p>
+            <code>flash_attn/flash_attn_interface.py</code> defines
+            <code>flash_attn_func</code> with the full public contract in its
+            signature: <code>dropout_p</code>, <code>softmax_scale</code>
+            (defaulting to 1/sqrt(headdim)), <code>causal</code>,
+            <code>window_size</code>, <code>softcap</code>,
+            <code>alibi_slopes</code>, <code>deterministic</code>. The module's
+            import block is worth reading first: it imports the compiled
+            extension <code>flash_attn_2_cuda</code> under the neutral name
+            <code>flash_attn_gpu</code>, falling back to a Triton
+            implementation on ROCm, which is the whole multi-backend story in
+            twenty lines.
+          </p>
+          <h3>Stage 2: autograd and the custom op</h3>
+          <p>
+            The function does no math; it calls
+            <code>FlashAttnFunc.apply</code>, a
+            <code>torch.autograd.Function</code> in the same file. Its
+            <code>forward</code> invokes <code>_flash_attn_forward</code>,
+            which is registered as a torch custom op
+            (<code>flash_attn::_flash_attn_forward</code>) with a "fake"
+            shape-propagation twin so <code>torch.compile</code> can trace
+            through it without running the kernel. The op calls
+            <code>flash_attn_gpu.fwd(...)</code> and returns four things:
+            <code>out</code>, <code>softmax_lse</code>, an optional dropout
+            mask tensor, and the RNG state. <code>ctx.save_for_backward</code>
+            keeps <code>q, k, v, out, softmax_lse, rng_state</code>, and that
+            list is the recomputation strategy stated as code: no attention
+            matrix is saved, only a float32 logsumexp of shape (batch, nheads,
+            seqlen_q), one number per query row.
+          </p>
+          <h3>Stage 3: the C++ contract</h3>
+          <p>
+            <code>flash_attn_gpu.fwd</code> is pybind11 for
+            <code>mha_fwd</code> in <code>csrc/flash_attn/flash_api.cpp</code>
+            (the module exposes exactly five entry points: <code>fwd</code>,
+            <code>varlen_fwd</code>, <code>bwd</code>,
+            <code>varlen_bwd</code>, <code>fwd_kvcache</code>). This function
+            is the contract made explicit: it checks dtype and device, requires
+            the last dimension contiguous, pads head dimension up to a multiple
+            of 8, allocates the output and the LSE tensor, and fills a plain
+            <code>Flash_fwd_params</code> struct with every pointer, stride,
+            and scale the kernel will need. Reading it answers most "does it
+            support X" questions faster than the README.
+          </p>
+          <h3>Stage 4: static dispatch to a precompiled kernel</h3>
+          <p>
+            <code>run_mha_fwd</code> selects the kernel with compile-time
+            switches from <code>csrc/flash_attn/src/static_switch.h</code>:
+            macros expand booleans and the head-dimension bucket into template
+            arguments, landing on
+            <code>run_mha_fwd_&lt;elem_type, kHeadDim, Is_causal&gt;</code>.
+            Each combination lives in its own tiny .cu file, over a hundred of
+            them, with names that are the dispatch table spelled out:
+            <code>flash_fwd_hdim128_bf16_causal_sm80.cu</code> and its
+            siblings for head dims 32 through 256, fp16 and bf16, causal and
+            not. Splitting per file exists purely to parallelize compilation.
+            For decode shapes with tiny query length there is a separate
+            split-KV path (<code>run_mha_fwd_splitkv_dispatch</code>) that
+            parallelizes over the KV dimension instead and merges partials.
+          </p>
+          <h3>Stage 5: launch geometry</h3>
+          <p>
+            <code>csrc/flash_attn/src/flash_fwd_launch_template.h</code>
+            computes the grid, and this single line is FlashAttention-2's
+            headline improvement over version 1:
+          </p>
+          <pre><code>const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
+dim3 grid(num_m_block, params.b, params.h);</code></pre>
+          <p>
+            One thread block per (query tile, batch, head). Parallelizing over
+            the query-sequence dimension, not just batch times heads, is what
+            keeps a long-context, small-batch workload from leaving most of
+            the GPU idle. Tile sizes (<code>kBlockM</code>,
+            <code>kBlockN</code>) come from
+            <code>kernel_traits.h</code> and vary with head dimension and
+            architecture, on the order of 64 to 128 queries by 32 to 128 keys.
+          </p>
+          <h3>Stage 6: the main loop</h3>
+          <p>
+            <code>csrc/flash_attn/src/flash_fwd_kernel.h</code> is the heart.
+            Each thread block loads its Q tile into SRAM once, then iterates
+            over KV tiles from the last block backward. The loop body is four
+            steps: copy the K tile and compute the score tile QK^T with tensor
+            cores, apply masking (causal, local window, ALiBi) from
+            <code>mask.h</code>, fold the scores into the running softmax
+            state via <code>softmax.template softmax_rescale_o(...)</code>
+            from <code>softmax.h</code>, then multiply the exponentiated tile
+            against the V tile and accumulate into the output registers. The
+            code structurally separates the iterations that need mask checks
+            (<code>n_masking_steps</code>) from the clean interior iterations
+            so the common path pays nothing for masking. The score tile lives
+            and dies in registers and shared memory; it is never written out.
+          </p>
+          <h3>Stage 7: epilogue</h3>
+          <p>
+            After the last tile, <code>normalize_softmax_lse</code> divides
+            the accumulated output by the final softmax denominator, converts
+            to the output dtype, and writes two things to HBM: the O tile, and
+            the per-row logsumexp into <code>params.softmax_lse_ptr</code>.
+            The kernel that computed a 4096 by 4096 attention matrix per head
+            wrote 4096 floats of evidence that it ever existed.
+          </p>
+          <h3>Stage 8: the backward, briefly</h3>
+          <p>
+            When <code>loss.backward()</code> reaches this node, autograd calls
+            <code>mha_bwd</code>, which first launches a preprocess kernel
+            (<code>flash_bwd_preprocess_kernel.h</code>,
+            <code>compute_dot_do_o</code>) computing the row-wise dot product
+            of dO and O, then the main backward kernel
+            (<code>flash_bwd_kernel.h</code>) which recomputes each score tile
+            from Q, K, and the saved LSE, and accumulates dQ, dK, dV. Part VII
+            walks the algebra; the point at this altitude is that the backward
+            trades recomputed FLOPs for never having stored the forward's
+            quadratic intermediate.
           </p>
 
-          <h2>Reading the repository</h2>
+          <h2>Part V: Deep dive: the IO argument</h2>
           <p>
-            Read it in three altitudes, and resist starting at the bottom.
-            The top is the Python package in <code>flash_attn/</code>: the
-            interface module there (<code>flash_attn_interface.py</code>)
-            defines the public functions and the
-            <code>torch.autograd.Function</code> subclasses that bind the
-            forward and backward CUDA launches into PyTorch's autograd, and
-            it is short enough to read completely; next to it,
-            <code>flash_attn/modules/</code> has an <code>mha.py</code>
-            showing how the authors embed the kernels in a full attention
-            module, and <code>flash_attn/ops/</code> collects auxiliary
-            Triton and fused kernels beyond attention itself.
+            A GPU is two memory systems glued to arithmetic units. Using the
+            A100 figures from the FlashAttention paper: HBM offers 40 to 80 GB
+            at 1.5 to 2.0 TB/s, while on-chip SRAM is 192 KB per each of 108
+            streaming multiprocessors with aggregate bandwidth around 19 TB/s,
+            an order of magnitude faster and about four orders of magnitude
+            smaller. Whether a kernel is limited by compute or by memory is
+            decided by its arithmetic intensity, FLOPs per byte moved, against
+            the machine's ratio. Big matrix multiplies do O(n³) work on O(n²)
+            data and saturate the tensor cores. Elementwise ops and softmax do
+            O(n) work on O(n) data and are pure memory traffic.
           </p>
           <p>
-            The middle altitude is the C++ dispatch under
-            <code>csrc/flash_attn/</code>, where the API translation unit
-            validates shapes and strides, fills a parameter struct, and
-            selects a kernel instantiation by head dimension and dtype; it
-            is worth reading because it documents the actual contract, what
-            layouts are accepted, what gets padded, and which variants
-            exist. The bottom is the kernel source in the <code>src/</code>
-            subdirectory below that, where the forward kernel is the right
-            first read: find the main loop over key/value blocks and match
-            each stage, load tile, matrix multiply, running max and sum
-            update, rescale, against the online-softmax recurrence, keeping
-            the derivation beside you. After that, the backward kernel shows
-            the recomputation story, <code>hopper/</code> shows the
-            FlashAttention-3 rewrite, and <code>tests/test_flash_attn.py</code>
-            is the ground truth throughout, since it checks every variant
-            against a plain PyTorch reference implementation, which also
-            makes it the best catalog of what the library actually supports.
-            The benchmarking scripts under <code>benchmarks/</code> are the
-            honest way to see what the kernels do for your shapes on your
-            hardware.
+            Standard attention implements a memory-bound pattern at quadratic
+            scale. It computes S = QK^T and writes all N² scores to HBM, reads
+            them back to compute P = softmax(S), writes P, then reads P again
+            to compute PV. In HBM-access terms that is Θ(Nd + N²) reads and
+            writes, and for realistic sizes the N² term towers over everything:
+            at N = 4096, d = 64, one head's score matrix is 16.8 million
+            entries against 262 thousand entries of Q, K, V combined, a
+            64-to-1 ratio of intermediate traffic to actual input.
+            <mark>The matmul FLOPs were never the bottleneck; shuttling the
+            score matrix through slow memory three times was.</mark>
           </p>
+          <p>
+            FlashAttention's analysis counts memory accesses instead of FLOPs
+            and shows the tiled algorithm needs Θ(N²d²/M) HBM accesses, where
+            M is the SRAM size. With M around 100 KB and d = 64, that is
+            roughly a 10 to 20 times reduction in traffic, which matched the
+            observed wall-clock speedups, and the paper proves no exact
+            attention algorithm can do asymptotically better over the whole
+            range of SRAM sizes. Two corollaries matter in practice. Memory
+            for the attention op drops from O(N²) to O(N), because the score
+            matrix never materializes, which is what makes 32k and 128k
+            contexts feasible at all. And the speedup grows with sequence
+            length, since the eliminated term is the quadratic one; at short
+            sequences flash and naive attention are close, which surprises
+            people benchmarking at N = 512.
+          </p>
+          <p>
+            The trap to correct explicitly: FlashAttention is not an
+            approximation. It computes the identical mathematical function,
+            exactly, in exact arithmetic; years of sparse and low-rank
+            attention research were aimed at FLOPs, the resource that was not
+            scarce. Floating-point outputs differ from a naive implementation
+            in the last bits because summation order differs, which is why the
+            repository's own tests compare against a reference within
+            tolerance rather than bit-for-bit.
+          </p>
+
+          <h2>Part VI: Deep dive: tiling and the online softmax</h2>
+          <p>
+            The obstacle to tiling attention was always the softmax
+            denominator, which sums exp(s_j - m) over an entire row of scores
+            using the row maximum m for numerical safety. A tile of scores
+            seems useless until the whole row is known. The escape is a
+            recurrence: keep a running maximum m and running sum l, and when a
+            new tile arrives with its own maximum, rescale everything computed
+            so far by exp(m_old - m_new). I derive this fully on the
+            <a href="/ml/softmax">softmax page</a>; here is the algebra worked
+            once numerically, one query row, four scores split into two tiles,
+            [1, 3] then [2, 5]:
+          </p>
+          <pre class="flow">Tile 1: scores [1, 3]
+  m1 = 3
+  l1 = e^(1-3) + e^(3-3) = 0.1353 + 1 = 1.1353
+  acc = 0.1353*v1 + 1.0000*v2          (unnormalized)
+
+Tile 2: scores [2, 5]
+  m2 = max(3, 5) = 5
+  correction c = e^(3-5) = 0.1353      (old work was scaled by wrong max)
+  l2 = c*l1 + e^(2-5) + e^(5-5)
+     = 0.1536 + 0.0498 + 1 = 1.2034
+  acc = c*acc + 0.0498*v3 + 1.0000*v4
+
+Check against one pass over [1,3,2,5], m=5:
+  e^-4 + e^-2 + e^-3 + e^0 = 0.0183+0.1353+0.0498+1 = 1.2034  ✓
+Final: out = acc / l2,  LSE = m2 + ln(l2) = 5.1851</pre>
+          <p>
+            Each KV tile is loaded to SRAM, used, and discarded; the state
+            carried between tiles is one maximum, one sum, and the
+            unnormalized output accumulator per query row. That is the entire
+            replacement for N² stored scores. The kernel encodes this in
+            <code>softmax.h</code> as <code>softmax_rescale_o</code>, with two
+            production details worth knowing. First, it computes exponentials
+            as <code>exp2f(x * log2(e) * scale - m * log2(e) * scale)</code>
+            rather than <code>expf</code>, folding the softmax scale and the
+            base conversion into one fused multiply so the hardware's fast
+            base-2 exponential unit does the work; that is why the params
+            struct carries <code>scale_softmax_log2</code>. Second, a row
+            whose running maximum is negative infinity (fully masked, which
+            happens legitimately in causal cross-attention shapes) is detected
+            and produces zeros instead of NaNs.
+          </p>
+          <p>
+            One more identity closes the loop: instead of saving m and l
+            separately for the backward, the kernel saves the single value
+            LSE = m + log(l), the log-sum-exp itself, in float32. Any
+            probability can then be reconstructed later as
+            p_ij = exp(s_ij - LSE_i), no second maximum needed. That is the
+            (batch, nheads, seqlen_q) float32 tensor from Stage 2, and it is
+            also what
+            split-KV decoding and ring-attention style distributed tricks use
+            to merge partial attentions computed over disjoint key ranges:
+            two partial (out, LSE) pairs combine into one by exactly the tile
+            2 arithmetic above.
+          </p>
+          <p>
+            Misconception to retire: the rescaling does not accumulate error
+            across hundreds of tiles in any way that matters. The corrections
+            are exact identities in real arithmetic, accumulation happens in
+            float32 regardless of input dtype, and the repository's test suite
+            (<code>tests/test_flash_attn.py</code>) asserts the kernel's error
+            versus an fp64-ish reference stays within a small multiple of the
+            baseline fp16 implementation's own error.
+          </p>
+
+          <h2>Part VII: Deep dive: the backward pass and recomputation</h2>
+          <p>
+            Backpropagating through attention needs the probability matrix P
+            twice: dV = P^T dO, and dS = P ∘ (dP - D) where dP = dO V^T. The
+            forward refused to store P, so the backward recomputes it, tile by
+            tile, from Q, K, and the saved LSE: p_ij = exp(q_i·k_j·scale -
+            LSE_i). This is the second act of the compute-for-memory trade,
+            the same exchange as activation checkpointing but inside a single
+            operator, and on memory-bound hardware the recomputation is the
+            cheap side of the ledger.
+          </p>
+          <p>
+            The term D deserves its own sentence because it is the trick that
+            makes the tiled backward local. The softmax Jacobian couples a
+            whole row: dS_ij = P_ij (dP_ij - Σ_k P_ik dP_ik). That row sum
+            looks like it needs the full row of P again, but it equals
+            rowsum(dO ∘ O), computable from tensors we already have. So the
+            backward begins with a small preprocess kernel,
+            <code>compute_dot_do_o</code> in
+            <code>csrc/flash_attn/src/flash_bwd_preprocess_kernel.h</code>,
+            writing D once per query row, and every tile of the main backward
+            (<code>flash_bwd_kernel.h</code>) is then independent:
+          </p>
+          <pre class="flow">preprocess:  D_i = rowsum(dO_i ∘ O_i)                    one pass, linear
+main loop over (KV tile j):        (parallelized over KV blocks)
+  recompute S_j  = Q K_j^T
+  recompute P_j  = exp(S_j*scale - LSE)                   uses saved fp32 LSE
+  dV_j += P_j^T dO
+  dP_j  = dO V_j^T
+  dS_j  = P_j ∘ (dP_j - D)
+  dK_j += dS_j^T Q
+  dQ   += dS_j K_j        &lt;- crosses tiles: atomicAdd</pre>
+          <p>
+            The dQ line explains the API's <code>deterministic</code> flag:
+            the backward parallelizes over KV blocks, so multiple thread
+            blocks contribute to the same dQ rows, and by default they combine
+            with atomic adds, whose ordering varies run to run. That is why
+            <mark>gradients from flash-attention are correct but not
+            bit-reproducible by default</mark>; passing
+            <code>deterministic=True</code> switches to a slower deterministic
+            accumulation. Teams chasing exact loss-curve reproducibility hit
+            this constantly and suspect a bug; it is summation order, the same
+            phenomenon as the forward's last-bit differences, amplified
+            because gradients feed back into training.
+          </p>
+          <p>
+            Cost accounting, so the trade is concrete: the backward performs
+            roughly 2.5 times the forward's matmul FLOPs (five tile matmuls
+            versus two) plus the recomputation of S, yet runs at the same
+            order of speed as the forward because it, too, never touches HBM
+            with a quadratic tensor. Storing P instead would cost N² times
+            heads times layers of memory and the bandwidth to write and read
+            it; recomputing costs FLOPs the tensor cores had to spare. The
+            saved-tensors list in <code>FlashAttnFunc</code> is this paragraph
+            in one line of Python.
+          </p>
+
+          <h2>Part VIII: Deep dive: one algorithm, four generations of kernels</h2>
+          <p>
+            The repository is organized by hardware generation, and reading its
+            directory layout is reading a history of NVIDIA architectures.
+            Everything below <code>csrc/</code> is compiled extension code:
+            <code>csrc/flash_attn/</code> is FlashAttention-2 proper
+            (<code>flash_api.cpp</code> plus <code>src/</code> with the kernel
+            headers and the wall of per-shape .cu instantiation files),
+            <code>csrc/cutlass/</code> is NVIDIA's CUTLASS vendored as a
+            submodule, <code>csrc/flash_attn_ck/</code> binds AMD's Composable
+            Kernel implementation, and <code>csrc/fused_dense_lib/</code> and
+            <code>csrc/layer_norm/</code> are auxiliary fused ops for the
+            training stack under <code>flash_attn/models/</code> and
+            <code>flash_attn/modules/</code>.
+          </p>
+          <p>
+            The FA2 kernels are written against CuTe, CUTLASS's layout
+            algebra, where tensor shapes, strides, and the partitioning of
+            tiles across warps and threads are types manipulated
+            algebraically instead of hand-written index arithmetic. That is
+            what keeps one algorithm maintainable across head dimensions 32 to
+            256, two dtypes, causal and local masking, dropout, and forward
+            plus backward: the algorithm is written once over abstract
+            layouts, and C++ templates instantiate concrete variants, one .cu
+            file each so <code>ninja</code> can compile them in parallel.
+            Setup.py targets sm80 and sm90, with sm100 and sm120 added on
+            CUDA 12.8 or newer toolkits.
+          </p>
+          <p>
+            FlashAttention-3 lives in <code>hopper/</code> as its own package
+            with its own <code>setup.py</code> (H100/H800, CUDA 12.3 or newer
+            required). Same mathematics, new choreography: Hopper's TMA
+            engine copies tiles asynchronously, warpgroup-wide WGMMA
+            instructions run matmuls asynchronously, and FA3's kernels use
+            warp specialization, in
+            <code>mainloop_fwd_sm90_tma_gmma_ws.hpp</code>, so producer warps
+            move data while consumer warps compute, with softmax of one tile
+            overlapped against the matmuls of the next; a ping-pong schedule
+            across warpgroups hides the softmax latency further, and an fp8
+            forward path with block quantization recovers accuracy that naive
+            fp8 would lose. The FA3 paper reports 1.5 to 2 times FA2's speed
+            on H100, up to about 740 TFLOPs/s in fp16, near 75 percent
+            utilization. The <code>hopper/instantiations/</code> directory
+            holds 451 generated .cu files, produced by
+            <code>generate_kernels.py</code>: at this variant count, the
+            dispatch table is itself generated code. The fourth generation is
+            visible in <code>flash_attn/cute/</code>, a Python CuTe-DSL
+            implementation targeting Hopper and Blackwell, the README's
+            "FlashAttention-4" direction, which trades C++ templates for
+            Python-generated kernels.
+          </p>
+          <p>
+            The misconception to retire here: "FlashAttention" is not one
+            kernel you install but a family indexed by (architecture, dtype,
+            head dim, mask type, forward/backward), plus independent
+            reimplementations, in PyTorch SDPA, Triton, cuDNN, FlashInfer, and
+            every serious inference engine. When someone reports "flash
+            attention is slow" the first question is which implementation on
+            which chip at which shape, because a decode-shaped call (seqlen_q
+            of 1) that misses the split-KV path, for instance, wastes almost
+            the whole GPU regardless of how good the kernel is.
+          </p>
+
+          <h2>Part IX: Reading the repository</h2>
+          <p>
+            A staged plan, top altitude first. Every path below exists in the
+            repository as of v2.8.4.
+          </p>
+          <h3>Stage 0: the contract from outside</h3>
+          <p>
+            Read <code>README.md</code> (usage, requirements, the FA3 section)
+            and the docstrings of <code>flash_attn_func</code> and
+            <code>flash_attn_varlen_func</code> in
+            <code>flash_attn/flash_attn_interface.py</code>, including the
+            bottom-right causal-mask alignment diagrams. You should be able to
+            answer: what layouts and dtypes are accepted; how GQA is
+            expressed; what causal means when seqlen_q differs from seqlen_k;
+            what varlen's <code>cu_seqlens</code> encode.
+          </p>
+          <h3>Stage 1: the Python layer completely</h3>
+          <p>
+            Read all of <code>flash_attn/flash_attn_interface.py</code>: the
+            import of <code>flash_attn_2_cuda</code>, the custom-op wrappers,
+            the <code>FlashAttnFunc</code> family of autograd Functions and
+            what each saves for backward. Then skim
+            <code>flash_attn/modules/mha.py</code> to see the kernels embedded
+            in a full attention module, and <code>flash_attn/bert_padding.py</code>
+            for the pad/unpad utilities that feed varlen. Questions: what
+            exactly is saved between forward and backward, and what is
+            recomputed? Why is the LSE float32? Where does dropout's RNG state
+            live?
+          </p>
+          <h3>Stage 2: the C++ contract</h3>
+          <p>
+            Read <code>csrc/flash_attn/flash_api.cpp</code>: just
+            <code>mha_fwd</code> and <code>mha_bwd</code>, plus the pybind
+            block at the bottom. Note every shape check, the head-dim padding
+            to multiples of 8, and <code>run_mha_fwd</code>'s dispatch.
+            Questions: which five functions does the extension export; what
+            triggers the split-KV path; where do kernel launch parameters come
+            from?
+          </p>
+          <h3>Stage 3: the forward kernel with the derivation beside you</h3>
+          <p>
+            Read <code>csrc/flash_attn/src/flash_fwd_kernel.h</code> main loop
+            with <code>softmax.h</code> open in a second pane and the
+            recurrence from Part VI on paper. Match each stage: tile load,
+            QK^T gemm, mask, <code>softmax_rescale_o</code>, PV accumulate,
+            epilogue with <code>normalize_softmax_lse</code>. Then
+            <code>flash_fwd_launch_template.h</code> for the grid and
+            <code>kernel_traits.h</code> for the tile shapes. Questions: why
+            two loops (masking steps versus clean steps); what state persists
+            across KV iterations; why exp2?
+          </p>
+          <h3>Stage 4: backward, then generations</h3>
+          <p>
+            Read <code>flash_bwd_preprocess_kernel.h</code> (small) and as
+            much of <code>flash_bwd_kernel.h</code> as you can stomach, then
+            switch to <code>hopper/flash_fwd_kernel_sm90.h</code> and
+            <code>hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp</code> to see the
+            same loop re-choreographed with producer/consumer warps.
+            <code>tests/test_flash_attn.py</code> is ground truth throughout:
+            every variant is checked against a plain PyTorch reference, which
+            also makes it the best catalog of what is actually supported.
+          </p>
+          <h3>Where not to start</h3>
+          <p>
+            Do not start in <code>hopper/</code>, whose asynchronous pipeline
+            obscures the algorithm under Hopper-specific machinery; do not
+            start in the CUTLASS submodule, which is a semester of its own;
+            and do not start by reading the hundred instantiation .cu files,
+            which contain one line each. The readable spine is
+            interface, api, forward kernel, in that order.
+          </p>
+
+          <h2>Part X: Hands-on labs</h2>
+          <p>
+            Labs 1, 2, 3, and 5 need a CUDA GPU (Ampere or newer); labs 4 and
+            6 run anywhere. Numbers shown vary with hardware and versions;
+            shapes and trends should reproduce.
+          </p>
+          <h3>Lab 1: see the memory argument (concept: Part V)</h3>
+          <p>
+            Compare peak memory of the math backend versus the flash backend
+            through PyTorch SDPA, no flash-attn install needed:
+          </p>
+          <pre><code>import torch
+from torch.nn.attention import sdpa_kernel, SDPBackend
+import torch.nn.functional as F
+
+def peak(backend, S):
+    q = torch.randn(1, 16, S, 64, dtype=torch.float16, device="cuda")
+    torch.cuda.reset_peak_memory_stats()
+    with sdpa_kernel(backend):
+        F.scaled_dot_product_attention(q, q, q, is_causal=True)
+    torch.cuda.synchronize()
+    return torch.cuda.max_memory_allocated() / 2**20
+
+for S in [1024, 2048, 4096, 8192]:
+    print(S, round(peak([SDPBackend.MATH], S)),
+             round(peak([SDPBackend.FLASH_ATTENTION], S)))</code></pre>
+          <p>
+            Observe: math-backend peak memory grows roughly 4x per doubling of
+            S (the N² matrix, times heads), flash grows roughly linearly. At
+            8192 the math backend allocates gigabytes for one layer's
+            attention; flash allocates megabytes.
+          </p>
+          <h3>Lab 2: verify exactness and its limits (concept: Parts V, VI)</h3>
+          <pre><code>import torch
+from flash_attn import flash_attn_func
+
+torch.manual_seed(0)
+q = torch.randn(1, 2048, 8, 64, dtype=torch.bfloat16, device="cuda")
+k, v = torch.randn_like(q), torch.randn_like(q)
+
+out = flash_attn_func(q, k, v, causal=True)
+
+qf, kf, vf = [t.transpose(1, 2).float() for t in (q, k, v)]
+s = qf @ kf.transpose(-1, -2) / 64**0.5
+s = s.masked_fill(torch.ones(2048, 2048, device="cuda").triu(1).bool(), float("-inf"))
+ref = (s.softmax(-1) @ vf).transpose(1, 2)
+
+print((out.float() - ref).abs().max())   # ~1e-2 scale for bf16 inputs
+print(torch.equal(out.float(), ref))     # False, and that is expected</code></pre>
+          <p>
+            Observe: max error is at the level bf16 rounding forces on any
+            implementation, and exact equality is false. The right mental
+            model: same function, different summation order.
+          </p>
+          <h3>Lab 3: touch the logsumexp (concept: Parts IV, VI)</h3>
+          <pre><code>import torch
+from flash_attn.flash_attn_interface import _flash_attn_forward
+
+q = torch.randn(2, 1024, 8, 64, dtype=torch.bfloat16, device="cuda")
+k, v = torch.randn_like(q), torch.randn_like(q)
+out, lse, _, _ = _flash_attn_forward(q, k, v, 0.0, 64**-0.5, causal=False,
+                                     window_size_left=-1, window_size_right=-1,
+                                     softcap=0.0, alibi_slopes=None,
+                                     return_softmax=False)
+print(lse.shape, lse.dtype)   # torch.Size([2, 8, 1024]) torch.float32
+
+# reconstruct row 0's probabilities from LSE and check they sum to 1
+s = (q[0, :, 0].float() @ k[0, :, 0].float().T) * 64**-0.5
+p = torch.exp(s[0] - lse[0, 0, 0])
+print(p.sum())                # ~1.0</code></pre>
+          <p>
+            Observe: the entire memory of the forward pass, per row, is one
+            float, and it suffices to rebuild any attention probability.
+            (Internal function; argument order may shift between versions,
+            check the signature in your installed
+            <code>flash_attn_interface.py</code>.)
+          </p>
+          <h3>Lab 4: online softmax by hand (concept: Part VI, no GPU)</h3>
+          <pre><code>import numpy as np
+
+def online_softmax_matvec(s, v, block=4):
+    m, l, acc = -np.inf, 0.0, np.zeros_like(v[0])
+    for i in range(0, len(s), block):
+        sb, vb = s[i:i+block], v[i:i+block]
+        m_new = max(m, sb.max())
+        c = np.exp(m - m_new)
+        p = np.exp(sb - m_new)
+        l = c * l + p.sum()
+        acc = c * acc + p @ vb
+        m = m_new
+    return acc / l, m + np.log(l)
+
+rng = np.random.default_rng(0)
+s, v = rng.normal(size=64), rng.normal(size=(64, 8))
+ref = np.exp(s - s.max()); ref /= ref.sum()
+out, lse = online_softmax_matvec(s, v)
+print(np.abs(out - ref @ v).max())   # ~1e-16</code></pre>
+          <p>
+            Observe: a dozen lines reproduce the kernel's core recurrence to
+            machine precision. Change <code>block</code> and confirm the
+            answer does not.
+          </p>
+          <h3>Lab 5: the cost of padding (concept: Parts II, III)</h3>
+          <p>
+            Build a ragged batch (lengths drawn from, say, a lognormal capped
+            at 4096), time <code>flash_attn_func</code> on the padded
+            rectangle versus <code>flash_attn_varlen_func</code> on the packed
+            tensor using <code>torch.cuda.Event</code> timing. Observe:
+            speedup approximately equals total padded tokens over total real
+            tokens (squared, for the attention part); with realistic length
+            skew, 2 to 4 times is common. This is Lab-sized proof that the
+            missing mask argument is a feature.
+          </p>
+          <h3>Lab 6: census of the kernel zoo (concept: Part VIII, no GPU)</h3>
+          <pre><code>git clone --depth 1 https://github.com/Dao-AILab/flash-attention.git
+cd flash-attention
+ls csrc/flash_attn/src/ | grep -c '\.cu$'        # ~100 instantiation files
+ls csrc/flash_attn/src/flash_fwd_hdim128*        # read the name grammar
+ls hopper/instantiations | wc -l                 # ~451, and generated:
+head -30 hopper/generate_kernels.py</code></pre>
+          <p>
+            Observe: the dispatch dimensions (direction, head dim, dtype,
+            causal, arch) are literally the file-name grammar, and FA3's
+            variant count forced the jump from hand-written files to a
+            generator script.
+          </p>
+
+          <h2>Part XI: Questions and model answers</h2>
+          <p><strong>Q1. What problem does FlashAttention solve, in one sentence?</strong></p>
+          <p>
+            Standard attention is bottlenecked by reading and writing the N by
+            N score matrix through GPU main memory, and FlashAttention computes
+            the exact same function while keeping that matrix entirely in
+            on-chip SRAM tiles, cutting HBM traffic from quadratic to roughly
+            linear-in-N terms.
+          </p>
+          <p><strong>Q2. Is it an approximation?</strong></p>
+          <p>
+            No. In exact arithmetic the output is identical to naive attention.
+            Floating-point results differ in the last bits because summation
+            order differs, which is also true between any two BLAS libraries.
+            The repository's tests compare against a PyTorch reference within
+            tolerance for exactly this reason.
+          </p>
+          <p><strong>Q3. Why can softmax be computed without seeing the whole row?</strong></p>
+          <p>
+            Because max and sum-of-exponentials are both associative once you
+            carry the maximum: given partial (m, l) statistics for a prefix and
+            a new block, the merged statistics are m' = max, and the old l and
+            output accumulator are multiplied by exp(m - m') before the new
+            block's terms are added. Applied per tile, this is the online
+            softmax; the full derivation is on my <a href="/ml/softmax">softmax
+            page</a>.
+          </p>
+          <p><strong>Q4. What does the forward save for the backward, and why is it enough?</strong></p>
+          <p>
+            Q, K, V, the output O, the RNG state for dropout, and a float32
+            logsumexp per query row. P is rebuilt tile by tile as
+            exp(QK^T·scale - LSE), and the softmax-Jacobian row sum is
+            recovered as rowsum(dO ∘ O), computed by a preprocess kernel, so no
+            quadratic tensor is ever stored.
+          </p>
+          <p><strong>Q5. Why are training runs with flash-attention not bit-reproducible by default?</strong></p>
+          <p>
+            The backward parallelizes over KV blocks and accumulates dQ with
+            atomic adds, whose ordering is nondeterministic. The
+            <code>deterministic=True</code> flag buys reproducibility with a
+            slower accumulation strategy. The gradients are correct either way.
+          </p>
+          <p><strong>Q6. What changed between FlashAttention-1 and 2?</strong></p>
+          <p>
+            The algorithm stayed; the parallelization and work partitioning
+            changed. FA2 launches a grid over (query blocks, batch, heads)
+            instead of just (batch, heads), so long sequences at small batch
+            fill the GPU, rebalances work between warps to cut shared-memory
+            traffic, and trims non-matmul FLOPs. You can see the headline
+            change as one grid-dimension line in
+            <code>flash_fwd_launch_template.h</code>.
+          </p>
+          <p><strong>Q7. What is FlashAttention-3, at concept level?</strong></p>
+          <p>
+            A Hopper-specific rewrite in <code>hopper/</code>: warp
+            specialization with TMA-driven asynchronous copies so data movement
+            overlaps compute, softmax overlapped with the next tile's WGMMA
+            matmuls, and an fp8 forward with block quantization. Per the FA3
+            paper, 1.5 to 2 times FA2 on H100, up to roughly 75 percent of
+            peak in fp16.
+          </p>
+          <p><strong>Q8. When does flash-attention not help much?</strong></p>
+          <p>
+            Short sequences, where the quadratic term it eliminates is small;
+            decode steps with one query token, unless the split-KV path is
+            engaged, since a single query row cannot fill a grid dimension;
+            and workloads already dominated by MLP or communication time, where
+            attention is a minor slice of the step.
+          </p>
+          <p><strong>Q9. Why does the API have no attention-mask tensor?</strong></p>
+          <p>
+            Arbitrary dense masks would force reading an N² mask, reintroducing
+            the traffic the kernel exists to avoid. The supported structures,
+            causal, sliding window, ALiBi, and variable-length packing via
+            <code>cu_seqlens</code>, are all expressible as index arithmetic
+            inside the kernel. If you want padding masks, pack with the varlen
+            API instead.
+          </p>
+          <p><strong>Q10. What does the causal flag do when seqlen_q and seqlen_k differ?</strong></p>
+          <p>
+            The mask is aligned to the bottom-right of the score matrix: the
+            last query attends to all keys, which is the correct convention for
+            incremental decoding where queries are the newest tokens. The
+            docstring in <code>flash_attn_interface.py</code> draws the exact
+            picture, and rows that end up fully masked produce zeros.
+          </p>
+          <p><strong>Q11. How does one repository serve so many head dims, dtypes, and GPUs?</strong></p>
+          <p>
+            The algorithm is written once over CuTe layouts; C++ templates
+            instantiate each (head dim, dtype, causal) variant into its own
+            .cu file for parallel compilation, boolean flags become template
+            parameters through <code>static_switch.h</code> macros, and each
+            hardware generation gets its own kernel family (sm80 in
+            <code>csrc/flash_attn</code>, sm90 in <code>hopper/</code>, AMD
+            via Composable Kernel or Triton).
+          </p>
+          <p><strong>Q12. What is the logsumexp trick for combining partial attentions?</strong></p>
+          <p>
+            Attention over a union of key sets is a weighted combination of
+            attentions over the parts, with weights derivable from the parts'
+            LSEs; carrying (out, LSE) makes attention mergeable. Split-KV
+            decoding uses this to parallelize one query over KV chunks and
+            combine, and distributed ring-attention schemes use the same
+            algebra across devices.
+          </p>
+          <p><strong>Q13. Your import fails with an undefined C++ symbol. What happened?</strong></p>
+          <p>
+            The flash-attn binary was compiled against a different torch build
+            than the one installed; the extension links torch's C++ ABI, so
+            the pair must be built and upgraded together. Rebuild with
+            <code>pip install flash-attn --no-build-isolation</code> against
+            the current torch, and in production pin the pair and ship
+            CI-built wheels.
+          </p>
+          <p><strong>Q14. Compare using this repo directly versus PyTorch SDPA.</strong></p>
+          <p>
+            SDPA is zero-dependency, compiler-friendly, and picks a good
+            backend automatically, the right default for standard shapes. The
+            repo's own API adds the production edges: varlen packing,
+            KV-cache with paging and in-place append, sliding window, softcap,
+            ALiBi, determinism control, and earlier access to new-generation
+            kernels. Frameworks tend to start with SDPA and graduate per
+            feature.
+          </p>
+          <p><strong>Q15. What would you measure first if attention seems slow?</strong></p>
+          <p>
+            Shape and backend: confirm which implementation actually ran (SDPA
+            can silently fall back to the math backend when a constraint fails,
+            for instance an unsupported mask or dtype), then whether the shape
+            is decode-like (seqlen_q of 1, needs split-KV), whether batching is
+            padded rather than packed, and only then kernel-level metrics like
+            achieved occupancy and DRAM throughput against the roofline.
+          </p>
+
+          <h2>Part XII: Design lessons</h2>
+          <p>
+            <strong>Count the scarce resource, not the obvious one.</strong>
+            Years of attention research optimized FLOPs while the wall clock
+            was set by memory traffic. The roofline discipline, classify the
+            kernel, then optimize the binding resource, is the same reasoning
+            behind external-memory algorithms in databases and cache-oblivious
+            data structures; the B-tree and FlashAttention are answers to the
+            same question asked of different hierarchies.
+          </p>
+          <p>
+            <strong>Recomputation is a first-class storage strategy.</strong>
+            Saving one float per row and recomputing tiles beats storing the
+            quadratic intermediate. The same trade appears in activation
+            checkpointing, in databases replaying a WAL instead of storing
+            every page version, and in build systems that cache hashes rather
+            than artifacts. The general form: when bandwidth is the bottleneck
+            and compute is idle, store the seed, not the crop.
+          </p>
+          <p>
+            <strong>Concentrate cleverness behind a boring contract.</strong>
+            The public surface is one function over plain tensors; the
+            complexity lives beneath a stable seam, which is why PyTorch,
+            Hugging Face, and vLLM could all adopt it without redesign. This
+            is the syscall pattern, and it is also the reason model definition
+            code in projects like vLLM stays readably plain: the cleverness
+            was pushed into the primitive.
+          </p>
+          <p>
+            <strong>When variants multiply, generate the code.</strong> The
+            repository's dispatch is file names; FA2 maintains about a hundred
+            hand-listed instantiations, and FA3's 451 come from
+            <code>generate_kernels.py</code>. Knowing when to switch from
+            writing instances to writing the generator is the same judgment
+            that produces SQL query generators, protobuf compilers, and BLAS
+            autotuners.
+          </p>
+          <p>
+            <strong>Test against a slow oracle.</strong> Every kernel variant
+            is validated against a naive PyTorch reference within a tolerance
+            that is itself calibrated to the reference's own floating-point
+            error. Differential testing against an obviously-correct
+            implementation is the only sane way to test fast code, the same
+            method SQLite applies with its fuzzed query oracle and CPUs apply
+            against architectural simulators.
+          </p>
+          <p>
+            <strong>Expect the fastest kernel to have a shelf life.</strong>
+            The algorithm survived three hardware generations; the kernels did
+            not, and the repository is structured to absorb that: per-arch
+            directories, a shared algorithm story, tests as the invariant.
+            Designing code so the durable part (the math, the contract) is
+            separated from the perishable part (the choreography) is the
+            transferable move.
+          </p>
+
+          <h2>Part XIII: Memorization framework</h2>
+          <p>
+            One sentence: flash-attention computes exact attention by
+            streaming KV tiles through SRAM with an online softmax, saving
+            only a per-row logsumexp and recomputing the rest in the backward,
+            reimplemented per GPU generation.
+          </p>
+          <pre class="flow">func -&gt; autograd -&gt; api -&gt; dispatch -&gt; tile loop -&gt; O + LSE -&gt; (bwd: D, recompute, dQKV)</pre>
+          <pre class="flow">func       flash_attn/flash_attn_interface.py   flash_attn_func
+autograd   same file                            FlashAttnFunc, saves q,k,v,out,LSE,rng
+api        csrc/flash_attn/flash_api.cpp        mha_fwd: checks, pads, params struct
+dispatch   csrc/flash_attn/src/static_switch.h  + ~100 per-shape .cu files
+tile loop  csrc/flash_attn/src/flash_fwd_kernel.h + softmax.h  QK^T, mask, rescale, PV
+bwd        flash_bwd_preprocess_kernel.h        D = rowsum(dO∘O), then flash_bwd_kernel.h</pre>
+          <p>Memorize these blocks:</p>
+          <pre class="flow">LAYOUT: (batch, seqlen, nheads, headdim); fp16/bf16 only; head dim &lt;= 256;
+GQA = fewer KV heads; causal mask aligns BOTTOM-RIGHT when seqlen_q != seqlen_k.</pre>
+          <pre class="flow">ONLINE SOFTMAX STATE per query row: running max m, running sum l, unnormalized acc.
+New tile: c = exp(m_old - m_new); l = c*l + sum(exp(s - m_new)); acc = c*acc + P·V.
+Saved for backward: LSE = m + ln(l), float32, shape (B, H, seqlen_q).</pre>
+          <pre class="flow">IO COUNTS (paper): naive Θ(Nd + N²) HBM accesses; flash Θ(N²d²/M), M = SRAM size;
+~10-20x less traffic at typical d, M. Memory O(N²) -&gt; O(N). FLOPs slightly UP.</pre>
+          <pre class="flow">GRID (FA2): dim3 grid(num_m_block, batch, heads); seqlen parallelism is the FA2 story.
+FA3 story: hopper/, warp specialization, TMA + WGMMA overlap, FP8 forward.</pre>
+          <pre class="flow">BACKWARD: D = rowsum(dO∘O); P = exp(S·scale - LSE); dV = PᵀdO; dS = P∘(dP - D);
+dQ via atomicAdd =&gt; nondeterministic by default; deterministic=True to fix.</pre>
+
+          <h2>Final takeaway</h2>
           <div class="takeaway">
             <strong>Key takeaway:</strong> flash-attention is one algorithmic
             identity, the online softmax, deployed with total commitment to a
-            hardware fact, that attention is bound by memory traffic. Tile
-            the computation so the score matrix never touches slow memory,
-            recompute instead of store in the backward pass, and re-express
-            the same mathematics for each GPU generation; everything in the
-            repository is one of those three moves.
+            hardware fact, that attention is bound by memory traffic. Tile the
+            computation so the score matrix never touches slow memory, save a
+            logsumexp and recompute instead of store in the backward, and
+            re-express the same mathematics for each GPU generation;
+            everything in the repository, from the autograd wrapper to the 451
+            generated Hopper kernels, is one of those three moves.
           </div>
         </article>
       </div>

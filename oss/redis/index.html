@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Redis walkthrough · Stanley Jacob</title>
-    <meta name="description" content="A walkthrough of the Redis source: how to use it in five minutes, how the event loop, the object system with its listpack and skiplist encodings, and RDB/AOF persistence work, and a guided reading path from server.c to a command's reply." />
+    <meta name="description" content="A full chapter on Redis: a practical tutorial, a systems-internals walkthrough following one SET and one GET from the socket through ae.c, networking.c, server.c, and dict.c, deep dives into the event loop, encodings, persistence, and eviction, plus a staged repository reading plan and hands-on labs." />
     <link rel="stylesheet" href="/style.css" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
   </head>
@@ -36,11 +36,13 @@
           under source-available licenses is offered under the AGPLv3 again as
           of Redis 8. It is the default cache, queue, and leaderboard of the
           industry, and it is also one of the most readable C codebases you
-          will ever open. This walkthrough covers how to use it in five
-          minutes, the single-threaded event loop, the object system and its
-          space-saving encodings, how persistence works from a process that
-          never wants to block, and a reading path that follows one command
-          from socket to reply.
+          will ever open. This is a full chapter, not a tour: a practical
+          tutorial, a systems-internals walkthrough that follows one
+          <code>SET</code> and one <code>GET</code> from the client socket
+          through the event loop to the reply buffer, deep dives into the
+          four load-bearing subsystems, a staged plan for reading the
+          repository, and labs you can run tonight. File names and defaults
+          were checked against the Redis 8.0 source tree.
         </p>
       </div>
     </header>
@@ -48,13 +50,76 @@
     <section class="soft">
       <div class="wrap">
         <article class="prose article">
-          <h2>Using it in five minutes</h2>
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">client ──RESP bytes──▶ socket ──▶ ae.c event loop (epoll/kqueue)
+                                      │ readable event
+                                      ▼
+                        networking.c  readQueryFromClient()
+                                      │ parse RESP into argv
+                                      ▼
+                        server.c      processCommand() ─▶ command table
+                                      │ dispatch          (src/commands/*.json)
+                                      ▼
+                        t_string.c    setCommand() / getCommand()
+                                      │
+                                      ▼
+                        dict.c        keyspace hash table ──▶ robj value
+                                      │
+                                      ▼
+                        networking.c  reply buffer ──▶ write on next tick ──▶ client</pre>
           <p>
-            Install the server from your package manager or run the official
-            container, start it, and talk to it with the bundled client:
+            Hold this picture and the whole codebase falls into place. Redis is
+            one thread running one loop. The loop waits for sockets to become
+            readable, reads command bytes off them, parses those bytes into an
+            argument vector, looks the command up in a table, and calls a C
+            function that touches an in-memory hash table. The reply is
+            appended to a per-client buffer and written back out on a later
+            turn of the same loop. Everything else in the repository, the
+            persistence machinery, replication, cluster mode, the background
+            thread pool, exists to serve that loop without ever blocking it.
           </p>
-          <pre><code>sudo apt install redis-server   # or: brew install redis
-redis-server                    # or: docker run -p 6379:6379 redis</code></pre>
+          <p>
+            The one-sentence identity: <mark>Redis is a dictionary of typed,
+            adaptively encoded data structures, served over a text protocol by
+            a single-threaded event loop, with durability done off to the side
+            by forked children and background threads.</mark> The dictionary is
+            <code>dict.c</code>, the types and encodings are
+            <code>object.c</code> plus the <code>t_*.c</code> files, the loop
+            is <code>ae.c</code>, the protocol is <code>networking.c</code>,
+            and the off-to-the-side work is <code>rdb.c</code>,
+            <code>aof.c</code>, and <code>bio.c</code>. Six ideas, six sets of
+            files, and the source is flat enough that all of them live in one
+            directory.
+          </p>
+          <p>
+            What makes Redis worth studying rather than merely using is that
+            each of those six ideas is a deliberate answer to a question you
+            will face designing any server: how do I get concurrency without
+            locks, how do I keep small data small, how do I persist without
+            pausing, how do I expire millions of keys without scanning them.
+            The rest of this chapter takes each answer apart.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <h3>Installing on Linux and macOS</h3>
+          <pre><code># Debian/Ubuntu
+sudo apt install redis-server
+
+# macOS
+brew install redis
+brew services start redis   # or just: redis-server
+
+# anywhere, via container
+docker run -p 6379:6379 redis</code></pre>
+          <p>
+            Distro packages can lag by a major version; if you want current
+            Redis 8 on Ubuntu, the official APT repository at
+            <code>packages.redis.io</code> or the Docker image is the reliable
+            route. Verify what you got with <code>redis-server --version</code>
+            and check liveness with <code>redis-cli ping</code>, which should
+            answer <code>PONG</code>.
+          </p>
+          <h3>A first real session</h3>
           <pre><code>$ redis-cli
 127.0.0.1:6379&gt; SET user:1000:name "Ada"
 OK
@@ -62,6 +127,8 @@ OK
 "Ada"
 127.0.0.1:6379&gt; EXPIRE user:1000:name 60
 (integer) 1
+127.0.0.1:6379&gt; TTL user:1000:name
+(integer) 57
 127.0.0.1:6379&gt; INCR pageviews
 (integer) 1
 127.0.0.1:6379&gt; ZADD leaderboard 3172 ada 2891 lin
@@ -80,112 +147,753 @@ OK
             <code>redis-cli MONITOR</code> in a second terminal is the best
             free tour of what an application actually asks its cache to do.
           </p>
-
-          <h2>Idea one: one thread and an event loop</h2>
+          <h3>From code</h3>
           <p>
-            The core of Redis is a single thread running an event loop, written
-            from scratch in <code>ae.c</code> in a few hundred lines over
-            epoll, kqueue, or select depending on the platform. Every client
-            socket is registered with the loop, and when data arrives the
-            handler reads a command, executes it, and queues the reply, one
-            command at a time for the whole server. This sounds like a
-            limitation until you notice what it buys: <mark>because commands
-            run one at a time against data that lives entirely in memory, every
-            command is atomic by construction and the code has no locks, no
-            data races, and no lost wakeups to reason about.</mark> The design
-            works because the workload cooperates: typical operations are O(1)
-            or O(log n) touches of RAM taking microseconds, so the bottleneck
-            is the network rather than the CPU, and modern Redis lets extra
-            I/O threads handle reading and writing sockets while command
-            execution stays single-threaded. The famous corollary is that one
-            slow command, a <code>KEYS *</code> against a big keyspace, stalls
-            everyone behind it, which is why the documentation is so insistent
-            about avoiding O(n) commands in production. When one box is not
-            enough you shard across many, which is Redis Cluster's job and the
-            subject of my <a href="/systems/distributed-cache">distributed
-            cache design write-up</a>.
+            The natural client language is Python with
+            <code>redis-py</code> (<code>pip install redis</code>):
+          </p>
+          <pre><code>import redis
+
+r = redis.Redis(host="localhost", port=6379, decode_responses=True)
+r.set("user:1000:name", "Ada", ex=3600)
+print(r.get("user:1000:name"))          # 'Ada'
+r.hset("user:1000", mapping={"name": "Ada", "city": "London"})
+print(r.hgetall("user:1000"))           # {'name': 'Ada', 'city': 'London'}</code></pre>
+          <h3>Mistake one: KEYS in production</h3>
+          <p>
+            Every command runs on the one thread, so an O(n) scan of the whole
+            keyspace stalls every other client until it finishes. The cursor
+            based <code>SCAN</code> does the same job in bounded slices:
+          </p>
+          <pre><code># wrong: blocks the server for the duration of the scan
+KEYS user:*
+
+# right: iterate in small batches, other clients interleave
+SCAN 0 MATCH user:* COUNT 100
+# ...repeat with the returned cursor until it comes back as 0</code></pre>
+          <h3>Mistake two: check-then-set races</h3>
+          <p>
+            Two clients can interleave between a <code>GET</code> and a
+            <code>SET</code>. Redis's answer is to push the atomicity into one
+            command; the lock idiom is the canonical example:
+          </p>
+          <pre><code># wrong: two commands, another client can win between them
+exists = r.get("lock:job42")
+if not exists:
+    r.set("lock:job42", my_id)
+
+# right: one atomic command, with an expiry so a crash cannot
+# leave the lock held forever
+acquired = r.set("lock:job42", my_id, nx=True, ex=30)</code></pre>
+          <h3>Mistake three: one round trip per operation</h3>
+          <p>
+            Redis usually answers in well under a millisecond, so the dominant
+            cost of a chatty loop is your own network round trips. Pipelining
+            sends a batch and reads the replies together:
+          </p>
+          <pre><code># wrong: 10,000 network round trips
+for i in range(10000):
+    r.set(f"k:{i}", i)
+
+# right: a few round trips, typically an order of magnitude faster
+pipe = r.pipeline()
+for i in range(10000):
+    pipe.set(f"k:{i}", i)
+pipe.execute()</code></pre>
+          <h3>Mistake four: JSON blobs where a hash belongs</h3>
+          <p>
+            Serializing an object into one string means every field update is
+            a read-modify-write of the whole blob, done in your application
+            with a race window. A hash lets Redis update one field atomically,
+            and small hashes are stored in a compact encoding you will meet in
+            Part V:
+          </p>
+          <pre><code># wrong: fetch, mutate, write back the whole object
+u = json.loads(r.get("user:1000"))
+u["city"] = "Paris"
+r.set("user:1000", json.dumps(u))
+
+# right: one atomic field write
+r.hset("user:1000", "city", "Paris")</code></pre>
+          <h3>Mistake five: forgetting that memory is the budget</h3>
+          <p>
+            Out of the box <code>maxmemory</code> is unset and
+            <code>maxmemory-policy</code> is <code>noeviction</code>, so a
+            "cache" that never sets TTLs simply grows until the box swaps or
+            the OOM killer arrives, and once a limit is set, writes start
+            failing with an error instead of evicting. A cache deployment
+            wants an explicit limit and an eviction policy, for example
+            <code>maxmemory 2gb</code> with
+            <code>maxmemory-policy allkeys-lru</code>. Part V explains what
+            those policies actually do.
           </p>
 
-          <h2>Idea two: the object system and its encodings</h2>
+          <h2>Part III: When it is the right tool</h2>
           <p>
-            Every value in Redis is a <code>robj</code>, a small header
-            defined in <code>server.h</code> and managed in
-            <code>object.c</code>, carrying a type, strings, lists, sets,
-            hashes, sorted sets and more, and separately an encoding, the
-            concrete representation currently in use. That separation is the
-            trick: <mark>a type keeps one command interface while swapping its
-            underlying data structure based on size, so small collections are
-            stored as a listpack, a compact serialized buffer scanned
-            linearly, and converted to a real hash table or skiplist only when
-            they grow past configured thresholds.</mark> A small hash is
-            therefore a few contiguous bytes rather than a pointer-chasing
-            table, a list is a quicklist, a linked list whose nodes are
-            listpacks, and a large sorted set becomes the classic pairing of a
-            skiplist for order plus a dict for O(1) score lookup, implemented
-            in <code>t_zset.c</code>. The same economy shows up in strings,
-            which come in an integer encoding, an embedded short-string
-            encoding allocated inline with the header, and a general raw
-            encoding built on <code>sds.c</code>, Redis's length-prefixed
-            dynamic strings. You can watch all of this from the client with
-            <code>OBJECT ENCODING key</code>, growing a hash element by
-            element until it flips representation, which is the cheapest
-            systems lesson available anywhere.
+            Redis is the right tool when the working set fits in memory and
+            you want latency measured in microseconds with data structure
+            semantics: caching, session storage, rate limiting, leaderboards,
+            distributed locks, pub/sub fan-out, and queues via lists or
+            streams. It is a strong fit precisely when the operations you need
+            map onto its commands, because then every operation is one atomic,
+            already-implemented, already-fast primitive.
+          </p>
+          <p>
+            The alternatives frame the boundaries. Memcached is the purer
+            cache: multithreaded, only strings, no persistence, and still a
+            fine choice when you want nothing but a flat LRU cache saturating
+            big NICs. Valkey is the Linux Foundation fork created in 2024 when
+            Redis left open source licensing; it is command-compatible and the
+            default choice in some distros, and everything in this chapter
+            about the architecture applies to it too. And when the data is
+            relational, larger than memory, or must be the authoritative copy,
+            a disk-first database such as Postgres is the right substrate,
+            with Redis in front of it rather than instead of it; my
+            <a href="/software/notes/databases-for-system-design">databases
+            note</a> covers that decision in general form.
+          </p>
+          <p>
+            The architecture-shaped warning: <mark>do not make Redis the only
+            copy of data you cannot afford to lose.</mark> Persistence is
+            real but bounded: the default AOF policy fsyncs once per second,
+            RDB snapshots are minutes apart, and failover to an
+            asynchronously-updated replica can discard acknowledged writes.
+            The safe shape keeps a durable system of record behind it:
+          </p>
+          <pre class="flow">safe:      app ──▶ Redis (cache, TTLs, eviction)
+                │ miss / write-through
+                ▶ Postgres (source of truth, real durability)
+
+dangerous: app ──▶ Redis (only copy, everysec fsync, async replica)
+                          │ crash or failover
+                          ▶ up to seconds of acknowledged writes gone</pre>
+          <p>
+            When one box is not enough you shard across many, which is Redis
+            Cluster's job and the subject of my
+            <a href="/systems/distributed-cache">distributed cache design
+            write-up</a>, which derives the same architecture from
+            requirements instead of from code.
           </p>
 
-          <h2>Idea three: persistence without blocking</h2>
+          <h2>Part IV: The full life of one command</h2>
           <p>
-            An in-memory server still has to survive restarts, and Redis offers
-            two answers with one shared trick. RDB, in <code>rdb.c</code>, is a
-            point-in-time binary snapshot of the whole dataset, and AOF, in
-            <code>aof.c</code>, is a log of every write command, replayable at
-            startup and periodically rewritten into a compact form, with
-            fsync policy configurable between every write, every second, or
-            never. The shared trick is <code>fork()</code>: for a background
-            save the process forks, and the child walks a frozen copy of the
-            dataset provided for free by the kernel's copy-on-write pages
-            while the parent keeps serving traffic, at the cost of extra
-            memory as pages diverge under write-heavy load. The practical
-            posture most deployments land on is AOF with everysec fsync for
-            durability plus RDB snapshots for fast restarts and backups, and
-            the same snapshot machinery doubles as the transfer format when a
-            replica first synchronizes.
+            This is the core of the chapter. We follow
+            <code>SET user:1000:name "Ada"</code> and then
+            <code>GET user:1000:name</code> from the client's socket to the
+            reply, naming every file the bytes pass through. Once you can
+            narrate this path from memory, the repository reads like
+            annotations on a diagram you already own.
           </p>
 
-          <h2>Reading the repository</h2>
+          <h3>Stage 0: the bytes on the wire</h3>
           <p>
-            Everything lives flat in <code>src/</code>, and the right way in is
-            to follow one command. Start in <code>server.c</code>, where
-            <code>main()</code> loads the config, calls the server
-            initialization that creates the event loop and listening sockets,
-            and enters <code>aeMain()</code>; read <code>ae.c</code> in full,
-            it is short and self-contained with the platform backends in
-            <code>ae_epoll.c</code> and friends. Then trace a
-            <code>SET</code>: the readable event fires
-            <code>readQueryFromClient()</code> in <code>networking.c</code>,
-            the RESP protocol parser builds an argument vector, and
-            <code>processCommand()</code> in <code>server.c</code> looks up the
-            command in a table that recent versions generate from the JSON
-            specs under <code>src/commands/</code>, checks ACLs and memory, and
-            dispatches to <code>setCommand()</code> in <code>t_string.c</code>,
-            which stores the value through the keyspace dict from
-            <code>dict.c</code> and queues the reply back in
-            <code>networking.c</code>. The type files <code>t_list.c</code>,
-            <code>t_hash.c</code>, <code>t_set.c</code>, and
-            <code>t_zset.c</code> all follow the same pattern over the
-            structures in <code>listpack.c</code>, <code>quicklist.c</code>,
-            and <code>dict.c</code>, whose incremental rehashing is a gem worth
-            reading on its own. With that spine in place, <code>rdb.c</code>,
-            <code>aof.c</code>, <code>replication.c</code>, and the background
-            thread pool in <code>bio.c</code> each read as an extension of a
-            loop you already understand.
+            The client speaks RESP, the REdis Serialization Protocol. A
+            command is an array of bulk strings, length-prefixed so the parser
+            never scans for delimiters inside values:
+          </p>
+          <pre><code>*3\r\n$3\r\nSET\r\n$14\r\nuser:1000:name\r\n$3\r\nAda\r\n</code></pre>
+          <p>
+            <code>*3</code> announces three items, each <code>$n</code>
+            announces a bulk string of n bytes. The replies we expect back are
+            <code>+OK\r\n</code> for the SET and
+            <code>$3\r\nAda\r\n</code> for the GET. The protocol is simple
+            enough to speak by hand with <code>nc localhost 6379</code>, and
+            that simplicity is a design decision: parsing is cheap, and every
+            language gets a client for free.
+          </p>
+
+          <h3>Stage 1: accept, and a client is born</h3>
+          <p>
+            At startup, <code>main()</code> in <code>server.c</code> loads the
+            config, creates the event loop, and listens on port 6379 using the
+            small socket library in <code>anet.c</code>. When our client
+            connects, the accept handler creates a <code>client</code> struct
+            (defined in <code>server.h</code>: the query buffer, the argument
+            vector, the reply buffer, flags) and registers the new socket with
+            the event loop, setting <code>readQueryFromClient</code> as its
+            read handler. From this point the client is just another file
+            descriptor the loop watches.
+          </p>
+
+          <h3>Stage 2: ae.c wakes up</h3>
+          <p>
+            The heart of the server is <code>aeMain()</code> in
+            <code>ae.c</code>, a few hundred lines implementing an event loop
+            over whichever multiplexing syscall the platform offers:
+            <code>ae_epoll.c</code> on Linux, <code>ae_kqueue.c</code> on
+            macOS and BSD, with select as the fallback. The loop blocks in
+            <code>epoll_wait</code> until a registered descriptor is ready,
+            then fires the handler attached to it. Our SET arrives, the kernel
+            marks the socket readable, and the loop calls
+            <code>readQueryFromClient</code>. Before each blocking wait the
+            loop also calls <code>beforeSleep()</code>, a hook that matters at
+            the end of this story, and it schedules time events, chiefly
+            <code>serverCron</code>, the housekeeping tick that runs 10 times
+            a second by default.
+          </p>
+
+          <h3>Stage 3: networking.c reads and parses</h3>
+          <p>
+            <code>readQueryFromClient</code> in <code>networking.c</code>
+            reads from the socket into the client's query buffer, then calls
+            <code>processInputBuffer</code>, which hands our array-of-bulk
+            bytes to <code>processMultibulkBuffer</code>. The parser walks the
+            length prefixes and builds <code>c-&gt;argv</code>, an array of
+            three string objects: <code>SET</code>,
+            <code>user:1000:name</code>, <code>Ada</code>. Nothing has been
+            interpreted yet; Redis so far has only turned bytes into an argv,
+            exactly like a shell.
+          </p>
+
+          <h3>Stage 4: server.c looks up and vets the command</h3>
+          <p>
+            <code>processCommand</code> in <code>server.c</code> looks up
+            <code>argv[0]</code> in the command table. Since Redis 7 that
+            table is generated from JSON specifications under
+            <code>src/commands/</code>, one file per command
+            (<code>set.json</code> declares arity, flags, key positions), so
+            metadata that used to live in a giant C array is now data. With
+            the command found, the function runs the gauntlet: is the client
+            authenticated, do its ACLs permit this command, are we out of
+            memory and is this a write (if <code>maxmemory</code> is set,
+            this is where eviction is attempted before a denial), should the
+            write be refused because persistence is failing. Only then does
+            <code>call()</code> invoke the command's function pointer. This
+            one function is also where MULTI queuing, replication
+            propagation, and slow-log timing hook in, which is why it repays
+            slow reading.
+          </p>
+
+          <h3>Stage 5: t_string.c executes SET</h3>
+          <p>
+            <code>setCommand</code> in <code>t_string.c</code> parses options
+            (NX, EX, and friends) and delegates to
+            <code>setGenericCommand</code>, which stores the value into the
+            database. Two things happen on the way in. First, the value was
+            already wrapped as an <code>robj</code>, and
+            <code>tryObjectEncoding</code> in <code>object.c</code> tries to
+            shrink it: a string that parses as an integer becomes an
+            <code>int</code> encoding, anything of 44 bytes or fewer becomes
+            <code>embstr</code>, allocated in one block with its header, and
+            only longer strings get the general <code>raw</code> encoding over
+            an <code>sds</code> string from <code>sds.c</code>. Second, the
+            key goes into the keyspace.
+          </p>
+
+          <h3>Stage 6: dict.c stores the pair</h3>
+          <p>
+            Each database is fundamentally a hash table from
+            <code>dict.c</code> (Redis 8 wraps it in a kvstore layer, but the
+            dict is still the engine): chained buckets, powers-of-two sizing,
+            and the famous trick, incremental rehashing. When the table needs
+            to grow, Redis allocates the new table beside the old one and
+            migrates a few buckets per operation instead of stopping the
+            world to rehash millions of keys, because <mark>a single-threaded
+            server cannot afford any O(n) pause, so every O(n) job inside
+            Redis is either incremental, forked, or pushed to a background
+            thread.</mark> Our key hashes to a bucket, the entry is stored,
+            the keyspace notification and dirty counter for persistence tick
+            over, and the command is done in a few hundred nanoseconds of
+            actual data structure work.
+          </p>
+
+          <h3>Stage 7: the reply buffer</h3>
+          <p>
+            <code>setGenericCommand</code> ends with
+            <code>addReply(c, shared.ok)</code>, appending the five bytes
+            <code>+OK\r\n</code> to the client's output. Replies go into a
+            fixed per-client buffer first, spilling into a linked list of
+            chunks only when they outgrow it (the logic is
+            <code>_addReplyToBufferOrList</code> in
+            <code>networking.c</code>; tiny replies like ours never leave the
+            fixed buffer). Crucially, no write happens yet. The client is
+            added to a pending-writes list, and when the event loop next
+            passes through <code>beforeSleep()</code>, Redis writes all
+            pending outputs directly, installing a write event handler only
+            for the sockets that could not take the whole reply at once. Most
+            replies therefore complete with zero extra trips through epoll. A
+            client that reads too slowly while its buffer grows past the
+            configured limits is disconnected
+            (<code>closeClientOnOutputBufferLimitReached</code>), which is
+            how Redis protects its memory from a stuck consumer.
+          </p>
+
+          <h3>Stage 8: GET, and the read path's one twist</h3>
+          <p>
+            The GET travels the same road: readable event, parse,
+            <code>processCommand</code>, then <code>getCommand</code> in
+            <code>t_string.c</code>, which calls
+            <code>lookupKeyReadOrReply</code>. The twist is inside the
+            lookup: before returning a value, Redis checks whether the key
+            has an expiry that has already passed, and if so deletes it and
+            reports a miss. <mark>Expiration in Redis is lazy first: a dead
+            key is reclaimed when someone touches it, and a background cycle
+            exists only to catch the keys nobody ever touches again.</mark>
+            Our key is alive, the value's bytes are appended as
+            <code>$3\r\nAda\r\n</code>, and the same beforeSleep pass flushes
+            it to the socket. Total path length for a GET: one epoll wakeup,
+            one read, a hash lookup, one write. That is the entire secret of
+            sub-millisecond Redis.
+          </p>
+
+          <h2>Part V: Internals deep dives</h2>
+
+          <h3>Deep dive: the event loop, and where the threads actually are</h3>
+          <p>
+            "Redis is single-threaded" is the most repeated and most
+            oversimplified fact about it. The precise claim: <mark>command
+            execution is single-threaded, so every command is atomic by
+            construction, and the data structures need no locks; but the
+            process is not single-threaded, and knowing where the other
+            threads are is the real understanding.</mark> The design works
+            because the workload cooperates: typical commands are O(1) or
+            O(log n) touches of RAM taking microseconds, so the bottleneck is
+            the network, not the CPU. One thread that never waits beats many
+            threads that contend, and the code gets to be simple: no data
+            races, no lock ordering, no lost wakeups, anywhere in the command
+            path.
+          </p>
+          <p>
+            The threads that do exist form three groups. I/O threads, off by
+            default and enabled with <code>io-threads N</code>, parallelize
+            socket reading, writing, and protocol parsing when a single core
+            saturates on network work; commands still execute serially on the
+            main thread, so atomicity survives. The background thread pool in
+            <code>bio.c</code> takes jobs that would otherwise stall the
+            loop: closing files (which can block in the kernel), AOF fsync,
+            and lazy freeing, where <code>UNLINK</code> or eviction hands a
+            huge object to a background thread to deallocate instead of
+            freeing millions of allocations inline. And forked children
+            handle RDB saves and AOF rewrites, as the persistence dive
+            explains. The corollary of one execution thread is the famous
+            trap: one slow command stalls everyone, which is why
+            <code>KEYS</code>, <code>SMEMBERS</code> on giant sets,
+            unbounded <code>LRANGE</code>, and O(n) Lua scripts are the
+            classic production incidents, and why <code>SCAN</code> and its
+            cousins exist.
+          </p>
+          <pre class="flow">main thread:   ae loop ▶ parse ▶ execute ▶ reply    (the only place commands run)
+io threads:    read sockets / write sockets / parse  (optional, io-threads N)
+bio threads:   close(fd) │ aof fsync │ lazy free     (bio.c, always present)
+fork children: RDB save  │ AOF rewrite               (whole-process snapshots)</pre>
+
+          <h3>Deep dive: the object system and adaptive encodings</h3>
+          <p>
+            Every value is an <code>robj</code> (defined in
+            <code>server.h</code>, managed in <code>object.c</code>): a type,
+            an encoding, a 24-bit clock field used by LRU/LFU, a refcount,
+            and a pointer. The type is the command interface, string, list,
+            set, hash, sorted set, stream; the encoding is the concrete
+            representation currently in use, and <mark>the trick of the
+            object system is that a type keeps one interface while swapping
+            its data structure underneath as the value grows.</mark> Small
+            collections are stored as a listpack, a compact serialized buffer
+            scanned linearly, because for a handful of elements a linear scan
+            of contiguous bytes beats a hash table in both space and real
+            time. Past configured thresholds, the collection converts, once
+            and irreversibly, to the pointer-based structure that scales.
+          </p>
+          <table>
+            <tr><th>Type</th><th>Small encoding</th><th>Converts to</th><th>Threshold (defaults, Redis 8.0 redis.conf)</th></tr>
+            <tr><td>string</td><td>int / embstr</td><td>raw</td><td>embstr up to 44 bytes</td></tr>
+            <tr><td>hash</td><td>listpack</td><td>hashtable</td><td>512 entries / 64-byte values</td></tr>
+            <tr><td>list</td><td>listpack</td><td>quicklist</td><td>list-max-listpack-size -2 (8&nbsp;KB per node)</td></tr>
+            <tr><td>set</td><td>intset or listpack</td><td>hashtable</td><td>512 ints / 128 entries, 64-byte values</td></tr>
+            <tr><td>sorted set</td><td>listpack</td><td>skiplist + dict</td><td>128 entries / 64-byte values</td></tr>
+          </table>
+          <p>
+            The scaled-up structures are worth knowing by name. A large list
+            is a quicklist (<code>quicklist.c</code>), a doubly linked list
+            whose nodes are themselves listpacks, a two-level design that
+            keeps memory compact while making push and pop at both ends O(1).
+            A large sorted set (<code>t_zset.c</code>) is the classic
+            pairing: a skiplist for order and range queries plus a dict for
+            O(1) member-to-score lookup, both pointing at shared elements.
+            The trap to correct: encodings never convert back down when a
+            collection shrinks, and a single oversized value flips the whole
+            collection, so a hash of 511 tiny fields plus one 100-byte value
+            is a hashtable. Watch it happen yourself with
+            <code>OBJECT ENCODING key</code>, which is Lab 2, and the
+            cheapest systems lesson available anywhere.
+          </p>
+
+          <h3>Deep dive: persistence from a process that never wants to block</h3>
+          <p>
+            Redis offers two persistence forms with one shared trick. RDB
+            (<code>rdb.c</code>) is a point-in-time binary snapshot of the
+            whole dataset written to <code>dump.rdb</code>; the default
+            config asks for one after 3600 seconds if at least 1 key changed,
+            300 seconds if 100 changed, or 60 seconds if 10000 changed. AOF
+            (<code>aof.c</code>, off by default) logs every write command and
+            replays the log at startup; since Redis 7 it is multi-part,
+            living in an <code>appendonlydir/</code> directory as a base
+            snapshot plus incremental append files and a manifest, which made
+            the rewrite path simpler and safer than the old single-file
+            dance.
+          </p>
+          <p>
+            The shared trick is <code>fork()</code>. For a background save
+            the process forks; the child sees a frozen copy of all memory,
+            courtesy of the kernel's copy-on-write page tables, and serializes
+            at leisure while the parent keeps serving. The cost is physical:
+            as the parent mutates pages, the kernel copies them, so a
+            write-heavy workload during a save can grow resident memory
+            toward two copies of the hot pages, and the fork itself must copy
+            page tables, a pause proportional to dataset size that
+            <code>INFO</code> reports as <code>latest_fork_usec</code>. AOF
+            rewrite uses the same fork: the child writes a compact base from
+            the frozen state while the parent accumulates new increments.
+          </p>
+          <p>
+            The durability dial is <code>appendfsync</code>:
+            <code>always</code> (fsync every write, the slow-but-safest
+            setting), <code>everysec</code> (the default: fsync once per
+            second from a <code>bio.c</code> background thread, so a crash
+            loses at most about a second), and <code>no</code> (let the OS
+            decide). The misconception to correct: <mark>AOF-everysec Redis
+            is not a durable database in the Postgres sense; an acknowledged
+            write can still die with the process, and replication is
+            asynchronous, so failover can lose acknowledged writes too.</mark>
+            The posture most deployments land on is AOF everysec plus RDB
+            snapshots for fast restarts and backups, and the same RDB
+            machinery doubles as the transfer format when a replica first
+            synchronizes (<code>replication.c</code>).
+          </p>
+
+          <h3>Deep dive: expiration and eviction</h3>
+          <p>
+            Expiration answers "this key has a TTL"; eviction answers "we are
+            out of memory, sacrifice something." They are different machines.
+            Expiries live in a separate per-database dict mapping key to
+            expiry time. Reclamation is lazy first, as the GET path showed:
+            <code>expireIfNeeded</code> deletes a dead key at touch time.
+            The active side (<code>expire.c</code>) runs from
+            <code>serverCron</code>: each cycle samples 20 keys per database
+            from the expires dict, deletes the dead ones, and if more than
+            10% of the sample was dead, loops again, all under a CPU budget
+            of 25% of cron time. The effect is a probabilistic guarantee: the
+            fraction of already-dead keys still holding memory stays around
+            one in ten, without ever scanning the keyspace.
+          </p>
+          <p>
+            Eviction (<code>evict.c</code>) triggers on the write path when
+            <code>maxmemory</code> is exceeded. The policy grid is two
+            axes: which keys are candidates (<code>allkeys-*</code> or
+            <code>volatile-*</code>, the latter only keys with TTLs) and how
+            victims are chosen (<code>lru</code>, <code>lfu</code>,
+            <code>random</code>, or <code>volatile-ttl</code> for
+            shortest-TTL-first), plus the default <code>noeviction</code>,
+            which refuses writes with an error instead. The LRU is
+            deliberately approximate: instead of maintaining a global
+            recency list (pointer overhead on every object, cache-hostile
+            updates on every touch), each robj carries a 24-bit last-access
+            clock, and eviction samples <code>maxmemory-samples</code> keys
+            (default 5), keeping a small pool of the best candidates seen and
+            evicting the oldest. The redis.io docs show that at 10 samples
+            the approximation is close to true LRU at a fraction of the
+            cost. LFU reuses the same 24 bits as a logarithmic access
+            counter plus decay timestamp, tuned by
+            <code>lfu-log-factor</code> (default 10) and
+            <code>lfu-decay-time</code> (default 1 minute), so a burst
+            yesterday does not outrank steady traffic today. The trap:
+            <mark>volatile-* policies can only evict keys that have TTLs, so
+            a workload that never sets expiries under volatile-lru behaves
+            exactly like noeviction and fails writes at the limit.</mark>
+          </p>
+
+          <h2>Part VI: Reading the repository</h2>
+          <p>
+            Everything lives flat in <code>src/</code>. Read it in stages,
+            each with questions you should be able to answer before moving
+            on.
+          </p>
+          <p>
+            <strong>Stage 0, the loop.</strong> Read <code>ae.c</code> in
+            full, with a glance at <code>ae_epoll.c</code>; it is short and
+            self-contained. Then in <code>server.c</code> read
+            <code>main()</code>, <code>initServer()</code>, and
+            <code>beforeSleep()</code>. Questions: what are the two kinds of
+            events ae supports? Where does the loop block? What work does
+            Redis deliberately do right before blocking?
+          </p>
+          <p>
+            <strong>Stage 1, one command end to end.</strong> In
+            <code>networking.c</code>: <code>readQueryFromClient</code>,
+            <code>processMultibulkBuffer</code>, <code>addReply</code>. In
+            <code>server.c</code>: <code>processCommand</code> and
+            <code>call()</code>. In <code>t_string.c</code>:
+            <code>setCommand</code> and <code>getCommand</code>. Glance at
+            <code>src/commands/set.json</code> to see the generated command
+            table's source of truth. Questions: where exactly could a
+            command be rejected before executing? Why do replies not write
+            to the socket immediately? What makes every command atomic?
+          </p>
+          <p>
+            <strong>Stage 2, the data structures.</strong>
+            <code>dict.c</code> (incremental rehashing is a gem worth reading
+            twice), <code>sds.c</code>, <code>listpack.c</code>,
+            <code>quicklist.c</code>, then <code>object.c</code> for
+            <code>tryObjectEncoding</code> and the conversion logic, then one
+            type file, ideally <code>t_zset.c</code> for the
+            skiplist-plus-dict pairing. Questions: how does a dict rehash
+            without pausing? At what moments does a listpack become a
+            hashtable? Why does a sorted set need two structures?
+          </p>
+          <p>
+            <strong>Stage 3, durability.</strong> <code>rdb.c</code>
+            (<code>rdbSaveBackground</code> and the fork),
+            <code>aof.c</code> (the multi-part manifest and rewrite), and
+            <code>bio.c</code>. Questions: what precisely does the child
+            process see after fork? What can be lost under everysec? Which
+            three job types does bio run and why those three?
+          </p>
+          <p>
+            <strong>Stage 4, memory pressure.</strong> <code>expire.c</code>
+            and <code>evict.c</code>. Questions: why sample instead of
+            scanning? Why is the LRU clock only 24 bits? What does
+            volatile-lru do with no TTLs set?
+          </p>
+          <p>
+            <strong>Where not to start:</strong> <code>cluster.c</code> and
+            its siblings (a distributed system grafted onto the server, best
+            read only after the standalone story is solid),
+            <code>replication.c</code>'s partial-resync edge cases, and the
+            scripting layer. None of them make sense until the single-node
+            loop is second nature.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <h3>Lab 1: watch the traffic, measure the latency</h3>
+          <pre><code>redis-cli MONITOR                   # terminal 1: every command, live
+redis-benchmark -t set,get -n 100000 -q   # terminal 2
+redis-cli --latency                 # then: sustained latency probe</code></pre>
+          <p>
+            <code>MONITOR</code> prints every command the server executes
+            (never leave it on in production; it costs real throughput).
+            <code>--latency</code> shows the round-trip floor, typically a
+            fraction of a millisecond on localhost; numbers vary by machine.
+            Concept taught: the request path from Part IV, observed from
+            outside.
+          </p>
+          <h3>Lab 2: watch an encoding transition</h3>
+          <pre><code>redis-cli DEL h
+redis-cli HSET h f1 v1
+redis-cli OBJECT ENCODING h         # "listpack"
+for i in $(seq 1 600); do redis-cli HSET h f$i v$i &gt; /dev/null; done
+redis-cli OBJECT ENCODING h         # "hashtable" (past 512 entries)
+redis-cli DEL h
+redis-cli HSET h big $(python3 -c "print('x'*100)")
+redis-cli OBJECT ENCODING h         # "hashtable" (one 100-byte value &gt; 64)</code></pre>
+          <p>
+            Concept taught: adaptive encodings and their thresholds, and that
+            one oversized value flips the whole collection.
+          </p>
+          <h3>Lab 3: force a snapshot, observe the fork</h3>
+          <pre><code>redis-benchmark -t set -n 1000000 -r 1000000 -q   # fill some memory
+redis-cli BGSAVE
+redis-cli INFO persistence | grep -E "rdb_bgsave_in_progress|latest_fork_usec|rdb_last_bgsave_status"</code></pre>
+          <p>
+            <code>latest_fork_usec</code> is the pause the fork itself cost;
+            watch it grow if you load more data and save again. On Linux,
+            <code>ps aux | grep redis</code> during the save shows the child
+            process, and repeating the <code>INFO persistence</code> call
+            during a write-heavy save shows copy-on-write growth in the
+            <code>current_cow_size</code> field. Concept taught: fork-based
+            snapshotting and its memory cost.
+          </p>
+          <h3>Lab 4: eviction policies in miniature</h3>
+          <pre><code>redis-cli CONFIG SET maxmemory 20mb
+redis-cli CONFIG SET maxmemory-policy noeviction
+redis-benchmark -t set -n 200000 -r 200000 -d 512 -q   # writes start erroring
+redis-cli CONFIG SET maxmemory-policy allkeys-lru
+redis-benchmark -t set -n 200000 -r 200000 -d 512 -q   # writes succeed, old keys go
+redis-cli INFO stats | grep evicted_keys
+redis-cli CONFIG SET maxmemory 0            # cleanup</code></pre>
+          <p>
+            Concept taught: the noeviction default versus LRU sampling, and
+            <code>evicted_keys</code> as the counter that proves it.
+          </p>
+          <h3>Lab 5: one slow command stalls everyone</h3>
+          <pre><code>redis-cli --latency                 # terminal 1: leave running, note the baseline
+redis-cli DEBUG SLEEP 2             # terminal 2: block the loop for 2 seconds</code></pre>
+          <p>
+            The latency probe spikes to roughly two thousand milliseconds for
+            one sample and recovers. Concept taught: single-threaded
+            execution means every client shares the fate of the slowest
+            command; this is exactly what a stray <code>KEYS</code> does in
+            production.
+          </p>
+
+          <h2>Part VIII: Understanding checks</h2>
+          <p><strong>What is Redis in one sentence?</strong>
+            An in-memory data structure server: a dictionary of typed,
+            adaptively encoded values, executed one command at a time by a
+            single-threaded event loop, with durability handled by forked
+            children and background threads.</p>
+          <p><strong>Why is single-threaded execution fast rather than a bottleneck?</strong>
+            Because commands are microsecond-scale memory operations, the
+            real constraint is network I/O, not CPU. One thread that never
+            blocks avoids all locking, contention, and context-switch costs,
+            and I/O threads can be added for the network half without
+            touching execution atomicity.</p>
+          <p><strong>What actually runs on other threads or processes?</strong>
+            Optional I/O threads for socket read/write and parsing; the
+            bio.c pool for file closes, AOF fsync, and lazy frees; and
+            forked children for RDB saves and AOF rewrites. Command
+            execution itself is always the main thread.</p>
+          <p><strong>Why is every Redis command atomic?</strong>
+            Because only one command executes at a time on the one execution
+            thread. There is no interleaving to protect against, so atomicity
+            is a structural property, not a locking achievement.</p>
+          <p><strong>Walk the path of a SET.</strong>
+            Readable event in ae.c fires readQueryFromClient in networking.c;
+            processMultibulkBuffer parses RESP into argv; processCommand in
+            server.c looks up the command table and runs ACL and memory
+            checks; setCommand in t_string.c stores an encoded robj into the
+            dict.c keyspace; addReply queues +OK, flushed to the socket in
+            the next beforeSleep pass.</p>
+          <p><strong>What problem does incremental rehashing solve?</strong>
+            Growing a hash table normally requires an O(n) stop-the-world
+            rehash, which a single-threaded server cannot afford. Redis keeps
+            old and new tables side by side and migrates a few buckets per
+            operation, bounding every pause while the table converges.</p>
+          <p><strong>Why do small hashes use a listpack instead of a hash table?</strong>
+            A listpack is one contiguous allocation scanned linearly, so for
+            a few dozen elements it beats a hash table on memory (no
+            pointers, no buckets) and often on time (cache locality). The
+            encoding converts to a real hashtable at 512 entries or a 64-byte
+            value by default, and never converts back.</p>
+          <p><strong>What does fork-based persistence cost?</strong>
+            The fork itself pauses the server proportionally to page-table
+            size (visible as latest_fork_usec), and copy-on-write means a
+            write-heavy workload during a save duplicates dirtied pages, so
+            memory headroom must budget for the divergence.</p>
+          <p><strong>Can AOF with everysec lose data?</strong>
+            Yes, by design: writes are acknowledged before the fsync that
+            happens once per second on a background thread, so a crash can
+            lose about the last second. appendfsync always closes that
+            window at a large throughput cost, and failover to an async
+            replica can lose acknowledged writes regardless.</p>
+          <p><strong>How does Redis expire millions of keys without scanning them?</strong>
+            Lazily on access (a touched dead key is deleted and reported
+            missing), plus an active sampling cycle: 20 keys sampled per
+            database per iteration, looping while more than 10% of the
+            sample is expired, capped at 25% of cron CPU. The result is a
+            bounded fraction of stale keys, found without any full scan.</p>
+          <p><strong>How approximate is approximated LRU?</strong>
+            Each object stores a 24-bit access clock; eviction samples five
+            keys by default, pools the best candidates, and evicts the
+            oldest seen. It is not true LRU, but with 10 samples the redis.io
+            docs show behavior close to exact LRU, and it costs no global
+            list and no per-access pointer maintenance.</p>
+          <p><strong>When is Memcached the better choice?</strong>
+            When the need is exactly a flat, volatile string cache at very
+            high connection counts: Memcached is multithreaded and can
+            saturate more cores per instance for that one job. The moment
+            you want data structures, persistence, replication, or atomic
+            server-side operations, Redis wins.</p>
+          <p><strong>Why did a write suddenly return an OOM error under memory pressure?</strong>
+            maxmemory was reached under the default noeviction policy, or
+            under a volatile-* policy with no TTL-bearing keys to evict.
+            Either configure allkeys-lru (or lfu) for cache workloads, or
+            treat the error as backpressure for store workloads.</p>
+          <p><strong>Your p99 latency spikes every few minutes; where do you look first?</strong>
+            Suspect loop stalls: a periodic O(n) command (SLOWLOG GET),
+            expiry storms of large keys, fork pauses at BGSAVE/rewrite
+            (latest_fork_usec), or a swap-thrashing host. The single-threaded
+            model means anything slow shows up as everyone's latency, which
+            paradoxically makes diagnosis easy.</p>
+          <p><strong>Why is the reply buffered instead of written inside the command?</strong>
+            Writing inside execution would let one slow client block the
+            loop mid-command. Buffering decouples execution from socket
+            readiness: the loop writes when the socket can take it, and
+            output-buffer limits disconnect consumers that fall too far
+            behind.</p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>One writer, no locks, as an architecture.</strong> Redis
+            gets atomicity and simplicity by serializing all mutation
+            through one thread and moving everything slow off that thread.
+            The same shape appears in Node.js, in LMAX-style trading
+            engines, and in every actor system: if the critical section is
+            everything, make it fast instead of concurrent.
+          </p>
+          <p>
+            <strong>Never pay O(n) in the foreground.</strong> Every
+            unavoidable O(n) job in Redis is amortized (dict rehashing,
+            SCAN cursors), sampled (expiry, LRU), forked (RDB, AOF rewrite),
+            or backgrounded (lazy free, fsync). That inventory of four
+            techniques is reusable verbatim in any latency-sensitive
+            service.
+          </p>
+          <p>
+            <strong>Interface stability over representation stability.</strong>
+            The type/encoding split lets Redis change data structures under
+            a fixed command surface, per key, at runtime, by size. The same
+            idea is adaptive representations in V8 (small-integer to heap
+            number, shape transitions) and adaptive indexes in databases.
+          </p>
+          <p>
+            <strong>Approximation as a budget decision.</strong> Approximate
+            LRU with 5 samples and probabilistic expiry with a 10% stale
+            target trade a little precision for enormous constant-factor
+            wins, and both expose the dial (maxmemory-samples,
+            active-expire-effort) instead of hiding the trade. Sampling
+            instead of scanning generalizes to hot-key detection, quantile
+            estimation, and load shedding.
+          </p>
+          <p>
+            <strong>Borrow the kernel.</strong> Copy-on-write fork turns "get
+            a consistent snapshot of gigabytes without stopping" from a hard
+            concurrent-programming problem into one syscall. Recognizing
+            which hard problems the OS has already solved (mmap, sendfile,
+            io_uring elsewhere) is a recurring senior move.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            The one-sentence summary: <mark>Redis is a single-threaded event
+            loop executing atomic commands against an in-memory dict of
+            adaptively encoded objects, with all slow work forked,
+            backgrounded, sampled, or amortized.</mark>
+          </p>
+          <pre class="flow">Socket → ae → RESP → dispatch → t_*.c → dict/robj → reply buffer → socket
+
+ae.c → networking.c → server.c → t_string.c → dict.c/object.c → networking.c</pre>
+          <p>Memorize these blocks:</p>
+          <p>
+            <strong>The loop:</strong> ae.c over epoll/kqueue; commands
+            execute only on the main thread; io-threads (optional) for
+            socket I/O; bio.c for close/fsync/lazyfree; fork for RDB and
+            AOF rewrite.
+          </p>
+          <p>
+            <strong>The encodings:</strong> embstr up to 44 bytes; hash
+            listpack up to 512 entries/64-byte values; zset and set
+            listpack up to 128; intset up to 512; conversions are one-way.
+          </p>
+          <p>
+            <strong>Durability:</strong> RDB via fork + copy-on-write, default
+            save points 3600/1, 300/100, 60/10000; AOF off by default,
+            appendfsync everysec loses up to about a second; Redis 7+ AOF is
+            multi-part in appendonlydir/.
+          </p>
+          <p>
+            <strong>Memory pressure:</strong> expiry is lazy plus active
+            sampling (20 keys, 10% stale target, 25% CPU cap); eviction is
+            policy grid (allkeys/volatile × lru/lfu/random/ttl), default
+            noeviction, LRU approximated by 5-key sampling over a 24-bit
+            clock.
           </p>
           <div class="takeaway">
             <strong>Key takeaway:</strong> Redis is a demonstration that doing
             one thing at a time can be a performance strategy: a single-threaded
             loop over in-memory data structures makes every command atomic and
-            lock-free, adaptive encodings make those structures cheap, and fork
-            with copy-on-write lets durability happen off to the side without
-            ever stopping the loop.
+            lock-free, adaptive encodings make those structures cheap, fork
+            with copy-on-write lets durability happen off to the side, and
+            sampling makes expiry and eviction affordable, so the loop never
+            stops to do anything slow.
           </div>
         </article>
       </div>

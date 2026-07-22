@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Faiss walkthrough · Stanley Jacob</title>
-    <meta name="description" content="A walkthrough of facebookresearch/faiss: similarity search in five minutes, the flat, IVF, HNSW, and PQ index families, the index factory string, how to choose an index, and a guided reading path through the C++ core." />
+    <meta name="description" content="A full chapter on facebookresearch/faiss: a practical tutorial, the complete life of one k-NN query through IndexIVFPQ from the Python binding through coarse quantization, ADC scanning, and the top-k heap, deep dives into the index families, product quantization worked numerically, the index_factory grammar, the train/add/search lifecycle, and GPU indexes, plus a staged reading plan, labs, and understanding checks." />
     <link rel="stylesheet" href="/style.css" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
   </head>
@@ -34,13 +34,16 @@
           is Meta's library for similarity search and clustering of dense
           vectors, a C++ core with Python bindings that grew out of FAIR's
           billion-scale GPU search work and now sits under a large fraction of
-          the world's embedding retrieval, either directly or inside the vector
-          databases built on top of it. It matters because it is where the
-          canonical approximate nearest neighbor index structures live as
-          production code rather than as papers. This walkthrough covers using
-          it in five minutes, the index families and the factory string that
-          composes them, how to choose an index, and a reading path through the
-          repository.
+          the world's embedding retrieval, either directly or inside the
+          vector databases built on top of it. This is a full chapter, not a
+          tour: a practical tutorial, the complete life of one k-nearest
+          neighbor query through <code>IndexIVFPQ</code> from the Python
+          binding down to the distance-table scan and the top-k heap, deep
+          dives into the index families, product quantization worked
+          numerically, the <code>index_factory</code> grammar, and the
+          train/add/search lifecycle, then a staged reading plan, hands-on
+          labs, and understanding checks. Facts below were verified against
+          the repository at release 1.14.3.
         </p>
       </div>
     </header>
@@ -48,164 +51,900 @@
     <section class="soft">
       <div class="wrap">
         <article class="prose article">
-          <h2>Using it in five minutes</h2>
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">index.search(xq, k)                       Python (numpy)     faiss/python/class_wrappers.py
+        |
+SWIG binding into C++                     one .so per CPU    faiss/python/loader.py picks AVX2/AVX512
+        |
+IndexIVF::search                          orchestration      faiss/IndexIVF.cpp
+        |
+quantizer-&gt;search(xq, nprobe)             coarse quantizer   an IndexFlat (or HNSW) over nlist centroids
+        |
+search_preassigned                        per-probe loop     faiss/IndexIVF.cpp
+        |
+scanner: build ADC table for this list    M*ksub lookups     faiss/impl/ProductQuantizer.cpp
+scan_codes over the inverted list         table sums         faiss/invlists/InvertedLists.h
+        |
+max-heap of current top-k                 replace-top        faiss/utils/Heap.h
+        |
+heap_reorder -&gt; sorted (D, I) back to numpy</pre>
           <p>
-            The official binaries ship through conda, as
-            <code>faiss-cpu</code> and <code>faiss-gpu</code> (the pip packages
-            of the same names are community builds):
+            The one-sentence identity: Faiss is a menu of data structures that
+            all implement one tiny contract, <code>train</code>,
+            <code>add</code>, <code>search</code>, over dense float vectors,
+            where each structure is a different named point in the triangle of
+            recall, speed, and memory. The library's genius is not any single
+            algorithm but the composition: a pruning structure (inverted
+            lists, a graph) decides which vectors to look at, an encoding
+            (raw floats, quantized codes) decides what looking at one costs,
+            and the two choices are independent.
           </p>
-          <pre><code>conda install -c pytorch -c conda-forge faiss-cpu</code></pre>
           <p>
-            Every index speaks the same tiny API: construct for a
-            dimensionality, <code>add</code> a matrix of vectors,
-            <code>search</code> a matrix of queries for the k nearest, getting
-            back distances and integer ids. Exact search is two lines:
+            The canonical composed index, and this chapter's specimen, is
+            <code>IndexIVFPQ</code>: k-means partitions the vector space into
+            <code>nlist</code> cells, every database vector is stored in the
+            inverted list of its nearest centroid as a product-quantized code
+            of a few bytes, and a query visits only the <code>nprobe</code>
+            most promising cells, computing approximate distances straight
+            from the codes without ever decompressing them. That one design
+            is why a billion vectors fit in RAM on one machine and why a
+            query over them costs milliseconds.
           </p>
+          <p>
+            Everything else in the repository hangs off this skeleton: the
+            flat indexes are the contract with no pruning and no compression,
+            HNSW swaps the pruning strategy for a navigable graph, OPQ and
+            scalar quantizers swap the encoding, the factory string is a
+            grammar for naming compositions, and the GPU tree reimplements the
+            hot compositions for CUDA. If you understand one IVFPQ query end
+            to end, you can place every file in the repository.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <h3>Installing</h3>
+          <p>
+            The official binaries ship through conda, on Linux and macOS
+            alike (the pip packages of the same names are community builds):
+          </p>
+          <pre><code># Linux or macOS, CPU
+conda install -c pytorch -c conda-forge faiss-cpu=1.14.3
+
+# Linux with NVIDIA GPUs
+conda install -c pytorch -c nvidia -c conda-forge faiss-gpu=1.14.3</code></pre>
+          <p>
+            There is no GPU build for macOS; the CPU package covers Apple
+            Silicon. A quick smoke test:
+          </p>
+          <pre><code>python -c "import faiss; print(faiss.__version__)"   # 1.14.3</code></pre>
+          <h3>First session: exact search in four lines</h3>
           <pre><code>import numpy as np
 import faiss
 
 d = 128
-xb = np.random.random((100_000, d)).astype("float32")
-xq = np.random.random((5, d)).astype("float32")
+rng = np.random.default_rng(0)
+xb = rng.random((100_000, d), dtype="float32")
+xq = rng.random((5, d), dtype="float32")
 
 index = faiss.IndexFlatL2(d)
 index.add(xb)
-D, I = index.search(xq, 10)</code></pre>
+D, I = index.search(xq, 5)
+print(I[0])   # e.g. [90923 51641 67989 27636 88863], ids of the 5 nearest
+print(D[0])   # squared L2 distances, ascending, e.g. [13.19 13.32 13.51 ...]</code></pre>
           <p>
-            Approximate indexes add one step, <code>train</code>, which learns
-            the index's internal structure from your data before anything is
-            added, and a speed-versus-recall knob queried at search time:
+            Exact ids and distances vary with the random data; the shape
+            contract does not: <code>D</code> and <code>I</code> are (nq, k),
+            distances ascending for L2. Two conventions to absorb immediately:
+            Faiss returns <em>squared</em> L2 distances (no square root is
+            taken, since it does not change the ranking), and ids are
+            sequential integers assigned in <code>add</code> order unless you
+            arrange otherwise.
           </p>
-          <pre><code>index = faiss.index_factory(d, "IVF1024,Flat")
-index.train(xb)
+          <h3>The first approximate index, and the first mistake</h3>
+          <p>
+            Approximate indexes have internal structure that must be learned
+            from data before anything can be added. Forgetting that is the
+            canonical first error:
+          </p>
+          <pre><code># WRONG: add before train
+index = faiss.index_factory(d, "IVF1024,Flat")
+index.add(xb)          # RuntimeError: ... is_trained ...
+
+# RIGHT: train, then add, then search
+index = faiss.index_factory(d, "IVF1024,Flat")
+index.train(xb)        # runs k-means for the 1024 centroids
 index.add(xb)
-index.nprobe = 16
-D, I = index.search(xq, 10)</code></pre>
+index.nprobe = 16      # search-time knob; the default is 1
+D, I = index.search(xq, 5)</code></pre>
           <p>
-            Moving to a GPU is a wrapper around an existing index,
+            The second line of that fix matters as much as the first:
+            <mark>the default <code>nprobe</code> is 1, which visits one cell
+            in a thousand and produces recall bad enough to make IVF look
+            broken</mark>. A large fraction of "Faiss gives wrong results"
+            reports are this default. Sweep <code>nprobe</code> and measure
+            recall before concluding anything.
+          </p>
+          <h3>Cosine similarity is a preprocessing step</h3>
+          <p>
+            Faiss has L2 and inner-product metrics (plus a few exotic ones).
+            Cosine similarity is not a separate metric; it is inner product
+            over normalized vectors, and forgetting to normalize the queries
+            too is the classic half-bug:
+          </p>
+          <pre><code># WRONG: inner product over unnormalized embeddings, "cosine" in name only
+index = faiss.IndexFlatIP(d)
+index.add(xb)
+
+# RIGHT: normalize both sides, then inner product == cosine
+xb_n = xb.copy(); faiss.normalize_L2(xb_n)
+xq_n = xq.copy(); faiss.normalize_L2(xq_n)
+index = faiss.IndexFlatIP(d)
+index.add(xb_n)
+D, I = index.search(xq_n, 5)   # D is cosine similarity, descending</code></pre>
+          <h3>Dtypes, ids, and persistence</h3>
+          <p>
+            The API is float32; passing float64 does not error, because the
+            Python wrappers call <code>np.ascontiguousarray(x,
+            dtype="float32")</code>, which means every call silently copies
+            and converts your array. Cast once at the boundary. Custom ids
+            need either an index that supports <code>add_with_ids</code>
+            natively (the IVF family does) or an <code>IndexIDMap</code>
+            wrapper around one that does not (flat indexes). Persistence is
+            two functions, and the file is a faithful snapshot of the whole
+            object graph:
+          </p>
+          <pre><code>faiss.write_index(index, "vectors.faiss")
+index2 = faiss.read_index("vectors.faiss")   # trained, populated, ready</code></pre>
+          <h3>Scaling the same four lines</h3>
+          <p>
+            The endgame of the tutorial is realizing that everything above
+            survives at scale with only the factory string changing:
+            <code>"Flat"</code> for exactness, <code>"HNSW32"</code> when
+            memory is cheap and latency matters, <code>"IVF65536,PQ32"</code>
+            when a hundred million vectors must fit in a modest box, with
+            <code>index.nprobe</code> or <code>efSearch</code> as the live
+            recall dial. Moving any CPU index to a GPU is a wrapper,
             <code>faiss.index_cpu_to_gpu(faiss.StandardGpuResources(), 0,
-            index)</code>, and multi-GPU variants exist; the GPU indexes are
-            designed as drop-in replacements for the CPU ones.
+            index)</code>, covered at concept level in Part VIII.
           </p>
 
-          <h2>Four families and one triangle</h2>
+          <h2>Part III: When it is the right tool</h2>
           <p>
-            Everything in Faiss is a point in a triangle whose corners are
-            recall, speed, and memory, and the index families are named
-            strategies for trading among them. Flat indexes are the exact
-            corner: store every vector as-is and brute-force every query,
-            perfectly accurate, memory-hungry, and linear in dataset size, but
-            so well optimized that exact search is the right answer far later
-            than intuition suggests. IVF, the inverted file, buys speed by
-            pruning: k-means clusters the vectors into <code>nlist</code>
-            cells at train time, each vector is stored in the list of its
-            nearest centroid, and a query visits only the
-            <code>nprobe</code> closest cells, so recall becomes a dial you
-            turn at search time. HNSW takes the graph route instead, linking
-            each vector to neighbors in a hierarchy of layers that a search
-            greedily descends; it needs no training, answers in logarithmic
-            hops with excellent recall, and pays for it in memory for the
-            links and in slower construction.
+            Faiss is the right tool when the problem is the search itself:
+            offline batch retrieval over embeddings, the retrieval core inside
+            a service you are building (the position it occupies in my
+            <a href="/systems/rag">RAG design</a> and
+            <a href="/systems/visual-search">visual search design</a>
+            write-ups), deduplication and clustering at scale (its k-means is
+            among the fastest available), research on ANN structures, and any
+            setting where you want in-process search with no network hop and
+            total control of the memory layout.
           </p>
           <p>
-            The fourth family attacks memory rather than time. Product
-            quantization splits each vector into <code>m</code> subvectors and
-            replaces each with the id of its nearest centroid in a small
-            learned codebook, compressing a vector to <code>m</code> bytes at
-            typical settings, so a 512-byte float vector might become 32 bytes
-            that still support fast approximate distance computation directly
-            on the codes. <mark>The families compose, and the composition is
-            the point: an IVF structure to prune the search, PQ codes inside
-            the lists to shrink memory, and optionally a flat re-ranking pass
-            over exact vectors for the final few candidates.</mark> IVF plus
-            PQ is what makes billion-vector search fit in RAM at all, and it
-            is the combination the GPU implementation accelerates hardest.
+            The alternatives divide by what they add or remove. hnswlib is a
+            leaner choice when the answer is exactly "one HNSW graph in RAM"
+            and nothing else. ScaNN ships Google's anisotropic quantization
+            with excellent recall-per-cycle on CPU. And the managed vector
+            databases, Milvus, Qdrant, Weaviate, pgvector inside Postgres,
+            exist because <mark>Faiss is deliberately not a database: it has
+            no durability story, no replication, no metadata filtering beyond
+            ID selectors, no live CRUD semantics under concurrent writers,
+            and no server</mark>. Several of them embed or reimplement Faiss
+            structures; what you are buying is the operational shell around
+            the index, and when you need that shell, buy it rather than build
+            it.
+          </p>
+          <p>
+            That is also the architecture-shaped warning. The tempting design
+            is one long-lived index object inside a service, mutated in place
+            by writers while readers search it. Faiss's actual contract is
+            that concurrent searches are safe but any mutation concurrent
+            with anything is yours to synchronize, and index quality decays as
+            the data distribution drifts from what <code>train</code> saw.
+            The safe architecture treats indexes as immutable, versioned
+            artifacts: build offline, ship a file, swap a pointer, keep a
+            small sidecar (flat or HNSW) for fresh vectors, and retrain on a
+            schedule.
+          </p>
+          <pre class="flow">SAFE                                      DANGEROUS
+builder job -&gt; index.v42 file             one shared IndexIVFPQ object
+   -&gt; replicas read_index(v42)            writers: add()/remove_ids() live
+   -&gt; atomic swap, delete v41             readers: search() concurrently
+fresh writes -&gt; small sidecar index       -&gt; races, stale centroids,
+searched alongside, merged at rebuild        unbounded quality drift</pre>
+
+          <h2>Part IV: The full life of one query</h2>
+          <p>
+            The canonical operation: one query vector through
+            <code>index = faiss.index_factory(128, "IVF4096,PQ8")</code>,
+            trained and filled with 10 million vectors,
+            <code>index.nprobe = 16</code>, <code>index.search(xq, 10)</code>.
+            Every stage names the file that owns it.
+          </p>
+          <h3>Stage 1: the Python surface</h3>
+          <p>
+            <code>import faiss</code> runs
+            <code>faiss/python/loader.py</code>, which inspects the CPU and
+            loads the most capable compiled variant of the SWIG-generated
+            module (AVX512, AVX2, or scalar; SVE on ARM). The class you hold
+            is a SWIG proxy for the C++ <code>IndexIVFPQ</code>, but the
+            method you call is not raw SWIG:
+            <code>faiss/python/class_wrappers.py</code> replaces
+            <code>search</code> with <code>replacement_search</code>, which
+            validates the (n, d) shape, makes the array contiguous float32,
+            allocates the (n, k) result matrices, and passes raw pointers
+            across the boundary. The binding layer is deliberately dumb; no
+            search logic lives in Python.
+          </p>
+          <h3>Stage 2: orchestration in IndexIVF::search</h3>
+          <p>
+            <code>faiss/IndexIVF.cpp</code> owns the top of the C++ call. It
+            resolves the effective <code>nprobe</code> (clamped to
+            <code>nlist</code>, overridable per call via
+            <code>SearchParameters</code>), then splits large query batches
+            into slices parallelized with OpenMP. For each slice it runs a
+            two-phase plan: coarse quantization, then preassigned search.
+            The same file maintains <code>indexIVF_stats</code>, global
+            counters of lists visited, codes scanned, and heap updates, which
+            Part X uses as a measurement tool.
+          </p>
+          <h3>Stage 3: coarse quantization</h3>
+          <p>
+            The "which cells" question is itself a nearest-neighbor search:
+            <code>quantizer-&gt;search(n, x, nprobe, coarse_dis, idx)</code>,
+            where the quantizer is a plain <code>IndexFlat</code> over the
+            4096 centroids that <code>train</code> learned (large
+            <code>nlist</code> deployments use an HNSW quantizer here, which
+            is what the factory spelling <code>IVF65536_HNSW32</code> means).
+            The result is 16 cell ids with their distances. The recursion is
+            worth savoring: Faiss prunes a big search using a small exact
+            search over the summary it built of the data.
+          </p>
+          <h3>Stage 4: setup for the scan</h3>
+          <p>
+            <code>search_preassigned</code> (same file) initializes the
+            result heap for each query, k slots managed by the heap
+            primitives in <code>faiss/utils/Heap.h</code> (a max-heap for L2,
+            so the worst current candidate sits at the top for cheap
+            replacement), chooses a parallelization mode
+            (<code>parallel_mode</code>: over queries by default, over probes
+            for low-query-count workloads), and asks the index for a
+            <code>get_InvertedListScanner()</code>, the strategy object that
+            knows how to score this index's codes. Inverted lists themselves
+            live behind the <code>InvertedLists</code> abstraction in
+            <code>faiss/invlists/</code>, in-RAM arrays by default, memory
+            mapped on-disk variants (<code>OnDiskInvertedLists.h</code>) when
+            data exceeds RAM.
+          </p>
+          <h3>Stage 5: the ADC distance table</h3>
+          <p>
+            For each probed cell, the scanner (built in
+            <code>faiss/IndexIVFPQ.cpp</code>) prepares asymmetric distance
+            computation. The query is not quantized; instead, for this cell,
+            compute the residual r = x minus centroid (IVFPQ encodes
+            residuals by default, <code>by_residual = true</code>), then
+            build a table of distances from r's subvectors to every codebook
+            centroid: for M = 8 subquantizers with ksub = 256 centroids each,
+            a table of 8 x 256 = 2048 floats
+            (<code>ProductQuantizer::compute_distance_table</code> in
+            <code>faiss/impl/ProductQuantizer.cpp</code>). All the geometry
+            of a 128-dimensional distance is now precomputed; scoring a code
+            will be table lookups. (An optional
+            <code>use_precomputed_table</code> mode moves part of this work
+            to build time at a memory cost; the long comment above
+            <code>initialize_IVFPQ_precomputed_table</code> in
+            <code>IndexIVFPQ.cpp</code> is the best writeup of the trick.)
+          </p>
+          <h3>Stage 6: scanning codes</h3>
+          <p>
+            <code>scanner-&gt;scan_codes(list_size, codes, ids, ...)</code>
+            is the hot loop of the entire library: for each 8-byte code in
+            the inverted list, the approximate distance is the sum of 8 table
+            entries, table[0][code[0]] + table[1][code[1]] + ..., about 390
+            thousand codes for our 16 probes over 10 million balanced
+            vectors, and each candidate that beats the heap's worst entry
+            replaces it via <code>maxheap_replace_top</code>. The
+            SIMD-blocked FastScan variants
+            (<code>IndexIVFPQFastScan</code>, 4-bit codes scored with
+            register-resident lookup tables) exist because even this loop has
+            a faster shape when codes shrink to fit SIMD registers.
+          </p>
+          <h3>Stage 7: return</h3>
+          <p>
+            After the last probe, <code>heap_reorder</code> sorts each heap
+            into ascending distance order, stats are accumulated, and the
+            preallocated numpy arrays from Stage 1 are already full: the
+            (5, 10) <code>D</code> and <code>I</code> the caller receives
+            were written in place by C++. Total work per query: 4096 exact
+            128-dim distances, 16 tables of 2048 entries, ~390k sums of 8
+            bytes' worth of lookups, ~10 heap replacements that survive.
+            Compare the flat baseline: 10 million exact 128-dim distances.
           </p>
 
-          <h2>The factory string is the library's grammar</h2>
+          <h2>Part V: Deep dive: the families, and PQ by the numbers</h2>
+          <p>
+            Every index is a point in the recall/speed/memory triangle, and
+            the families are named strategies for trading among the corners:
+          </p>
+          <table>
+            <tr><th>Family</th><th>Prunes with</th><th>Stores</th><th>Pays with</th></tr>
+            <tr><td>Flat</td><td>nothing</td><td>raw floats</td><td>time and memory, perfect recall</td></tr>
+            <tr><td>IVF</td><td>k-means cells</td><td>raw or coded</td><td>recall, tunable via nprobe</td></tr>
+            <tr><td>HNSW</td><td>navigable graph</td><td>raw floats + links</td><td>memory and build time</td></tr>
+            <tr><td>PQ / OPQ</td><td>nothing (an encoding)</td><td>m-byte codes</td><td>distance accuracy</td></tr>
+          </table>
+          <p>
+            Product quantization deserves the numbers, because the numbers
+            are the idea. Take d = 128, M = 8 subvectors of dsub = 16
+            dimensions, nbits = 8 so ksub = 256 centroids per subquantizer.
+            Training runs k-means 8 times, once per 16-dimensional slice of
+            the data, producing codebooks of 8 x 256 x 16 = 32,768 floats,
+            131 KB total. Encoding a vector snaps each slice to its nearest
+            centroid and records the 8 one-byte centroid ids:
+          </p>
+          <pre class="flow">vector (512 bytes)   [ x0..x15 | x16..x31 | ... | x112..x127 ]
+                          |          |                |
+nearest centroid id      142         7               209
+code (8 bytes)       [142, 7, ..., 209]        64x compression
+
+effective codebook: 256^8 = 1.8e19 virtual centroids
+from only 8*256 = 2048 stored ones: the product in "product quantization"</pre>
+          <p>
+            The compounding matters at fleet scale: 100 million vectors at
+            d = 128 are 51.2 GB raw, 0.8 GB as PQ8 codes (plus ids and
+            centroids). And the codes are not just storage, they are a
+            compute format: with the query's 2048-entry table from Part IV,
+            a distance costs 8 loads and 7 adds instead of 128 multiplies and
+            adds, which is where the speed of the scan comes from. The
+            approximation error is the sum of each subquantizer's
+            quantization error; OPQ (<code>OPQ16_64</code> in factory
+            spelling) learns a rotation first so variance spreads evenly
+            across subvectors and dimensions within them, cheap insurance
+            that usually buys several recall points.
+          </p>
+          <p>
+            The famous trap in this family: <mark>PQ distances are estimates,
+            so the top-k by code distance is not the true top-k, and the fix
+            is to re-rank</mark>: retrieve a few times k candidates by code,
+            then rescore just those with exact vectors, which is the
+            <code>IndexRefine</code> wrapper (<code>,RFlat</code> as a
+            factory suffix) or, in RAG-style systems, the re-ranking stage
+            downstream. A second correction worth stating: IVF's recall
+            failures are not random noise; they happen when the true neighbor
+            sits in a cell you did not probe, which is systematically more
+            likely for queries near cell boundaries. Raising
+            <code>nprobe</code> is the cure, and recall versus
+            <code>nprobe</code> is the first curve to plot for any deployment.
+          </p>
+
+          <h2>Part VI: Deep dive: the index_factory grammar</h2>
           <p>
             With families that compose, constructing indexes by hand gets
-            verbose, so Faiss exposes a small language instead.
-            <code>index_factory</code> takes a comma-separated string with up
-            to three parts, an optional preprocessing transform, the coarse
-            structure, and the encoding, and builds the whole pipeline:
-            <code>"Flat"</code> is exact search, <code>"HNSW32"</code> is a
-            graph with 32 links per node, <code>"IVF4096,PQ32"</code> is 4096
-            inverted lists over 32-byte PQ codes, and
-            <code>"OPQ16_64,IVF4096,PQ16"</code> first learns a rotation that
-            makes the data friendlier to quantization, then prunes, then
-            compresses. <mark>Learning to read factory strings is learning
-            Faiss, because every deployed index is one of these one-liners and
-            every benchmark in the literature can be named in the same
-            grammar.</mark> The knobs that remain at search time, such as
-            <code>nprobe</code> for IVF and <code>efSearch</code> for HNSW,
-            are exactly the ones that trade latency for recall on a live
-            system, and the ParameterSpace and AutoTune machinery can sweep
-            them against a ground truth to map the frontier for you.
+            verbose, so Faiss exposes a small language.
+            <code>faiss.index_factory(d, spec)</code> parses a
+            comma-separated spec of up to three parts, an optional
+            preprocessing transform, the coarse structure, and the encoding,
+            plus an optional refinement suffix, and builds the object graph.
+            The parser is <code>faiss/index_factory.cpp</code>, and it is
+            literally a pile of regular expressions
+            (<code>match("PCA(W?)(R?)([0-9]+)")</code> and friends), which
+            makes it a readable, exhaustive catalog of what exists:
           </p>
-
-          <h2>Choosing an index</h2>
+          <pre class="flow">"Flat"                    IndexFlatL2
+"HNSW32"                  IndexHNSWFlat, 32 links per node
+"IVF4096,Flat"            IndexIVFFlat: prune, store raw
+"IVF4096,PQ8"             IndexIVFPQ: prune, store 8-byte codes
+"PCA64,IVF4096,PQ8"       IndexPreTransform -&gt; PCA to 64 dims -&gt; IVFPQ
+"OPQ16_64,IVF4096,PQ16"   learned rotation -&gt; prune -&gt; 16-byte codes
+"IVF65536_HNSW32,PQ16"    HNSW as the coarse quantizer over 65536 centroids
+"IVF4096,PQ8,RFlat"       + exact re-ranking over the raw vectors
+"IVF1024,SQ8"             scalar quantizer: 1 byte per dimension</pre>
           <p>
-            The wiki's guidelines page is the reference, but the shape of the
-            decision is simple. If the dataset is small, up to the low
-            millions, and latency is not desperate, use flat and be exact,
-            since every approximate method is measured against that baseline
-            anyway. If you need speed and memory is plentiful, HNSW is the
-            usual answer. At larger scales IVF variants take over, with
-            <code>nlist</code> commonly set around a small multiple of the
-            square root of the dataset size, flat codes inside the lists while
-            memory lasts and PQ codes when it does not, and beyond RAM
-            entirely there are on-disk inverted lists and sharding across
-            machines. The honest part of the decision is that recall targets
-            come from the product, not the library, so the workflow is to pick
-            a candidate factory string, measure recall at your latency budget
-            on your own vectors, and adjust. I walk through that end-to-end
-            sizing exercise in the <a href="/systems/visual-search">visual
-            search design write-up</a>, and the retrieval half of
-            <a href="/systems/rag">the RAG system design</a> is largely about
-            what happens around an index like this.
+            <mark>Learning to read factory strings is learning Faiss</mark>:
+            every deployed index is one of these one-liners, every benchmark
+            in the ANN literature can be named in the grammar, and the string
+            is the natural unit of configuration to A/B test. What the string
+            does not fix are the search-time knobs, <code>nprobe</code> for
+            IVF, <code>efSearch</code> for HNSW (default 16, in
+            <code>faiss/impl/HNSW.h</code>), <code>k_factor</code> for
+            refinement, and those are exactly the parameters that trade
+            latency for recall on a live system. The
+            <code>ParameterSpace</code> machinery in
+            <code>faiss/AutoTune.h</code> can sweep them against a ground
+            truth to map the frontier; <code>tutorial/python/</code> and
+            <code>demos/demo_auto_tune.py</code> show it working.
+          </p>
+          <p>
+            A useful habit: after building from a string, walk the object
+            graph to confirm what you got, since composition means your
+            "index" may be a transform wrapping an IVF wrapping a quantizer:
+          </p>
+          <pre><code>index = faiss.index_factory(128, "OPQ16_64,IVF4096,PQ16")
+print(type(index))                        # IndexPreTransform
+inner = faiss.downcast_index(index.index) # the IVFPQ inside
+print(inner.nlist, inner.pq.M)            # 4096 16
+quant = faiss.downcast_index(inner.quantizer)
+print(type(quant))                        # IndexFlat(L2) over centroids</code></pre>
+
+          <h2>Part VII: Deep dive: the three lifecycles</h2>
+          <p>
+            Faiss separates what most databases fuse: <code>train</code>
+            learns structure from a sample, <code>add</code> populates,
+            <code>search</code> queries, and the separation is load-bearing.
+            Training an IVF4096,PQ8 index runs k-means for 4096 coarse
+            centroids and 8 more k-means runs for the PQ codebooks. It does
+            not need all your data: the clustering code
+            (<code>faiss/Clustering.h</code>) subsamples to at most
+            <code>max_points_per_centroid = 256</code> points per centroid
+            and warns below <code>min_points_per_centroid = 39</code>, so for
+            nlist = 4096 something like one to two million representative
+            vectors is a sensible training set, and training on a small
+            uniform sample of the corpus is standard practice.
+          </p>
+          <p>
+            Three consequences follow. First, <code>is_trained</code> is a
+            real state, and adding before training throws. Second, the
+            centroids freeze at train time: you can keep adding vectors
+            forever, but if the distribution drifts, vectors land in
+            increasingly wrong cells and recall decays silently, which is why
+            the safe architecture in Part III retrains on a schedule. Third,
+            training is the expensive, offline step and search-time knobs are
+            cheap, so the tuning loop is: fix a factory string, train once,
+            then sweep <code>nprobe</code>-class knobs against a ground truth
+            built with a flat index (the <code>contrib/evaluation.py</code>
+            helpers exist for exactly this).
+          </p>
+          <p>
+            The add and persistence lifecycles have their own file-level
+            homes worth knowing: <code>add_with_ids</code> and deletion by
+            <code>IDSelector</code> live in the IVF family with a
+            <code>DirectMap</code> (in <code>faiss/invlists/</code>) when you
+            need id-to-location lookup; serialization is
+            <code>faiss/impl/index_write.cpp</code> and
+            <code>index_read.cpp</code>, a tagged binary format that round
+            trips the entire object graph, which is what makes the
+            build-offline-ship-file architecture trivial; and beyond-RAM
+            deployments swap the in-memory inverted lists for
+            <code>OnDiskInvertedLists</code> without changing the index
+            logic above them.
+          </p>
+          <p>
+            Concurrency, stated precisely because it is the trap:
+            <code>search</code> is const and thread-safe from many threads
+            against a quiescent index and is itself internally parallelized
+            with OpenMP; <code>add</code>, <code>train</code>, and
+            <code>remove_ids</code> are not safe against anything concurrent.
+            "Faiss is thread-safe" and "Faiss is not thread-safe" are both
+            wrong sentences; the correct one is "reads share, writes
+            exclude, and you hold the lock."
           </p>
 
-          <h2>Reading the repository</h2>
+          <h2>Part VIII: Deep dive: the GPU tree, at concept level</h2>
+          <p>
+            <code>faiss/gpu/</code> mirrors the hot CPU indexes as CUDA
+            implementations: <code>GpuIndexFlat</code>,
+            <code>GpuIndexIVFFlat</code>, <code>GpuIndexIVFPQ</code>, plus
+            <code>GpuIndexCagra</code> binding the cuVS CAGRA graph index
+            from NVIDIA's RAPIDS work. The same Index contract holds, so
+            <code>faiss.index_cpu_to_gpu</code> (the cloner in
+            <code>faiss/gpu/GpuCloner.cpp</code>) converts an existing CPU
+            index, and <code>StandardGpuResources</code> owns the memory
+            pools and streams that make repeated searches allocation-free.
+          </p>
+          <p>
+            Concept level is the right level here because the GPU tree's
+            design point differs: it wants big query batches to amortize
+            kernel launches and PCIe transfers, it keeps k-selection on the
+            GPU with specialized heap kernels rather than round-tripping
+            candidates, and it historically imposed stricter parameter
+            limits than CPU (notably k and nprobe caps at 2048). A single
+            query at a time on a GPU index can easily lose to AVX512 CPU
+            code; a hundred thousand queries in one call is where the GPU
+            version wins by an order of magnitude. If your workload is
+            offline embedding joins or index construction (GPU k-means for
+            training, then move to CPU for serving), the GPU tree is the
+            right tool; latency-critical single-query serving usually is
+            not, and the CPU FastScan indexes are the competitor to beat.
+          </p>
+
+          <h2>Part IX: Reading the repository</h2>
           <p>
             Faiss is a C++ library first, with the Python API generated from
-            it, so read the C++ headers even if you only ever call Python; the
-            names map one to one. Start with <code>faiss/Index.h</code>, the
-            abstract base class whose train, add, and search methods define the
-            contract everything implements, then read
-            <code>IndexFlat</code> as the smallest real implementation.
-            <code>IndexIVF</code> is the heart of the library, the coarse
-            quantizer plus inverted lists structure that most large-scale
-            deployments use, and its subclasses like
-            <code>IndexIVFFlat</code> and <code>IndexIVFPQ</code> show how
-            the storage inside lists varies independently of the pruning
-            around them. The algorithmic cores live in
-            <code>faiss/impl/</code>, where <code>HNSW.cpp</code> and
-            <code>ProductQuantizer.cpp</code> are self-contained enough to
-            read against their papers, and <code>index_factory.cpp</code> is
-            the parser that turns the grammar above into object graphs, a
-            genuinely useful map of what exists.
+            it, so read C++ headers even if you only ever call Python; names
+            map one to one. Every path below exists at release 1.14.3.
+          </p>
+          <h3>Stage 0: the contract</h3>
+          <p>
+            Read <code>faiss/Index.h</code> completely: the abstract base
+            class, maybe two hundred meaningful lines, defining
+            <code>train</code>, <code>add</code>, <code>search</code>,
+            <code>range_search</code>, <code>reconstruct</code>, and the
+            codec interface (<code>sa_encode</code>/<code>sa_decode</code>).
+            Then <code>faiss/MetricType.h</code>. Questions you should be
+            able to answer: why do all results come back as (distances,
+            labels) matrices; what does <code>is_trained</code> gate; what
+            id conventions does <code>add</code> promise?
+          </p>
+          <h3>Stage 1: the smallest real index, and the tutorial</h3>
+          <p>
+            Read <code>faiss/IndexFlat.h/.cpp</code>, which is the contract
+            with no ideas in it, then run the numbered scripts in
+            <code>tutorial/python/</code> (<code>1-Flat.py</code>,
+            <code>2-IVFFlat.py</code>, <code>3-IVFPQ.py</code>,
+            <code>6-HNSW.py</code>, <code>7-PQFastScan.py</code>).
+            Questions: where does brute-force distance computation actually
+            happen (follow it into <code>faiss/utils/distances.h</code>);
+            what changes between the three tutorial index types in code
+            written against them?
+          </p>
+          <h3>Stage 2: the heart</h3>
+          <p>
+            Read <code>faiss/IndexIVF.h</code> and then
+            <code>IndexIVF::search</code> and
+            <code>search_preassigned</code> in <code>faiss/IndexIVF.cpp</code>
+            with Part IV of this chapter beside you, plus
+            <code>faiss/invlists/InvertedLists.h</code>. Questions: where
+            exactly does coarse quantization happen; what does an
+            <code>InvertedListScanner</code> abstract over; what do the
+            <code>parallel_mode</code> values parallelize?
+          </p>
+          <h3>Stage 3: the encodings</h3>
+          <p>
+            Read <code>faiss/impl/ProductQuantizer.h/.cpp</code> against the
+            2011 Jégou et al. paper, then <code>faiss/IndexIVFPQ.cpp</code>
+            (especially the precomputed-tables comment block), then
+            <code>faiss/impl/HNSW.h/.cpp</code> against the Malkov and
+            Yashunin paper. Questions: what is asymmetric about ADC; why
+            encode residuals inside IVF; what do <code>efSearch</code> and
+            <code>efConstruction</code> each control?
+          </p>
+          <h3>Stage 4: the grammar and the edges</h3>
+          <p>
+            Read <code>faiss/index_factory.cpp</code> top to bottom as a
+            catalog, skim <code>faiss/impl/index_write.cpp</code> to see the
+            serialization format, then sample the outer rings as interest
+            dictates: <code>faiss/gpu/</code>, <code>contrib/</code>
+            (<code>datasets.py</code>, <code>evaluation.py</code>,
+            <code>ivf_tools.py</code>), <code>benchs/</code> for reproduced
+            paper results, <code>c_api/</code> for the C shell other
+            languages bind.
+          </p>
+          <h3>Where not to start</h3>
+          <p>
+            Do not start in <code>faiss/utils/</code> (SIMD distance kernels,
+            meaningful only once you know who calls them), in
+            <code>faiss/impl/</code>'s FastScan and additive-quantizer
+            corners (research-frontier code with the highest churn), or in
+            the SWIG layer (<code>faiss/python/swigfaiss.swig</code> is
+            plumbing). And do not read any of it before running the
+            tutorial scripts; this library rewards touching first.
+          </p>
+
+          <h2>Part X: Hands-on labs</h2>
+          <p>
+            All labs run on CPU. Timings vary with hardware; trends and
+            shapes should reproduce. Setup shared by labs 1 to 4:
+          </p>
+          <pre><code>import numpy as np, faiss, time
+d, nb, nq = 64, 200_000, 500
+rng = np.random.default_rng(0)
+xb = rng.standard_normal((nb, d), dtype="float32")
+xq = rng.standard_normal((nq, d), dtype="float32")
+gt = faiss.IndexFlatL2(d); gt.add(xb)
+_, I_true = gt.search(xq, 10)                  # ground truth top-10</code></pre>
+          <h3>Lab 1: recall is a dial (concept: Parts V, VII)</h3>
+          <pre><code>index = faiss.index_factory(d, "IVF1024,Flat")
+index.train(xb); index.add(xb)
+for nprobe in [1, 2, 4, 8, 16, 32, 64]:
+    index.nprobe = nprobe
+    t0 = time.perf_counter(); _, I = index.search(xq, 10)
+    dt = time.perf_counter() - t0
+    recall = (I == I_true).sum() / I_true.size
+    print(f"nprobe={nprobe:3d} recall@10={recall:.3f} qps={nq/dt:,.0f}")</code></pre>
+          <p>
+            Observe: recall climbing from roughly 0.2-0.4 at nprobe=1 toward
+            0.95+ at 64 while QPS falls a few fold. This one curve is the
+            IVF trade in its entirety, and the nprobe=1 row is why the
+            default burns beginners.
+          </p>
+          <h3>Lab 2: PQ, felt numerically (concept: Part V)</h3>
+          <pre><code>pq = faiss.ProductQuantizer(d, 8, 8)     # M=8 subvectors, 8 bits each
+pq.train(xb)
+codes = pq.compute_codes(xb[:5])
+print(codes.shape, codes.dtype)          # (5, 8) uint8: 8 bytes per vector
+recon = pq.decode(codes)
+err = np.linalg.norm(xb[:5] - recon, axis=1) / np.linalg.norm(xb[:5], axis=1)
+print(err)                               # relative error, commonly ~0.5-0.9
+                                         # for random Gaussian data</code></pre>
+          <p>
+            Observe: 64 to 1 compression and a large per-vector
+            reconstruction error, yet Lab 1's machinery still ranks
+            neighbors usefully, because ranking tolerates far more distance
+            error than reconstruction does. Note random Gaussian data is
+            PQ's worst case; real embeddings, which concentrate on
+            lower-dimensional structure, quantize much better.
+          </p>
+          <h3>Lab 3: read the object graph (concept: Part VI)</h3>
+          <pre><code>index = faiss.index_factory(d, "OPQ8_32,IVF256,PQ8")
+index.train(xb); index.add(xb)
+print(type(index).__name__)                        # IndexPreTransform
+vt = faiss.downcast_VectorTransform(index.chain.at(0))
+print(type(vt).__name__, vt.d_in, vt.d_out)        # OPQMatrix 64 32
+ivf = faiss.downcast_index(index.index)
+print(type(ivf).__name__, ivf.nlist, ivf.pq.M)     # IndexIVFPQ 256 8</code></pre>
+          <p>
+            Observe: the factory string reads left to right as the object
+            graph reads outside in. Change the string, re-inspect, and the
+            grammar of Part VI becomes muscle memory.
+          </p>
+          <h3>Lab 4: count the work, don't guess it (concept: Part IV)</h3>
+          <pre><code>index = faiss.index_factory(d, "IVF1024,PQ8")
+index.train(xb); index.add(xb)
+for nprobe in [1, 8, 64]:
+    index.nprobe = nprobe
+    stats = faiss.cvar.indexIVF_stats; stats.reset()
+    index.search(xq, 10)
+    print(f"nprobe={nprobe:3d} lists={stats.nlist/nq:7.1f} "
+          f"codes={stats.ndis/nq:9.0f} heap_updates={stats.nheap_updates/nq:6.0f}")</code></pre>
+          <p>
+            Observe: codes scanned per query scales linearly with nprobe
+            (about nprobe/1024 of the 200k database), while heap updates
+            stay tiny. The cost model from Part IV, stage 7, printed by the
+            library itself.
+          </p>
+          <h3>Lab 5: files as the deployment unit (concept: Parts III, VII)</h3>
+          <pre><code>flat = faiss.IndexFlatL2(d); flat.add(xb)
+faiss.write_index(flat, "flat.faiss")
+ivfpq = faiss.index_factory(d, "IVF1024,PQ8")
+ivfpq.train(xb); ivfpq.add(xb)
+faiss.write_index(ivfpq, "ivfpq.faiss")
+# ls -l: flat.faiss ~51 MB (200k * 64 * 4 bytes), ivfpq.faiss ~3.5 MB
+back = faiss.read_index("ivfpq.faiss")
+print(back.ntotal, faiss.downcast_index(back.quantizer).ntotal)  # 200000 1024</code></pre>
+          <p>
+            Observe: the serialized file carries the trained centroids, the
+            codebooks, the codes, and the ids, so a reader process needs
+            zero retraining, which is what makes the build-then-swap
+            architecture from Part III a rename plus a
+            <code>read_index</code>.
+          </p>
+          <h3>Lab 6: the refine escape hatch (concept: Part V)</h3>
+          <pre><code>for spec in ["IVF1024,PQ8", "IVF1024,PQ8,RFlat"]:
+    index = faiss.index_factory(d, spec)
+    index.train(xb); index.add(xb)
+    ps = faiss.ParameterSpace()
+    ps.set_index_parameter(index, "nprobe", 32)
+    _, I = index.search(xq, 10)
+    print(spec, "recall@10 =", (I == I_true).sum() / I_true.size)</code></pre>
+          <p>
+            Observe: re-ranking PQ candidates against exact vectors
+            recovers several recall points for the price of storing the raw
+            vectors again, a pure memory-for-recall trade, and note
+            <code>ParameterSpace</code> setting <code>nprobe</code> through
+            the wrapper, which is the idiom for knobs on composed indexes.
+          </p>
+
+          <h2>Part XI: Questions and model answers</h2>
+          <p><strong>Q1. What is Faiss, in one sentence that distinguishes it from a vector database?</strong></p>
+          <p>
+            Faiss is an in-process C++/Python library of vector index data
+            structures behind a train/add/search contract; it deliberately
+            provides no server, durability, replication, or metadata
+            filtering, which is exactly the layer vector databases add,
+            often on top of Faiss's own structures.
+          </p>
+          <p><strong>Q2. Walk through one IVFPQ query at a high level.</strong></p>
+          <p>
+            The query is compared exactly against the nlist coarse centroids
+            to pick the nprobe nearest cells; for each cell, the query's
+            residual builds an M by ksub table of subvector-to-centroid
+            distances; each stored code in the cell is scored as M table
+            lookups summed; candidates that beat the current worst enter a
+            k-slot max-heap; heaps are sorted and returned as (D, I).
+          </p>
+          <p><strong>Q3. Why does IVFPQ encode residuals rather than raw vectors?</strong></p>
+          <p>
+            Within a cell, vectors share their centroid's location, so the
+            residual distribution is centered and much lower variance than
+            the raw data, and the same code budget quantizes it more
+            accurately. The cost is that distance tables become
+            cell-dependent, which is why they are built per probe, and why
+            the precomputed-tables optimization exists.
+          </p>
+          <p><strong>Q4. What exactly does train do, and what happens if you skip or reuse it badly?</strong></p>
+          <p>
+            Train runs k-means for the coarse centroids and per-subvector
+            codebooks (on a subsample, at most 256 points per centroid).
+            Skipping it throws at add time via <code>is_trained</code>.
+            Reusing a training done on last year's distribution silently
+            degrades recall as vectors land in poorly fitting cells, which
+            is an argument for scheduled rebuilds, not a code fix.
+          </p>
+          <p><strong>Q5. How do you get cosine similarity?</strong></p>
+          <p>
+            Normalize database and query vectors to unit length with
+            <code>faiss.normalize_L2</code> and use an inner-product index
+            (<code>IndexFlatIP</code> or metric argument); cosine is then
+            identical to inner product. Normalizing only one side is the
+            classic half-bug.
+          </p>
+          <p><strong>Q6. Why 8 bytes can beat 512: what makes PQ distances fast, not just small?</strong></p>
+          <p>
+            ADC precomputes, per query, the distance from each query
+            subvector to all 256 centroids of each subquantizer; a code's
+            distance is then M table lookups and adds instead of a
+            d-dimensional arithmetic pass. Compression pays once in memory
+            and again in compute format.
+          </p>
+          <p><strong>Q7. When would you pick HNSW over IVF, and what does it cost?</strong></p>
+          <p>
+            HNSW needs no training, handles incremental adds gracefully, and
+            reaches high recall at low latency for datasets that fit in RAM
+            with room to spare; it pays in memory for links (dozens of extra
+            bytes per vector at HNSW32), slower construction, and no
+            compression story of its own, which is why beyond tens of
+            millions of vectors IVF+PQ variants usually take over.
+          </p>
+          <p><strong>Q8. Read this string: "OPQ16_64,IVF4096_HNSW32,PQ16,RFlat".</strong></p>
+          <p>
+            Learn a rotation and project to 64 dimensions (OPQ with 16
+            blocks); partition into 4096 cells whose coarse quantizer is
+            itself an HNSW graph (for fast centroid lookup at large nlist);
+            store 16-byte PQ codes in the lists; after the code scan,
+            re-rank the shortlist against stored raw vectors.
+          </p>
+          <p><strong>Q9. What are the search-time knobs, and why do they matter operationally?</strong></p>
+          <p>
+            <code>nprobe</code> (IVF), <code>efSearch</code> (HNSW), and
+            <code>k_factor</code> (refinement) trade latency for recall
+            without touching the built index, so a live service can move
+            along the frontier per request class; everything baked into the
+            factory string requires a rebuild to change.
+          </p>
+          <p><strong>Q10. Your recall is fine on a benchmark but poor in production. Name three suspects.</strong></p>
+          <p>
+            Default <code>nprobe=1</code> left in place; distribution drift
+            between the training sample and production vectors (or training
+            on synthetic/random data); and a metric mismatch, such as
+            embeddings trained for cosine being searched with unnormalized
+            L2 or inner product. A fourth classic: measuring recall against
+            no ground truth at all, rather than a flat index over the same
+            data.
+          </p>
+          <p><strong>Q11. What is thread-safe in Faiss?</strong></p>
+          <p>
+            Concurrent <code>search</code> calls against an index nobody is
+            mutating are safe, and single searches are internally
+            OpenMP-parallel. Any concurrent <code>add</code>,
+            <code>train</code>, or <code>remove_ids</code> requires external
+            exclusion. The robust production pattern sidesteps the question:
+            immutable index snapshots swapped atomically.
+          </p>
+          <p><strong>Q12. How does Faiss handle ids, and where do people trip?</strong></p>
+          <p>
+            Plain indexes assign sequential ids in add order; IVF indexes
+            support <code>add_with_ids</code> natively; flat indexes need an
+            <code>IndexIDMap</code> wrapper for custom ids. The trip is
+            deleting or re-adding while assuming ids are stable handles into
+            external metadata; treat the mapping as your application's
+            responsibility, with -1 reserved for "no result."
+          </p>
+          <p><strong>Q13. Compare Faiss and hnswlib for a 5-million-vector, RAM-resident, low-latency service.</strong></p>
+          <p>
+            Both would serve HNSW; hnswlib is smaller, header-only, and has
+            fewer moving parts, a fine choice if HNSW is the final answer.
+            Faiss buys option value: the same code path can move to IVF+PQ
+            when the corpus grows tenfold, add refinement, use GPU for
+            builds, and serialize uniformly, so the choice is really "is
+            this system's index strategy settled forever?"
+          </p>
+          <p><strong>Q14. When are GPU indexes the right call?</strong></p>
+          <p>
+            Batch-heavy work: offline joins of millions of queries, index
+            construction and k-means training, and research sweeps. The GPU
+            tree wants big batches to amortize transfers and keeps
+            k-selection on-device; single-query latency serving on a modern
+            AVX-512 CPU with FastScan indexes is often faster and always
+            cheaper, so serve on CPU unless the query volume is itself
+            batch-shaped.
+          </p>
+          <p><strong>Q15. What would you measure first when a query is slow?</strong></p>
+          <p>
+            The work counters: reset <code>faiss.cvar.indexIVF_stats</code>,
+            run the query, and read lists visited, codes scanned, and heap
+            updates. That immediately separates "scanning too much"
+            (nprobe or unbalanced lists, fix with tuning or better
+            training) from "scanning is slow" (dtype conversion copies,
+            non-contiguous arrays, missing SIMD build, thread contention),
+            which have entirely different fixes.
+          </p>
+
+          <h2>Part XII: Design lessons</h2>
+          <p>
+            <strong>A tiny uniform contract makes a zoo composable.</strong>
+            Everything is train/add/search over (n, d) float32, so indexes
+            nest inside indexes: the coarse quantizer of an IVF is itself an
+            Index, refinement wraps an Index around an Index, and the GPU
+            tree substitutes freely. This is the same move as Unix file
+            descriptors and PyTorch's Module: make the interface small
+            enough that composition is the default, and the library's power
+            becomes combinatorial.
           </p>
           <p>
-            After the core, <code>faiss/gpu/</code> mirrors the index classes
-            for CUDA and ROCm, <code>contrib/</code> holds the higher-level
-            Python utilities, and the <code>tutorial/</code> and
-            <code>demos/</code> directories contain short runnable examples
-            that make good first sessions; the <code>benchs/</code> directory
-            reproduces published results. A productive exercise is to take one
-            dataset, build <code>"Flat"</code>, <code>"HNSW32"</code>, and
-            <code>"IVF1024,PQ32"</code> over it, and plot recall against
-            queries per second while sweeping each index's search-time knob,
-            which teaches more about the triangle in an hour than any amount
-            of reading.
+            <strong>Separate the pruning decision from the encoding
+            decision.</strong> "Which candidates do I look at" and "what
+            does looking at one cost" are orthogonal axes, and Faiss's
+            families are their cross product. The same factoring appears in
+            databases as index selection versus page format, and in search
+            engines as candidate generation versus scoring; recognizing two
+            fused concerns and splitting them is the recurring senior move.
           </p>
+          <p>
+            <strong>Turn configuration into a language when the space is
+            combinatorial.</strong> The factory string is a domain-specific
+            grammar over the composition space, cheap to log, diff, and A/B
+            test, with a regex parser anyone can read. Connection strings,
+            ffmpeg filter graphs, and scikit-learn pipelines are the same
+            pattern: when valid configurations form an algebra, name the
+            algebra.
+          </p>
+          <p>
+            <strong>Precompute per-query, not per-candidate.</strong> The
+            ADC table moves all d-dimensional geometry into one
+            per-list setup step so the per-candidate cost collapses to
+            lookups. The general form, hoist invariant work to the outermost
+            loop that can hold it, is the essence of query compilation in
+            databases and of shader specialization in graphics, and PQ is
+            its cleanest small example.
+          </p>
+          <p>
+            <strong>Make cost observable, not inferable.</strong>
+            <code>indexIVF_stats</code> ships in the library: lists visited,
+            codes scanned, heap updates, per phase timings. Systems that
+            expose their own work counters get debugged by their users;
+            systems that do not get blamed. The EXPLAIN of a database and
+            the stats blocks of Faiss are the same design conviction.
+          </p>
+
+          <h2>Part XIII: Memorization framework</h2>
+          <p>
+            One sentence: Faiss is train/add/search over composable index
+            structures, where a coarse structure prunes the candidate set,
+            an encoding sets the cost of scoring each candidate, and a heap
+            keeps the top-k, with recall traded against speed and memory by
+            named knobs.
+          </p>
+          <pre class="flow">query -&gt; binding -&gt; coarse quantize -&gt; probe lists -&gt; ADC table -&gt; scan codes -&gt; heap -&gt; (D, I)</pre>
+          <pre class="flow">binding    faiss/python/class_wrappers.py    replacement_search: float32, shapes, pointers
+orchestr.  faiss/IndexIVF.cpp                IndexIVF::search, nprobe, OpenMP slicing
+coarse     (quantizer) faiss/IndexFlat.cpp   nprobe nearest of nlist centroids
+setup      faiss/IndexIVF.cpp                search_preassigned, heap init, scanner
+table      faiss/impl/ProductQuantizer.cpp   compute_distance_table, M x ksub floats
+scan       faiss/IndexIVFPQ.cpp + invlists/  scan_codes: M lookups per code
+heap       faiss/utils/Heap.h                maxheap_replace_top, heap_reorder</pre>
+          <p>Memorize these blocks:</p>
+          <pre class="flow">CONTRACT: train (learn structure, subsampled ~&lt;=256 pts/centroid) -&gt; add -&gt; search.
+float32 in, (nq, k) distances + int64 ids out; L2 distances are SQUARED; -1 = no result.</pre>
+          <pre class="flow">PQ NUMBERS: d=128, M=8, nbits=8 =&gt; dsub=16, ksub=256, code = 8 bytes (64x),
+codebooks 8*256*16 floats, ADC table per query 8*256 = 2048 floats,
+distance = 8 lookups + 7 adds. Virtual centroids: 256^8.</pre>
+          <pre class="flow">FACTORY GRAMMAR: [transform,] coarse, encoding [,refine]
+OPQ16_64 , IVF4096(_HNSW32) , PQ16 , RFlat.  Search knobs stay live:
+nprobe (IVF, default 1!), efSearch (HNSW, default 16), k_factor (refine).</pre>
+          <pre class="flow">TRIANGLE: Flat = exact corner; IVF = tunable pruning; HNSW = memory-for-latency graph;
+PQ/OPQ = memory-for-accuracy encoding; compose IVF+PQ+refine for billion scale.</pre>
+          <pre class="flow">OPERATIONS: library not database; searches share, mutations exclude;
+ship immutable index files (write_index/read_index) and swap; retrain on drift.</pre>
+
+          <h2>Final takeaway</h2>
           <div class="takeaway">
             <strong>Key takeaway:</strong> Faiss is a small contract, train,
-            add, search, over a composable set of trade-offs: prune with IVF,
-            link with HNSW, compress with PQ, verify with flat. Learn the
-            factory string grammar and the recall-speed-memory triangle behind
-            it, and both the library and the vector databases built on it stop
-            being magic.
+            add, search, over a composable set of trade-offs: prune with
+            IVF, link with HNSW, compress with PQ, verify with flat. One
+            query through IndexIVFPQ, coarse quantize, build the table, scan
+            the codes, keep the heap, contains the whole library in
+            miniature; learn that path and the factory grammar that names
+            its variations, and both Faiss and the vector databases built on
+            it stop being magic.
           </div>
         </article>
       </div>

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>nginx walkthrough · Stanley Jacob</title>
-    <meta name="description" content="A walkthrough of the nginx source: how to use it in five minutes, the event-driven master/worker architecture, the eleven phases of request processing, the config as a declarative language, and a guided reading path." />
+    <meta name="description" content="A full chapter on nginx: a practical tutorial, the complete life of one HTTP request from accept through the epoll worker loop, the header parsing state machine, the eleven processing phases, upstream proxying, and the write chain, deep dives into the master/worker model, the event core, the phase engine, and the config language, plus a staged source reading plan and hands-on labs." />
     <link rel="stylesheet" href="/style.css" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
   </head>
@@ -32,13 +32,17 @@
         <p class="lead">
           <a href="https://nginx.org" target="_blank" rel="noreferrer">nginx</a>
           is the web server, reverse proxy, and load balancer that Igor Sysoev
-          wrote to handle enormous connection counts on early-2000s hardware
-          and that now fronts a huge share of the internet's traffic; the
-          canonical source lives at nginx.org with an official mirror at
+          wrote against the C10K problem and that now fronts a huge share of
+          the internet's traffic; the canonical source lives at nginx.org with
+          the official repository at
           <a href="https://github.com/nginx/nginx" target="_blank" rel="noreferrer">github.com/nginx/nginx</a>.
-          This walkthrough covers how to use it in five minutes, the three
-          ideas that make a codebase from 2004 still the tool of choice, and a
-          guided path for reading the C source without getting lost.
+          This is a full chapter, not a tour: a practical tutorial, then the
+          complete life of one HTTP request from the accept queue through the
+          epoll loop, the parsing state machine, the eleven processing phases,
+          and the write chain, deep dives into the four load-bearing
+          subsystems, a staged plan for reading the C source, and labs you
+          can run tonight. File paths were verified against the repository
+          in the 1.29 mainline era.
         </p>
       </div>
     </header>
@@ -46,23 +50,89 @@
     <section class="soft">
       <div class="wrap">
         <article class="prose article">
-          <h2>Using it in five minutes</h2>
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">client TCP SYN
+   │
+   ▼
+kernel accept queue ──── master process (root: reads config,
+   │                     binds sockets, supervises workers)
+   ▼
+worker process (one per core, unprivileged)
+   │  epoll_wait: which sockets are ready?
+   ▼
+header parsing state machine (resumable, byte at a time)
+   │
+   ▼
+eleven request phases (rewrite → find-config → access → ... → content)
+   │
+   ├── static: open file, sendfile
+   └── proxy:  ngx_http_upstream → backend connect/send/receive
+   ▼
+filter chain (headers, gzip, chunked, ...) → write chain (buffers)
+   │
+   ▼
+writev / sendfile → kernel → client</pre>
           <p>
-            Every package manager carries it, so install is one line and the
-            three commands you will actually use daily are check, reload, and
-            stop:
+            The one-sentence identity: <mark>nginx is a small fixed set of
+            single-threaded event loops, each multiplexing tens of thousands
+            of connections through non-blocking state machines, configured by
+            a declarative language that is compiled once at startup.</mark>
+            Every famous nginx property, the tiny memory footprint, the
+            zero-downtime reloads, the module ecosystem, falls out of one of
+            those three clauses.
           </p>
-          <pre><code>sudo apt install nginx     # Debian/Ubuntu
-brew install nginx         # macOS</code></pre>
-          <pre><code>nginx -t          # parse and validate the config, without touching the running server
-nginx -s reload   # apply new config with zero dropped connections
-nginx -s quit     # graceful shutdown</code></pre>
           <p>
-            The canonical minimal use is a reverse proxy in front of an
-            application server. Drop this into a file in
-            <code>conf.d/</code> or <code>sites-enabled/</code>, depending on
-            how your distro lays things out, then <code>nginx -t</code> and
-            <code>nginx -s reload</code>:
+            The design is a bet made in 2002 and still paying off: instead of
+            one thread or process per connection, which drowns in stacks and
+            context switches at ten thousand connections, run roughly one
+            worker per CPU core and never block. A worker asks the kernel via
+            <code>epoll</code> (Linux) or <code>kqueue</code> (BSD, macOS)
+            which of its connections have events, runs a short callback for
+            each, and asks again. Concurrency scales with memory per
+            connection, a few kilobytes, rather than with schedulable
+            threads. The price is a discipline that shapes every line of the
+            source: no callback may ever wait, so everything, header parsing
+            included, is written as a state machine that can stop mid-byte
+            and resume when the next event arrives.
+          </p>
+          <p>
+            The other half of the model is that nginx is two programs in one:
+            a privileged master that owns the config and the listening
+            sockets, and disposable workers that own the traffic. Reloads,
+            upgrades, and crashes are all handled by replacing workers under
+            a master that never stops listening, which is why nginx restarts
+            are something other servers have and nginx mostly does not need.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <h3>Install and first session</h3>
+          <pre><code>sudo apt install nginx     # Debian/Ubuntu (config in /etc/nginx)
+brew install nginx         # macOS (config in $(brew --prefix)/etc/nginx,
+                           #        listens on 8080 by default)</code></pre>
+          <p>
+            The three commands you will actually run daily are check, reload,
+            and quit, and the check output is worth recognizing on sight:
+          </p>
+          <pre><code>$ sudo nginx -t
+nginx: the configuration file /etc/nginx/nginx.conf syntax is ok
+nginx: configuration file /etc/nginx/nginx.conf test is successful
+
+$ sudo nginx -s reload   # apply new config, zero dropped connections
+$ sudo nginx -s quit     # graceful shutdown</code></pre>
+          <p>
+            <code>nginx -T</code> prints the entire effective config with all
+            includes expanded, the single most useful debugging command on a
+            machine you did not configure yourself. On Debian-family systems
+            the server runs under systemd
+            (<code>systemctl status nginx</code>) and site configs live in
+            <code>sites-enabled/</code>; other layouts use
+            <code>conf.d/</code>. Same server, different includes.
+          </p>
+          <h3>The canonical config, and the traps around it</h3>
+          <p>
+            The shape of most nginx deployments in the wild is ten lines:
+            static files served directly, everything else forwarded to an app
+            server.
           </p>
           <pre><code>server {
     listen 80;
@@ -79,122 +149,790 @@ nginx -s quit     # graceful shutdown</code></pre>
     }
 }</code></pre>
           <p>
-            Static files are served directly, everything else is forwarded to
-            the app listening on port 8000, and that one block is the shape of
-            most nginx deployments in the wild, with TLS termination, caching,
-            compression, and rate limiting layered on as extra directives
-            rather than extra software.
+            TLS termination, caching, compression, and rate limiting are all
+            extra directives in this same file rather than extra software.
+            Now the two traps every beginner hits. First,
+            <code>root</code> versus <code>alias</code>: <code>root</code>
+            appends the full request URI to the path, <code>alias</code>
+            replaces the location prefix.
+          </p>
+          <pre><code># Request: GET /static/app.css
+
+location /static/ {
+    root /var/www/assets;      # serves /var/www/assets/static/app.css
+}
+
+location /static/ {
+    alias /var/www/assets/;    # serves /var/www/assets/app.css
+}</code></pre>
+          <p>
+            If your files 404 and the path in the error log contains the
+            location prefix twice, this is why. Second,
+            <code>proxy_pass</code> changes meaning with a trailing URI:
+          </p>
+          <pre><code>location /api/ {
+    proxy_pass http://127.0.0.1:8000;     # backend sees /api/users
+    proxy_pass http://127.0.0.1:8000/;    # backend sees /users
+}</code></pre>
+          <p>
+            With no URI part, nginx forwards the request URI unchanged; with
+            one (even just <code>/</code>), the matched location prefix is
+            replaced by it. Both behaviors are correct; mixing them up is a
+            silent route rewrite. A third habit worth forming immediately:
+            <code>proxy_set_header</code> directives do not accumulate across
+            levels, so defining even one in a <code>location</code> discards
+            all the ones inherited from <code>server</code>. Part V explains
+            why the config behaves that way.
           </p>
 
-          <h2>Idea one: the event-driven master/worker architecture</h2>
+          <h2>Part III: When it is the right tool</h2>
           <p>
-            nginx was designed against the C10K problem, the observation that
-            the thread-per-connection and process-per-connection servers of
-            its era collapsed under ten thousand concurrent connections
-            because each connection carried a stack, a scheduler entry, and
-            context-switch overhead. nginx's answer is a small fixed set of
-            processes: one master that reads the configuration, binds the
-            listening sockets, and supervises, plus a handful of workers,
-            typically one per CPU core, that do all the actual work.
-            <mark>Each worker is a single-threaded event loop that multiplexes
-            tens of thousands of connections over non-blocking sockets</mark>,
-            asking the kernel via epoll on Linux or kqueue on BSD which
-            connections are ready and running a short callback for each, so
-            concurrency scales with memory per connection rather than with
-            threads. The same process model is what makes operations graceful:
-            on <code>nginx -s reload</code> the master parses the new config,
-            starts fresh workers with it, and tells the old workers to finish
-            their in-flight requests and exit, so configuration changes and
-            even binary upgrades happen without dropping a connection. The
-            discipline this imposes on the code is the part worth
-            internalizing: nothing in a worker may block, so every module is
-            written as a state machine that can be suspended whenever it would
-            wait.
+            nginx is the default edge: TLS termination, static files, reverse
+            proxying, load balancing, response caching, and request
+            policing (the <code>limit_req</code> leaky bucket is the same
+            algorithm family I work through in my
+            <a href="/systems/rate-limiter">rate limiter design write-up</a>).
+            It shines wherever many slow, untrusted client connections must
+            be absorbed cheaply in front of a small number of fast backends,
+            and it remains the engine inside much of the cloud: the
+            long-dominant Kubernetes ingress controller, ingress-nginx, is
+            template-generated nginx config around this exact binary (my
+            <a href="/oss/kubernetes">Kubernetes walkthrough</a> covers where
+            that sits in the stack).
+          </p>
+          <p>
+            The honest alternatives: <strong>Caddy</strong> wins on operator
+            ergonomics, automatic TLS certificates and a far friendlier
+            config, at some cost in raw efficiency and module depth.
+            <strong>HAProxy</strong> is the sharper pure load balancer, with
+            richer health checking and connection-level control, but it does
+            not serve files. <strong>Envoy</strong> is built for dynamic
+            control planes, config delivered over an API rather than files,
+            which is why service meshes standardized on it; as a
+            hand-configured edge it is heavier than you want.
+            <strong>Apache httpd</strong> still makes sense for
+            <code>.htaccess</code>-style per-directory delegation and
+            embedded-interpreter deployments. nginx's own limit is symmetric
+            with its strength: its config is static per reload, its worker
+            model punishes anything that blocks, and business logic belongs
+            behind it, not in it.
+          </p>
+          <p>
+            The architecture-shaped warning: <mark>never expose a
+            thread-or-process-per-connection app server directly to the
+            internet when you could put nginx in front, because slow clients
+            occupy an app-server worker for the entire transfer but cost an
+            nginx worker almost nothing.</mark>
+          </p>
+          <pre class="flow">DANGEROUS                            SAFE
+internet ── gunicorn (8 workers)     internet ── nginx (event loop,
+  8 slow phones uploading              absorbs slow clients, buffers
+  = all workers busy                   requests and responses)
+  = site down for everyone               │ fast local socket
+                                       gunicorn workers stay busy
+                                       only for actual app time</pre>
+          <p>
+            This is proxy buffering, and it is nginx's quiet superpower: the
+            backend is only occupied for the milliseconds it takes to hand
+            nginx the response, while nginx drips it to a phone on a train
+            for as long as that takes. Lab 4 measures it.
           </p>
 
-          <h2>Idea two: request processing as a pipeline of phases</h2>
+          <h2>Part IV: The full life of one request</h2>
           <p>
-            Inside a worker, an HTTP request does not run through one big
-            function; it advances through a fixed pipeline of eleven phases,
-            from post-read after the headers are parsed, through the rewrite
-            phases, location lookup, pre-access and access checks, a
-            pre-content phase for things like <code>try_files</code>, the
-            content phase that produces the response, and finally the log
-            phase. <mark>Modules never call each other; they register handlers
-            at phases, and the phase engine calls them in order</mark>, with
-            each handler able to pass control onward, finalize the request, or
-            park it and resume later when an event arrives. Response bodies
-            then flow out through a separate chain of filters, which is how
-            gzip, chunking, byte ranges, and SSI compose without knowing about
-            one another. This is why nginx modules feel like configuration
-            rather than plugins: access control runs in the access phase
-            whether it is IP-based, password-based, or a subrequest to an auth
-            service, and rate limiting is just a pre-access phase handler, the
-            same leaky-bucket idea I work through in my
-            <a href="/systems/rate-limiter">rate limiter design write-up</a>.
+            The canonical operation is one HTTP request through a worker.
+            Follow <code>GET /api/users</code> against the config in Part II,
+            naming the actual files at each stage.
+          </p>
+          <h3>Stage 1: accept</h3>
+          <p>
+            The master bound the listening sockets before forking, so every
+            worker inherits them. When the kernel completes a TCP handshake
+            it queues the connection; a worker's epoll reports the listening
+            socket readable and <code>ngx_event_accept()</code>
+            (<code>src/event/ngx_event_accept.c</code>) accepts it, pulls a
+            free <code>ngx_connection_t</code> from the worker's
+            preallocated pool (sized by <code>worker_connections</code>,
+            default 512), sets the socket non-blocking, and registers a read
+            handler. Which worker wins an incoming connection is its own
+            small subsystem: modern kernels spread accepts across workers
+            (with <code>reuseport</code> available to give each worker its
+            own accept queue), replacing the old accept-mutex dance.
+          </p>
+          <h3>Stage 2: the worker event loop</h3>
+          <p>
+            The worker's life is one function,
+            <code>ngx_process_events_and_timers()</code> in
+            <code>src/event/ngx_event.c</code>: compute the nearest timer
+            deadline, call the poller with that timeout, run the handler of
+            every ready event, then expire due timers. The poller behind it
+            on Linux is <code>src/event/modules/ngx_epoll_module.c</code>,
+            which registers connection sockets edge-triggered; timers live in
+            a red-black tree (<code>src/event/ngx_event_timer.c</code> over
+            <code>src/core/ngx_rbtree.c</code>), which is how a worker
+            tracks tens of thousands of per-connection timeouts with one
+            clock. Everything that happens from here on is a handler invoked
+            by this loop, and no handler may block, ever.
+          </p>
+          <h3>Stage 3: parsing the request line and headers</h3>
+          <p>
+            The read handler for a new connection waits for bytes, then
+            enters <code>ngx_http_process_request_line()</code> and
+            <code>ngx_http_process_request_headers()</code> in
+            <code>src/http/ngx_http_request.c</code>, which call the parser
+            in <code>src/http/ngx_http_parse.c</code>. The parser is the
+            purest expression of the no-blocking rule: a hand-written state
+            machine with states like <code>sw_method</code>,
+            <code>sw_uri</code>, and <code>sw_header_value</code> that
+            consumes one byte at a time and, when the buffer runs dry
+            mid-header, simply returns <code>NGX_AGAIN</code>; the request
+            object stores the current state, the worker goes off to serve
+            other connections, and parsing resumes at the same byte when
+            epoll reports more data. Parsed headers accumulate in the
+            <code>ngx_http_request_t</code>, allocated from a per-request
+            memory pool (<code>src/core/ngx_palloc.c</code>) that will be
+            freed in one shot at the end, which is why nginx code almost
+            never frees anything explicitly.
+          </p>
+          <h3>Stage 4: the eleven phases</h3>
+          <p>
+            With headers complete, <code>ngx_http_core_run_phases()</code> in
+            <code>src/http/ngx_http_core_module.c</code> walks the phase
+            list. The eleven, from the enum in
+            <code>ngx_http_core_module.h</code>: POST_READ (e.g.
+            <code>realip</code> recovering client addresses),
+            SERVER_REWRITE, FIND_CONFIG (location matching, no module
+            handlers allowed), REWRITE, POST_REWRITE (loop back if the URI
+            changed), PREACCESS (<code>limit_req</code>,
+            <code>limit_conn</code>), ACCESS (<code>allow</code>/<code>deny</code>,
+            auth), POST_ACCESS, PRECONTENT (<code>try_files</code>,
+            <code>mirror</code>), CONTENT, and LOG. Our request matches
+            <code>location /api/</code> at FIND_CONFIG, sails through the
+            empty check phases, and reaches CONTENT, where the location's
+            content handler is <code>proxy_pass</code>'s, registered by
+            <code>src/http/modules/ngx_http_proxy_module.c</code>. A request
+            can be parked at any phase, a handler that must wait returns and
+            resumes on a later event, so "walking the phases" can span many
+            loop iterations.
+          </p>
+          <h3>Stage 5: upstream, the proxying machine</h3>
+          <p>
+            The proxy module itself mostly writes and reads HTTP; the hard
+            parts, connecting, pooling, retrying, buffering, live in the
+            shared upstream machinery of
+            <code>src/http/ngx_http_upstream.c</code>, the largest file in
+            the tree. The sequence: pick a peer via the load-balancing
+            module (<code>ngx_http_upstream_round_robin.c</code> by
+            default), start a non-blocking connect
+            (<code>src/event/ngx_event_connect.c</code>), and when the
+            socket goes writable send the proxied request that the proxy
+            module's <code>create_request</code> built (this is where
+            <code>proxy_set_header</code> values were baked in). Then read
+            and parse the backend's status line and headers, and hand the
+            body to the pipe engine in
+            <code>src/event/ngx_event_pipe.c</code>, which shuttles bytes
+            from the upstream socket to the client socket through a bounded
+            set of buffers, spilling to a temp file if the backend outruns a
+            slow client. If the backend fails, upstream logic retries the
+            next peer per <code>proxy_next_upstream</code>. For a static
+            request this whole stage is replaced by
+            <code>src/http/modules/ngx_http_static_module.c</code>: open the
+            file (through the open-file cache), and emit a buffer that
+            points at a file range rather than memory.
+          </p>
+          <h3>Stage 6: the filter and write chains</h3>
+          <p>
+            Nothing goes to the client directly; it goes through two chains
+            of filters built at startup. The header filter chain ends at
+            <code>src/http/ngx_http_header_filter_module.c</code>, which
+            renders the status line and headers into a buffer. Body output
+            flows as chains of <code>ngx_buf_t</code> (buffers that may
+            point at memory or at file ranges) through body filters:
+            <code>copy</code>, <code>postpone</code>, <code>gzip</code>,
+            <code>chunked</code>, each a module that transforms the chain
+            and calls the next, until
+            <code>src/http/ngx_http_write_filter_module.c</code> hands the
+            accumulated chain to the connection's send function,
+            <code>ngx_writev_chain()</code> or the sendfile path
+            (<code>src/os/unix/ngx_linux_sendfile_chain.c</code>), which
+            writes as much as the socket accepts. A short write is not an
+            error: the unsent tail stays queued, a write event is armed, and
+            the loop returns later, which is proxy buffering meeting the
+            event model.
+          </p>
+          <h3>Stage 7: finalize, log, keep alive</h3>
+          <p>
+            <code>ngx_http_finalize_request()</code> runs the LOG phase
+            (access log handlers), then either destroys the request and
+            waits for the next one on a keep-alive connection or closes it.
+            The request pool is freed in one call, returning every
+            allocation the request made. The connection object goes back to
+            the free list, and the worker, which never knew it was handling
+            this request "specially" among thousands, keeps looping.
           </p>
 
-          <h2>Idea three: the config is a declarative language</h2>
+          <h2>Part V: Internals deep dives</h2>
+          <h3>Deep dive 1: the master/worker model and zero-downtime everything</h3>
+          <pre class="flow">            master (root: parse config, bind :80/:443, never serves)
+              │ fork
+   ┌──────────┼──────────┐        signals to master:
+worker     worker     worker      HUP   reload config
+(user nginx, serve traffic)       USR2  upgrade binary on the fly
+   ▲                              WINCH gracefully stop workers
+   └── socketpair channels ───    QUIT  graceful shutdown</pre>
           <p>
-            The nginx config file looks like settings but behaves like a small
-            declarative language. Directives live in nested contexts, main,
-            <code>http</code>, <code>server</code>, <code>location</code>, and
-            values set at an outer level are inherited by inner ones unless
-            overridden, so a config reads as a tree of increasingly specific
-            answers to "what should happen to a request that looks like
-            this." Crucially there is no general control flow: you declare
-            which server names and location patterns exist, and nginx selects
-            among them with fixed, documented matching rules at request time.
-            The implementation mirrors the surface: every module declares the
-            directives it understands along with which contexts they may
-            appear in, the core config parser reads tokens and dispatches to
-            the owning module, and the whole file is compiled at startup into
-            per-module configuration structs that request processing then
-            consults without ever re-parsing anything. That is why
-            <code>nginx -t</code> can prove a config valid before it goes
-            live, and why the sharp edges people hit, such as
-            <code>if</code> inside <code>location</code> behaving strangely,
-            are really places where an imperative-looking directive leaks the
-            declarative machinery underneath.
+            The split is privilege separation first: only the master runs as
+            root, and only to read certificates and bind low ports; workers
+            drop to the <code>user</code> directive's account before touching
+            a byte of traffic. The processes talk over per-worker Unix
+            socketpairs (<code>src/os/unix/ngx_channel.c</code>), and the
+            supervision loop lives in
+            <code>src/os/unix/ngx_process_cycle.c</code>, which is the file
+            to read to see the whole story in one place: on
+            <code>SIGHUP</code> the master parses the new configuration into
+            a fresh cycle object (<code>src/core/ngx_cycle.c</code>), and
+            only if it parses cleanly forks new workers with it, then asks
+            the old workers to shut down gracefully; they stop accepting,
+            finish their in-flight requests, and exit. <mark>A reload is not
+            "restart quickly", it is two complete generations of workers
+            briefly coexisting, which is why nothing is dropped and why a
+            broken config never takes the site down.</mark> During a drain
+            you can see the old generation in the process list, marked
+            <code>worker process is shutting down</code>. The binary upgrade
+            is the same idea one level up: <code>SIGUSR2</code> makes the
+            master exec the new binary as a second master sharing the same
+            inherited listening sockets, and signals then retire the old
+            generation, so even replacing the executable drops nothing.
+          </p>
+          <h3>Deep dive 2: the event core, and why blocking is forbidden</h3>
+          <p>
+            A worker is one thread; there is no scheduler to save you. If a
+            handler blocks for 100 ms, every one of that worker's
+            connections, potentially tens of thousands, freezes for 100 ms.
+            This is why the codebase contains no ordinary
+            <code>read()</code>-and-wait anywhere in the request path, why
+            DNS resolution has its own async resolver
+            (<code>src/core/ngx_resolver.c</code>), and why disk I/O, the one
+            thing epoll cannot make non-blocking on Linux files, gets special
+            treatment: sendfile, async file I/O where configured, and thread
+            pools (<code>src/core/ngx_thread_pool.c</code>,
+            <code>aio threads</code>) as the escape hatch for serving big
+            files from slow disks. The connection math is worth doing once:
+            <code>worker_processes auto</code> (one per core) times
+            <code>worker_connections</code> (default 512, commonly raised
+            into the tens of thousands) bounds concurrent connections, and
+            each proxied request consumes two, one to the client and one to
+            the backend. The trap to internalize: <mark>a third-party module
+            that makes a synchronous call, a blocking database query, a
+            filesystem stat on NFS, silently converts nginx back into the
+            architecture it was built to replace</mark>, and the symptom is
+            mysterious multi-second latency on unrelated cheap requests
+            served by the same worker.
+          </p>
+          <h3>Deep dive 3: the phase engine and the module system</h3>
+          <p>
+            nginx modules famously compose without knowing about each other,
+            and the phase engine is the mechanism. At startup, each module's
+            postconfiguration hook may push a handler into the array for one
+            of the phases that accept handlers; the core then builds a flat
+            execution list with a checker function per phase that interprets
+            handler return codes: roughly, "I handled it, finalize",
+            "decline, next handler", or "waiting, park the request here".
+            Modules never call each other; they only occupy slots in a
+            pipeline whose order is fixed by the core. That is why
+            <code>access</code> rules, an auth subrequest, and an IP allow
+            list all combine predictably: they are all just ACCESS-phase
+            handlers. The filter half mirrors it: each filter module, at
+            startup, saves the current head of the chain
+            (<code>ngx_http_top_body_filter</code>) and installs itself as
+            the new head, so the chain is built by prepending in reverse
+            registration order, and calling "the next filter" is calling
+            the saved pointer. Two consequences follow. Configuration order
+            of modules matters for filters (it fixes gzip-before-chunked and
+            friends), and a module can be dropped into the build
+            (<code>--add-module</code> or dynamic <code>load_module</code>)
+            and hook the pipeline without a single change elsewhere, which
+            is how the OpenResty/Lua ecosystem grafted a scripting language
+            onto a server that never planned for one.
+          </p>
+          <h3>Deep dive 4: the config is a compiled declarative language</h3>
+          <p>
+            The config file looks like settings but is handled like source
+            code: <code>src/core/ngx_conf_file.c</code> tokenizes it, each
+            directive is dispatched to the module that declared it, and the
+            result is a tree of per-module C structs, compiled once at
+            startup and only consulted, never re-parsed, at request time.
+            <code>rewrite</code> and <code>if</code> conditions literally
+            compile to a tiny script engine
+            (<code>src/http/ngx_http_script.c</code>) evaluated at request
+            time. Inheritance across <code>http</code>, <code>server</code>,
+            and <code>location</code> is implemented by each module's merge
+            functions, and the rule that generates the classic surprises is
+            this: <mark>values inherit only when the inner level sets
+            nothing; array-valued directives like
+            <code>proxy_set_header</code> and <code>add_header</code>
+            replace the entire inherited set the moment you define even one
+            locally.</mark>
+          </p>
+          <p>
+            Location selection follows fixed rules, worth working through
+            once against a config like this:
+          </p>
+          <pre><code>location = /            { return 200 "A exact /"; }
+location /              { return 200 "B prefix /"; }
+location /images/       { return 200 "C prefix /images/"; }
+location ^~ /static/    { return 200 "D prefix, no regex"; }
+location ~* \.(png|jpg)$ { return 200 "E regex images"; }</code></pre>
+          <table>
+            <tr><th>Request</th><th>Winner</th><th>Why</th></tr>
+            <tr><td><code>/</code></td><td>A</td><td>exact match wins immediately</td></tr>
+            <tr><td><code>/images/logo.png</code></td><td>E</td><td>longest prefix is C, but regexes are checked before plain prefixes apply, and E matches</td></tr>
+            <tr><td><code>/static/logo.png</code></td><td>D</td><td><code>^~</code> on the longest matching prefix suppresses the regex pass</td></tr>
+            <tr><td><code>/about</code></td><td>B</td><td>no regex matches, fall back to longest prefix</td></tr>
+          </table>
+          <p>
+            The algorithm: find the longest matching prefix location; if it
+            is exact (<code>=</code>) use it now; if it is marked
+            <code>^~</code> skip regexes; otherwise try the regex locations
+            in the order they appear in the file and take the first match,
+            falling back to the remembered prefix. Note what is absent:
+            file order never matters for prefixes, and always matters for
+            regexes. And the famous trap, "if is evil", is the declarative
+            machinery leaking: <code>if</code> inside <code>location</code>
+            is implemented as an implicit nested location that the request
+            is re-homed into, so content-related directives inside it can
+            be ignored or misfire (the community documents the pathological
+            cases, and the safe subset: <code>return</code> and
+            <code>rewrite</code> inside <code>if</code> are fine).
+            <code>try_files</code> and <code>map</code> exist largely so
+            you do not need <code>if</code>.
           </p>
 
-          <h2>Reading the repository</h2>
+          <h2>Part VI: Reading the repository</h2>
           <p>
-            The source is compact C under a single <code>src/</code> tree, and
-            the layout maps cleanly onto the ideas above:
-            <code>src/core/</code> holds the primitive types and
-            infrastructure, strings, memory pools, the red-black tree, and the
-            cycle object that represents one lifetime of a loaded
-            configuration; <code>src/event/</code> is the event loop with the
-            platform pollers under <code>src/event/modules/</code>;
-            <code>src/http/</code> is the HTTP machinery with the optional
-            modules in <code>src/http/modules/</code>; and
-            <code>src/os/unix/</code> is the platform layer. Start at
-            <code>src/core/nginx.c</code>, where <code>main()</code> lives,
-            and follow it into <code>src/os/unix/ngx_process_cycle.c</code> to
-            read the master process loop and the worker loop, which is the
-            master/worker story in perhaps a thousand lines. Then read the
-            event core in <code>src/event/ngx_event.c</code> alongside the
-            epoll module to see what "process events and timers" concretely
-            means. For HTTP, <code>src/http/ngx_http_request.c</code> takes a
-            connection from accepted to parsed request, and
-            <code>src/http/ngx_http_core_module.c</code> contains the phase
-            engine that walks the eleven phases; with those two files
-            understood, any module in <code>src/http/modules/</code> becomes
-            readable as "handlers hooked into known places," and
-            <code>ngx_http_upstream.c</code> is the biggest and most
-            rewarding of them, the shared machinery behind proxying. The
+            The source is compact C under one <code>src/</code> tree, and it
+            reads best in dependency order, with the
             <a href="https://nginx.org/en/docs/dev/development_guide.html" target="_blank" rel="noreferrer">official
-            development guide</a> on nginx.org is unusually good and worth
-            keeping open beside the code.
+            development guide</a> open beside it.
+          </p>
+          <p>
+            <strong>Stage 0, orientation.</strong> Skim the development
+            guide's sections on strings, buffers, and event handling; build
+            from a release tarball with <code>./configure &amp;&amp; make</code>
+            so you can add <code>ngx_log_error</code> lines later. Questions
+            you should answer: what are <code>ngx_str_t</code>,
+            <code>ngx_buf_t</code>, and a cycle?
+          </p>
+          <p>
+            <strong>Stage 1, the idioms.</strong> Read
+            <code>src/core/ngx_string.h</code>,
+            <code>src/core/ngx_palloc.c</code> (memory pools),
+            <code>src/core/ngx_array.c</code>,
+            <code>src/core/ngx_list.c</code>, and
+            <code>src/core/ngx_buf.c</code>. Questions: why do requests
+            almost never free memory? Why are counted strings used instead
+            of C strings? What can an <code>ngx_buf_t</code> point at
+            besides memory?
+          </p>
+          <p>
+            <strong>Stage 2, the processes.</strong>
+            <code>src/core/nginx.c</code> (<code>main()</code>), then
+            <code>src/os/unix/ngx_process_cycle.c</code> with
+            <code>ngx_process.c</code> and <code>ngx_channel.c</code>.
+            Questions: exactly what happens on SIGHUP, step by step? How do
+            workers learn they should exit? Why do old and new workers
+            coexist during a reload?
+          </p>
+          <p>
+            <strong>Stage 3, the event loop.</strong>
+            <code>src/event/ngx_event.c</code>
+            (<code>ngx_process_events_and_timers</code>),
+            <code>src/event/modules/ngx_epoll_module.c</code>,
+            <code>src/event/ngx_event_timer.c</code>, and
+            <code>src/event/ngx_event_accept.c</code>. Questions: where does
+            the loop's timeout come from? What data structure holds timers
+            and why that one? What limits concurrent connections per worker?
+          </p>
+          <p>
+            <strong>Stage 4, HTTP.</strong>
+            <code>src/http/ngx_http_request.c</code> from
+            <code>ngx_http_wait_request_handler</code> down, dipping into
+            <code>src/http/ngx_http_parse.c</code> to see one state machine
+            in full, then the phase engine in
+            <code>src/http/ngx_http_core_module.c</code> with the enum in
+            its header. Questions: how does parsing survive a packet
+            boundary mid-header? What can a phase handler return, and what
+            does each return value make the checker do? Which phases accept
+            no handlers?
+          </p>
+          <p>
+            <strong>Stage 5, the payoff.</strong>
+            <code>src/http/ngx_http_upstream.c</code> with
+            <code>src/event/ngx_event_pipe.c</code> for proxying, the
+            filter pair <code>ngx_http_header_filter_module.c</code> and
+            <code>ngx_http_write_filter_module.c</code>, and then one
+            optional module read end to end;
+            <code>src/http/modules/ngx_http_limit_req_module.c</code> is a
+            perfect choice, a complete leaky-bucket rate limiter in one
+            file. Questions: what happens when the client is slower than
+            the backend? Where do proxy buffers spill to disk? How does a
+            module you have never seen attach itself to the request path?
+          </p>
+          <p>
+            Where <em>not</em> to start: <code>ngx_http_upstream.c</code>
+            itself (the biggest file in the tree, read it fifth, not
+            first), the HTTP/2 and HTTP/3 trees under
+            <code>src/http/v2/</code> and <code>src/http/v3/</code>, the
+            async resolver, and <code>ngx_http_script.c</code>, all of
+            which assume fluency in the idioms from Stages 1 and 3.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            Each lab teaches one deep-dive concept. They assume a Linux box
+            (or container) with nginx installed and a shell backend:
+            <code>python3 -m http.server 8000</code> works for all of them.
+          </p>
+          <p>
+            <strong>Lab 1: a reverse proxy in ten lines, reloaded under
+            load.</strong> Install the Part II config, start
+            <code>hey</code> in one terminal against the proxy while
+            reloading in another:
+          </p>
+          <pre><code>hey -z 30s -c 50 http://localhost/ &amp;
+sudo nginx -s reload
+sudo nginx -s reload</code></pre>
+          <p>
+            When hey prints its summary, check the status code report: all
+            200s, no connection errors, despite two full worker-generation
+            swaps mid-run. Then break the config on purpose (delete a
+            semicolon), run <code>nginx -t</code>, and reload anyway:
+            traffic continues on the old config because the master refuses
+            to promote a config that does not parse. Concept: reload is two
+            coexisting worker generations, not a restart.
+          </p>
+          <p>
+            <strong>Lab 2: location matching, empirically.</strong> Put the
+            five-location config from Deep dive 4 in a test server block
+            (add <code>default_type text/plain;</code>), then:
+          </p>
+          <pre><code>for p in / /about /images/logo.png /static/logo.png /images/x.gif; do
+  printf '%-22s → ' "$p"; curl -s "http://localhost$p"; echo
+done</code></pre>
+          <p>
+            Predict each winner before running it; the surprising two are
+            <code>/images/logo.png</code> (regex beats longer prefix) and
+            <code>/static/logo.png</code> (<code>^~</code> suppresses the
+            regex). Then reorder the location blocks and rerun to prove that
+            prefix order never matters and regex order always does. Concept:
+            the fixed matching algorithm from the config-language deep dive.
+          </p>
+          <p>
+            <strong>Lab 3: watch the process model breathe.</strong>
+          </p>
+          <pre><code>ps -ef | grep [n]ginx        # one root master, N unprivileged workers
+sudo kill -HUP $(cat /var/run/nginx.pid)
+ps -ef | grep [n]ginx        # new worker PIDs</code></pre>
+          <p>
+            Now hold a connection open (<code>curl</code> against a slow
+            endpoint, or a WebSocket) and reload again:
+            <code>ps</code> shows an extra worker labeled
+            <code>nginx: worker process is shutting down</code> that lingers
+            until your connection closes, the old generation draining.
+            Inspect sockets with <code>ss -tlnp</code> to see all workers
+            sharing the same listeners. Concept: master/worker supervision
+            and graceful drain from Deep dive 1.
+          </p>
+          <p>
+            <strong>Lab 4: proxy buffering, measured.</strong> Make the
+            backend slow and streaming, a tiny script that prints a line per
+            second for ten seconds, and compare time-to-first-byte through
+            the proxy:
+          </p>
+          <pre><code>curl -s -o /dev/null -w 'ttfb=%{time_starttransfer} total=%{time_total}\n' \
+     http://localhost/stream            # proxy_buffering on (default)
+# add: proxy_buffering off;  reload, repeat</code></pre>
+          <p>
+            With buffering on, first byte arrives when nginx has a full
+            buffer (or the response ends), and the backend connection is
+            released early; with it off, bytes flow immediately, which is
+            what you want for SSE and long-polling
+            (<code>X-Accel-Buffering: no</code> lets the backend request
+            this per response). Then fetch a large file through the proxy
+            with a rate-limited client
+            (<code>curl --limit-rate 50k</code>) and watch
+            <code>ss</code> on port 8000: buffered, the backend socket
+            closes almost instantly while nginx spoon-feeds the client;
+            unbuffered, the backend is held hostage for the whole transfer.
+            Concept: buffering decouples backend occupancy from client
+            speed, the safe-architecture diagram made visible.
+          </p>
+          <p>
+            <strong>Lab 5: make if be evil.</strong> Configure the
+            documented pathological case, an <code>if</code> with a
+            content-adjacent directive inside a location, alongside the
+            <code>try_files</code> version of the same intent, and compare
+            behavior with <code>curl -i</code>. Keep the takeaway modest
+            and precise: <code>return</code> and <code>rewrite</code>
+            inside <code>if</code> behave; mixing <code>if</code> with
+            content directives re-homes the request into an implicit
+            location with half-copied settings. Concept: the declarative
+            machinery under an imperative-looking directive.
+          </p>
+
+          <h2>Part VIII: Questions and model answers</h2>
+          <p>Understanding checks; try answering before reading.</p>
+          <p>
+            <strong>1. What is nginx in one sentence, structurally?</strong>
+            A privileged master supervising a few single-threaded,
+            event-driven workers, each multiplexing enormous numbers of
+            non-blocking connections through a fixed phase pipeline and
+            filter chain, configured by a declarative language compiled at
+            startup.
+          </p>
+          <p>
+            <strong>2. Why one worker per core instead of a thread per
+            connection?</strong> Threads cost stacks, scheduler entries, and
+            context switches, which is what collapsed at C10K. An event
+            loop costs a few kilobytes per connection and one
+            <code>epoll_wait</code> per batch of ready events, so
+            concurrency scales with memory, and pinning roughly one worker
+            per core removes contention.
+          </p>
+          <p>
+            <strong>3. Walk through what happens on
+            <code>nginx -s reload</code>.</strong> The signal (HUP) goes to
+            the master, which parses the new config into a fresh cycle;
+            on any error it logs and keeps the old workers untouched. On
+            success it forks new workers with the new config and asks the
+            old ones to shut down gracefully: they stop accepting, drain
+            in-flight requests, then exit. Two generations coexist during
+            the drain, so no connection is dropped.
+          </p>
+          <p>
+            <strong>4. How does a binary upgrade with zero downtime
+            work?</strong> SIGUSR2 makes the master exec the new binary as
+            a second master that inherits the same listening socket file
+            descriptors, so both generations accept simultaneously; WINCH
+            retires the old workers, QUIT the old master, and if the new
+            binary misbehaves the old master can be revived to roll back.
+          </p>
+          <p>
+            <strong>5. Why is the header parser written as a resumable
+            state machine?</strong> Because headers arrive in arbitrary
+            TCP-sized pieces and a worker may never wait for more bytes.
+            The parser consumes what is buffered, stores its exact state
+            (down to mid-header-name) in the request, returns
+            <code>NGX_AGAIN</code>, and resumes at the next read event, so
+            a slow client costs state, not a blocked thread.
+          </p>
+          <p>
+            <strong>6. Name the eleven phases and what runs at three of
+            them.</strong> Post-read, server-rewrite, find-config, rewrite,
+            post-rewrite, preaccess, access, post-access, precontent,
+            content, log. Examples: <code>limit_req</code> at preaccess,
+            <code>allow</code>/<code>deny</code> and auth at access,
+            <code>try_files</code> at precontent, with proxying and static
+            files at content and access logging at log.
+          </p>
+          <p>
+            <strong>7. How do two modules that have never heard of each
+            other compose correctly?</strong> Neither calls the other; each
+            registers handlers into fixed phases (or splices into the
+            filter chain), and the core's phase engine and chain order
+            define all interaction. Composition is positional, not
+            call-graph-based, so adding a module cannot break another
+            module's control flow.
+          </p>
+          <p>
+            <strong>8. What does the upstream machinery add beyond "open a
+            socket to the backend"?</strong> Peer selection and load
+            balancing, non-blocking connects with timeouts, request
+            buffering and retrying on the next peer, header parsing of the
+            backend response, and the event-pipe that moves the body
+            between two sockets of different speeds with bounded memory and
+            temp-file spill.
+          </p>
+          <p>
+            <strong>9. Why does defining one <code>proxy_set_header</code>
+            in a location drop the ones from the server block?</strong>
+            Inheritance is implemented per module by merge functions with
+            the rule "inner level set means inner level wins", and for
+            array-valued directives the unit of setting is the whole
+            array. Defining any element locally means the local array
+            replaces the inherited one; nginx has no append-across-levels.
+          </p>
+          <p>
+            <strong>10. A regex location beats a longer prefix location.
+            Is that a bug?</strong> No, it is the documented algorithm:
+            remember the longest matching prefix, but check regexes first
+            in file order unless the remembered prefix was exact
+            (<code>=</code>) or marked <code>^~</code>. If prefix should
+            win, mark it <code>^~</code>.
+          </p>
+          <p>
+            <strong>11. Why is "if" considered evil, and what is the safe
+            subset?</strong> <code>if</code> inside <code>location</code>
+            creates an implicit nested location and re-homes the request
+            into it, so content-related directives inside behave
+            unpredictably. <code>return</code> and <code>rewrite</code>
+            inside <code>if</code> are safe; for existence checks use
+            <code>try_files</code>, and for value dispatch use
+            <code>map</code>.
+          </p>
+          <p>
+            <strong>12. When would you choose HAProxy, Caddy, or Envoy
+            instead?</strong> HAProxy for the most surgical pure load
+            balancing and health checking with no file serving; Caddy when
+            operator simplicity and automatic TLS outweigh tuning depth;
+            Envoy when config must be pushed dynamically from a control
+            plane, as in service meshes. nginx holds the middle: edge
+            proxy, static content, caching, and an enormous module
+            ecosystem in one static-config binary.
+          </p>
+          <p>
+            <strong>13. Cheap requests intermittently take seconds, but
+            only on one worker's connections. Diagnose.</strong> Something
+            on that worker's event loop is blocking: a module doing
+            synchronous I/O, a stat on a hung network filesystem, disk
+            reads without <code>aio threads</code>. Every connection
+            multiplexed by the blocked worker stalls together; correlate
+            with <code>strace -p</code> on the slow worker and look for a
+            long syscall.
+          </p>
+          <p>
+            <strong>14. What does proxy buffering actually decouple, and
+            when do you turn it off?</strong> It decouples backend
+            occupancy from client speed: nginx slurps the response into
+            buffers (spilling past them to temp files) and frees the
+            backend, then drips bytes to slow clients. Turn it off for
+            SSE, long-polling, and streaming, where time-to-first-byte
+            and continuous flow matter more than backend efficiency.
+          </p>
+          <p>
+            <strong>15. Why can <code>nginx -t</code> promise so much?</strong>
+            Because the config is compiled: the full file is parsed,
+            every directive dispatched to its owning module, contexts
+            validated, and the per-module structs built, the same work a
+            reload would do, minus swapping workers. What it cannot prove
+            is runtime behavior: an upstream that is down or a cert that
+            expires tomorrow still tests "successful".
+          </p>
+          <p>
+            <strong>16. Where does memory for a request come from and
+            go?</strong> From a per-request pool
+            (<code>ngx_palloc</code>): allocations are pointer bumps,
+            nothing is individually freed, and finalizing the request
+            destroys the pool in one call. This trades peak precision for
+            speed and the near-elimination of leak and use-after-free
+            bugs in request handling.
+          </p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Separate the control plane from the data plane.</strong>
+            The master owns config, sockets, and lifecycle; workers own
+            traffic. Because the planes are separate processes, config
+            changes and binary upgrades become worker replacement, not
+            downtime. The same split defines Envoy plus its control plane
+            and every orchestrator, including the
+            <a href="/oss/kubernetes">Kubernetes</a> controller/kubelet
+            divide.
+          </p>
+          <p>
+            <strong>If you forbid blocking, forbid it everywhere.</strong>
+            The event model only works because it is total: parsing,
+            proxying, DNS, even config-time versus request-time work are
+            all structured so no handler waits. Half-async systems get the
+            complexity without the benefit; Node.js, Redis, and every
+            serious event-driven server relearn this rule.
+          </p>
+          <p>
+            <strong>Fixed extension points beat free composition.</strong>
+            Modules cannot call each other, only occupy phases and filter
+            slots, so the interaction surface is the pipeline definition
+            itself and adding a module is safe by construction. This is
+            middleware done rigorously, and it is why thousands of
+            third-party modules coexist; compare plugin systems where any
+            hook can call anything and upgrades break the world.
+          </p>
+          <p>
+            <strong>Compile configuration, then only read it.</strong>
+            Parsing once at startup into structs makes request-time
+            behavior fast and makes <code>nginx -t</code> a real proof;
+            declarative-with-fixed-selection semantics (location matching)
+            keeps behavior analyzable in a way ad-hoc scripting never is.
+            The same pattern appears in query planners, terraform plan,
+            and FPGA synthesis: front-load interpretation, freeze the
+            hot path.
+          </p>
+          <p>
+            <strong>Pool your allocations to match your lifetimes.</strong>
+            Per-request memory pools turn thousands of malloc/free pairs
+            into one bulk free that cannot leak. Arena allocation keyed to
+            a natural lifetime shows up in compilers (per-function
+            arenas), game engines (per-frame), and Apache (also
+            per-request); it is the C answer to a problem GC languages
+            solve at higher cost.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            One sentence: <mark>a root master compiles the config and
+            supervises per-core workers, each an epoll loop driving
+            resumable state machines that carry every request through
+            eleven fixed phases and out through a filter chain, with
+            buffering decoupling fast backends from slow clients.</mark>
+          </p>
+          <pre class="flow">accept → epoll loop → parse (state machine) → 11 phases
+       → content (static | upstream+pipe) → filters → write chain → kernel</pre>
+          <p>The chain mapped to source files:</p>
+          <pre class="flow">master/workers   src/os/unix/ngx_process_cycle.c
+epoll loop       src/event/ngx_event.c + src/event/modules/ngx_epoll_module.c
+accept           src/event/ngx_event_accept.c
+parse            src/http/ngx_http_request.c + ngx_http_parse.c
+phases           src/http/ngx_http_core_module.c (+ enum in the .h)
+upstream/pipe    src/http/ngx_http_upstream.c + src/event/ngx_event_pipe.c
+filters/write    src/http/ngx_http_*_filter_module.c → ngx_http_write_filter_module.c
+to the kernel    src/os/unix/ngx_writev_chain.c / ngx_linux_sendfile_chain.c</pre>
+          <p>Memorize these:</p>
+          <p>
+            <strong>The phase list.</strong> post-read, server-rewrite,
+            find-config, rewrite, post-rewrite, preaccess, access,
+            post-access, precontent, content, log. Eleven, fixed, in that
+            order.
+          </p>
+          <p>
+            <strong>The signal set.</strong> HUP reload, USR1 reopen logs,
+            USR2 upgrade binary, WINCH drain workers, QUIT graceful stop,
+            TERM fast stop. All sent to the master;
+            <code>nginx -s</code> is sugar over them.
+          </p>
+          <p>
+            <strong>The location algorithm.</strong> Longest prefix
+            remembered; <code>=</code> wins instantly; <code>^~</code>
+            blocks regexes; otherwise first matching regex in file order
+            wins, else the remembered prefix.
+          </p>
+          <p>
+            <strong>The inheritance rule.</strong> Inner level set means
+            inner level wins, and for array directives
+            (<code>proxy_set_header</code>, <code>add_header</code>) one
+            local definition replaces the whole inherited set.
+          </p>
+          <p>
+            <strong>The blocking rule.</strong> One worker is one thread;
+            anything that blocks it blocks every connection it holds.
           </p>
           <div class="takeaway">
             <strong>Key takeaway:</strong> nginx endures because three ideas
             reinforce each other: a few single-threaded workers that never
             block, a fixed phase pipeline that lets independent modules
-            compose, and a declarative config compiled once at startup. Read
-            the process cycle, the event loop, and the phase engine, and the
-            rest of the codebase turns from folklore into pattern.
+            compose, and a declarative config compiled once at startup.
+            Read the process cycle, the event loop, and the phase engine,
+            and the rest of the codebase turns from folklore into pattern;
+            run the labs, and the folklore about reloads, location
+            matching, and buffering turns into things you have measured.
           </div>
         </article>
       </div>

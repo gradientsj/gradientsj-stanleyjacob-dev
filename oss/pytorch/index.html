@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>PyTorch walkthrough · Stanley Jacob</title>
-    <meta name="description" content="A walkthrough of the PyTorch repository: how to use it in five minutes, how autograd records and replays the backward pass, what the dispatcher does on every operator call, and how torch.compile fits on top." />
+    <meta name="description" content="A full chapter on the PyTorch repository: a practical tutorial, the complete life of one loss.backward() call from Python through the dispatcher, autograd graph, and kernels, deep dives on the dispatcher, autograd, and torch.compile, a staged reading plan, hands-on labs, and understanding checks." />
     <link rel="stylesheet" href="/style.css" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
   </head>
@@ -34,11 +34,13 @@
           is the dominant open source deep learning framework, started at Meta
           AI and now governed by the PyTorch Foundation under the Linux
           Foundation, and it is the substrate that most of modern ML research
-          and a large share of production training runs on. This walkthrough
-          covers how to use it in five minutes, what actually happens when you
-          call <code>loss.backward()</code>, the dispatcher that sits under
-          every operator, a high-level view of <code>torch.compile</code>, and
-          a guided path for reading a repository that can feel bottomless.
+          and a large share of production training runs on. This chapter is
+          three things at once: a practical tutorial, a systems-internals
+          walkthrough that follows one <code>loss.backward()</code> call from
+          Python all the way down to kernels and back, and a staged guide to
+          reading a repository that can feel bottomless. It ends with labs you
+          can run tonight, understanding checks with model answers, and a
+          compact framework for keeping the whole system in your head.
         </p>
       </div>
     </header>
@@ -46,17 +48,89 @@
     <section class="soft">
       <div class="wrap">
         <article class="prose article">
-          <h2>Using it in five minutes</h2>
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">Python API            torch/                    nn.Module, optim, tensor methods
+      |
+      |  generated bindings + argument parsing
+      v
+Dispatcher            c10/ + ATen/core/dispatch/  per-op table, keyed by DispatchKeySet
+      |
+      |  key priority: Autocast -&gt; Autograd -&gt; backend
+      v
+ATen operators        aten/src/ATen/native/      native_functions.yaml schemas
+      |
+      |  structured kernels, TensorIterator
+      v
+Device kernels        native/cpu/ (SIMD loops), native/cuda/ (kernel launches)
+
+  side channel written on the way down, replayed later:
+Autograd tape         torch/csrc/autograd/       graph of Nodes, engine.cpp walks it
+  optional layer that captures instead of interpreting:
+Compiler              torch/_dynamo, _functorch, _inductor</pre>
           <p>
-            Installation is one line, and the selector on pytorch.org will give
-            you the right variant for your CUDA version if you need a specific
-            one:
+            The one-sentence identity: <mark>PyTorch is a runtime-recorded
+            autograd tape sitting on an extensible operator dispatcher, with a
+            compiler bolted on top that captures graphs opportunistically
+            instead of demanding them up front.</mark> Every call like
+            <code>torch.add</code> descends through the same stack: a thin
+            Python surface, a dispatcher that picks the right kernel based on
+            keys the tensors carry, an operator library (ATen) whose inventory
+            is declared in one YAML file, and device kernels at the bottom.
+            Autograd is not a separate mode; it is one of the dispatch keys,
+            and its kernel records a graph node before re-dispatching to the
+            layer below.
           </p>
-          <pre><code>pip install torch</code></pre>
           <p>
-            The whole training idiom fits in a screen. You define a module,
-            run a forward pass, compute a loss, call backward to populate
-            gradients, and let an optimizer apply them:
+            That stack explains the repository's shape. Pure Python lives
+            under <code>torch/</code>; the C++ operator library is ATen under
+            <code>aten/src/ATen/</code>; the small core both depend on
+            (<code>TensorImpl</code>, dispatch keys, device abstractions) is
+            <code>c10/</code>; and the C++ that binds it all to Python,
+            autograd engine included, is <code>torch/csrc/</code>. Two YAML
+            files are the skeleton key: <code>native_functions.yaml</code>
+            declares roughly 2,600 operator schemas and which kernel
+            implements each per backend, and <code>derivatives.yaml</code>
+            declares roughly 700 derivative formulas (counts from main,
+            July 2026). Code generation turns both into C++ at build time,
+            which is why some classes you will meet, like
+            <code>AddBackward0</code>, exist in no checked-in source file.
+          </p>
+          <p>
+            Hold on to the two directions of travel. The forward direction is
+            a call descending the stack and, as a side effect, appending nodes
+            to a graph. The backward direction is an engine walking that graph
+            in reverse, where every derivative computation is itself an
+            operator call that descends the same stack again. Once you see
+            that symmetry, the rest of this chapter is detail.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <p>
+            Installation is one line on both Linux and macOS, and the
+            selector on <a href="https://pytorch.org" target="_blank" rel="noreferrer">pytorch.org</a>
+            gives the exact command for a specific CUDA or ROCm build:
+          </p>
+          <pre><code>pip install torch          # CPU on macOS (plus MPS on Apple silicon), CUDA-enabled on Linux</code></pre>
+          <p>
+            The latest stable release as I write is 2.13.0 (July 2026), which
+            supports Python 3.10 through 3.14. A first session should be a
+            REPL, because the object model teaches itself:
+          </p>
+          <pre><code>&gt;&gt;&gt; import torch
+&gt;&gt;&gt; x = torch.tensor([2.0], requires_grad=True)
+&gt;&gt;&gt; y = x * x
+&gt;&gt;&gt; y
+tensor([4.], grad_fn=&lt;MulBackward0&gt;)
+&gt;&gt;&gt; y.backward()
+&gt;&gt;&gt; x.grad
+tensor([4.])</code></pre>
+          <p>
+            That <code>grad_fn=&lt;MulBackward0&gt;</code> is the whole story
+            in miniature: running the multiply recorded a graph node, and
+            <code>backward()</code> replayed it. The full training idiom fits
+            in a screen. You define a module, run a forward pass, compute a
+            loss, call backward to populate gradients, and let an optimizer
+            apply them:
           </p>
           <pre><code>import torch
 import torch.nn as nn
@@ -74,151 +148,918 @@ loss.backward()
 opt.step()
 opt.zero_grad()</code></pre>
           <p>
-            Since the 2.0 release the same model can be handed to the compiler
-            with one call, and the eager code above keeps working unchanged:
+            Now the mistakes every beginner makes, each of which is a direct
+            consequence of internals covered later. First, gradients
+            accumulate; they are added into <code>.grad</code>, not assigned.
+            Forgetting to clear them silently mixes batches:
+          </p>
+          <pre><code># wrong: gradients from every past step pile up in .grad
+for xb, yb in loader:
+    loss_fn(model(xb), yb).backward()
+    opt.step()
+
+# right: clear before (or after) each step
+for xb, yb in loader:
+    opt.zero_grad()
+    loss_fn(model(xb), yb).backward()
+    opt.step()</code></pre>
+          <p>
+            Second, the graph is freed as backward consumes it, so calling
+            backward twice on the same forward pass fails with
+            <code>RuntimeError: Trying to backward through the graph a second
+            time</code>. The fix is almost never
+            <code>retain_graph=True</code>; it is realizing you wanted one
+            combined loss:
+          </p>
+          <pre><code># wrong: second backward walks an already-freed graph
+loss_a.backward()
+loss_b.backward()   # if loss_b shares any forward computation with loss_a: RuntimeError
+
+# right: sum losses, walk the graph once
+(loss_a + loss_b).backward()</code></pre>
+          <p>
+            Third, in-place operations can invalidate tensors that autograd
+            saved for the backward pass. The version-counter machinery
+            (Part V) catches this at backward time, not at the mutation site,
+            which confuses people because the error appears far from the bug:
+          </p>
+          <pre><code>x = torch.randn(3, requires_grad=True)
+y = x.sigmoid()     # sigmoid saves its output to compute its derivative
+y.mul_(2)           # mutates the saved tensor in place
+y.sum().backward()  # RuntimeError: one of the variables needed for gradient
+                    # computation has been modified by an inplace operation</code></pre>
+          <p>
+            Deeper usage is layered onto the same loop rather than replacing
+            it: <code>.to("cuda")</code> for devices, <code>torch.autocast</code>
+            for mixed precision, <code>torch.no_grad()</code> for inference
+            (which skips tape recording entirely, saving both time and the
+            memory of saved activations). When the built-in operator set is
+            not enough, you can join the tape yourself with a custom
+            <code>autograd.Function</code>, which is exactly the interface the
+            generated operator nodes implement:
+          </p>
+          <pre><code>class Cube(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return x ** 3
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        (x,) = ctx.saved_tensors
+        return 3 * x * x * grad_out
+
+y = Cube.apply(torch.tensor([2.0], requires_grad=True))</code></pre>
+          <p>
+            And since the 2.0 release the same model can be handed to the
+            compiler with one call, with the eager code kept working
+            unchanged:
           </p>
           <pre><code>compiled = torch.compile(model)
-logits = compiled(x)</code></pre>
+logits = compiled(x)   # first call compiles (slow), later calls run the compiled code</code></pre>
+
+          <h2>Part III: When it is the right tool</h2>
           <p>
-            Everything else, moving to GPU with <code>.to("cuda")</code>,
-            mixed precision with <code>torch.autocast</code>, distributed
-            training with <code>torch.distributed</code>, is layered on top of
-            this loop rather than replacing it, which is a large part of why
-            the framework won.
+            PyTorch is the right default for research and training almost
+            unconditionally: define-by-run means your model is ordinary
+            Python you can step through in a debugger, the ecosystem
+            (Hugging Face, torchvision, the CUDA kernel community) assumes
+            it, and <code>torch.compile</code> recovers most of the
+            performance that graph-first frameworks used to hold over it.
+            It is also a fine substrate for production training at any scale,
+            which is what <a href="/oss/nanogpt">nanoGPT</a> demonstrates at
+            the small end and torchtitan at the large end.
+          </p>
+          <p>
+            The honest cases for alternatives: JAX, when your work is shaped
+            like composed function transforms (<code>grad</code> of
+            <code>vmap</code> of <code>pmap</code>) over pure functions, when
+            you target TPUs, or when you want XLA's whole-program compilation
+            as the default rather than an opt-in. TensorFlow persists mostly
+            where its deployment story (TFLite, TF Serving, established
+            mobile pipelines) is already entrenched. And for
+            <em>serving</em> LLMs specifically, a dedicated inference engine
+            beats a hand-rolled PyTorch loop, because serving is a
+            scheduling-and-memory problem before it is a math problem.
+          </p>
+          <p>
+            That last point is the architecture-shaped warning. Eager PyTorch
+            pays Python overhead and a kernel launch per operator, holds the
+            GIL between launches, and does nothing to batch concurrent
+            requests. Wrapping <code>model(x)</code> in a web handler works
+            in a demo and collapses under load:
+          </p>
+          <pre class="flow">dangerous: request thread -&gt; Python handler -&gt; eager model(x) -&gt; GPU
+           (one request at a time, GIL contention, per-op launch overhead,
+            GPU idle between tiny kernels)
+
+safe:      requests -&gt; queue -&gt; batching engine (compiled/exported model,
+           or a serving system like vLLM) -&gt; GPU at high occupancy</pre>
+          <p>
+            The same warning generalizes: any hot loop that crosses the
+            Python-operator boundary millions of times per second is fighting
+            the framework's design. The escape hatches, in order of effort,
+            are <code>torch.compile</code>, CUDA graphs
+            (<code>mode="reduce-overhead"</code>), and export to a runtime.
           </p>
 
-          <h2>Idea one: autograd is a tape recorded at runtime</h2>
+          <h2>Part IV: The full life of one loss.backward()</h2>
           <p>
-            PyTorch's original bet was define-by-run. There is no separate
-            graph-construction phase; your model is ordinary Python, and the
-            graph that backpropagation needs is recorded as a side effect of
-            executing the forward pass. Every time an operator runs on a
-            tensor that requires gradients, the output tensor gets a
-            <code>grad_fn</code> pointing at a node that knows how to compute
-            that operator's derivative, and each node holds edges to the nodes
-            that produced its inputs. By the time you have a scalar loss, you
-            are holding the root of a directed acyclic graph that describes,
-            in reverse, everything the forward pass did.
-          </p>
-          <p>
-            So <code>loss.backward()</code> is not magic, it is a graph
-            traversal. The autograd engine seeds the root with a gradient of
-            one, then walks the graph from the loss backwards, calling each
-            node's backward function to transform the incoming gradient and
-            passing the results along the edges, using dependency counts so a
-            node fires only after all gradients flowing into it have arrived.
-            At the leaves, the tensors you created with
-            <code>requires_grad=True</code>, special accumulator nodes add the
-            arriving gradient into the <code>.grad</code> field, which is why
-            gradients accumulate across calls and why training loops call
-            <code>zero_grad()</code>. <mark>The forward pass writes the tape
-            and backward replays it in reverse, so control flow, loops, and
-            data-dependent branches differentiate for free because the tape
-            only ever records what actually ran.</mark> The derivative
-            formulas themselves are not written by hand at every call site;
-            they are declared once per operator in a YAML file and code
-            generation produces the graph-node classes, which is a pattern you
-            will meet again reading the repo.
+            This is the core of the chapter. The specimen is the small net
+            from Part II: <code>Linear(784, 128) → ReLU → Linear(128, 10)</code>
+            into a cross-entropy loss, on CPU for concreteness. Before
+            following the backward call, it pays to follow one forward
+            operator all the way down, because backward will reuse every
+            stage of that path.
           </p>
 
-          <h2>Idea two: the dispatcher</h2>
+          <h3>Prologue: what one torch.add call traverses</h3>
           <p>
-            The second load-bearing idea is less visible but explains most of
-            the repository's shape. A call like <code>torch.add</code> has to
-            end up in very different code depending on whether the tensors are
-            on CPU or CUDA, whether they are dense or sparse, whether autograd
-            needs to record the call, whether autocast wants to change the
-            dtype, and whether something like <code>torch.vmap</code> or a
-            quantization wrapper is active. PyTorch resolves this with a
-            dispatcher: every tensor carries a set of dispatch keys, every
-            operator has a table of kernels registered per key, and each call
-            finds the highest-priority relevant key and jumps to its kernel.
-            Crucially the layers stack, so the autograd kernel does its
-            recording and then re-dispatches to the device kernel below it,
-            the way nested virtual method calls would.
+            <code>torch.add(a, b)</code> does not hit a Python
+            implementation. The binding is C++ generated at build time by
+            <code>tools/autograd/gen_python_functions.py</code>, and its
+            first job is argument parsing
+            (<code>torch/csrc/utils/python_arg_parser.cpp</code>): matching
+            your Python objects against the operator's schemas and converting
+            them to C++ types. From there the call enters the dispatcher
+            (<code>aten/src/ATen/core/dispatch/Dispatcher.h</code>). Every
+            tensor carries a <code>DispatchKeySet</code>, a 64-bit bitset in
+            its <code>TensorImpl</code>; the dispatcher unions the keysets of
+            all arguments and jumps to the kernel registered for the highest
+            priority key present in the operator's table.
           </p>
           <p>
-            <mark>Think of the dispatcher as an extensibility point rather
-            than a switch statement: features like autograd, autocast,
-            functorch transforms, and out-of-tree backends are all just
-            dispatch keys, which is how they compose without knowing about
-            each other.</mark> The operator inventory lives in a single
-            schema file, <code>native_functions.yaml</code>, that declares
-            every native operator's signature and which kernel implements it
-            per backend, and code generation turns those declarations into
-            the registration glue. Once you know this, the answer to "where
-            is the code for operator X" stops being a mystery: find its entry
-            in the YAML, and the entry names the C++ functions to read.
-          </p>
-
-          <h2>Idea three: torch.compile, at altitude</h2>
-          <p>
-            Eager execution pays a price: every operator is a separate kernel
-            launch with Python overhead between launches, and no one gets to
-            optimize across operator boundaries. <code>torch.compile</code>
-            attacks this without giving up define-by-run, and it is best
-            understood as a pipeline of three named components. TorchDynamo
-            hooks Python frame evaluation and symbolically walks your
-            function's bytecode, extracting the tensor operations into a
-            graph and installing guards, cheap runtime checks on things like
-            shapes and dtypes, so the captured graph is reused only when it
-            is still valid; when it hits Python it cannot capture, it breaks
-            the graph and falls back to eager for that piece. AOTAutograd
-            then traces ahead-of-time through the autograd machinery so the
-            backward pass becomes a graph too, not just the forward. Finally
-            TorchInductor compiles the graphs, generating Triton kernels on
-            GPU and C++ with OpenMP on CPU, fusing chains of pointwise
-            operations into single kernels so intermediate tensors never
-            touch memory. The design goal running through all three is
-            graceful partiality: unsupported code degrades to eager instead
-            of failing, which is what makes the one-line adoption story
-            honest.
+            For a CPU float tensor with <code>requires_grad=True</code>, the
+            winning key is <code>AutogradCPU</code>. That lands in a
+            generated function (from
+            <code>tools/autograd/gen_variable_type.py</code> plus the
+            <code>add</code> entry in <code>derivatives.yaml</code>) which
+            does three things: constructs an <code>AddBackward0</code> node,
+            wires its edges to the <code>grad_fn</code>s of the inputs, and
+            re-dispatches with the autograd keys masked off. The second
+            dispatch resolves to <code>CPU</code>, which for <code>add</code>
+            is a structured kernel: the schema in
+            <code>native_functions.yaml</code> says
+            <code>structured_delegate: add.out</code>, and <code>add.out</code>
+            builds a <code>TensorIterator</code>
+            (<code>aten/src/ATen/TensorIterator.cpp</code>) that handles
+            broadcasting, type promotion, and memory-overlap checks, then
+            runs the actual arithmetic from the one-line loop body in
+            <code>aten/src/ATen/native/ufunc/add.h</code>, vectorized with
+            SIMD on CPU or instantiated as a CUDA kernel by the ufunc
+            codegen. One user-visible call, four layers, and the only
+            handwritten math is one line.
           </p>
 
-          <h2>Reading the repository</h2>
+          <h3>Stage 1: the forward pass wrote the tape</h3>
           <p>
-            The repo is one of the largest in open source, so do not read it
-            breadth-first; follow one operator call and one backward call, and
-            let the layers reveal themselves. A useful map first: pure Python
-            lives under <code>torch/</code>, the C++ tensor and operator
-            library is ATen under <code>aten/src/ATen/</code>, the small core
-            that both depend on (TensorImpl, dispatch keys, device
-            abstractions) is <code>c10/</code>, and the C++ that binds it all
-            to Python, autograd engine included, is <code>torch/csrc/</code>.
+            By the time you hold <code>loss</code>, every operator in the
+            forward pass has done what <code>add</code> did above.
+            <code>nn.Linear</code> called <code>F.linear</code>, which is a
+            <code>CompositeImplicitAutograd</code> operator: it has no
+            derivative formula of its own and instead decomposes into
+            <code>addmm</code> (bias-plus-matmul), whose derivative is
+            declared. So the graph hanging off <code>loss</code> looks like
+            this, which you can verify by printing
+            <code>loss.grad_fn</code> and walking
+            <code>.next_functions</code>:
+          </p>
+          <pre class="flow">loss  grad_fn = NllLossBackward0
+                     |
+              LogSoftmaxBackward0          (CrossEntropyLoss = log_softmax + nll_loss)
+                     |
+              AddmmBackward0               (second Linear)
+              /      |       \
+   AccumulateGrad  ReluBackward0  AccumulateGrad
+   (bias2 leaf)        |          (weight2 leaf, via a transpose view)
+                  AddmmBackward0  (first Linear)
+                  /      |     \
+        AccumulateGrad  (input x: no edge, requires_grad=False)  AccumulateGrad
+        (bias1 leaf)                                             (weight1 leaf)</pre>
+          <p>
+            Each node is a C++ <code>torch::autograd::Node</code>
+            (<code>torch/csrc/autograd/function.h</code>) holding edges to
+            its producers and <code>SavedVariable</code>s for whatever the
+            derivative formula needs (for <code>addmm</code>, the inputs; for
+            <code>relu</code>, the output). Leaf tensors, the parameters,
+            have no <code>grad_fn</code>; instead each owns an
+            <code>AccumulateGrad</code> node that graph edges point at. Note
+            what was <em>not</em> built: no graph for <code>x</code>, because
+            it does not require grad, and nothing was planned ahead of time.
+            The tape only records what actually ran, which is why Python
+            control flow differentiates for free.
+          </p>
+
+          <h3>Stage 2: from Python into the engine</h3>
+          <p>
+            <code>loss.backward()</code> is
+            <code>Tensor.backward</code> in <code>torch/_tensor.py</code>,
+            which forwards to <code>torch.autograd.backward</code> in
+            <code>torch/autograd/__init__.py</code>. That function validates
+            that <code>loss</code> is scalar (or that you passed an explicit
+            <code>gradient</code>), constructs the seed gradient, a ones
+            tensor shaped like <code>loss</code>, and calls
+            <code>_engine_run_backward</code>
+            (<code>torch/autograd/graph.py</code>), which crosses into C++
+            through <code>Variable._execution_engine.run_backward</code> in
+            <code>torch/csrc/autograd/python_engine.cpp</code>. The GIL is
+            released here; from this point the traversal is pure C++ unless a
+            Python hook or a custom <code>Function</code> forces a
+            round-trip back up.
+          </p>
+
+          <h3>Stage 3: Engine::execute builds the GraphTask</h3>
+          <p>
+            <code>Engine::execute</code> in
+            <code>torch/csrc/autograd/engine.cpp</code> wraps the roots in a
+            <code>GraphRoot</code> node and builds a <code>GraphTask</code>,
+            the per-invocation state: an error flag, the outstanding-task
+            count, and crucially a dependency map. A traversal from the
+            roots counts, for every reachable node, how many incoming
+            gradient contributions it must wait for. This is topological
+            bookkeeping: <code>ReluBackward0</code> must not fire until the
+            <code>AddmmBackward0</code> above it has produced its gradient,
+            and a node feeding two consumers must wait for both. The engine
+            also owns one worker thread and one <code>ReadyQueue</code> per
+            device, spun up lazily; CPU work runs on the calling thread. For
+            a GPU model, backward for each device runs on that device's
+            dedicated engine thread.
+          </p>
+
+          <h3>Stage 4: the ready queue drains</h3>
+          <p>
+            Execution is a worklist algorithm. A <code>NodeTask</code> pairs
+            a node with an <code>InputBuffer</code>, the accumulated
+            gradients arriving at that node. The loop in
+            <code>Engine::thread_main</code> pops a task and calls
+            <code>evaluate_function</code>, which runs pre-hooks, calls the
+            node's <code>apply()</code> with the buffered gradients, then
+            distributes the outputs along the node's edges: for each edge,
+            decrement the consumer's dependency count, add the gradient into
+            the consumer's <code>InputBuffer</code> (this addition is where
+            gradients from forked paths merge), and push the consumer onto
+            the right device's ready queue once its count hits zero. For our
+            net the order is forced: <code>NllLossBackward0</code>, then
+            <code>LogSoftmaxBackward0</code>, then the second
+            <code>AddmmBackward0</code>, then <code>ReluBackward0</code>,
+            then the first <code>AddmmBackward0</code>, with
+            <code>AccumulateGrad</code> nodes firing as their single
+            dependencies resolve.
+          </p>
+
+          <h3>Stage 5: each backward op descends the stack again</h3>
+          <p>
+            What does <code>AddmmBackward0::apply</code> actually do? It is
+            generated code (in the build-time file
+            <code>torch/csrc/autograd/generated/Functions.cpp</code>)
+            implementing the formulas from <code>derivatives.yaml</code>. For
+            a matmul the real entry reads:
+          </p>
+          <pre><code># tools/autograd/derivatives.yaml (main, July 2026)
+- name: mm(Tensor self, Tensor mat2) -&gt; Tensor
+  self: mm_mat1_backward(grad, mat2, self.sym_sizes(), self.sym_strides(), self.layout(), 1)
+  mat2: mm_mat2_backward(grad, self, mat2.sym_sizes(), mat2.sym_strides(), mat2.layout(), 1)</code></pre>
+          <p>
+            Those helpers bottom out in <code>at::mm</code> calls:
+            grad-of-input is <code>grad @ weight</code>, grad-of-weight is
+            <code>input^T @ grad</code>. <mark>Every one of these is a
+            first-class ATen operator that goes through the dispatcher,
+            exactly like the prologue's <code>add</code>, just with the
+            autograd keys excluded so no tape is recorded about the backward
+            pass itself</mark> (unless you asked for
+            <code>create_graph=True</code>, in which case backward is taped
+            too and second derivatives work). Before using any saved tensor,
+            the <code>SavedVariable</code> unpacking checks its version
+            counter, which is where the in-place error from Part II is
+            actually raised. On CPU these ops run to completion; on CUDA
+            they are asynchronous kernel launches on a stream, and the
+            engine handles cross-device edges with stream synchronization.
+          </p>
+
+          <h3>Stage 6: AccumulateGrad and the return to Python</h3>
+          <p>
+            The traversal terminates at the four
+            <code>AccumulateGrad</code> nodes
+            (<code>torch/csrc/autograd/functions/accumulate_grad.cpp</code>).
+            Each takes the arriving gradient and either installs it as the
+            parameter's <code>.grad</code> (stealing the buffer when it can,
+            to avoid a copy) or adds it in place if <code>.grad</code>
+            already exists. This accumulate-not-assign choice is deliberate:
+            it is what makes gradient accumulation over micro-batches, and
+            multiple backward calls from independent losses, work with no
+            extra machinery, at the price of the <code>zero_grad()</code>
+            ritual. As nodes complete, the graph's saved tensors are freed
+            (the "buffers have already been freed" behavior), the
+            outstanding-task count hits zero, <code>Engine::execute</code>
+            returns, the GIL is retaken, and your next line of Python runs.
+            The optimizer then reads <code>.grad</code> in
+            <code>opt.step()</code>, closing the loop. Total machinery
+            engaged for our toy net: one graph task, one thread, about a
+            dozen nodes, and a few dozen dispatched operator calls.
+          </p>
+
+          <h2>Part V: Internals deep dives</h2>
+
+          <h3>Deep dive: the dispatcher</h3>
+          <p>
+            The dispatcher answers one question millions of times per
+            second: given this operator and these arguments, which function
+            runs? Its data structures are small. Each
+            <code>TensorImpl</code> (<code>c10/core/TensorImpl.h</code>)
+            carries a <code>DispatchKeySet</code>
+            (<code>c10/core/DispatchKeySet.h</code>), a 64-bit bitset. Each
+            operator has an <code>OperatorEntry</code>
+            (<code>aten/src/ATen/core/dispatch/OperatorEntry.h</code>) with a
+            table mapping keys to kernels. A call unions the argument
+            keysets with thread-local included/excluded sets, finds the
+            highest-priority set bit that the operator has a kernel for, and
+            jumps. Priority is the load-bearing part, because keys are
+            layers, not alternatives:
+          </p>
+          <pre class="flow">highest priority
+   Autocast*        cast inputs, re-dispatch (above autograd so casts get taped)
+   Autograd*        record a Node, re-dispatch with autograd masked off
+   ADInplaceOrView  version-counter bumps and view bookkeeping
+   backend keys     CPU, CUDA, MPS, XPU, Sparse*, Quantized*, Meta, ...
+lowest priority
+(simplified: functorch, Python-mode, and tracing keys also slot into this order)</pre>
+          <p>
+            A typical call therefore passes through several kernels, each
+            doing its cross-cutting work and re-dispatching below itself,
+            like middleware. <mark>Think of the dispatcher as an open
+            extensibility point rather than a switch statement: autograd,
+            autocast, functorch transforms, <code>__torch_dispatch__</code>
+            modes, and out-of-tree backends are all just keys, which is how
+            they compose without knowing about each other.</mark> An ordering
+            subtlety worth memorizing: Autocast sits <em>above</em> Autograd
+            precisely so the dtype casts it inserts are recorded on the tape
+            and differentiated correctly; the comment in
+            <code>c10/core/DispatchKey.h</code> says so explicitly.
           </p>
           <p>
-            Start where users start, in <code>torch/nn/modules/</code>,
-            which is plain readable Python: <code>Module</code> with its
-            parameter registration and hooks, then a layer like
-            <code>Linear</code> that bottoms out in a call to a functional
-            op. Chase that op downward into ATen: the schema entry in
-            <code>native_functions.yaml</code> under
-            <code>aten/src/ATen/native/</code>, then the CPU and CUDA
-            kernels in the same directory tree. Next read the autograd half:
-            <code>tools/autograd/derivatives.yaml</code> declares each
-            operator's derivative, and the engine that executes the recorded
-            graph is in <code>torch/csrc/autograd/</code>, where
-            <code>engine.cpp</code> is long but rewards a careful read,
-            since the ready queue and dependency counting are exactly the
-            traversal described above. Then the compiler stack in Python:
-            <code>torch/_dynamo/</code> for capture and guards and
-            <code>torch/_inductor/</code> for code generation, with
-            <code>torchgen/</code> explaining how the YAML files become
-            generated C++. A good exercise is to pick one tiny operator and
-            trace it through all four layers, Python surface, dispatcher
-            registration, kernel, derivative; after one full pass the
-            repository stops feeling bottomless because every file you open
-            slots into one of those layers. If you want the numerical side
-            of what these frameworks compute, the
-            <a href="/ml">ML implementations section</a> builds several of
-            the core pieces from scratch.
+            The operator inventory is declarative. Here is the real schema
+            for <code>add</code>, abbreviated from
+            <code>aten/src/ATen/native/native_functions.yaml</code>:
+          </p>
+          <pre><code>- func: add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -&gt; Tensor
+  structured_delegate: add.out
+  variants: function, method
+  dispatch:
+    SparseCPU, SparseCUDA, ...: add_sparse
+    MkldnnCPU: mkldnn_add
+    ZeroTensor: add_zerotensor
+  tags: [core, pointwise]</code></pre>
+          <p>
+            <code>structured_delegate</code> says the dense implementation
+            lives in the <code>add.out</code> entry, a structured kernel
+            where shape checking and output allocation are written once and
+            shared between the functional, in-place, and out= variants.
+            <code>torchgen/</code> reads this file and generates the
+            registration glue, the Python bindings, and for pointwise ufuncs
+            even the CUDA kernels. Two practical consequences. First, "where
+            is the code for operator X" always has the same answer: find its
+            YAML entry; the entry names the C++ functions to read. Second,
+            extending PyTorch does not mean forking it: a
+            <code>TORCH_LIBRARY_IMPL</code> block can register kernels for
+            an existing op under a new backend key, which is exactly how
+            out-of-tree devices ship. The famous misconception to correct:
+            there is no Python-level if/else choosing CPU versus GPU, and
+            <code>torch.add</code> has no Python body at all; by the time a
+            device is chosen you are two layers below Python.
+          </p>
+
+          <h3>Deep dive: autograd</h3>
+          <p>
+            Three structures carry the whole system.
+            A <code>Node</code> (<code>torch/csrc/autograd/function.h</code>)
+            is a differentiable operation's backward half: an
+            <code>apply()</code> taking incoming gradients, plus
+            <code>next_edges</code> pointing at producer nodes. An
+            <code>Edge</code> is a (node, input index) pair, the index
+            mattering for multi-input nodes. And each tensor that
+            participates has <code>AutogradMeta</code>
+            (<code>torch/csrc/autograd/variable.h</code>) holding either a
+            <code>grad_fn</code> (non-leaf: the node that produced it) or a
+            lazily created <code>grad_accumulator</code> (leaf). This is why
+            <code>.grad</code> on a non-leaf is <code>None</code> by
+            default: intermediate gradients flow through
+            <code>InputBuffer</code>s and are discarded unless you call
+            <code>retain_grad()</code> or install a hook.
+          </p>
+          <p>
+            Saved tensors are the memory story. A derivative formula
+            declares what it needs, and the generated node stores those as
+            <code>SavedVariable</code>s, which is why training uses so much
+            more memory than inference: the activations live until backward
+            consumes them. Each save snapshots the tensor's version counter,
+            and unpacking rechecks it, turning silent in-place corruption
+            into a loud error. Two corollaries people miss: activation
+            checkpointing is just choosing not to save (recompute in
+            backward instead), and <code>torch.no_grad()</code> is just
+            excluding the autograd keys from dispatch, so nothing is
+            recorded and nothing is saved.
+          </p>
+          <p>
+            The derivative formulas live in
+            <code>tools/autograd/derivatives.yaml</code>, one entry per
+            differentiable op, in a C++-ish DSL:
+          </p>
+          <pre><code>- name: add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -&gt; Tensor
+  self: handle_r_to_c(self.scalar_type(), grad)
+  other: handle_r_to_c(other.scalar_type(), maybe_multiply(grad, alpha.conj()))
+
+- name: relu(Tensor self) -&gt; Tensor
+  self: threshold_backward(grad, result, 0)</code></pre>
+          <p>
+            <code>gen_variable_type.py</code> turns each entry into a
+            <code>Node</code> subclass and an autograd kernel. The
+            engine that replays them (<code>engine.cpp</code>) is worth a
+            careful read with the Stage 3 and 4 vocabulary in hand:
+            <code>GraphTask</code>, dependency counting,
+            <code>ReadyQueue</code> per device, <code>NodeTask</code>,
+            <code>InputBuffer</code>, and the reentrancy machinery that
+            handles backward-inside-backward. Misconceptions to correct
+            explicitly: <mark>the tape is rebuilt every iteration, so
+            autograd never "optimizes your graph"; it faithfully replays
+            what ran, and anything smarter is the compiler's job.</mark>
+            And define-by-run does not mean derivatives are computed by
+            tracing numerical perturbations; every formula is symbolic,
+            written once in YAML, and exact.
+          </p>
+
+          <h3>Deep dive: torch.compile, at altitude</h3>
+          <p>
+            Eager execution pays a price: Python between every kernel
+            launch, and no optimization across operator boundaries.
+            <code>torch.compile</code> attacks this without giving up
+            define-by-run, via three named components. I describe them at
+            concept level, verified against main in July 2026, because this
+            corner of the repo moves fastest.
+          </p>
+          <p>
+            <strong>TorchDynamo</strong> (<code>torch/_dynamo/</code>, with
+            the CPython hook in <code>torch/csrc/dynamo/eval_frame.c</code>)
+            intercepts Python frame execution and symbolically walks your
+            function's bytecode (<code>symbolic_convert.py</code>),
+            extracting tensor operations into an FX graph and compiling the
+            rest of the frame into resume functions. For every assumption it
+            bakes in, it installs a <em>guard</em>
+            (<code>guards.py</code>): a cheap runtime check on shapes,
+            dtypes, closure values, module identity. On later calls, if the
+            guards pass, the compiled artifact runs; if not, it recompiles
+            or falls back. When Dynamo meets Python it cannot capture (a
+            data-dependent branch on a tensor value, an unsupported builtin)
+            it inserts a <em>graph break</em>: eager runs that piece, and
+            compilation resumes after. <strong>AOTAutograd</strong>
+            (<code>torch/_functorch/aot_autograd.py</code>) then traces
+            through the autograd machinery ahead of time so the backward
+            pass becomes a graph too, and functionalizes mutations away.
+            <strong>TorchInductor</strong> (<code>torch/_inductor/</code>)
+            lowers the graphs into its own IR (<code>lowering.py</code>),
+            fuses operations (<code>scheduler.py</code>), and emits code:
+            Triton kernels on GPU (<code>codegen/triton.py</code>), C++ with
+            OpenMP on CPU. Chains of pointwise ops become single kernels, so
+            intermediates never touch memory; this is the same
+            memory-traffic logic that motivates
+            <a href="/oss/flash-attention">FlashAttention</a>, applied
+            automatically.
+          </p>
+          <p>
+            The design value running through all three is graceful
+            partiality: unsupported code degrades to eager instead of
+            failing, which is what makes the one-line adoption story honest.
+            The traps: the first call is slow by design (compilation
+            happens then, and again per new dynamic-shape bucket or guard
+            failure), so benchmark steady state; frequent recompiles usually
+            mean a guard on something that varies per call; and a model
+            riddled with graph breaks gets little fusion benefit, which
+            <code>torch._dynamo.explain</code> will show you precisely.
+          </p>
+
+          <h2>Part VI: Reading the repository</h2>
+          <p>
+            Do not read breadth-first. The staged plan below follows the
+            same descent as Part IV; every file named here exists on main as
+            of July 2026.
+          </p>
+          <p>
+            <strong>Stage 0, the Python surface.</strong> Read
+            <code>torch/nn/modules/module.py</code> (parameter registration,
+            hooks, <code>_call_impl</code>), then
+            <code>torch/nn/modules/linear.py</code>, then skim
+            <code>torch/_tensor.py</code> for how <code>Tensor.backward</code>
+            and friends delegate. Questions you should be able to answer:
+            where do parameters actually live in a module, what does
+            <code>model(x)</code> do before your <code>forward</code> runs,
+            and why is <code>Tensor.backward</code> three lines long?
+          </p>
+          <p>
+            <strong>Stage 1, one operator in ATen.</strong> Find
+            <code>add.Tensor</code> in
+            <code>aten/src/ATen/native/native_functions.yaml</code>, read
+            the surrounding schema conventions, then
+            <code>aten/src/ATen/native/BinaryOps.cpp</code>,
+            <code>aten/src/ATen/native/ufunc/add.h</code>, and
+            <code>aten/src/ATen/TensorIterator.h</code>. Questions: what
+            does <code>structured_delegate</code> buy, where does
+            broadcasting happen, and why do most pointwise ops contain no
+            loop code of their own?
+          </p>
+          <p>
+            <strong>Stage 2, the dispatch core.</strong> Read
+            <code>c10/core/DispatchKey.h</code> top to bottom (the comments
+            are a book chapter in themselves), then
+            <code>c10/core/DispatchKeySet.h</code>,
+            <code>aten/src/ATen/core/dispatch/Dispatcher.h</code>, and
+            <code>OperatorEntry.h</code>. Questions: how is per-backend
+            autograd (AutogradCPU vs AutogradCUDA) encoded in 64 bits, what
+            is a fallback kernel, and what happens when no kernel is
+            registered for the computed key?
+          </p>
+          <p>
+            <strong>Stage 3, autograd.</strong> Read
+            <code>tools/autograd/derivatives.yaml</code> (skim, then find
+            <code>mm</code> and <code>relu</code>),
+            <code>torch/csrc/autograd/variable.h</code>,
+            <code>function.h</code>,
+            <code>functions/accumulate_grad.cpp</code>, and then
+            <code>engine.cpp</code>, which is long but rewards patience.
+            Questions: what exactly is saved for backward and where, how do
+            two gradient paths into one node merge, and on which thread
+            does backward for a CUDA tensor run?
+          </p>
+          <p>
+            <strong>Stage 4, codegen.</strong> Skim
+            <code>torchgen/model.py</code> and <code>torchgen/gen.py</code>,
+            plus <code>tools/autograd/gen_variable_type.py</code> and
+            <code>gen_python_functions.py</code>. Question: for one operator,
+            name every artifact generated from its YAML entries.
+          </p>
+          <p>
+            <strong>Stage 5, the compiler.</strong>
+            <code>torch/_dynamo/convert_frame.py</code> and
+            <code>symbolic_convert.py</code> for capture,
+            <code>guards.py</code>, then
+            <code>torch/_functorch/aot_autograd.py</code>, then
+            <code>torch/_inductor/compile_fx.py</code>,
+            <code>lowering.py</code>, <code>scheduler.py</code>. Questions:
+            what is a guard concretely, why does AOTAutograd exist at all
+            given eager autograd works, and what decides whether two nodes
+            fuse?
+          </p>
+          <p>
+            Where <em>not</em> to start: <code>torch/csrc/jit/</code>, the
+            legacy TorchScript stack, is large, largely superseded by
+            <code>torch.compile</code>, and will teach you history rather
+            than the present; the build system (Bazel/CMake files,
+            <code>caffe2</code> remnants) is a tar pit; and the generated
+            code directories only exist after a source build, so do not go
+            hunting for <code>AddBackward0</code> in the checked-in tree.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            Each lab is runnable with a stock <code>pip install torch</code>
+            on CPU unless noted, and each teaches one concept from the deep
+            dives. Exact object addresses and log formats vary by version.
+          </p>
+          <p><strong>Lab 1: walk the tape by hand.</strong> Concept: the graph of Stage 1.</p>
+          <pre><code>import torch, torch.nn as nn
+model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
+loss = nn.functional.cross_entropy(model(torch.randn(5, 4)), torch.randint(0, 2, (5,)))
+node = loss.grad_fn
+while node:
+    print(type(node).__name__, "-&gt;", [type(f[0]).__name__ for f in node.next_functions if f[0]])
+    # descend the first edge that leads somewhere (skips leaf AccumulateGrad nodes)
+    node = next((f[0] for f in node.next_functions if f[0] and f[0].next_functions), None)</code></pre>
+          <p>
+            Observe the chain <code>NllLossBackward0</code>,
+            <code>LogSoftmaxBackward0</code>, <code>AddmmBackward0</code>,
+            <code>ReluBackward0</code>, <code>AddmmBackward0</code>, with
+            <code>AccumulateGrad</code> and transpose-view nodes hanging off
+            the addmm nodes. Match each to the diagram in Part IV.
+          </p>
+          <p><strong>Lab 2: prove gradients accumulate.</strong> Concept: AccumulateGrad.</p>
+          <pre><code>w = torch.ones(2, requires_grad=True)
+(w * 3).sum().backward()
+print(w.grad)        # tensor([3., 3.])
+(w * 3).sum().backward()
+print(w.grad)        # tensor([6., 6.])  &lt;- added, not replaced
+w.grad = None        # what zero_grad(set_to_none=True) does
+(w * 3).sum().backward()
+print(w.grad)        # tensor([3., 3.])</code></pre>
+          <p><strong>Lab 3: watch the dispatcher work.</strong> Concept: every forward and backward op is a dispatched ATen call.</p>
+          <pre><code>from torch.utils._python_dispatch import TorchDispatchMode
+import torch
+
+class Log(TorchDispatchMode):
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        print(func)
+        return func(*args, **(kwargs or {}))
+
+a = torch.randn(8, 8, requires_grad=True)
+w = torch.randn(8, 8, requires_grad=True)
+with Log():
+    (a @ w).relu().sum().backward()</code></pre>
+          <p>
+            Observe forward ops (<code>aten.mm.default</code>,
+            <code>aten.relu.default</code>, <code>aten.sum.default</code>),
+            then the seed (<code>aten.ones_like.default</code>), then the
+            backward ops (<code>aten.expand.default</code>,
+            <code>aten.threshold_backward.default</code>, two
+            <code>aten.mm.default</code> calls with transposes). This is
+            Stage 5 made visible: backward is just more operator calls. The
+            exact list varies slightly across releases.
+          </p>
+          <p><strong>Lab 4: trigger the version counter.</strong> Concept: SavedVariable integrity.</p>
+          <pre><code>x = torch.randn(3, requires_grad=True)
+y = x.sigmoid()
+y.mul_(2)
+try:
+    y.sum().backward()
+except RuntimeError as e:
+    print(e)   # "...modified by an inplace operation..." with a version mismatch</code></pre>
+          <p>
+            Then rerun with <code>y = x.relu()</code> replaced by an op that
+            saves its <em>input</em> instead of its output, and observe which
+            in-place edits are legal. Predicting the answer from
+            <code>derivatives.yaml</code> is the exercise.
+          </p>
+          <p><strong>Lab 5: see what the compiler generates.</strong> Concept: Dynamo capture and Inductor fusion. GPU makes it more dramatic but CPU works.</p>
+          <pre><code>import torch
+
+def f(x):
+    return (x.sin() + x.cos()).relu() * 2
+
+x = torch.randn(1_000_000)
+print(torch._dynamo.explain(f)(x))     # graph count, graph break count: expect 1 graph, 0 breaks
+# Then, from a shell:
+#   TORCH_LOGS="output_code" python thisfile.py
+# and read the generated C++ (CPU) or Triton (GPU): one fused kernel
+# for the whole pointwise chain instead of five.</code></pre>
+          <p>
+            Measure steady-state timing with and without
+            <code>torch.compile(f)</code> (skip the first call; that is
+            compilation). The speedup depends entirely on your hardware and
+            the op mix, so measure rather than assume.
+          </p>
+          <p><strong>Lab 6: cause and observe a recompile.</strong> Concept: guards.</p>
+          <pre><code># TORCH_LOGS="recompiles" python thisfile.py
+import torch
+
+@torch.compile
+def g(x, flag):
+    return x * 2 if flag else x * 3
+
+x = torch.randn(10)
+g(x, True); g(x, True)    # second call: guards pass, no recompile
+g(x, False)               # guard on `flag` fails -&gt; logged recompile</code></pre>
+          <p>
+            Observe the log naming the exact guard that failed. Then vary
+            the tensor's shape instead and watch dynamic-shape behavior:
+            typically one recompile to a symbolic-shape version, then
+            stability.
+          </p>
+
+          <h2>Part VIII: Questions and model answers</h2>
+          <p>
+            Understanding checks. Try to answer aloud before reading each
+            model answer.
+          </p>
+          <p><strong>1. What is PyTorch, in one sentence a systems person would accept?</strong></p>
+          <p>
+            A runtime-recorded autograd tape on top of an extensible
+            operator dispatcher, with an opportunistic graph compiler
+            layered above and a code-generated operator library below.
+          </p>
+          <p><strong>2. What does loss.backward() actually execute?</strong></p>
+          <p>
+            It seeds the recorded graph's root with a ones gradient, then
+            the C++ engine builds a GraphTask, counts dependencies, and
+            drains per-device ready queues, calling each node's backward
+            function and merging fan-in gradients in InputBuffers, until
+            AccumulateGrad nodes write the leaves' <code>.grad</code>
+            fields. Every derivative computation is itself a dispatched ATen
+            operator call.
+          </p>
+          <p><strong>3. Why do gradients accumulate instead of overwrite?</strong></p>
+          <p>
+            Because AccumulateGrad adds into <code>.grad</code>, which makes
+            micro-batch gradient accumulation and multiple independent
+            losses work with zero extra machinery. The cost is that training
+            loops must call <code>zero_grad()</code>, and forgetting it
+            silently blends stale gradients into every step.
+          </p>
+          <p><strong>4. Why does calling backward twice fail, and when is retain_graph the wrong fix?</strong></p>
+          <p>
+            The engine frees saved tensors as it consumes the graph, so a
+            second traversal finds them gone. <code>retain_graph=True</code>
+            is correct only when you genuinely need two traversals of the
+            same forward computation; if you simply have two losses, summing
+            them and walking once is cheaper and clearer.
+          </p>
+          <p><strong>5. What is a dispatch key, concretely?</strong></p>
+          <p>
+            A bit in a 64-bit set carried by every TensorImpl and combined
+            with thread-local state at call time. Each operator holds a
+            table from keys to kernels, and the call jumps to the kernel for
+            the highest-priority key present, with layered kernels like
+            autocast and autograd doing their work and re-dispatching below
+            themselves.
+          </p>
+          <p><strong>6. Why is Autocast a higher-priority key than Autograd?</strong></p>
+          <p>
+            So the dtype casts autocast inserts happen before recording,
+            which puts the cast operations onto the tape and makes their
+            gradients (and dtype transitions) correct in backward. If
+            autograd ran first, the tape would describe a computation that
+            never actually executed.
+          </p>
+          <p><strong>7. Where would you look for the implementation of an unfamiliar operator?</strong></p>
+          <p>
+            Its entry in <code>aten/src/ATen/native/native_functions.yaml</code>,
+            which names the implementing C++ function per backend or the
+            structured delegate; the derivative, if any, is in
+            <code>tools/autograd/derivatives.yaml</code>. No entry under
+            <code>dispatch</code> usually means it is composite and
+            decomposes into other ops.
+          </p>
+          <p><strong>8. Why does F.linear have no derivative formula?</strong></p>
+          <p>
+            It is CompositeImplicitAutograd: it decomposes into
+            <code>addmm</code> and matmul, which have formulas. Autograd
+            differentiates composites by taping their constituent ops, so
+            only primitive operators need entries in
+            <code>derivatives.yaml</code>.
+          </p>
+          <p><strong>9. Why is a non-leaf tensor's .grad None after backward?</strong></p>
+          <p>
+            Intermediate gradients flow through the engine's InputBuffers
+            and are discarded once consumed; only leaves have
+            AccumulateGrad nodes that persist gradients. Call
+            <code>retain_grad()</code> on the intermediate, or register a
+            hook, if you need its gradient.
+          </p>
+          <p><strong>10. A user reports "modified by an inplace operation" at backward time. How do you debug it?</strong></p>
+          <p>
+            Some op saved a tensor for its derivative and an in-place op
+            bumped that tensor's version afterward. Read the error's
+            mention of which output and node, find the in-place op (often an
+            innocuous <code>relu_</code>, <code>add_</code>, or an
+            activation reused buffer), and either make it out-of-place or
+            reorder it. <code>torch.autograd.set_detect_anomaly(True)</code>
+            will point at the recording site.
+          </p>
+          <p><strong>11. What are Dynamo guards and why do they exist?</strong></p>
+          <p>
+            Cheap runtime predicates (on shapes, dtypes, constants, module
+            identities) attached to each compiled graph, encoding the
+            assumptions baked into the compilation. They let compiled code
+            be reused safely from arbitrary Python call sites: guards pass,
+            run fast code; guards fail, recompile or fall back to eager.
+          </p>
+          <p><strong>12. Why does torch.compile need AOTAutograd when eager autograd already exists?</strong></p>
+          <p>
+            Eager autograd produces the backward incrementally at runtime,
+            which the compiler cannot optimize ahead of time. AOTAutograd
+            traces the autograd machinery once, ahead of execution, yielding
+            a backward graph that Inductor can fuse and schedule like the
+            forward, so both directions get compiled.
+          </p>
+          <p><strong>13. When would you reach for JAX instead?</strong></p>
+          <p>
+            When the work is naturally composed function transforms over
+            pure functions, when TPUs are the target, or when whole-program
+            XLA compilation and explicit PRNG/state threading fit the
+            problem. PyTorch's edge is debuggability, the ecosystem, and
+            mutation-friendly imperative code; JAX's is transform
+            composability and a compiler-first execution model.
+          </p>
+          <p><strong>14. Why is the first call to a compiled model slow, and what do you do about it?</strong></p>
+          <p>
+            Compilation happens on first execution per guard-set: Dynamo
+            capture, AOTAutograd tracing, Inductor codegen, and a Triton or
+            C++ compile. Warm up before measuring or serving, keep shapes
+            stable or rely on dynamic shapes, and watch
+            <code>TORCH_LOGS="recompiles"</code> for guard churn that
+            re-pays the cost repeatedly.
+          </p>
+          <p><strong>15. What does torch.no_grad() actually change?</strong></p>
+          <p>
+            It sets thread-local dispatcher state excluding the autograd
+            keys, so operator calls skip the recording kernels entirely: no
+            nodes, no saved activations. That is why it saves memory as well
+            as time, and why it is orthogonal to <code>model.eval()</code>,
+            which only flips module behavior like dropout and batch norm.
+          </p>
+          <p><strong>16. Why does PyTorch generate code from YAML instead of writing operators directly?</strong></p>
+          <p>
+            One schema entry fans out into bindings, dispatch registrations,
+            autograd node classes, and per-variant kernels; with roughly
+            2,600 operators, hand-writing that surface would drift
+            instantly. Single-source-of-truth declarations plus codegen keep
+            the four layers mechanically consistent, at the cost of build
+            complexity and generated classes you cannot grep for in the
+            source tree.
+          </p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Declare once, generate everything.</strong> The
+            YAML-plus-torchgen pattern keeps thousands of operators
+            consistent across Python bindings, dispatch tables, and autograd
+            nodes. The same move appears in protobuf/IDL-driven RPC stacks,
+            database system catalogs, and syscall table generation:
+            wherever a wide surface must stay mechanically in sync, a
+            declarative source of truth beats discipline.
+          </p>
+          <p>
+            <strong>An open dispatch table is an extensibility contract.</strong>
+            Making backends and cross-cutting features keys in a prioritized
+            table lets autograd, autocast, vmap, and out-of-tree hardware
+            compose without mutual knowledge. This is the VFS layer in
+            operating systems, middleware chains in web frameworks, and
+            LLVM's pass infrastructure: the framework owns the traversal,
+            plugins own the behavior.
+          </p>
+          <p>
+            <strong>Record-replay beats declare-ahead when developer
+            experience matters.</strong> Define-by-run won because the tape
+            costs a little runtime overhead but makes models ordinary,
+            debuggable programs. Write-ahead logs, tracing JITs, and
+            record-and-replay debuggers make the same trade: capture what
+            actually happened, then exploit the recording.
+          </p>
+          <p>
+            <strong>Graceful partiality makes compilers adoptable.</strong>
+            Dynamo's graph breaks and eager fallback mean the compiler
+            handles what it can and never blocks what it cannot, so adoption
+            is one line rather than a rewrite. JavaScript JITs
+            (deoptimization to interpreter) and query optimizers with
+            fallback plans embody the same principle: a partial fast path
+            plus a total slow path.
+          </p>
+          <p>
+            <strong>Guard cheaply what you cannot prove statically.</strong>
+            Instead of demanding static types and shapes, compiled PyTorch
+            assumes, guards, and recompiles on violation. Speculative
+            execution in CPUs, optimistic concurrency control in databases,
+            and inline caches in dynamic-language VMs are all this pattern:
+            bet on stability, verify cheaply, pay only on the rare miss.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            The one-sentence summary: <mark>PyTorch runs every operator call
+            through a keyed dispatcher whose autograd layer records a graph
+            that an engine later replays in reverse, and
+            <code>torch.compile</code> captures both directions into fused
+            kernels when it can.</mark>
+          </p>
+          <pre class="flow">forward:   torch.add -&gt; arg parser -&gt; dispatcher -&gt; Autograd key (record Node)
+           -&gt; backend key -&gt; TensorIterator -&gt; SIMD/CUDA loop
+
+backward:  loss.backward() -&gt; Engine::execute -&gt; GraphTask deps
+           -&gt; ReadyQueue -&gt; Node::apply (formulas from derivatives.yaml)
+           -&gt; dispatched kernels -&gt; AccumulateGrad -&gt; .grad -&gt; opt.step()
+
+compile:   Dynamo (capture + guards) -&gt; AOTAutograd (joint fwd/bwd graph)
+           -&gt; Inductor (fuse, codegen Triton/C++)</pre>
+          <p>The chain mapped to source:</p>
+          <pre class="flow">arg parsing        torch/csrc/utils/python_arg_parser.cpp
+dispatcher         c10/core/DispatchKey(Set).h, ATen/core/dispatch/Dispatcher.h
+operator schemas   aten/src/ATen/native/native_functions.yaml
+kernels            aten/src/ATen/native/{cpu,cuda}/, TensorIterator.cpp
+derivatives        tools/autograd/derivatives.yaml
+engine             torch/csrc/autograd/engine.cpp, functions/accumulate_grad.cpp
+compiler           torch/_dynamo/, torch/_functorch/aot_autograd.py, torch/_inductor/</pre>
+          <p>Memorize these blocks:</p>
+          <ul>
+            <li><strong>Four directories:</strong> <code>torch/</code> Python, <code>aten/</code> operators, <code>c10/</code> core types and keys, <code>torch/csrc/</code> the C++ bridge and autograd engine.</li>
+            <li><strong>Two YAML files:</strong> <code>native_functions.yaml</code> (what operators exist, ~2,600) and <code>derivatives.yaml</code> (how ~700 of them differentiate); codegen turns both into C++.</li>
+            <li><strong>Five engine nouns:</strong> GraphTask, ReadyQueue, NodeTask, InputBuffer, AccumulateGrad; dependency counts gate execution, InputBuffer adds merge fan-in, AccumulateGrad writes <code>.grad</code>.</li>
+            <li><strong>Key order that matters:</strong> Autocast above Autograd above ADInplaceOrView above backend keys, each re-dispatching below itself.</li>
+            <li><strong>Compile trio:</strong> Dynamo captures with guards and breaks, AOTAutograd makes backward a graph, Inductor fuses and emits Triton or C++.</li>
+          </ul>
+
+          <h2>Part XI: Final takeaway</h2>
+          <p>
+            If you internalize one page of this chapter, make it Part IV:
+            one call descending four layers on the way in, one engine
+            walking a recorded graph on the way back, and every backward
+            step re-entering the same four layers. The
+            <a href="/ml">ML implementations section</a> builds the
+            numerical pieces these layers compute, and
+            <a href="/oss/nanogpt">nanoGPT</a> is the ideal codebase to
+            watch this machinery carry a real model.
           </p>
           <div class="takeaway">
             <strong>Key takeaway:</strong> PyTorch is a runtime-recorded
             autograd tape sitting on an extensible operator dispatcher, with
             a compiler bolted on top that captures graphs opportunistically
-            instead of demanding them up front. Learn those three layers and
-            the enormous repository resolves into a small number of ideas
+            instead of demanding them up front. Learn those three layers,
+            and the two YAML files that declare the operator world, and the
+            enormous repository resolves into a small number of ideas
             executed at industrial scale.
           </div>
         </article>

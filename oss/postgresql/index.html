@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>PostgreSQL walkthrough · Stanley Jacob</title>
-    <meta name="description" content="A walkthrough of the PostgreSQL source: how to use it in five minutes, how MVCC and vacuum, the write-ahead log, the process model, and extensions fit together, and a guided reading path down the query pipeline from postmaster to executor." />
+    <meta name="description" content="A full chapter on PostgreSQL: a practical tutorial, the complete life of one UPDATE from libpq through parser, rewriter, planner, executor, heap, and WAL to commit, deep dives into MVCC and vacuum, the write-ahead log, the cost-based planner, and the process model, plus a staged source reading guide and hands-on labs." />
     <link rel="stylesheet" href="/style.css" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
   </head>
@@ -37,11 +37,13 @@
           patches by mailing list rather than pull request; the canonical
           repository lives at git.postgresql.org with a read-only mirror on
           GitHub. It has quietly become the default backing store for new
-          applications, and its source tree is one of the best-commented large
-          C codebases in existence. This walkthrough covers how to use it in
-          five minutes, the ideas that carry the system, MVCC and vacuum, the
-          write-ahead log, the process model and its extension points, and a
-          reading path straight down the query pipeline.
+          applications, and its source tree is one of the best-commented
+          large C codebases in existence. This page is a full chapter: a
+          practical tutorial, then the complete life of one UPDATE from the
+          client library through parser, rewriter, planner, executor, heap,
+          and write-ahead log to a durable commit, deep dives into MVCC and
+          vacuum, the WAL, the cost-based planner, and the process model, a
+          staged guide to reading the source, and hands-on labs.
         </p>
       </div>
     </header>
@@ -49,132 +51,935 @@
     <section class="soft">
       <div class="wrap">
         <article class="prose article">
-          <h2>Using it in five minutes</h2>
+
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">psql / your app
+   │  libpq wire protocol (TCP or unix socket)
+   ▼
+postmaster ── fork() ──▶ one backend process per connection
+                              │  tcop/postgres.c  (the traffic cop)
+                              ▼
+                         parser      (gram.y, analyze.c)
+                              ▼
+                         rewriter    (views, rules)
+                              ▼
+                         planner     (paths + costs → plan tree)
+                              ▼
+                         executor    (pull tuples through plan nodes)
+                              ▼
+                         heap + indexes   (row versions, never in place)
+                              ▼
+                shared buffers (cache) ──▶ WAL (durability first)
+                              ▼
+                         data files on disk</pre>
           <p>
-            The quickest zero-install route is the official container, which
-            gives you a full server and the <code>psql</code> client:
+            The one-sentence identity: <mark>PostgreSQL is a
+            process-per-connection server that compiles each query through a
+            parse, rewrite, plan, execute pipeline, stores rows as immutable
+            versions that vacuum later reclaims, and makes everything durable
+            by logging it to the WAL before it ever touches a data
+            file.</mark>
           </p>
-          <pre><code>docker run -d -e POSTGRES_PASSWORD=secret -p 5432:5432 postgres:17
+          <p>
+            Three commitments define the system. First, the pipeline: every
+            statement, from <code>SELECT 1</code> to a twelve-way join,
+            passes through the same four stages, and the source tree's
+            directories map onto them almost one to one. Second, MVCC by
+            versioning: an UPDATE never overwrites a row; it writes a new
+            version and marks the old one expired, so readers and writers
+            never block each other, and a background vacuum process pays the
+            bill. Third, WAL first: no change reaches a table or index page
+            on disk before a log record describing it is safely down, and
+            that single log turns out to also be the replication stream and
+            the point-in-time recovery mechanism.
+          </p>
+          <p>
+            Hold those three and everything operational about Postgres,
+            connection pooling, bloat, autovacuum tuning, replicas, becomes
+            a corollary rather than folklore. For the requirements-first view
+            of when to reach for a server database at all, see my
+            <a href="/software/notes/databases-for-system-design">databases
+            note</a>; for the storage-engine spectrum this sits on, the
+            <a href="/systems/key-value-store">key-value store design
+            write-up</a> and the <a href="/oss/rocksdb">RocksDB page</a> are
+            the B-tree-versus-LSM companion reads.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <h3>Install and first session</h3>
+          <p>
+            The quickest zero-install route is the official container
+            (PostgreSQL 18 is current as of this writing; 14 through 17
+            remain supported):
+          </p>
+          <pre><code>docker run -d -e POSTGRES_PASSWORD=secret -p 5432:5432 postgres:18
 docker exec -it $(docker ps -lq) psql -U postgres</code></pre>
           <p>
             On a real machine the package manager sets up a cluster and a
-            <code>postgres</code> system user for you:
+            <code>postgres</code> system user (Debian and Ubuntu ship an
+            older major by default; the PGDG apt repository carries current
+            releases):
           </p>
-          <pre><code>sudo apt install postgresql      # or: brew install postgresql@17
+          <pre><code>sudo apt install postgresql        # or: brew install postgresql@18
 sudo -u postgres createdb demo
 sudo -u postgres psql demo</code></pre>
-          <pre><code>demo=# CREATE TABLE events(id bigserial PRIMARY KEY, kind text, at timestamptz DEFAULT now());
-demo=# INSERT INTO events(kind) SELECT 'signup' FROM generate_series(1, 100000);
-demo=# CREATE INDEX ON events(kind);
-demo=# EXPLAIN ANALYZE SELECT count(*) FROM events WHERE kind = 'signup';</code></pre>
+          <pre><code>demo=# CREATE TABLE accounts(id bigint PRIMARY KEY, balance bigint NOT NULL);
+demo=# INSERT INTO accounts SELECT g, 1000 FROM generate_series(1, 100000) g;
+demo=# UPDATE accounts SET balance = balance - 100 WHERE id = 42;
+UPDATE 1
+demo=# EXPLAIN ANALYZE SELECT * FROM accounts WHERE id = 42;</code></pre>
           <p>
-            That last command is the one to remember, because
-            <code>EXPLAIN ANALYZE</code> prints the plan the optimizer chose
-            with estimated and actual costs side by side, and reading its
-            output is the daily interface to everything the rest of this page
-            describes.
+            That last command is the one to make a habit:
+            <code>EXPLAIN ANALYZE</code> runs the query and prints the plan
+            with estimated and actual costs side by side, and reading it is
+            the daily interface to everything in Parts IV and V.
+          </p>
+          <h3>From code</h3>
+          <p>
+            The natural client library for this chapter is psycopg, the
+            standard PostgreSQL adapter for Python, which speaks the libpq
+            protocol:
+          </p>
+          <pre><code>pip install "psycopg[binary]"</code></pre>
+          <pre><code>import psycopg
+
+with psycopg.connect("host=localhost dbname=demo user=postgres password=secret") as conn:
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE accounts SET balance = balance - %s WHERE id = %s",
+            (100, 42),
+        )
+        cur.execute("SELECT balance FROM accounts WHERE id = %s", (42,))
+        print(cur.fetchone())
+    # the with-block commits on clean exit, rolls back on exception</code></pre>
+          <h3>The mistakes everyone makes first</h3>
+          <p>
+            <strong>Mistake one: leaving transactions open.</strong> Client
+            libraries commonly start a transaction implicitly on the first
+            statement. A session that runs a query and then sits idle holds
+            its snapshot open, shows up as <code>idle in transaction</code>
+            in <code>pg_stat_activity</code>, blocks vacuum from reclaiming
+            anything newer than its snapshot, and can hold locks. Commit or
+            roll back promptly; set
+            <code>idle_in_transaction_session_timeout</code> as a backstop.
+          </p>
+          <p>
+            <strong>Mistake two: assuming <code>count(*)</code> is
+            cheap.</strong> Because visibility is per row version, Postgres
+            generally has to scan to count; there is no maintained row
+            counter. For monitoring, <code>pg_stat_user_tables</code> or an
+            estimate from <code>pg_class.reltuples</code> is usually what you
+            actually want.
+          </p>
+          <p>
+            <strong>Mistake three: string interpolation instead of
+            parameters.</strong>
+          </p>
+          <pre><code># wrong: injection plus no plan reuse
+cur.execute(f"SELECT * FROM accounts WHERE id = {user_input}")
+# right
+cur.execute("SELECT * FROM accounts WHERE id = %s", (user_input,))</code></pre>
+          <p>
+            <strong>Mistake four: opening a connection per request.</strong>
+            Every connection is a forked server process with real setup cost
+            and memory. Web applications need a pool (client-side or
+            PgBouncer); Part III's warning is this mistake at architecture
+            scale.
+          </p>
+          <p>
+            <strong>Mistake five: adding an index and assuming it will be
+            used.</strong> The planner is cost-based: on a hundred-row table
+            a sequential scan is genuinely cheaper than an index scan, and on
+            a filter matching half the table it usually is too. The habit
+            that fixes the confusion is checking
+            <code>EXPLAIN ANALYZE</code> before and after, which Lab 2 makes
+            concrete.
           </p>
 
-          <h2>Idea one: MVCC, or never update in place</h2>
+          <h2>Part III: When it is the right tool</h2>
           <p>
-            PostgreSQL's answer to concurrency is multi-version concurrency
-            control, and its particular flavor is radical: <mark>an UPDATE
-            never modifies a row in place but writes a whole new row version,
-            and every version carries the transaction IDs that created and
-            deleted it, so each transaction simply ignores versions that are
-            not visible to its snapshot.</mark> Readers therefore never block
-            writers and writers never block readers, which is a large part of
-            why Postgres behaves so well under mixed workloads. The bill
-            arrives later: superseded and deleted row versions, dead tuples,
-            accumulate in table files as bloat, and reclaiming them is the job
-            of vacuum, run continuously by the autovacuum daemon. Vacuum also
-            has a second, non-negotiable duty, because transaction IDs are
-            32-bit counters that wrap around, so old row versions must
-            periodically be frozen, marked visible to everyone, before the
-            counter laps them. Most operational Postgres lore, from tuning
-            autovacuum on hot tables to fearing wraparound on neglected ones,
-            is a direct corollary of this one storage decision, and it is the
-            central trade-off I lean on in my
-            <a href="/software/notes/databases-for-system-design">databases
-            note</a>.
+            PostgreSQL is the right default for a networked application's
+            system of record: multiple services or machines sharing data,
+            sustained concurrent writes, strong constraints and transactions,
+            and workloads that benefit from its unusually deep feature set
+            (rich types, partial and expression indexes, window functions,
+            logical replication, and an extension ecosystem from PostGIS to
+            vector search). Its habit of absorbing adjacent workloads, queue,
+            search, analytics, document store, is often the correct boring
+            choice at small and medium scale.
+          </p>
+          <p>
+            The named alternatives, and when they win:
+            <a href="/oss/sqlite">SQLite</a> when the database and the
+            application share one machine and one writer at a time is
+            acceptable; an embedded file beats a server on operational
+            simplicity every time it is sufficient. MySQL when your
+            organization already runs it well; its clustered primary-key
+            storage (InnoDB) and mature replication tooling remain real
+            strengths, though the technical gap has narrowed to taste in most
+            new-project decisions. <a href="/oss/duckdb">DuckDB</a> or a
+            warehouse when the workload is analytical scans over columns
+            rather than transactional point reads and writes; row-store
+            Postgres can be made to do OLAP, but columnar engines are built
+            for it.
+          </p>
+          <p>
+            The architecture-shaped warning:
+            <mark>do not point an elastic fleet of clients directly at
+            Postgres</mark>. One connection is one forked process holding
+            real memory, and a serverless platform or large microservice
+            fleet that opens connections freely will exhaust
+            <code>max_connections</code> or thrash the server with process
+            overhead long before the hardware is busy. The safe shape puts a
+            pooler in front, so thousands of client connections multiplex
+            onto tens of backend processes.
+          </p>
+          <pre class="flow">SAFE                                     DANGEROUS
+1000s of clients                         1000s of lambdas/pods
+      │                                        │ │ │ │ │
+      ▼                                        ▼ ▼ ▼ ▼ ▼
+  PgBouncer (pools)                        postgres: one forked
+      │  ~20-50 server conns               process PER connection
+      ▼                                    → max_connections hit,
+  postgres backends                          memory pressure, collapse</pre>
+
+          <h2>Part IV: The full life of one UPDATE</h2>
+          <p>
+            The canonical operation for this chapter is a write, because a
+            write exercises every mechanism a read does plus versioning,
+            locking, and the WAL:
+          </p>
+          <pre><code>UPDATE accounts SET balance = balance - 100 WHERE id = 42;</code></pre>
+          <p>
+            Every file named below was verified to exist in the current
+            master branch of the repository; the behavior described is
+            stable across recent releases and was checked against the
+            PostgreSQL 18 documentation.
           </p>
 
-          <h2>Idea two: everything flows through the WAL</h2>
+          <h3>Stage 1: libpq and the wire protocol</h3>
           <p>
-            Durability rests on a single mechanism: before any change touches a
-            table or index page, a record describing it is appended to the
-            write-ahead log, and a commit means the WAL, not the data files,
-            has reached disk. Data pages are modified in a shared buffer cache
-            and written back lazily, with periodic checkpoints bounding how
-            much log must be replayed after a crash. What makes the WAL the
-            most load-bearing component in the system is how much else turned
-            out to be the same problem: <mark>crash recovery, streaming
-            replication, and point-in-time recovery are all one mechanism,
-            because a replica is just a server replaying the primary's WAL and
-            a restore is just a base backup replayed forward to a chosen
-            moment.</mark> Logical replication and change-data-capture tools
-            decode the same stream into row-level events, which is why the WAL
-            is also the integration point for the wider data ecosystem.
+            psql and psycopg both sit on libpq
+            (<code>src/interfaces/libpq/</code>, with statement dispatch in
+            <code>fe-exec.c</code>). A plain <code>PQexec</code> sends the
+            SQL as a single simple-protocol message; parameterized calls use
+            the extended protocol's Parse, Bind, and Execute messages, which
+            is what keeps your parameters out of the SQL text entirely,
+            separating code from data at the protocol level. Either way,
+            bytes arrive at a server socket.
           </p>
 
-          <h2>Idea three: a process per connection, extensible at every joint</h2>
+          <h3>Stage 2: the postmaster and the fork</h3>
           <p>
-            Architecturally the server is a family of processes rather than
-            threads: the postmaster listens for connections and forks a
-            dedicated backend process for each one, cooperating through shared
-            memory that holds the buffer cache and lock tables, while
-            background processes, the checkpointer, the WAL writer, the
-            autovacuum launcher and its workers, do the housekeeping. The
-            model buys isolation, since a crashing backend cannot silently
-            corrupt its siblings, at the price of connections being expensive,
-            which is why serious deployments put a pooler such as PgBouncer in
-            front. The other defining trait is extensibility, inherited from
-            the original Berkeley design: types, operators, functions, and
-            even index access methods are rows in system catalogs rather than
-            hardcoded lists, so an extension loaded with
-            <code>CREATE EXTENSION</code> can add all of them. That is how
-            PostGIS turns Postgres into a geospatial database and how
-            pg_stat_statements, foreign data wrappers, and the vector-search
-            extensions work, and it is the main reason Postgres keeps
-            absorbing workloads that once required specialized systems.
+            The listening process is the postmaster
+            (<code>src/backend/postmaster/postmaster.c</code>). At
+            connection time, not query time, it forked a dedicated backend
+            process for this session after authentication; by the time our
+            UPDATE arrives, a private process is already waiting on the
+            socket. Postgres has no threads for query execution: one
+            connection is one process, cooperating with its siblings only
+            through shared memory (buffer cache, lock tables) and signals.
+            Background siblings, the checkpointer, WAL writer, autovacuum
+            launcher and workers, and WAL senders for replicas, were forked
+            by the postmaster at startup.
           </p>
 
-          <h2>Reading the repository</h2>
+          <h3>Stage 3: the traffic cop, tcop/postgres.c</h3>
           <p>
-            Clone the <a href="https://github.com/postgres/postgres" target="_blank" rel="noreferrer">mirror</a>
-            and live in <code>src/backend/</code>, whose subdirectories map
-            almost one-to-one onto the pipeline, and read the README files
-            scattered through the tree, which are genuinely excellent, with
-            <code>src/backend/optimizer/README</code> the standout. Begin at
-            <code>postmaster/postmaster.c</code> to see the fork-per-connection
-            model, then move to <code>tcop/postgres.c</code>, the traffic cop,
-            where <code>exec_simple_query()</code> is the spine of the whole
-            system: a query string goes to the parser in <code>parser/</code>
-            with the grammar in <code>gram.y</code>, through the rewriter in
-            <code>rewrite/</code> where views and rules are expanded, into the
-            planner via <code>optimizer/plan/planner.c</code>, which builds
-            candidate paths in <code>optimizer/path/allpaths.c</code> and
-            prices them with the cost model in
-            <code>optimizer/path/costsize.c</code> using statistics gathered
-            by ANALYZE, and finally to the executor in <code>executor/</code>,
-            starting at <code>execMain.c</code>, where plan nodes pull tuples
-            from each other one at a time. Below that, row storage and
-            visibility live in <code>access/heap/</code>, vacuum's hard work in
-            <code>access/heap/vacuumlazy.c</code> with its entry point in
-            <code>commands/vacuum.c</code>, the buffer cache in
-            <code>storage/buffer/bufmgr.c</code>, and the WAL machinery in
-            <code>access/transam/xlog.c</code>. A good first exercise is to
-            take one query, read its <code>EXPLAIN</code> output, and find the
-            executor node file that implements each plan node, since the names
-            match almost exactly.
+            The backend's main loop lives in
+            <code>src/backend/tcop/postgres.c</code>, and for a simple-protocol
+            message the spine of the whole system is one function:
+            <code>exec_simple_query()</code>. It is short enough to read in
+            a sitting and calls the next four stages in order, which makes it
+            the single best entry point into the codebase.
           </p>
+
+          <h3>Stage 4: parser and analyzer</h3>
+          <p>
+            The grammar in <code>src/backend/parser/gram.y</code> (bison, one
+            of the largest grammars in open source) produces a raw parse
+            tree; semantic analysis in
+            <code>src/backend/parser/analyze.c</code> then looks up
+            <code>accounts</code> in the catalogs, resolves
+            <code>id</code> and <code>balance</code> to typed references,
+            and resolves the operators, producing a
+            <code>Query</code> node. The split matters: raw parsing needs no
+            database access at all, analysis is all catalog lookups.
+          </p>
+
+          <h3>Stage 5: the rewriter</h3>
+          <p>
+            <code>src/backend/rewrite/rewriteHandler.c</code> applies the
+            rule system: views are expanded into their defining queries here,
+            and row-level security policies inject their predicates here.
+            Our UPDATE targets a plain table, so it passes through
+            unchanged, but the stage is why a view behaves exactly like its
+            definition; it literally becomes it before planning.
+          </p>
+
+          <h3>Stage 6: the planner</h3>
+          <p>
+            <code>src/backend/optimizer/plan/planner.c</code> drives
+            planning. Postgres separates <em>paths</em>, cheap descriptions
+            of possible strategies built in
+            <code>src/backend/optimizer/path/allpaths.c</code>, from the
+            final <em>plan tree</em> built only for the winner. Each path is
+            priced by the cost model in
+            <code>src/backend/optimizer/path/costsize.c</code> using
+            statistics that ANALYZE gathered into
+            <code>pg_statistic</code>. For <code>id = 42</code> on a primary
+            key, the index path wins trivially, and the plan is an index scan
+            feeding a <code>ModifyTable</code> node. EXPLAIN would show:
+          </p>
+          <pre><code>Update on accounts
+  -&gt;  Index Scan using accounts_pkey on accounts
+        Index Cond: (id = 42)</code></pre>
+
+          <h3>Stage 7: the executor</h3>
+          <p>
+            <code>src/backend/executor/execMain.c</code> runs the plan tree
+            as a pull pipeline: each node's function asks its child for the
+            next tuple (the classic Volcano model, one file per node type in
+            <code>executor/</code>, names matching EXPLAIN output almost
+            exactly). The index scan node descends
+            <code>accounts_pkey</code>, finds the heap location for
+            <code>id = 42</code>, checks that the row version is visible to
+            our snapshot, and hands it to
+            <code>src/backend/executor/nodeModifyTable.c</code>, which
+            computes the new tuple with <code>balance - 100</code> and asks
+            the table's access method to perform the update.
+          </p>
+
+          <h3>Stage 8: the heap update, a new row version</h3>
+          <p>
+            Here is the load-bearing storage moment, in
+            <code>src/backend/access/heap/heapam.c</code>
+            (<code>heap_update()</code>). <mark>Postgres does not modify the
+            row. It writes a complete new tuple whose <code>xmin</code> is
+            our transaction ID, sets <code>xmax</code> on the old tuple to
+            the same ID, and links old to new through the
+            <code>ctid</code> chain.</mark> Both versions now coexist in the
+            table's 8 kB pages, in shared buffers
+            (<code>src/backend/storage/buffer/bufmgr.c</code>). If no
+            indexed column changed and the old tuple's page has room, this
+            is a HOT update (heap-only tuple, see
+            <code>src/backend/access/heap/README.HOT</code>) and no index
+            entry is written; otherwise every index on the table gets a new
+            entry pointing at the new version. Our UPDATE changes only
+            <code>balance</code>, which is not indexed, so HOT applies.
+          </p>
+
+          <h3>Stage 9: WAL record emission</h3>
+          <p>
+            Before the modified buffer page can ever be written to disk, the
+            change is described in a WAL record assembled by
+            <code>src/backend/access/transam/xloginsert.c</code> and copied
+            into WAL buffers by the machinery in
+            <code>src/backend/access/transam/xlog.c</code>. Each record gets
+            a log sequence number (LSN), a byte position in the log, and the
+            page is stamped with it; the buffer manager enforces the
+            write-ahead rule by refusing to evict a data page until the WAL
+            up to that page's LSN is flushed. If this is the first touch of
+            the page since the last checkpoint, the record carries a full
+            page image to defend against torn writes.
+          </p>
+
+          <h3>Stage 10: commit</h3>
+          <p>
+            Our implicit transaction commits in
+            <code>src/backend/access/transam/xact.c</code>: a commit record
+            is appended to the WAL, and <code>XLogFlush</code> forces the log
+            to durable storage up through it (with
+            <code>synchronous_commit = on</code>, the default, the client
+            does not get success before this fsync). The transaction is then
+            marked committed in <code>pg_xact</code>
+            (<code>src/backend/access/transam/clog.c</code>), locks are
+            released, and the backend sends <code>UPDATE 1</code> and
+            ReadyForQuery back down the wire. Note what did <em>not</em>
+            happen: the 8 kB data page with our two row versions is still
+            only in shared buffers, dirty. The checkpointer or background
+            writer will get it to disk eventually; if power fails first,
+            crash recovery replays the WAL and reconstructs it. Durability
+            lives in the log, not the data files.
+          </p>
+
+          <h2>Part V: Internals deep dives</h2>
+
+          <h3>Deep dive 1: MVCC, vacuum, and wraparound</h3>
+          <p>
+            Every heap tuple header carries <code>xmin</code> (the
+            transaction that created it) and <code>xmax</code> (the
+            transaction that deleted or superseded it, 0 if none). A
+            snapshot is essentially "every transaction ID below this
+            horizon, minus this list of still-in-progress ones", taken per
+            statement in READ COMMITTED and per transaction in REPEATABLE
+            READ (snapshot code in
+            <code>src/backend/utils/time/snapmgr.c</code>). A tuple is
+            visible if its <code>xmin</code> committed before the snapshot
+            and its <code>xmax</code> did not. That is the whole trick:
+            readers never block writers because old versions remain
+            readable, and writers never block readers because new versions
+            are invisible until commit.
+          </p>
+          <pre class="flow">UPDATE accounts SET balance = 900 WHERE id = 42;   (txn 748)
+
+page: [ (0,1) xmin=701 xmax=748  id=42 balance=1000 ]  old version
+      [ (0,2) xmin=748 xmax=0    id=42 balance=900  ]  new version
+                 │
+   txn 730 (snapshot before 748): sees (0,1)
+   txn 749 (after 748 commits):   sees (0,2)</pre>
+          <p>
+            The bill: superseded versions, dead tuples, stay in the file as
+            bloat until VACUUM
+            (<code>src/backend/access/heap/vacuumlazy.c</code>, entry point
+            in <code>src/backend/commands/vacuum.c</code>) removes them,
+            which it may only do once no snapshot can still see them; this
+            is precisely why long-lived transactions cause bloat.
+            Autovacuum triggers per table once dead tuples exceed
+            <code>autovacuum_vacuum_threshold</code> (default 50) plus
+            <code>autovacuum_vacuum_scale_factor</code> (default 0.2, twenty
+            percent) of the table. And the correction worth engraving:
+            <mark>plain VACUUM makes dead space reusable but almost never
+            shrinks the file; only VACUUM FULL, which rewrites the table
+            under an exclusive lock, returns space to the operating
+            system.</mark>
+          </p>
+          <p>
+            Vacuum's second, non-negotiable duty is wraparound defense.
+            Transaction IDs are 32-bit and compared circularly, so a given
+            ID can only "see backward" about two billion transactions; a
+            tuple whose <code>xmin</code> falls off that horizon would
+            abruptly look like it came from the future. Vacuum therefore
+            freezes old tuples, marking them visible to everyone, and
+            <code>autovacuum_freeze_max_age</code> (default 200 million)
+            forces an anti-wraparound vacuum on any table that lets its
+            oldest unfrozen ID get that stale. Neglect this on an append-only
+            or vacuum-starved table and Postgres will eventually refuse
+            writes to protect itself; monitoring
+            <code>age(relfrozenxid)</code> is the standard defense.
+          </p>
+
+          <h3>Deep dive 2: the WAL, one log wearing three hats</h3>
+          <p>
+            The WAL is a stream of records in 16 MB segment files under
+            <code>pg_wal/</code>, addressed by LSN. Its first hat is crash
+            recovery: since every page change is logged before the page can
+            be evicted, replaying from the last checkpoint reconstructs all
+            committed work, and checkpoints (default every five minutes,
+            tunable with <code>checkpoint_timeout</code> and
+            <code>max_wal_size</code>) bound the replay window by forcing
+            dirty buffers to disk. The second hat is replication: a standby
+            is just a server in permanent recovery, replaying WAL shipped to
+            it by a WAL sender process
+            (<code>src/backend/replication/walsender.c</code>), and
+            synchronous replication merely means waiting for the standby's
+            acknowledgment before reporting commit. The third hat is
+            point-in-time recovery: a base backup plus archived WAL replayed
+            to a chosen LSN or timestamp. <mark>Crash recovery, replicas,
+            and PITR are not three subsystems; they are one mechanism, the
+            log, consumed three ways.</mark> Logical decoding reads the same
+            stream and emits row-level changes, which is how
+            change-data-capture tools ride the WAL. The trap to correct:
+            replication is not backup. A replica faithfully replays your
+            accidental <code>DROP TABLE</code> within milliseconds; only
+            base backups plus WAL archives let you rewind.
+          </p>
+
+          <h3>Deep dive 3: the planner and reading EXPLAIN ANALYZE</h3>
+          <p>
+            The planner's currency is cost, an abstract unit anchored by
+            <code>seq_page_cost = 1.0</code>. The defaults in
+            <code>costsize.c</code> that matter:
+            <code>random_page_cost = 4.0</code> (deliberately far below the
+            true random-versus-sequential ratio of magnetic disks because
+            most random reads are assumed cached; on SSDs many operators
+            lower it toward 1.1), <code>cpu_tuple_cost = 0.01</code>, and
+            <code>cpu_index_tuple_cost = 0.005</code>. Selectivity estimates
+            come from ANALYZE's statistics, histograms and most-common-value
+            lists at <code>default_statistics_target = 100</code> resolution
+            (estimation functions in
+            <code>src/backend/utils/adt/selfuncs.c</code>).
+          </p>
+          <p>
+            The reading skill, on real output shape:
+          </p>
+          <pre><code>Index Scan using accounts_pkey on accounts
+    (cost=0.29..8.31 rows=1 width=16)
+    (actual time=0.041..0.043 rows=1 loops=1)
+  Index Cond: (id = 42)
+Planning Time: 0.140 ms
+Execution Time: 0.070 ms</code></pre>
+          <p>
+            Read it in this order. First, <code>rows</code> estimated versus
+            <code>rows</code> actual: a large mismatch means stale or
+            insufficient statistics and is the root cause of most bad plans;
+            run ANALYZE, then look again. Second, where the time actually
+            went, remembering that <code>actual time</code> is per loop and
+            multiplies by <code>loops</code> (the classic misread on nested
+            loops). Third, the node types against your expectation: Seq Scan
+            where you expected an index is not a bug until the row estimate
+            says it should have been selective. Costs are unitless planning
+            currency, not milliseconds; only <code>actual time</code> is
+            time. Add <code>EXPLAIN (ANALYZE, BUFFERS)</code> to see shared
+            buffer hits versus disk reads per node.
+          </p>
+
+          <h3>Deep dive 4: the process model and shared buffers</h3>
+          <p>
+            Postgres runs queries in processes, not threads, a Berkeley-era
+            decision retained for the isolation it buys: a crashing backend
+            takes out one connection while the postmaster resets shared
+            state, and the codebase avoids whole classes of threading bugs.
+            The prices are connection weight (hence pooling) and the
+            constraint that everything shared must live in explicit shared
+            memory. The centerpiece of that shared memory is the buffer
+            cache in <code>src/backend/storage/buffer/bufmgr.c</code>: all
+            table and index pages are read and modified through it, dirty
+            pages are written back lazily by the background writer and at
+            checkpoints, and eviction runs a clock-sweep approximation of
+            LRU. Its size, <code>shared_buffers</code>, defaults to a
+            deliberately tiny 128 MB; the standard starting point on a
+            dedicated machine is around a quarter of RAM, not more, because
+            Postgres reads files through the OS page cache too and the two
+            caches double-buffer. This layered-cache effect is why "cold"
+            query timings are so hard to reason about casually, and why
+            <code>BUFFERS</code> output distinguishes hits from reads: a
+            "read" may still be served from the OS cache without touching
+            the disk.
+          </p>
+
+          <h2>Part VI: Reading the repository</h2>
+          <p>
+            Clone the mirror and live in <code>src/backend/</code>. The
+            tree's README files are genuinely excellent and every path below
+            was verified against current master.
+          </p>
+          <p>
+            <strong>Stage 0, orientation without code.</strong> Read
+            <code>src/backend/optimizer/README</code> (the standout),
+            <code>src/backend/access/transam/README</code> (transactions and
+            WAL), and <code>src/backend/storage/buffer/README</code>.
+            Questions you should be able to answer: what are the four
+            pipeline stages and in which directories do they live? What is
+            the difference between a path and a plan? What rule makes a log
+            "write-ahead"?
+          </p>
+          <p>
+            <strong>Stage 1, the spine.</strong> Read
+            <code>src/backend/postmaster/postmaster.c</code> (skim the fork
+            logic), then <code>src/backend/tcop/postgres.c</code>, focusing
+            on <code>exec_simple_query()</code>. Questions: at what moment
+            does a connection get its process? Which functions correspond to
+            parse, rewrite, plan, execute? Where would a second query in the
+            same session re-enter?
+          </p>
+          <p>
+            <strong>Stage 2, front half of the pipeline.</strong> Read
+            <code>src/backend/parser/README</code>, skim
+            <code>gram.y</code> for one statement type, read
+            <code>parser/analyze.c</code>, then
+            <code>rewrite/rewriteHandler.c</code>. Questions: why is parsing
+            split from analysis? How does a view become its definition? Where
+            would row-level security predicates attach?
+          </p>
+          <p>
+            <strong>Stage 3, planner.</strong> Read
+            <code>optimizer/plan/planner.c</code> top-down, then
+            <code>optimizer/path/allpaths.c</code> and
+            <code>optimizer/path/costsize.c</code>. Questions: where do
+            sequential and index paths get created for a base table? Which
+            function turns the cheapest path into a plan? Which GUCs appear
+            as variables in costsize.c?
+          </p>
+          <p>
+            <strong>Stage 4, executor.</strong> Read
+            <code>src/backend/executor/README</code>, then
+            <code>execMain.c</code>, then one scan node and
+            <code>nodeModifyTable.c</code>. Questions: how does the Volcano
+            pull model appear in code? Where does an UPDATE actually call
+            into the heap? How do EXPLAIN node names map to files?
+          </p>
+          <p>
+            <strong>Stage 5, storage and transactions.</strong> Read
+            <code>access/heap/heapam.c</code> (find
+            <code>heap_update()</code>), <code>access/heap/README.HOT</code>,
+            <code>storage/buffer/bufmgr.c</code>,
+            <code>access/transam/xact.c</code>, and
+            <code>access/transam/xlog.c</code> last, it is the deep end.
+            Questions: what exactly happens to xmin, xmax, and ctid on
+            update? When is a HOT update possible? What sequence of events
+            constitutes commit?
+          </p>
+          <p>
+            Where <em>not</em> to start: <code>gram.y</code> in full (tens
+            of thousands of grammar lines with no architecture in them),
+            <code>xlog.c</code> cold (it is among the hardest files in the
+            tree; earn it via the transam README), and the
+            <code>src/include/</code> headers as a reading path, useful as
+            reference, aimless as a tour.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            All labs run in stock psql against the demo database from Part
+            II. Exact IDs, timings, and sizes will differ on your machine;
+            the shapes will not.
+          </p>
+
+          <h3>Lab 1: watch row versions with xmin and xmax</h3>
+          <pre><code>-- session A
+BEGIN;
+UPDATE accounts SET balance = 900 WHERE id = 42;
+
+-- session B (a second psql)
+SELECT xmin, xmax, ctid, * FROM accounts WHERE id = 42;
+--  xmin | xmax | ctid  | id | balance
+--   748 |  751 | (0,42)| 42 |    1000     &lt;- old version, xmax set by A
+
+-- session A
+COMMIT;
+
+-- session B again
+SELECT xmin, xmax, ctid, * FROM accounts WHERE id = 42;
+--   751 |    0 | (0,442)| 42 |     900    &lt;- new version, new ctid</code></pre>
+          <p>
+            Observe: while A is uncommitted, B still sees the old version
+            but with a nonzero <code>xmax</code>, A's transaction ID staked
+            on it. After commit, B sees the new version with
+            <code>xmin</code> equal to that same ID and a different
+            <code>ctid</code>: the row moved, because it was never updated
+            in place. This is Deep dive 1 with your own eyes.
+          </p>
+
+          <h3>Lab 2: EXPLAIN ANALYZE before and after an index</h3>
+          <pre><code>CREATE TABLE events(id bigserial, kind text);
+INSERT INTO events(kind)
+  SELECT (ARRAY['signup','login','click'])[1 + g % 3]
+  FROM generate_series(1, 500000) g;
+
+EXPLAIN ANALYZE SELECT count(*) FROM events WHERE kind = 'signup';
+-- Seq Scan on events ... rows≈166000 ... Execution Time: tens of ms
+
+CREATE INDEX ON events(kind);
+ANALYZE events;
+EXPLAIN ANALYZE SELECT count(*) FROM events WHERE kind = 'signup';</code></pre>
+          <p>
+            Observe: with a third of the table matching, the planner may
+            justifiably stick with a scan or choose an index-only scan;
+            change the predicate to a rare value (insert one
+            <code>'rare'</code> row and query it) and watch the plan flip
+            decisively to the index with a row estimate near 1. The lesson
+            is Deep dive 3's: plans follow selectivity estimates, not the
+            existence of indexes.
+          </p>
+
+          <h3>Lab 3: create bloat, then watch vacuum work</h3>
+          <pre><code>CREATE TABLE bloat_demo AS SELECT g AS id, 0 AS n FROM generate_series(1,100000) g;
+SELECT pg_size_pretty(pg_relation_size('bloat_demo'));   -- e.g. 3544 kB
+UPDATE bloat_demo SET n = 1;                             -- 100k dead tuples
+SELECT pg_size_pretty(pg_relation_size('bloat_demo'));   -- roughly doubled
+SELECT n_dead_tup, n_live_tup FROM pg_stat_user_tables
+ WHERE relname = 'bloat_demo';
+VACUUM VERBOSE bloat_demo;
+SELECT pg_size_pretty(pg_relation_size('bloat_demo'));   -- barely shrinks!
+VACUUM FULL bloat_demo;
+SELECT pg_size_pretty(pg_relation_size('bloat_demo'));   -- back to original</code></pre>
+          <p>
+            Observe three facts from Deep dive 1: the update doubled the
+            heap because every row got a second version; plain VACUUM
+            reported removing dead tuples but the file stayed big (space is
+            reusable, not returned); VACUUM FULL rewrote the table and gave
+            the space back, at the price of an exclusive lock you would not
+            take casually in production.
+          </p>
+
+          <h3>Lab 4: watch the WAL advance</h3>
+          <pre><code>SELECT pg_current_wal_lsn();                       -- e.g. 0/1A2B3C40
+INSERT INTO accounts VALUES (999999, 0);
+SELECT pg_current_wal_lsn();                       -- a bit further
+SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '0/1A2B3C40');  -- bytes logged</code></pre>
+          <p>
+            Observe: every write moves the LSN, and the diff function tells
+            you exactly how many bytes of WAL your operation generated. Try
+            the same insert immediately after a
+            <code>CHECKPOINT;</code> command and see the count jump, because
+            the first touch of a page after a checkpoint logs a full page
+            image (Deep dive 2's torn-write defense, measurable from SQL).
+          </p>
+
+          <h3>Lab 5: read the system's pulse in pg_stat views</h3>
+          <pre><code>SELECT pid, state, wait_event_type, wait_event, query
+  FROM pg_stat_activity WHERE state &lt;&gt; 'idle';
+
+SELECT relname, seq_scan, idx_scan, n_dead_tup, last_autovacuum
+  FROM pg_stat_user_tables ORDER BY seq_scan DESC LIMIT 5;
+
+SELECT * FROM pg_stat_database WHERE datname = current_database();</code></pre>
+          <p>
+            Observe: <code>pg_stat_activity</code> shows every backend
+            process (Deep dive 4 as a table: each row is literally a forked
+            process; look for <code>idle in transaction</code>),
+            <code>pg_stat_user_tables</code> shows which tables are being
+            sequentially scanned (missing indexes announce themselves in
+            <code>seq_scan</code>) and how autovacuum is keeping up with
+            <code>n_dead_tup</code>, and <code>pg_stat_database</code>'s
+            <code>blks_hit</code> versus <code>blks_read</code> is your
+            shared-buffers hit rate.
+          </p>
+
+          <h2>Part VIII: Questions and model answers</h2>
+          <p>
+            Understanding checks; try each before reading the answer.
+          </p>
+          <p>
+            <strong>1. What happens, stage by stage, between typing an
+            UPDATE and seeing UPDATE 1?</strong> libpq sends the text to a
+            backend process the postmaster forked at connect time;
+            <code>exec_simple_query</code> runs it through parser and
+            analyzer (parse tree to Query), the rewriter (views, rules),
+            the planner (paths costed, cheapest becomes a plan), and the
+            executor, which finds the row, writes a new version, logs the
+            change to WAL, and at commit fsyncs the WAL before reporting
+            success.
+          </p>
+          <p>
+            <strong>2. What do xmin and xmax mean on a tuple?</strong> The
+            transaction IDs that created and (if any) deleted or superseded
+            that version. Visibility is computed per snapshot from them: a
+            version is visible if its creator committed before your snapshot
+            and its deleter, if any, did not.
+          </p>
+          <p>
+            <strong>3. Why do readers never block writers in
+            Postgres?</strong> Because an update creates a new version
+            instead of overwriting; readers keep using the old version their
+            snapshot can see while the writer works on the new one. The two
+            only meet when two <em>writers</em> target the same row, which
+            does lock.
+          </p>
+          <p>
+            <strong>4. Why does vacuum exist, in two sentences?</strong>
+            Versioning leaves superseded tuples in the heap, and something
+            must reclaim them once no snapshot can see them, or tables bloat
+            without bound. Vacuum also freezes old tuples so the 32-bit
+            transaction counter can wrap without making old data vanish.
+          </p>
+          <p>
+            <strong>5. What is transaction ID wraparound and what prevents
+            it?</strong> XIDs are 32-bit and circular, so comparisons only
+            work within a two-billion-transaction horizon; an unfrozen tuple
+            older than that would flip from "past" to "future" and disappear
+            from view. Anti-wraparound vacuums, forced by
+            <code>autovacuum_freeze_max_age</code> (default 200 million),
+            freeze old tuples first, and Postgres will stop accepting writes
+            rather than let the horizon be crossed.
+          </p>
+          <p>
+            <strong>6. What is a HOT update and why does it matter?</strong>
+            When an update changes no indexed column and the new version
+            fits on the same page, Postgres links it as a heap-only tuple
+            and writes no new index entries. On hot tables with wide
+            indexing this is the difference between an update costing one
+            page write and costing one per index.
+          </p>
+          <p>
+            <strong>7. Why is "the WAL" the answer to three different
+            questions?</strong> Crash recovery replays it, a standby is a
+            server permanently replaying a streamed copy of it, and PITR is
+            a base backup plus archived WAL replayed to a chosen point. One
+            append-only log of page changes happens to be exactly the
+            interface all three need.
+          </p>
+          <p>
+            <strong>8. Why is replication not a backup strategy?</strong>
+            Because replicas replay everything, including your mistakes, in
+            near real time; a dropped table is dropped on the standby
+            moments later. Only base backups plus WAL archives (or delayed
+            replicas as a partial mitigation) let you return to a moment
+            before the error.
+          </p>
+          <p>
+            <strong>9. EXPLAIN says cost=0.29..8.31. Milliseconds?</strong>
+            No: cost is a unitless currency anchored at
+            <code>seq_page_cost = 1.0</code>, used only to rank candidate
+            plans. Time appears only in EXPLAIN ANALYZE's
+            <code>actual time</code>, and even that is per loop and must be
+            multiplied by <code>loops</code>.
+          </p>
+          <p>
+            <strong>10. The planner ignores your new index. Name the three
+            likeliest reasons.</strong> The predicate matches too large a
+            fraction of the table for an index scan to beat a sequential
+            scan; the statistics are stale so the row estimate is wrong (run
+            ANALYZE and compare estimated versus actual rows); or the
+            expression in the query does not match the indexed expression
+            (functions, casts, collations).
+          </p>
+          <p>
+            <strong>11. A table's file barely shrinks after VACUUM. Is that
+            a bug?</strong> No. Plain VACUUM marks dead tuple space
+            reusable inside the file and only truncates trailing empty
+            pages; it deliberately avoids the exclusive lock a rewrite needs.
+            VACUUM FULL (or a tool like pg_repack) rewrites the table and
+            returns space to the OS.
+          </p>
+          <p>
+            <strong>12. What does "idle in transaction" cost you?</strong>
+            The session holds its snapshot and possibly locks, so vacuum
+            cannot reclaim any tuple version its snapshot might still see,
+            bloat accumulates cluster-wide, and lock waits can pile up
+            behind it. It is the classic silent Postgres incident, and
+            <code>pg_stat_activity</code> is where you catch it.
+          </p>
+          <p>
+            <strong>13. Why does Postgres want a connection pooler when
+            MySQL historically shrugged?</strong> A Postgres connection is a
+            forked OS process with meaningful memory and setup cost, while
+            MySQL used a thread per connection. Process-per-connection buys
+            fault isolation but makes connection churn and high connection
+            counts expensive, so poolers multiplex many clients onto few
+            backends.
+          </p>
+          <p>
+            <strong>14. When is SQLite the better choice than
+            Postgres?</strong> When the application and data share one
+            machine, writers are few, and operational simplicity dominates:
+            an in-process library with a single-file database eliminates the
+            server, the network, and the credential surface entirely. The
+            crossover is the moment a second machine needs the data.
+          </p>
+          <p>
+            <strong>15. Why can't Postgres answer count(*) from a
+            counter?</strong> Because the count depends on the observer:
+            each snapshot sees a different subset of row versions, so no
+            single stored number is correct for everyone. The scan is the
+            price of MVCC; estimates live in <code>pg_class.reltuples</code>
+            when approximate answers suffice.
+          </p>
+          <p>
+            <strong>16. How would you debug a query that is fast in staging
+            and slow in production?</strong> Compare
+            <code>EXPLAIN (ANALYZE, BUFFERS)</code> from both: look first
+            for estimated-versus-actual row divergence (statistics differ
+            with data), then buffers hit versus read (cache state differs),
+            then plan shape changes driven by table size crossing a cost
+            threshold. Fixes flow from which of the three diverged: ANALYZE
+            or higher statistics targets, memory or prewarming, or query and
+            index changes.
+          </p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Lesson 1: one durable log can power everything.</strong>
+            Postgres derives crash recovery, replication, and time travel
+            from a single WAL rather than three mechanisms. The same
+            consolidation is Kafka's entire identity, RocksDB's WAL plus
+            replication-by-log-shipping, and every event-sourced
+            architecture: when in doubt, make the log the source of truth
+            and everything else a replay.
+          </p>
+          <p>
+            <strong>Lesson 2: decide with an explicit cost model, not
+            heuristics.</strong> The planner reduces "which strategy" to
+            arithmetic over a handful of published constants and measured
+            statistics, which makes its decisions inspectable
+            (<code>EXPLAIN</code>) and tunable
+            (<code>random_page_cost</code>) instead of magical. Query
+            optimizers everywhere work this way, but so do good schedulers
+            and load balancers: expose the model, and operators can reason
+            about the system instead of appeasing it.
+          </p>
+          <p>
+            <strong>Lesson 3: buy isolation with processes when correctness
+            is the product.</strong> Process-per-connection looks archaic
+            next to thread pools and async runtimes, but it converts memory
+            corruption in one session into a bounded incident instead of a
+            silent cross-session data hazard. Chrome made the same trade
+            with process-per-site, and the pattern generalizes: the more
+            catastrophic shared-state corruption would be, the more an
+            address-space boundary is worth its overhead.
+          </p>
+          <p>
+            <strong>Lesson 4: never pay costs at write time that you can
+            defer to a janitor, but then take the janitor seriously.</strong>
+            MVCC moves conflict cost off the hot path and onto vacuum, a
+            deliberate asynchronous debt with a dedicated collector, tunable
+            and observable. Garbage-collected runtimes, LSM compaction in
+            <a href="/oss/rocksdb">RocksDB</a>, and log-structured
+            filesystems all make the same wager, and all teach the same
+            operational corollary: the deferred work needs first-class
+            monitoring, because it is load-bearing.
+          </p>
+          <p>
+            <strong>Lesson 5: store the system's own definition as data.</strong>
+            Types, functions, operators, and index methods are rows in
+            catalogs, which is why <code>CREATE EXTENSION</code> can teach a
+            thirty-year-old server geospatial indexing or vector search
+            without patching it. Plugin registries, Kubernetes CRDs, and
+            LLVM's target registration are the same idea: extensibility is a
+            data-modeling problem before it is an API problem.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            The one-sentence summary: <mark>PostgreSQL forks a process per
+            connection, runs every statement through parse, rewrite, plan,
+            and execute, writes new row versions instead of overwriting
+            (vacuum reclaims, freeze defends the XID horizon), and secures
+            every change in the WAL before data pages ever reach disk, with
+            that same WAL doubling as the replication and recovery
+            stream.</mark>
+          </p>
+          <pre class="flow">libpq → postmaster → parse → rewrite → plan → execute → heap → WAL → commit</pre>
+          <p>The chain mapped to source files (all under src/):</p>
+          <pre class="flow">libpq       interfaces/libpq/fe-exec.c
+postmaster  backend/postmaster/postmaster.c
+traffic cop backend/tcop/postgres.c        (exec_simple_query)
+parse       backend/parser/gram.y, analyze.c
+rewrite     backend/rewrite/rewriteHandler.c
+plan        backend/optimizer/plan/planner.c,
+            path/allpaths.c, path/costsize.c
+execute     backend/executor/execMain.c, nodeModifyTable.c
+heap        backend/access/heap/heapam.c   (xmin/xmax/ctid, HOT)
+WAL         backend/access/transam/xloginsert.c, xlog.c
+commit      backend/access/transam/xact.c  (flush WAL, mark pg_xact)</pre>
+          <p>Memorize these blocks:</p>
+          <p>
+            <strong>MVCC:</strong> every tuple carries xmin and xmax; update
+            equals new version plus xmax on the old; visibility is snapshot
+            arithmetic; vacuum reclaims dead versions and freezes old ones;
+            wraparound horizon is about two billion XIDs, with forced
+            vacuums at 200 million by default.
+          </p>
+          <p>
+            <strong>WAL:</strong> log before page, always; commit equals WAL
+            flushed through the commit record; 16 MB segments in pg_wal;
+            checkpoints bound replay; one log serves recovery, replication,
+            and PITR; replication is not backup.
+          </p>
+          <p>
+            <strong>Planner:</strong> paths costed, cheapest planned;
+            seq_page_cost 1.0, random_page_cost 4.0, statistics from ANALYZE
+            at target 100; read EXPLAIN ANALYZE by comparing estimated to
+            actual rows first; costs are not milliseconds.
+          </p>
+          <p>
+            <strong>Processes and memory:</strong> postmaster forks one
+            backend per connection; shared_buffers (default 128 MB, tune to
+            about a quarter of RAM) plus the OS page cache double-buffer;
+            checkpointer, background writer, autovacuum, and WAL senders are
+            sibling processes; pool your connections.
+          </p>
+
           <div class="takeaway">
-            <strong>Key takeaway:</strong> PostgreSQL is a small number of old,
-            sound decisions compounding for decades: version rows instead of
-            locking them and pay for it with vacuum, log every change once and
-            derive recovery and replication from that log, isolate connections
-            in processes, and keep the system's own behavior in catalogs so
-            extensions can teach an ancient codebase new tricks.
+            <strong>Key takeaway:</strong> PostgreSQL is a small number of
+            old, sound decisions compounding for decades: version rows
+            instead of locking them and pay for it with vacuum, log every
+            change once and derive recovery and replication from that log,
+            isolate connections in processes, and keep the system's own
+            behavior in catalogs so extensions can teach an ancient codebase
+            new tricks. Follow one UPDATE from libpq to the WAL flush and
+            you have touched every load-bearing wall in the building.
           </div>
         </article>
       </div>
