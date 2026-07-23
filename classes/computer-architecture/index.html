@@ -1,0 +1,2425 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Computer Architecture &middot; Stanley Jacob</title>
+    <meta name="description" content="From logic gates and clock-period arithmetic to pipelined datapaths, branch prediction, caches, virtual memory, Tomasulo's algorithm, cache coherence, SIMD, GPU throughput design, systolic arrays, and the roofline model, with worked numeric examples and measured H100 data." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes" class="active">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/classes">Classes</a></div>
+        <h1>Computer architecture: from logic gates to out-of-order superscalars and GPUs</h1>
+        <p class="lead">
+          Every layer of a computer is a bargain between latency, throughput,
+          and energy, and the terms of that bargain are set by physics one
+          level down. This page builds the whole stack in order: gates and
+          clocks, the five-stage pipeline and its hazards, branch predictors,
+          the cache and virtual-memory hierarchy, Tomasulo's algorithm and the
+          reorder buffer, coherence and consistency on multicores, SIMD, the
+          GPU as a throughput machine, and systolic accelerators. Along the
+          way it works the arithmetic that architects actually do: clock
+          periods, CPI, AMAT, occupancy, and the roofline, the last of these
+          calibrated against measured numbers from an NVIDIA H100 80GB in this
+          repository.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Why this subject matters now</h2>
+          <p>
+            For roughly forty years, software got faster by waiting. Dennard
+            scaling let each process generation shrink transistors, drop their
+            voltage, and raise the clock while keeping power density constant,
+            so a binary compiled in 1995 ran several times faster in 2000 on
+            the same source code. That regime ended around 2005 when threshold
+            voltages stopped scaling and leakage current made further voltage
+            reduction impossible; clocks froze near 3 to 5 GHz and the
+            industry pivoted to multicore, then to wide SIMD, then to GPUs,
+            and now to domain-specific accelerators. Each pivot moved work
+            that hardware used to do implicitly onto the programmer: cores
+            require parallel algorithms, SIMD requires data layout discipline,
+            GPUs require explicit management of a memory hierarchy, and
+            accelerators require casting the computation as the one dataflow
+            the silicon implements. A practitioner today is expected to reason
+            quantitatively about all of it: to read a profile and know whether
+            a kernel is bound by compute or by memory, to predict when a
+            branch-heavy loop will fall off a cliff, to explain why a
+            transformer trains at 74 percent of a GPU's peak while a
+            memory-bound elementwise pass reaches under one percent, and to
+            know which of those two numbers is actually good.
+          </p>
+          <p>
+            The subject also matters in the opposite direction. Machine
+            learning has become the dominant customer of new silicon, and the
+            architectures being built for it (tensor cores, systolic arrays,
+            HBM stacks, low-precision datapaths, structured sparsity) are
+            design points chosen from exactly the theory on this page. The
+            "hardware lottery" observation, that research directions win
+            partly because they map onto existing hardware, makes
+            architectural literacy a research skill, not only an engineering
+            one. The good news is that the field rests on a small number of
+            load-bearing ideas: locality, pipelining, prediction,
+            renaming, and replication. Everything below is one of those five
+            wearing different clothes.
+          </p>
+
+          <h2>Digital logic: where the clock period comes from</h2>
+          <h3>Combinational versus sequential circuits</h3>
+          <p>
+            A combinational circuit is a pure function of its current inputs:
+            gates, muxes, adders, ALUs. Change the inputs and, after the
+            gates' propagation delays settle, the outputs are the new function
+            value; there is no memory. A sequential circuit adds state,
+            almost always as edge-triggered D flip-flops: on the rising edge
+            of the clock, each flip-flop samples its input D and holds it on
+            its output Q until the next edge. A synchronous machine is
+            nothing more than these two elements alternating: registers hold
+            the state, a cloud of combinational logic computes the next state
+            and the outputs from the current state, and the clock edge
+            commits the result.
+          </p>
+          <pre class="flow">        ┌───────────────┐
+ clk ──► │  registers    │──── current state ────┐
+         │  (D flip-flops)│                      ▼
+         └───────▲───────┘        ┌────────────────────────┐
+                 │                │  combinational logic   │
+                 └── next state ──│  (gates, no memory)    │
+                                  └────────────────────────┘</pre>
+          <p>
+            Three timing parameters of the flip-flop govern everything. The
+            clock-to-Q delay \(t_{cq}\) is how long after the edge the stored
+            value appears at Q. The setup time \(t_{setup}\) is how long
+            before the next edge the input D must be stable to be captured
+            reliably. The hold time \(t_{hold}\) is how long after the edge D
+            must remain stable so the edge does not capture a value that is
+            already changing. From these, two constraints fall out. The setup
+            constraint bounds the clock period from below:
+          </p>
+          $$ T_{clk} \;\ge\; t_{cq} + t_{pd} + t_{setup} $$
+          <p>
+            where \(t_{pd}\) is the propagation delay of the longest
+            combinational path between any two registers, the critical path.
+            The signal must leave the source register (\(t_{cq}\)), traverse
+            the slowest logic (\(t_{pd}\)), and arrive at the destination
+            early enough to satisfy setup. The hold constraint is
+            independent of the clock period entirely:
+          </p>
+          $$ t_{cq,min} + t_{cd} \;\ge\; t_{hold} $$
+          <p>
+            where \(t_{cd}\) is the contamination delay, the shortest path
+            through the logic. It says the fastest new value racing out of a
+            register after an edge must not reach the next register before
+            that register's hold window closes. A hold violation cannot be
+            fixed by slowing the clock; it is fixed by inserting delay
+            buffers, which is why it is the more feared of the two in
+            physical design. Clock skew, the difference in edge arrival time
+            between two registers, tightens both constraints: skew toward the
+            receiver eats into the setup margin's benefit and directly
+            worsens the hold requirement.
+          </p>
+
+          <h3>Why pipelining raises throughput and not latency</h3>
+          <p>
+            The setup constraint says frequency is the reciprocal of the
+            worst register-to-register path. Pipelining is the act of cutting
+            a long combinational path into k shorter segments by inserting
+            registers, so the clock can run roughly k times faster and a new
+            input can be accepted every (shorter) cycle. Two facts follow
+            immediately from the timing algebra and are worth internalizing
+            as algebra, not slogans. First, throughput improves by at most k,
+            and in practice by less, because the cut points are never
+            perfectly balanced (the clock is set by the slowest stage, not
+            the average) and because every added register level charges the
+            fixed toll \(t_{cq} + t_{setup}\) per stage. Second, the latency
+            of any single input through the machine gets worse, not better:
+            the work is the same, the register toll is now paid k times, and
+            imbalance rounds every stage up to the slowest one. Pipelining
+            is purely a throughput transformation. If one result is needed
+            as fast as possible and there is no stream of independent work
+            behind it, pipelining is a loss.
+          </p>
+
+          <div class="problem">
+            <span class="plabel">Problem 1</span>
+            <p>
+              A single-cycle processor has five logic blocks in series with
+              delays: instruction fetch 250 ps, register read 150 ps, ALU
+              200 ps, data memory 250 ps, register writeback 100 ps. The
+              registers used for pipelining have \(t_{cq} = 60\) ps and
+              \(t_{setup} = 40\) ps. Compute (a) the maximum clock frequency
+              of the single-cycle design, (b) the maximum frequency of the
+              5-stage pipelined design with one register between each pair of
+              blocks, (c) the throughput speedup, and (d) the latency of one
+              instruction in both designs.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> (a) The single-cycle critical path
+                is the full chain: \(250+150+200+250+100 = 950\) ps of
+                logic, plus one register traversal, \(60 + 40 = 100\) ps, so
+                \(T = 1050\) ps and \(f = 1/1050\,\text{ps} \approx
+                0.95\) GHz.
+              </p>
+              <p>
+                (b) Pipelined, the clock is set by the slowest stage, data
+                memory or fetch at 250 ps, plus the per-stage register toll:
+                \(T = 250 + 60 + 40 = 350\) ps, so \(f \approx 2.86\) GHz.
+              </p>
+              <p>
+                (c) Throughput speedup is \(1050 / 350 = 3.0\), not 5,
+                because the stages are imbalanced (the 100 ps writeback
+                stage idles 150 ps every cycle) and the register toll of
+                100 ps is now paid every stage instead of once.
+              </p>
+              <p>
+                (d) Single-cycle latency is one period, 1050 ps. Pipelined
+                latency is five periods, \(5 \times 350 = 1750\) ps, which
+                is 67 percent worse. The pipeline wins only because it
+                finishes one instruction every 350 ps at steady state; the
+                individual instruction is slower. This is the general shape
+                of every pipelining decision, from ALUs to GPU tensor cores
+                to network switches.
+              </p>
+            </div>
+          </div>
+
+          <h2>ISA design: the contract between software and silicon</h2>
+          <h3>RISC versus CISC, stated honestly</h3>
+          <p>
+            An instruction set architecture is the durable interface: the
+            registers, instructions, memory model, and exception behavior
+            that software may rely on across implementations. The classic
+            RISC argument (fixed-length instructions, load/store
+            architecture, many general-purpose registers, simple addressing
+            modes) was that a simple, regular ISA lets the implementation be
+            pipelined aggressively and lets the compiler do the scheduling.
+            The classic CISC counterargument was code density and fewer
+            instructions per task. The honest modern accounting is more
+            nuanced than either camp's slogans. Every high-performance x86
+            since the mid-1990s has been a RISC-like out-of-order core behind
+            a decoder that cracks x86 instructions into micro-ops, so the
+            execution engines of a modern Intel, AMD, and Arm core look
+            strikingly alike; the ISA war was settled by translation, not
+            victory. What variable-length encoding still costs is the
+            front end: finding instruction boundaries in an x86 byte stream
+            requires either predecode bits, parallel speculative decoders, or
+            a micro-op cache that bypasses decode entirely, and this is real
+            area, power, and design effort. Fixed 4-byte instructions are one
+            reason Apple could build a very wide in-house decoder for its
+            M-series cores with comparative ease. The cost is bounded,
+            though: on large out-of-order cores the decode tax is a
+            few percent of power, which is why x86 remains competitive; on
+            small cores the tax is proportionally larger, which is why
+            embedded and mobile went RISC decades ago and never returned.
+          </p>
+          <p>
+            RISC-V is the current center of gravity for both teaching and
+            new silicon because it is modular and unencumbered. The base
+            integer ISA (RV32I or RV64I) is small enough to learn in an
+            afternoon: 32 registers (x0 hardwired to zero), load/store only,
+            and one memory addressing mode, base register plus 12-bit signed
+            immediate. Everything else is an extension: M (multiply/divide),
+            A (atomics), F/D (floating point), C (16-bit compressed
+            encodings, which recover most of CISC's density advantage), V
+            (vectors), and the privileged architecture for operating
+            systems. The compressed extension is the quiet star: RV64GC code
+            density is comparable to x86-64, removing the last practical
+            CISC advantage while keeping decode trivial, since a 16-bit or
+            32-bit boundary is determined by two bits of the first parcel.
+          </p>
+          <h3>Addressing modes and calling conventions</h3>
+          <p>
+            Addressing modes are where ISAs reveal their philosophy. x86-64
+            computes addresses as base + index × scale + displacement in a
+            single instruction, and instructions can take one memory operand
+            directly, so a compiler can fold an array access into an add.
+            Classic Arm adds pre- and post-increment modes that update the
+            base register as a side effect, which shrinks loops over arrays.
+            RISC-V offers only base + immediate, on the argument that the
+            fancier modes cost decode complexity and a wider adder in a
+            critical path while the compiler can synthesize them in one
+            extra instruction that is usually hoisted or strength-reduced
+            anyway. Measurement mostly vindicated this: the fused
+            compare-and-branch and the compressed extension bought back far
+            more than rich addressing modes would have.
+          </p>
+          <p>
+            The calling convention is the ISA's social contract, and reading
+            disassembly is impossible without it. In the standard RISC-V
+            convention, arguments and return values travel in a0 through a7,
+            ra holds the return address written by jal, sp is the stack
+            pointer, t-registers are caller-saved scratch (the callee may
+            destroy them), and s-registers are callee-saved (a function that
+            uses s1 must save and restore it). A minimal function that
+            needs one saved register compiles to a prologue that pushes ra
+            and s0, a body, and an epilogue that pops and returns:
+          </p>
+          <pre class="flow">sum_sq:                        # int sum_sq(int *p, int n)
+    addi  sp, sp, -16          # prologue: make frame
+    sd    ra, 8(sp)            # save return address (callee will call)
+    sd    s0, 0(sp)            # save callee-saved s0
+    li    s0, 0                # acc = 0
+loop:
+    beqz  a1, done             # while (n != 0)
+    lw    t0, 0(a0)            # t0 = *p        (base + imm addressing)
+    mulw  t0, t0, t0           # t0 = t0 * t0
+    addw  s0, s0, t0           # acc += t0
+    addi  a0, a0, 4            # p++
+    addiw a1, a1, -1           # n--
+    j     loop
+done:
+    mv    a0, s0               # return value in a0
+    ld    s0, 0(sp)            # epilogue: restore
+    ld    ra, 8(sp)
+    addi  sp, sp, 16
+    ret                        # jalr x0, 0(ra)</pre>
+          <p>
+            The landscape today: x86-64 (Intel and AMD) still owns desktops
+            and the majority of server sockets; Arm owns mobile entirely,
+            owns Apple's product line, and has serious server share through
+            AWS Graviton, Ampere, and NVIDIA Grace; RISC-V dominates new
+            embedded designs and management cores (billions of units,
+            including controllers inside NVIDIA GPUs and Western Digital
+            drives) and is climbing toward application processors. The
+            interesting structural fact is that all three now ship the same
+            microarchitectural playbook, so ISA choice is increasingly about
+            licensing, ecosystems, and software, not about achievable
+            performance.
+          </p>
+
+          <h2>The pipelined datapath and its hazards</h2>
+          <h3>From single-cycle to five stages</h3>
+          <p>
+            The single-cycle datapath executes one instruction per clock,
+            with the period stretched to cover the slowest instruction
+            (a load: fetch, decode, address arithmetic, memory, writeback in
+            one period). Problem 1 already showed why this wastes time: every
+            instruction pays for the slowest one's path. The classic fix is
+            the five-stage pipeline: IF fetches from instruction memory, ID
+            decodes and reads the register file, EX runs the ALU, MEM
+            accesses data memory, WB writes the register file. Pipeline
+            registers between stages carry both data and the control signals
+            each instruction will need downstream, so five instructions are
+            in flight at once, each owning one stage.
+          </p>
+          <pre class="flow">cycle:      1     2     3     4     5     6     7     8
+lw   x2,0(x1)   IF    ID    EX    MEM   WB
+add  x3,x4,x5         IF    ID    EX    MEM   WB
+sub  x6,x7,x8               IF    ID    EX    MEM   WB
+and  x9,x2,x3                     IF    ID    EX    MEM   WB</pre>
+          <p>
+            Hazards are the situations where the overlap lies about program
+            order. A structural hazard is two instructions needing the same
+            hardware in the same cycle; the canonical one, instruction fetch
+            and data access colliding on a single memory, is designed away by
+            split instruction and data caches, and the register file is
+            written in the first half of a cycle and read in the second so WB
+            and ID can share it. A data hazard is an instruction needing a
+            value an older in-flight instruction has not yet written. A
+            control hazard is not knowing what to fetch after a branch until
+            the branch resolves.
+          </p>
+          <h3>Forwarding, derived rather than asserted</h3>
+          <p>
+            Consider add x3, x1, x2 followed immediately by sub x5, x3, x4.
+            The add computes x3 at the end of its EX cycle but does not write
+            the register file until WB, two cycles later; the sub reads
+            registers in ID, one cycle after the add's EX. Without help the
+            sub would read a stale x3 and the pipeline would need two stall
+            cycles. But the needed value already exists inside the machine,
+            sitting in the EX/MEM pipeline register. Forwarding (bypassing)
+            adds muxes in front of each ALU input that can select, instead of
+            the register-file read, either the EX/MEM register (result of the
+            instruction one ahead) or the MEM/WB register (two ahead). The
+            control equation is exactly the hazard condition read off the
+            pipeline diagram: forward from EX/MEM to an ALU source if that
+            older instruction writes a register (RegWrite is set), its
+            destination is not x0, and its destination equals the source
+            register number; likewise from MEM/WB, but only if the EX/MEM
+            case did not already match, so the most recent value wins when
+            both are candidates.
+          </p>
+          <pre class="flow">            ┌──────────── forwarding paths ────────────┐
+            │                                          │
+   ID/EX ──►│  ┌─────┐    EX/MEM         MEM/WB        │
+  regfile ─►├─►│ ALU │──►[R]────────────►[R]──► WB     │
+   values ─►│  └─────┘     │               │           │
+            │      ▲       │               │           │
+            │      └───────┴◄──────────────┘           │
+            │      (mux selects newest matching value) │
+            └──────────────────────────────────────────┘</pre>
+          <p>
+            One data hazard survives forwarding. A load produces its value at
+            the end of MEM, but an immediately following dependent
+            instruction needs it at the start of its own EX, which is the
+            same cycle as the load's MEM. The value does not exist yet
+            anywhere in the machine at the moment it is needed; no wire can
+            forward backward in time. The hardware must stall one cycle
+            (a hazard detection unit in ID freezes IF and ID and injects a
+            bubble into EX), after which the MEM/WB forwarding path covers
+            it. This is the load-use hazard, and it is why compilers and
+            out-of-order schedulers try to put an independent instruction
+            between a load and its consumer.
+          </p>
+          <h3>Control hazards and CPI arithmetic</h3>
+          <p>
+            A conditional branch resolved in EX means two younger
+            instructions are already in IF and ID when the outcome is known;
+            if the prediction was wrong they must be squashed, costing two
+            cycles. Moving the comparison to ID (feasible for simple
+            equality tests) cuts the penalty to one at the price of a tighter
+            critical path and harder forwarding into ID. Real machines
+            instead predict, which is the next section; here it is enough to
+            do the accounting. The pipelined CPI is 1 plus the average stalls
+            per instruction:
+          </p>
+          $$ \text{CPI} \;=\; 1 \;+\; \sum_{h \in \text{hazards}} (\text{frequency of } h) \times (\text{penalty of } h) $$
+
+          <div class="problem">
+            <span class="plabel">Problem 2</span>
+            <p>
+              In a 5-stage pipeline with full forwarding, 25 percent of
+              instructions are loads and 40 percent of load results are used
+              by the very next instruction (1-cycle load-use stall).
+              Branches are 18 percent of instructions, resolve in EX
+              (2-cycle penalty on a wrong guess), and a static
+              predict-not-taken scheme is wrong 60 percent of the time.
+              Compute the CPI, and the speedup over the same pipeline
+              without forwarding, where every ALU-to-ALU dependence costs 2
+              stall cycles and 45 percent of instructions depend on the
+              immediately preceding ALU result.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> With forwarding: load-use stalls
+                add \(0.25 \times 0.40 \times 1 = 0.10\) cycles per
+                instruction; branch flushes add \(0.18 \times 0.60 \times 2
+                = 0.216\). CPI \(= 1 + 0.10 + 0.216 = 1.316\).
+              </p>
+              <p>
+                Without forwarding, the ALU dependences that forwarding had
+                made free now stall: \(0.45 \times 2 = 0.90\) extra, and the
+                load-use pair costs 2 cycles instead of 1, adding another
+                \(0.25 \times 0.40 \times 1 = 0.10\). CPI \(= 1.316 + 0.90 +
+                0.10 = 2.316\). Speedup from forwarding alone is
+                \(2.316 / 1.316 = 1.76\times\) at the same clock. Forwarding
+                is a large fraction of the entire benefit of pipelining, for
+                the price of two muxes and a handful of comparators; this
+                ratio of benefit to cost is why every pipelined machine
+                built since has included it. The remaining 0.216 of branch
+                CPI is the budget line that funds branch prediction.
+              </p>
+            </div>
+          </div>
+
+          <h2>Branch prediction</h2>
+          <h3>From static hints to saturating counters</h3>
+          <p>
+            The cheapest predictor is static: predict backward branches
+            taken (they are usually loop bottoms) and forward branches not
+            taken. This reaches roughly 60 to 70 percent on integer code and
+            costs nothing, but a pipeline that fetches many instructions per
+            cycle from a deep pipe needs far better. The first dynamic step
+            is a table of 2-bit saturating counters indexed by low PC bits:
+            states strongly-not-taken (00), weakly-not-taken (01),
+            weakly-taken (10), strongly-taken (11); predict from the high
+            bit, increment on taken, decrement on not-taken, saturating at
+            the ends. The second bit exists for hysteresis. A loop branch
+            that is taken nine times then falls through once would, with a
+            1-bit predictor, mispredict twice per loop visit: once at the
+            exit, and again at the next entry because the exit flipped the
+            bit. The 2-bit counter mispredicts only the exit: the single
+            not-taken decrements strongly-taken to weakly-taken, which still
+            predicts taken at the next entry. For an N-iteration loop the
+            accuracy is \((N-1)/N\) instead of \((N-2)/N\), and for nested
+            short loops the difference compounds.
+          </p>
+          <h3>Correlation, gshare, and TAGE</h3>
+          <p>
+            Per-branch counters cannot see patterns that span branches. The
+            branch guarding if (x == 0) is perfectly predictable from the
+            branch that just set x, and an alternating pattern T,N,T,N
+            defeats a saturating counter entirely (it oscillates between the
+            weak states, mispredicting half the time). Two-level predictors,
+            introduced by Yeh and Patt, add a global history register (GHR),
+            a shift register of the outcomes of the last k branches, and use
+            it to index the counter table: different recent histories get
+            different counters, so the alternating branch trains two
+            counters, one for "last was T" and one for "last was N", each of
+            which saturates correctly. gshare, McFarling's refinement, XORs
+            the history with the PC bits rather than concatenating them, so
+            the table is shared across branches with less systematic
+            aliasing:
+          </p>
+          $$ \text{index} = (\text{PC} \gg 2) \;\oplus\; \text{GHR}_{k\ \text{bits}} $$
+          <p>
+            The state of the art in this line is TAGE (tagged geometric
+            history length), due to Seznec. TAGE keeps several tables, each
+            indexed by a hash of the PC with a different history length, and
+            the lengths form a geometric series (for example 4, 8, 16, 32,
+            64, 128 bits), so the predictor can capture both very short and
+            very long correlations without paying long-history storage for
+            every branch. Entries are tagged, so a lookup knows whether the
+            entry actually belongs to this (PC, history) pair rather than
+            being an alias. Prediction comes from the matching table with the
+            longest history (the provider); allocation on a misprediction
+            trains a longer-history table, so branches migrate to exactly the
+            history length they need. TAGE variants with a statistical
+            corrector and a loop predictor (TAGE-SC-L) have won every
+            championship branch prediction contest since 2006 and are
+            understood to approximate what ships in current high-end cores,
+            which reach roughly 3 to 6 mispredictions per thousand
+            instructions on general code.
+          </p>
+          <h3>Targets: BTB and the return address stack</h3>
+          <p>
+            Direction is only half the problem; fetch needs the target
+            address in the same cycle. The branch target buffer (BTB) is a
+            cache indexed by fetch PC that remembers, for recently taken
+            branches, where they went, so the front end can redirect fetch
+            with zero bubbles on a BTB hit. Returns defeat a BTB because one
+            return site has many callers; the return address stack (RAS) is
+            a small hardware stack that pushes on call and pops on return,
+            predicting returns nearly perfectly until the stack overflows or
+            speculation corrupts it (real designs checkpoint the RAS top
+            pointer per predicted branch for repair). Indirect branches
+            (virtual calls, switch tables, interpreter dispatch) get their
+            own history-indexed target predictor (the ITTAGE variant of
+            TAGE); interpreters are famous branch-predictor stress tests
+            precisely because one indirect jump's target encodes the entire
+            bytecode stream.
+          </p>
+          <div class="problem">
+            <span class="plabel">Problem 3</span>
+            <p>
+              A 4-wide out-of-order core sustains a baseline IPC of 3.2 when
+              prediction is perfect. The pipeline restart penalty on a
+              misprediction is 16 cycles. Compute the effective IPC at 5
+              mispredictions per kilo-instruction (MPKI), typical of a good
+              TAGE predictor on integer code, and at 12 MPKI, typical of a
+              plain gshare. How much of the gshare machine's performance is
+              recovered by the better predictor?
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> Work in cycles per instruction.
+                Baseline CPI \(= 1/3.2 = 0.3125\). Each misprediction adds
+                16 cycles, so 5 MPKI adds \(5 \times 16 / 1000 = 0.080\) CPI
+                and 12 MPKI adds \(12 \times 16 / 1000 = 0.192\) CPI.
+              </p>
+              <p>
+                At 5 MPKI: CPI \(= 0.3125 + 0.080 = 0.3925\), IPC
+                \(= 2.55\). At 12 MPKI: CPI \(= 0.3125 + 0.192 = 0.5045\),
+                IPC \(= 1.98\). The better predictor is worth
+                \(2.55/1.98 = 1.29\times\), a 29 percent speedup from a
+                structure of a few tens of kilobytes, which is why modern
+                cores spend more SRAM on prediction than a 1990s machine
+                spent on its entire L1. Note also the leverage structure:
+                the wider and deeper the machine (lower baseline CPI, higher
+                restart penalty), the more each avoided misprediction is
+                worth, which is why prediction quality and issue width have
+                co-evolved.
+              </p>
+            </div>
+          </div>
+          <h2>Caches and the memory hierarchy</h2>
+          <h3>The mapping spectrum and the address breakdown</h3>
+          <p>
+            DRAM latency has improved by small constant factors while
+            processor cycle times improved by orders of magnitude, so a load
+            that misses everything costs on the order of 200 to 400 cycles
+            on a current server part. The entire memory hierarchy exists to
+            hide this behind two empirical regularities: temporal locality
+            (recently used data is likely to be used again) and spatial
+            locality (data near recently used data is likely to be used
+            soon). A cache stores fixed-size blocks (lines), essentially
+            always 64 bytes on CPUs, and the design space is where a given
+            line is allowed to live. Direct-mapped: each address maps to
+            exactly one location, found by indexing with middle address
+            bits; lookup is a single tag compare, fast and cheap, but two
+            hot addresses that share an index evict each other forever. In a
+            fully associative cache a line can live anywhere; no conflicts, but
+            every lookup compares every tag, which only works for small
+            structures like TLBs. Set-associative is the compromise: the
+            index selects a set, and the line may occupy any of the W ways
+            in it, with W tag compares in parallel. Hill and Smith's classic
+            measurement, still roughly true, is that doubling associativity
+            cuts the miss rate about as much as doubling capacity, up to
+            around 8 ways, after which conflict misses are mostly gone.
+          </p>
+          <p>
+            The address arithmetic is mechanical and worth being fast at.
+            With a capacity of C bytes, line size B, and associativity W:
+            offset bits \(= \log_2 B\), number of sets \(S = C/(B \times
+            W)\), index bits \(= \log_2 S\), and the tag is every remaining
+            high bit. A concrete example that recurs below: a 32 KiB, 8-way
+            L1 with 64-byte lines has \(S = 32768/(64 \times 8) = 64\) sets,
+            so 6 offset bits, 6 index bits, and for 48-bit physical
+            addresses a \(48 - 12 = 36\)-bit tag.
+          </p>
+          <pre class="flow">48-bit address, 32 KiB / 8-way / 64 B lines:
+
+  47                          12 11        6 5         0
+  ┌──────────────────────────────┬───────────┬───────────┐
+  │            tag (36)          │ index (6) │ offset (6)│
+  └──────────────────────────────┴───────────┴───────────┘
+                                  64 sets      64 B line
+  index+offset = 12 bits = 4 KiB = one way = one page (this
+  coincidence is engineered; see VIPT below)</pre>
+          <h3>The three Cs, write policies, and replacement</h3>
+          <p>
+            Misses are classified by what would have prevented them.
+            Compulsory misses are first-ever touches; only larger lines or
+            prefetching help. Capacity misses would occur even in a fully
+            associative cache of the same size; the working set is simply too
+            big. Conflict misses are the remainder, artifacts of limited
+            associativity; more ways or better index hashing help. On
+            multiprocessors a fourth C, coherence misses, appears: lines
+            invalidated by another core's writes, the subject of the
+            multicore section. Write policy is a second axis. Write-through
+            sends every store to the next level (simple, always-clean lines,
+            but bandwidth-hungry, so it survives mainly in L1s paired with
+            coalescing write buffers); write-back marks the line dirty and
+            writes it out only on eviction, which is what every modern
+            data cache does. Orthogonally, write-allocate fetches a line on a
+            store miss (betting on locality of subsequent accesses) while
+            no-write-allocate forwards the store onward without filling;
+            write-back caches essentially always allocate. Replacement within
+            a set is LRU or an approximation (tree-pseudo-LRU) at low
+            associativity; last-level caches increasingly use scan-resistant
+            policies like RRIP, because a single streaming pass over a large
+            array should not be allowed to flush the entire cache, which is
+            exactly what true LRU permits.
+          </p>
+          <h3>AMAT: the hierarchy's figure of merit</h3>
+          <p>
+            Average memory access time composes recursively: the time at
+            each level is its hit time plus its local miss rate times the
+            time of the level below.
+          </p>
+          $$ \text{AMAT} = t_{L1} + m_{L1}\,\big( t_{L2} + m_{L2}\,( t_{L3} + m_{L3}\, t_{mem} ) \big) $$
+          <p>
+            The local miss rate (misses at this level divided by accesses
+            that reached this level) is the right quantity for this formula;
+            the global miss rate (misses divided by all CPU accesses) is the
+            product of the local rates above and including the level, and
+            confusing the two is the most common error in hierarchy
+            arithmetic.
+          </p>
+          <div class="problem">
+            <span class="plabel">Problem 4</span>
+            <p>
+              A core has the 32 KiB / 8-way / 64 B L1 above with a 4-cycle
+              hit time and 10 percent miss rate, an L2 with 14-cycle hit
+              time and 20 percent local miss rate, and DRAM at 200 cycles.
+              (a) For the address 0x7FFC12345678, give the tag, set index,
+              and byte offset in the L1. (b) Compute the AMAT. (c) A
+              prefetcher cuts the L2 local miss rate to 12 percent; compute
+              the new AMAT and the speedup on a workload where memory
+              accounts for 40 percent of execution time.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> (a) The low 12 bits are 0x678 =
+                0110 0111 1000. Offset = low 6 bits = 11 1000 = 0x38 = 56.
+                Index = next 6 bits = 01 1001 = 0x19 = set 25. Tag = the
+                address shifted right 12 = 0x7FFC12345.
+              </p>
+              <p>
+                (b) AMAT \(= 4 + 0.10 \times (14 + 0.20 \times 200) = 4 +
+                0.10 \times 54 = 9.4\) cycles. Note the structure: DRAM
+                contributes \(0.10 \times 0.20 \times 200 = 4.0\) of the
+                9.4, as much as the entire L1 hit time, from just 2 percent
+                of accesses. Tail levels dominate through their latency even
+                at tiny global miss rates.
+              </p>
+              <p>
+                (c) New AMAT \(= 4 + 0.10 \times (14 + 0.12 \times 200) = 4
+                + 0.10 \times 38 = 7.8\) cycles. Memory time shrinks by
+                \(7.8/9.4 = 0.830\), so total time becomes \(0.60 + 0.40
+                \times 0.830 = 0.932\), a \(1/0.932 = 1.073\times\) overall
+                speedup. This is Amdahl's law in miniature: a 17 percent
+                memory-side improvement is worth 7 percent end to end
+                because 60 percent of the time was never waiting on memory.
+              </p>
+            </div>
+          </div>
+          <h3>Cache blocking: making arithmetic intensity, not finding it</h3>
+          <p>
+            The naive triple loop for \(C = AB\) with \(n \times n\)
+            matrices performs \(2n^3\) floating point operations. If the
+            matrices do not fit in cache, the inner product formulation
+            streams a row of A against a column of B for every output
+            element, and each element of B is fetched from memory \(n\)
+            times over the whole computation. Blocking (tiling) partitions
+            the matrices into \(b \times b\) tiles chosen so that three
+            tiles fit in cache, and computes tile-by-tile. Each tile of A
+            and B is then loaded once per tile-row/column of the result,
+            i.e. \(n/b\) times, so total traffic falls from \(O(n^3)\) words
+            to roughly \(2n^3/b + n^2\) words. The flops are unchanged. The
+            arithmetic intensity, flops per byte of memory traffic, for
+            single precision (4-byte words) is therefore
+          </p>
+          $$ \text{AI} \;\approx\; \frac{2n^3}{(2n^3/b)\times 4\ \text{bytes}} \;=\; \frac{b}{4}\ \text{flops/byte} $$
+          <p>
+            growing linearly in the tile size. The constraint is \(3b^2
+            \times 4 \le C\): for the 32 KiB L1, \(b \le \sqrt{32768/12}
+            \approx 52\), so \(b = 48\) gives AI \(\approx 12\) flops/byte
+            against roughly 0.17 flops/byte for the unblocked streaming
+            case (2 flops per 12 bytes moved). This is the single most
+            important transformation in high-performance computing, and it
+            is worth seeing that it changes no arithmetic at all: it only
+            reorders the same operations so the reuse that was always
+            present algebraically becomes reuse the cache can see within its
+            capacity. Hong and Kung proved the matching lower bound:
+            any schedule of the classical algorithm with a fast memory of
+            size M must move \(\Omega(n^3/\sqrt{M})\) words, so blocking
+            with \(b \sim \sqrt{M/3}\) is asymptotically optimal, not just a
+            good trick. The C code in the implementation section measures
+            this effect directly, and the same idea reappears twice more on
+            this page: FlashAttention is blocking applied to the attention
+            score matrix, and the CUDA tiled matmul is blocking applied to
+            GPU shared memory.
+          </p>
+
+          <h2>Virtual memory</h2>
+          <h3>Pages, page tables, and a concrete multi-level walk</h3>
+          <p>
+            Virtual memory gives every process a private address space,
+            enforces protection, and lets physical memory be allocated
+            lazily and non-contiguously. Both are divided into 4 KiB pages,
+            and a per-process page table maps virtual page numbers (VPN) to
+            physical page numbers (PPN). A flat table is impossibly large:
+            a 48-bit space of 4 KiB pages has \(2^{36}\) entries, 512 GiB
+            of table at 8 bytes each, almost all of it describing unmapped
+            holes. Multi-level (radix-tree) tables fix this by making the
+            table sparse: the VPN is split into fields, each indexing one
+            level, and subtrees for unmapped regions are simply absent.
+            RISC-V Sv39 is the cleanest concrete example: a 39-bit virtual
+            address is a 12-bit page offset and three 9-bit VPN fields, and
+            each level is one 4 KiB page holding 512 8-byte page table
+            entries (PTEs). Nine bits indexing 512 entries of 8 bytes is
+            exactly 4 KiB: the radix is chosen so each table node is itself
+            one page.
+          </p>
+          <p>
+            Walking a concrete address makes the mechanism stick. Take
+            virtual address 0x16582A7C4 with the root page table at
+            physical page 0x80123 (held in the satp register). The offset is
+            the low 12 bits, 0x7C4. The VPN is the address shifted right by
+            12: 0x16582A = 1,464,362. Splitting into 9-bit fields from the
+            top: VPN[2] \(= 1464362 \gg 18 = 5\), VPN[1] \(= (1464362 \gg 9)
+            \,\&amp;\, 511 = 300\), VPN[0] \(= 1464362 \,\&amp;\, 511 =
+            42\).
+          </p>
+          <pre class="flow">VA 0x1_6582_A7C4  (Sv39: 9 | 9 | 9 | 12)
+
+   000000101 | 100101100 | 000101010 | 0111 1100 0100
+   VPN[2]=5    VPN[1]=300  VPN[0]=42    offset=0x7C4
+
+walk (each step is one physical memory read):
+ 1. root:  PTE at 0x80123000 + 5*8   = 0x80123028 → PPN of level-1 table
+ 2. mid:   PTE at (that PPN «12) + 300*8         → PPN of level-0 table
+ 3. leaf:  PTE at (that PPN «12) + 42*8          → PPN of the data page,
+           plus V/R/W/X/U/A/D permission bits
+ PA = (leaf PPN « 12) | 0x7C4</pre>
+          <p>
+            Three loads to translate one load: a 4x cost, before the data
+            access itself, and x86-64 with four levels (or five with
+            57-bit addressing) is worse. If a non-leaf PTE has its valid bit
+            clear the walk stops and the hardware raises a page fault, which
+            is how demand paging, copy-on-write, and mmap all work: the OS
+            handles the fault, fixes the tables, and restarts the
+            instruction, which requires the precise exceptions the
+            out-of-order section builds. A leaf at level 1 instead of level
+            0 maps a 2 MiB megapage (512 x 4 KiB), and at level 2 a 1 GiB
+            page; large pages exist mostly to fix the TLB economics computed
+            next.
+          </p>
+          <h3>TLBs and reach</h3>
+          <p>
+            No machine walks tables on every access; the translation
+            lookaside buffer caches recent VPN-to-PPN mappings. A typical
+            current design has a small fully associative L1 TLB (tens of
+            entries, checked in parallel with the L1 cache) and an L2 TLB of
+            one to two thousand entries. The figure of merit is reach: a
+            1536-entry L2 TLB of 4 KiB pages covers \(1536 \times 4\,\text{KiB}
+            = 6\) MiB. Any working set beyond 6 MiB, which describes
+            essentially every database, JVM heap, and ML workload, misses
+            the TLB even though the data may be sitting in the last-level
+            cache, and each miss costs a multi-level walk (mitigated by
+            dedicated page-walk caches for the upper levels). The same TLB
+            with 2 MiB pages reaches 3 GiB, which is why transparent huge
+            pages and explicit hugetlbfs are worth 10 to 40 percent on
+            TLB-bound workloads and why every serious database and allocator
+            has a huge-page story.
+          </p>
+          <h3>VIPT: why L1 size, ways, and page size are entangled</h3>
+          <p>
+            The L1 lookup wants to start before translation finishes.
+            The virtually-indexed, physically-tagged (VIPT) trick: index the
+            cache with address bits that are identical in the virtual and
+            physical address, namely the page-offset bits, while the walk or
+            TLB produces the physical tag in parallel; the tag compare then
+            uses physical bits, so no aliasing or homonym problems arise.
+            The constraint is that index + offset bits must fit within the
+            12-bit page offset, i.e. one way of the cache can be at most one
+            page. The 32 KiB 8-way L1 from the cache section is exactly at
+            the boundary: \(32768 / 8 = 4096\) bytes per way, 6 index + 6
+            offset = 12 bits, all untranslated. This is not a coincidence
+            but a constraint that has pinned x86 L1 data caches at 32 to
+            48 KiB for two decades; growing the L1 requires either more ways
+            (Apple's M-series uses large, higher-associativity L1s enabled
+            partly by the 16 KiB base page of its OS, which frees two more
+            untranslated bits) or giving up pure VIPT.
+          </p>
+          <h2>Out-of-order execution</h2>
+          <h3>Why in-order stalls are unacceptable</h3>
+          <p>
+            An in-order pipeline stalls every instruction behind a
+            long-latency one: a single L2 miss freezes hundreds of cycles of
+            issue slots even when abundant independent work sits just behind
+            it in program order. The dependences that actually constrain
+            correctness are read-after-write (RAW), true dataflow. The other
+            two hazard classes, write-after-read (WAR) and write-after-write
+            (WAW), are artifacts of reusing a finite set of register names,
+            not of the computation; they can be removed by giving each new
+            write a fresh physical location. Out-of-order execution is
+            exactly this: rename away the false dependences, then let
+            instructions execute in dataflow order, constrained only by RAW
+            edges and structural resources, while a separate in-order
+            mechanism preserves the illusion of sequential execution for
+            exceptions and the outside world.
+          </p>
+          <h3>Tomasulo's algorithm, worked step by step</h3>
+          <p>
+            Tomasulo's 1967 design for the IBM 360/91 floating-point unit
+            contains the whole idea. Each functional unit has reservation
+            stations (RS), buffers holding an operation plus, for each
+            source operand, either the value itself or the tag of the RS
+            that will produce it. A register alias table (RAT, called the
+            register status table in the original) records, for each
+            architectural register, whether its latest value is in the
+            register file or is being produced by some RS. Results broadcast
+            on a common data bus (CDB) carrying (tag, value); every waiting
+            RS and the register file snoop it and capture matching values.
+            Renaming happens at issue: an instruction reads its sources as
+            values if ready, otherwise as tags, and then overwrites the RAT
+            entry of its destination with its own tag. Because a consumer
+            captures the value or the tag of the specific producer it read
+            at issue, later writes to the same architectural register cannot
+            disturb it: WAR gone. Because the RAT always points to the
+            youngest writer, only the youngest write updates the register:
+            WAW gone.
+          </p>
+          <p>
+            The standard six-instruction sequence exercises every case.
+            Assume two load buffers with pipelined 2-cycle loads, latencies
+            of 2 for add/sub, 10 for multiply, 40 for divide, one
+            instruction issued per cycle, one CDB, and execution may start
+            the cycle after the last operand arrives.
+          </p>
+          <pre class="flow">I1: fld  f6, 0(x2)      # load
+I2: fld  f2, 8(x3)      # load
+I3: fmul f0, f2, f4     # RAW on f2 (I2)
+I4: fsub f8, f2, f6     # RAW on f2 (I2), f6 (I1)
+I5: fdiv f10, f0, f6    # RAW on f0 (I3); reads f6
+I6: fadd f6, f8, f2     # RAW on f8 (I4); WRITES f6: WAR vs I5,
+                        #                            WAW vs I1</pre>
+          <div class="tbl-wrap"><table class="data">
+            <thead><tr><th>Instr</th><th>Issue</th><th>Exec start</th><th>Exec done</th><th>CDB write</th><th>Waiting on</th></tr></thead>
+            <tbody>
+              <tr><td>I1 fld f6</td><td>1</td><td>2</td><td>3</td><td>4</td><td>nothing</td></tr>
+              <tr><td>I2 fld f2</td><td>2</td><td>3</td><td>4</td><td>5</td><td>nothing</td></tr>
+              <tr><td>I3 fmul f0,f2,f4</td><td>3</td><td>6</td><td>15</td><td>16</td><td>f2 tag=Load2 (arrives 5)</td></tr>
+              <tr><td>I4 fsub f8,f2,f6</td><td>4</td><td>6</td><td>7</td><td>8</td><td>f2 (5), f6 (4)</td></tr>
+              <tr><td>I5 fdiv f10,f0,f6</td><td>5</td><td>17</td><td>56</td><td>57</td><td>f0 tag=Mult1 (16); f6 value captured at issue</td></tr>
+              <tr><td>I6 fadd f6,f8,f2</td><td>6</td><td>9</td><td>10</td><td>11</td><td>f8 tag=Add1 (8)</td></tr>
+            </tbody>
+          </table></div>
+          <p>
+            Reading the table teaches four things. First, I4 finishes at
+            cycle 8 while I3, older in program order, finishes at 16:
+            completion is out of order, driven purely by dataflow. Second,
+            the WAR hazard between I6 (writes f6 at cycle 11) and I5 (reads
+            f6, does not execute until 17) is a non-event, because I5
+            captured the f6 value into its reservation station at issue in
+            cycle 5; the architectural register f6 is irrelevant to it
+            afterward. Third, the WAW between I1 and I6 on f6 resolves
+            because after cycle 6 the RAT maps f6 to I6's station, so I1's
+            broadcast at cycle 4 updated f6 only up to the moment it was
+            re-renamed; the final architectural value is I6's, as program
+            order demands. Fourth, the critical path of the whole block is
+            I2 to I3 to I5: \(5 + 11 + 41 = 57\) cycles are dictated by true
+            dependences and latencies; renaming removed everything else.
+          </p>
+          <h3>The reorder buffer and precise exceptions</h3>
+          <p>
+            Pure Tomasulo updates registers the moment the CDB fires, and
+            the table above shows I6 writing architectural f6 at cycle 11,
+            46 cycles before the older I5 completes. If I5 raises a
+            divide-by-zero exception at cycle 57, the register file already
+            holds the future: f6 has a value from an instruction that,
+            architecturally, should never have executed. This is an
+            imprecise exception, and it makes demand paging (which must
+            restart a faulting load exactly) and debuggability impossible.
+            The fix, standard since the late 1980s, is the reorder buffer
+            (ROB): instructions allocate a ROB entry in program order at
+            issue, execute out of order exactly as above, but write only
+            speculative state (the ROB entry or a physical register); a
+            separate commit stage retires instructions from the ROB head
+            strictly in order, making each one architectural only when all
+            older ones have committed. An exception or branch misprediction
+            is handled by draining or flushing: everything younger than the
+            faulting instruction is discarded before it can commit, so the
+            architectural state seen by the handler is exactly the
+            sequential-semantics state. Modern designs merge the value
+            storage into a unified physical register file with a
+            checkpointed rename map, but the in-order-allocate,
+            out-of-order-execute, in-order-commit skeleton is universal, and
+            ROB capacity (roughly 300 to 600 entries in current high-end
+            cores, with Apple's big cores measured at the top of that range)
+            is the window within which the machine can find independent work
+            to hide a cache miss.
+          </p>
+          <h3>Load-store queues and memory disambiguation</h3>
+          <p>
+            Registers rename cleanly because names are static; memory does
+            not, because addresses are computed at runtime. A load may not
+            bypass an older store to the same address, but whether the
+            addresses collide is unknown until both are computed. The
+            load-store queue (LSQ) holds all in-flight memory operations in
+            program order. A store writes the data cache only at commit
+            (stores must never be undone); until then its address and data
+            wait in the store queue. An executing load searches the store
+            queue for older stores: on an address match with data ready, the
+            value is forwarded directly (store-to-load forwarding, and this
+            path is why a store followed by a load of the same location is
+            fast); on a match without data, the load waits; with no match,
+            it goes to the cache. The remaining question is whether a load
+            may issue while an older store's address is still unknown.
+            Conservative designs wait; aggressive designs predict
+            independence and speculate, checking later when the store's
+            address arrives and squashing the load and its dependents on a
+            violation. Memory dependence predictors (store sets and
+            descendants of Moshovos and Sohi's work) make this speculation
+            right often enough that all high-end cores do it, and this
+            speculation is also the mechanism behind several of the
+            transient-execution security findings: the microarchitecture
+            briefly computed with values the architecture would forbid.
+          </p>
+
+          <h2>Superscalar, SMT, and the end of the free lunch</h2>
+          <h3>Wide issue and where ILP runs out</h3>
+          <p>
+            A superscalar machine fetches, decodes, renames, issues,
+            executes, and commits several instructions per cycle; current
+            high-end cores are 6- to 10-wide at decode with ROBs in the
+            hundreds of entries. The costs grow faster than linearly:
+            dependence checks among W co-issued instructions are
+            \(O(W^2)\) comparators, the register file needs roughly \(3W\)
+            ports (port count grows area and delay superlinearly), and
+            wakeup-select scheduling logic over a large window is a wire-
+            and power-dense structure whose delay resists pipelining.
+            Meanwhile the returns diminish: limit studies going back to
+            Wall's 1991 measurements show that real integer programs, under
+            realistic prediction and finite windows, sustain modest usable
+            instruction-level parallelism, with branches and memory
+            latency, not raw width, as the binding constraints. Doubling
+            width without also improving prediction accuracy and the memory
+            hierarchy buys little, which is why the industry's width growth
+            has been slow and always accompanied by predictor and cache
+            growth.
+          </p>
+          <h3>Simultaneous multithreading</h3>
+          <p>
+            If one thread cannot fill an 8-wide machine, several can.
+            Simultaneous multithreading (SMT, Tullsen, Eggers, and Levy's
+            1995 design; Intel's Hyper-Threading) duplicates only the
+            architectural state (PCs, rename maps, architectural registers)
+            and lets instructions from multiple threads coexist in the same
+            out-of-order window, sharing the caches, execution ports, and
+            most queues. When thread A stalls on a miss, thread B's
+            instructions issue into the slots A would have wasted. The
+            gains are workload-dependent: 10 to 30 percent aggregate
+            throughput on mixed server workloads is typical for 2-way SMT,
+            while cache-thrashing pairs can produce losses, and shared-state
+            side channels have caused cloud providers to disable SMT for
+            some tenancy models. GPUs, in the section below, take this exact
+            idea to its logical extreme: instead of 2 threads hiding
+            occasional misses, tens of warps hide latency that is assumed to
+            be everywhere.
+          </p>
+          <h3>Dennard scaling, the power wall, and dark silicon</h3>
+          <p>
+            The reason all of this reorganization happened is thermal.
+            Dynamic power is \(P = \alpha C V^2 f\): activity factor times
+            switched capacitance times voltage squared times frequency.
+            Dennard's 1974 observation was that scaling feature size by
+            \(1/\kappa\) scales C by \(1/\kappa\) and permits V to scale by
+            \(1/\kappa\) while f rises by \(\kappa\); power per transistor
+            falls as \(1/\kappa^2\) while transistor density rises as
+            \(\kappa^2\), so power density is constant. Chips could get
+            faster and denser at fixed watts, indefinitely. The regime
+            broke around the 90 nm node because voltage stopped scaling:
+            V cannot drop below a few multiples of the threshold voltage
+            without transistors failing to switch, and lowering the
+            threshold instead raises subthreshold leakage exponentially.
+            With V pinned near 1 volt, every further density increase now
+            increases power density, and frequency became the sacrificial
+            variable: clocks have sat between 3 and 6 GHz since roughly
+            2005 while transistor budgets kept doubling. The consequences
+            cascade: first multicore (spend transistors on cores, not
+            frequency), then the dark-silicon analysis of Esmaeilzadeh,
+            Blem, St. Amant, Sankaralingam, and Burger (ISCA 2011) showing
+            that at fixed power budgets a growing fraction of a chip must
+            be idle or clocked down at any moment, and finally the
+            domain-specific turn: if transistors are cheap but watts are
+            scarce, the winning move is specialized circuits that do more
+            useful work per joule, lit up only when their workload runs.
+            Horowitz's ISSCC 2014 energy ledger quantifies the pressure at
+            45 nm: a 32-bit integer add costs about 0.1 pJ, a 32-bit
+            floating multiply 3.7 pJ, a 32 KiB SRAM read 5 pJ, and a DRAM
+            access roughly 640 pJ. Fetching and decoding an instruction to
+            do a 0.1 pJ add costs orders of magnitude more than the add;
+            moving the operands from DRAM costs four orders of magnitude
+            more. Every architecture on the rest of this page, SIMD, GPUs,
+            and systolic arrays alike, is a strategy for amortizing
+            instruction and data-movement energy over more arithmetic.
+          </p>
+          <h2>Multicore: coherence, false sharing, and consistency</h2>
+          <h3>Cache coherence and MESI, with a worked trace</h3>
+          <p>
+            Private caches replicate data, and replication plus writes
+            requires a protocol. Coherence is the single-location contract:
+            for each memory location, there is a total order of writes, every
+            read returns the latest write in that order, and at any moment a
+            line has either one writer or many readers, never both. The
+            invalidation-based MESI protocol enforces this with four stable
+            states per cache line. Modified: this cache holds the only copy,
+            it is dirty, memory is stale. Exclusive: the only copy, clean;
+            the crucial optimization is that E can be silently upgraded to M
+            on a write with no bus traffic, so private data is written for
+            free. Shared: possibly one of several clean read copies.
+            Invalid: not present. Controllers snoop the interconnect (or, at
+            core counts beyond a handful, consult a directory that tracks
+            sharers explicitly) and react to each other's requests. A
+            two-core trace on one line X covers every interesting
+            transition:
+          </p>
+          <div class="tbl-wrap"><table class="data">
+            <thead><tr><th>Step</th><th>Operation</th><th>Bus transaction</th><th>Core 0 state</th><th>Core 1 state</th><th>Data movement</th></tr></thead>
+            <tbody>
+              <tr><td>0</td><td>initial</td><td>&mdash;</td><td>I</td><td>I</td><td>&mdash;</td></tr>
+              <tr><td>1</td><td>C0 reads X</td><td>BusRd; no other sharer responds</td><td>E</td><td>I</td><td>memory &rarr; C0</td></tr>
+              <tr><td>2</td><td>C1 reads X</td><td>BusRd; C0 snoops, downgrades</td><td>S</td><td>S</td><td>C0 or memory &rarr; C1</td></tr>
+              <tr><td>3</td><td>C0 writes X</td><td>BusUpgr (invalidate, no data)</td><td>M</td><td>I</td><td>none; C1's copy killed</td></tr>
+              <tr><td>4</td><td>C1 reads X</td><td>BusRd; C0 in M must respond</td><td>S</td><td>S</td><td>C0 &rarr; C1, writeback to memory</td></tr>
+              <tr><td>5</td><td>C1 writes X</td><td>BusUpgr</td><td>I</td><td>M</td><td>none; C0's copy killed</td></tr>
+            </tbody>
+          </table></div>
+          <p>
+            Step 1 is why E exists: a subsequent private write would cost
+            nothing, whereas MSI would charge an invalidation broadcast for
+            every first write to private data. Step 4 shows the expensive
+            case, a dirty intervention, where the owning cache must supply
+            the line; extensions address its costs, with MOESI (AMD) adding
+            an Owned state so the dirty line can be shared without an
+            immediate memory writeback, and MESIF (Intel) adding Forward to
+            pick which of several clean sharers responds. Steps 3 and 5
+            alternating are the pathology called ping-ponging: a line that
+            two cores take turns writing migrates back and forth on every
+            access, each transfer costing a cross-core round trip on the
+            order of 40 to 100 ns, hundreds of times slower than an L1 hit.
+          </p>
+          <h3>False sharing</h3>
+          <p>
+            Coherence operates on whole 64-byte lines, but programs think in
+            variables. If two threads on different cores each update their
+            own counter, and the two counters happen to occupy the same
+            line, the protocol cannot tell: every increment by one thread
+            invalidates the line in the other's cache, and the trace above
+            runs in a loop at memory-system speed even though there is no
+            logical sharing at all. This is false sharing, and it turns a
+            perfectly parallel loop into one serialized on the coherence
+            fabric. The fix is layout: pad or align per-thread hot data to
+            line boundaries (alignas(64) in C++, and the standard exposes
+            std::hardware_destructive_interference_size for exactly this),
+            or restructure to thread-local accumulation with a final
+            reduction. The microbenchmark in the implementation section
+            makes the effect measurable in a few lines: the padded and
+            unpadded versions differ only in layout, execute the identical
+            instruction stream per thread, and typically differ by
+            several-fold in wall time on any current multicore part.
+          </p>
+          <h3>Memory consistency: SC, TSO, and weak models</h3>
+          <p>
+            Coherence orders accesses to one location; consistency defines
+            what orders hold across locations, and it is the contract that
+            lock-free code lives or dies by. Sequential consistency (SC),
+            Lamport's definition, requires that all memory operations appear
+            to interleave in some single total order consistent with each
+            thread's program order. It is what programmers implicitly
+            assume, and essentially no hardware provides it by default,
+            because the easiest performance optimization in a core breaks
+            it: the store buffer. Letting a core continue past a store while
+            the store waits (for the M-state acquisition of its line) means
+            the core's own later loads can complete before its earlier store
+            is globally visible. This yields total store order (TSO), the
+            x86 model, formalized by Sewell, Owens, and colleagues as
+            x86-TSO: stores are seen by all cores in one order, loads may
+            forward from the local store buffer, and the one reordering
+            visible to software is store-then-load. The litmus test: with x
+            and y initially 0, thread A does x = 1 then reads y; thread B
+            does y = 1 then reads x. Under SC at least one thread must read
+            1. Under TSO both can read 0, both stores parked in their local
+            buffers, and this outcome is routinely observable on any x86
+            machine. Arm and RISC-V (RVWMO) go further: they permit
+            load-load, load-store, and store-store reordering too,
+            constrained only by dependences and explicit barriers, which
+            buys hardware simplicity and power at the cost of requiring
+            software to say what it means.
+          </p>
+          <p>
+            The practical discipline is to program to the language model,
+            not the hardware. C++ and Rust atomics with acquire/release
+            semantics express exactly the orderings needed: a release store
+            makes all prior writes visible to any thread whose acquire load
+            observes it, which is precisely the producer-consumer handoff;
+            seq_cst additionally enforces a global order among the marked
+            operations themselves (needed for patterns like the litmus test
+            above, and compiled on x86 to an mfence or locked instruction
+            after the store, the one expensive case on TSO). On Arm,
+            acquire/release map to the dedicated ldar/stlr instructions.
+            The classic failure mode is publishing a pointer with a plain
+            store: on a weak model the consumer can observe the pointer
+            before the pointed-to initialization, a bug that will pass every
+            test on an x86 workstation and fire on an Arm server. Data-race-
+            free programs, in which all conflicting accesses are ordered by
+            synchronization, get SC semantics on every model; everything
+            outside that discipline requires reading Nagarajan, Sorin, Hill,
+            and Wood's primer, which is the reference this section
+            compresses.
+          </p>
+
+          <h2>SIMD: data parallelism inside the core</h2>
+          <p>
+            The energy ledger said instruction overhead dwarfs arithmetic,
+            and SIMD is the in-core answer: one fetched, decoded, scheduled
+            instruction operates on a whole vector register of lanes. The
+            x86 line widened from 128-bit SSE to 256-bit AVX/AVX2 to 512-bit
+            AVX-512 (16 fp32 or 32 bf16 lanes), the latter adding
+            per-lane predication through mask registers, which lets
+            conditional loops vectorize without branches; AVX-512's early
+            reputation for frequency throttling on 14 nm parts has largely
+            faded on current cores, and its successor AVX10 unifies the
+            feature sets. Arm's NEON is fixed at 128 bits, while SVE and
+            SVE2 are vector-length agnostic: the ISA exposes a width the
+            implementation chooses (128 to 2048 bits), and code written with
+            predicates and increment-by-vector-length runs correctly on any
+            of them, an idea RISC-V's V extension pushes further with a
+            dynamically set vector length register. Fujitsu's A64FX
+            (512-bit SVE) and AWS Graviton and NVIDIA Grace (SVE2 at
+            narrower widths) are the production proof points.
+          </p>
+          <p>
+            Getting SIMD performance out of a compiler is mostly a matter of
+            not preventing it. Auto-vectorization fails, silently, on
+            possible pointer aliasing (two arrays that might overlap force
+            scalar order; restrict or __restrict__ removes the doubt),
+            on loop-carried dependences, on early exits, and on
+            floating-point reductions, where reassociating the sum changes
+            rounding and so requires an explicit flag (-ffast-math or
+            OpenMP simd reduction) to permit. The flags -O3
+            -march=native -fopt-info-vec-missed on GCC, or -Rpass-missed=
+            loop-vectorize on Clang, make the compiler explain itself, and
+            reading that output is the highest-leverage low-effort
+            optimization step that exists. When the compiler cannot be
+            persuaded, intrinsics (the _mm512_* and vld1q_* families) give
+            manual control at the cost of per-ISA code, which is why
+            production kernels in XNNPACK or oneDNN are generated or
+            hand-written per microarchitecture, and libraries like Google's
+            Highway abstract over the ISAs. The correct mental model is that
+            SIMD is cheap ILP with a layout tax: structure-of-arrays data,
+            unit-stride access, and branch-free inner loops are the price of
+            admission, and paying it is also exactly what the GPU will
+            demand next, at 32 lanes instead of 16.
+          </p>
+          <h2>The GPU as a throughput architecture</h2>
+          <h3>Latency machines and throughput machines</h3>
+          <p>
+            A CPU core is a latency machine: it spends its transistor and
+            power budget making one instruction stream finish as soon as
+            possible, via out-of-order windows, branch predictors, and a
+            deep cache hierarchy, all of which are mechanisms for tolerating
+            or avoiding stalls on behalf of a single thread. A GPU inverts
+            every one of those decisions. It assumes tens of thousands of
+            threads are available, strips the per-thread machinery to almost
+            nothing (in-order issue, no speculation, small per-thread cache
+            share), and hides latency not by avoiding it but by switching:
+            when a warp stalls on memory, the scheduler issues another warp,
+            and with enough warps resident the arithmetic units never
+            notice DRAM latency at all. SMT taken to its limit, as promised
+            above. The measured machine for everything in this section is
+            the NVIDIA H100 80GB HBM3 in this repository: 132 streaming
+            multiprocessors (SMs), 2048 resident threads per SM, 65536
+            32-bit registers per SM, compute capability 9.0, measured with
+            PyTorch 2.7 and CUDA 12.8.
+          </p>
+          <h3>SMs, warps, and SIMT</h3>
+          <p>
+            The CUDA software hierarchy (threads, blocks of up to 1024
+            threads, a grid of blocks) maps onto hardware as: blocks are
+            assigned to SMs, and each block's threads are partitioned into
+            warps of 32 that issue in lockstep, one instruction for 32
+            lanes. This is SIMT, SIMD with a thread-programming face: each
+            lane has its own registers and may branch independently, but
+            divergent branches within a warp are executed by running both
+            paths with lanes masked off, so a fully divergent warp runs at
+            1/32 efficiency. Each H100 SM has four scheduler partitions,
+            each choosing one ready warp per cycle among its resident
+            warps; with up to \(2048/32 = 64\) warps resident per SM, the
+            scheduler nearly always finds issuable work. Chip-wide that is
+            \(132 \times 2048 = 270{,}336\) resident threads, against the
+            dozens a CPU socket holds, which is the clearest single number
+            for the design-point difference.
+          </p>
+          <pre class="flow">grid ──► blocks ──► warps (32 threads, lockstep issue)
+
+H100 (measured device properties):
+  132 SMs
+   └─ per SM: ≤ 2048 threads = 64 warps, 4 warp schedulers
+              65,536 × 32-bit registers (256 KiB register file)
+              L1/shared memory (48 KiB usable per block by default,
+              opt-in to ~227 KiB), 4 tensor cores
+  chip: 50 MB L2, HBM3 measured at ~2,992 GB/s (copy, fp32)
+
+register file per SM (256 KiB) is LARGER than L1: the GPU's
+"architectural state" for 2048 threads is the biggest memory
+closest to the ALUs, the exact inverse of a CPU.</pre>
+          <h3>Occupancy and latency hiding by arithmetic</h3>
+          <p>
+            Occupancy is resident warps as a fraction of the 64-warp
+            maximum, and it is limited by whichever resource a block
+            exhausts first: registers (65536 per SM, allocated per thread at
+            compile time), shared memory, or the thread and block caps. Its
+            purpose is Little's law. To keep a pipe of bandwidth B busy at
+            latency L, the outstanding traffic must be at least \(B \times
+            L\). At the measured 2992.4 GB/s of HBM bandwidth and roughly
+            500 ns of DRAM latency, the chip needs \(2992.4\ \text{GB/s}
+            \times 500\ \text{ns} \approx 1.50\) MB in flight at all times,
+            about 11.3 KiB per SM, or 91 outstanding 128-byte lines per SM.
+            A single warp issuing one load at a time contributes 128 bytes;
+            the machine therefore needs on the order of many tens of warps
+            per SM with loads in flight (fewer if each warp has several
+            independent loads unrolled, which is why unrolling and
+            vectorized 128-bit loads matter as much as occupancy). This is
+            the quantitative sense in which oversubscription replaces
+            caches and speculation: the CPU hides one thread's 500 ns
+            behind a predictor and an out-of-order window; the GPU hides it
+            behind 63 other warps.
+          </p>
+          <div class="problem">
+            <span class="plabel">Problem 5</span>
+            <p>
+              A kernel is compiled to 96 registers per thread and launched
+              in blocks of 256 threads, using 12 KiB of shared memory per
+              block, on the H100 above (65536 registers per SM, 2048
+              threads per SM, assume 100 KiB of shared memory available per
+              SM for this launch). (a) Compute the occupancy. (b) The
+              compiler can cap the kernel at 64 registers per thread by
+              spilling; what occupancy does that give? (c) State the
+              condition under which the spill version is the right trade.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> (a) Registers per block: \(96
+                \times 256 = 24{,}576\). Blocks per SM by registers:
+                \(\lfloor 65536 / 24576 \rfloor = 2\). By shared memory:
+                \(\lfloor 100 / 12 \rfloor = 8\). By threads: \(\lfloor
+                2048 / 256 \rfloor = 8\). Registers bind: 2 blocks = 512
+                threads = 16 warps, occupancy \(16/64 = 25\) percent.
+              </p>
+              <p>
+                (b) At 64 registers: \(64 \times 256 = 16{,}384\) per
+                block, \(\lfloor 65536/16384 \rfloor = 4\) blocks = 1024
+                threads = 32 warps, occupancy 50 percent.
+              </p>
+              <p>
+                (c) Spilling trades register pressure for local-memory
+                traffic, which lands in L2 and DRAM. The trade wins only
+                if the kernel is latency-bound with too few warps to
+                satisfy Little's law, so that doubling resident warps
+                buys more stall coverage than the spill traffic costs. A
+                compute-bound kernel at 25 percent occupancy with enough
+                ILP per warp loses from spilling; this is why "maximize
+                occupancy" is a heuristic, not a law, and why the
+                measured matmuls below run near peak from far fewer, very
+                register-heavy warps. Volkov's analysis of this trade is
+                the standard reference.
+              </p>
+            </div>
+          </div>
+          <h3>The memory hierarchy on an H100, with measured numbers</h3>
+          <p>
+            The hierarchy is explicit: per-thread registers (65536 32-bit
+            registers per SM); shared memory/L1 within an SM, programmer-
+            managed, 48 KiB per block by default and up to about 227 KiB by
+            opt-in, at roughly 100x lower latency than DRAM; a 50 MB L2
+            shared by all SMs; and 80 GB of HBM3. The measured stream-style
+            bandwidths from this machine (h100.json in this repository):
+            fp32 copy 2992.4 GB/s, fp32 add 3063.5 GB/s, fp32 reduction
+            2995.2 GB/s, bf16 copy 2930.3 GB/s, all within a few percent of
+            the nominal 3.35 TB/s HBM spec after refresh and ECC overheads.
+            Measured matmul throughput at n = 8192: 51.4 TFLOPS in fp32
+            (no tensor cores), 409.7 in tf32, 728.7 in bf16, 700.8 in fp16;
+            at n = 4096 bf16 peaks at 744.6 TFLOPS, about 75 percent of the
+            989 TFLOPS dense bf16 figure in NVIDIA's Hopper whitepaper. Two
+            structural lessons sit in those numbers. First, the tensor-core
+            ratio: bf16 tensor cores deliver \(728.7/51.4 = 14.2\times\)
+            the fp32 SIMT datapath, so on this machine "use the tensor
+            cores" is not an optimization but a change of machine. Second,
+            the bf16 advantage over fp32 input at equal multiply count
+            (728.7 vs 409.7 for tf32) is bandwidth and register economics:
+            half-width operands double the data per register and per byte
+            moved.
+          </p>
+          <p>
+            The measured attention numbers show the hierarchy acting on a
+            real kernel. Naive attention at sequence length 4096
+            materializes a 4.29 GB score matrix in HBM and achieves 23.8
+            TFLOPS; FlashAttention at the same size keeps tiles in shared
+            memory, moves 0.30 GB peak, and achieves 563.0 TFLOPS, a
+            measured 23.6x. At L = 16384 the naive kernel cannot run at all
+            (the 68.7 GB score matrix approaches the 80 GB card) while the
+            tiled kernel proceeds at 640.1 TFLOPS. Same arithmetic, same
+            silicon; the entire difference is which level of the hierarchy
+            the intermediate lives in. That is cache blocking from the
+            matmul section, transplanted to a programmer-managed hierarchy.
+          </p>
+
+          <h2>Domain-specific accelerators and systolic arrays</h2>
+          <h3>Deriving the systolic array</h3>
+          <p>
+            Even a GPU pays instruction overhead: every tensor-core MMA is
+            still fetched, scheduled, and fed through a register file. If
+            the workload is known to be matrix multiplication, the logical
+            end point is to delete the instructions entirely and lay the
+            dataflow down in wires. Kung's 1982 formulation: a systolic
+            array is a grid of processing elements (PEs) through which data
+            flows rhythmically, each PE consuming operands from its
+            neighbors, performing one multiply-accumulate, and passing
+            operands along. Memory is touched only at the array edges;
+            every value fetched once is reused across an entire row or
+            column of PEs, so the data-movement energy per MAC approaches
+            the wire energy between neighbors, and the 640 pJ DRAM number
+            from Horowitz's ledger is amortized over hundreds of
+            operations.
+          </p>
+          <p>
+            The output-stationary version for \(C = AB\) with 2x2 matrices
+            makes the choreography concrete. PE(i,j) accumulates
+            \(C_{ij}\) in place. Row i of A streams in from the left,
+            delayed by i cycles; column j of B streams from the top,
+            delayed by j cycles; A values step right and B values step down
+            each cycle. The skew is what aligns \(A_{ik}\) and \(B_{kj}\)
+            at PE(i,j) at the same instant. With
+            \(A = \begin{bmatrix}1&amp;2\\3&amp;4\end{bmatrix}\),
+            \(B = \begin{bmatrix}5&amp;6\\7&amp;8\end{bmatrix}\):
+          </p>
+          <pre class="flow">feed (skewed):        B00=5  B01=6            A moves →, B moves ↓
+                      B10=7  B11=8 (delayed)
+
+cycle 1: PE(0,0): 1·5 = 5
+cycle 2: PE(0,0): 5 + 2·7 = 19 ✓ C00 done
+         PE(0,1): 1·6 = 6            (a=1 arrived from PE(0,0))
+         PE(1,0): 3·5 = 15           (b=5 arrived from PE(0,0))
+cycle 3: PE(0,1): 6 + 2·8 = 22 ✓ C01
+         PE(1,0): 15 + 4·7 = 43 ✓ C10
+         PE(1,1): 3·6 = 18
+cycle 4: PE(1,1): 18 + 4·8 = 50 ✓ C11
+
+C = [[19, 22], [43, 50]], in 3N−2 = 4 cycles for N = 2,
+with every input read from memory exactly once.</pre>
+          <p>
+            A single \(N \times N\) product takes \(3N - 2\) cycles, but
+            the fill and drain skew is pipelined away when products stream
+            back to back, so steady-state throughput is \(N^2\) MACs per
+            cycle from \(2N\) input words per cycle: arithmetic intensity
+            proportional to N by construction, which is the blocking
+            analysis again, now frozen into silicon geometry.
+          </p>
+          <h3>The TPU and the dataflow taxonomy</h3>
+          <p>
+            Google's first Tensor Processing Unit (Jouppi et al., ISCA
+            2017) is the canonical production instance: a 256x256
+            weight-stationary systolic array of 8-bit MACs (65,536 PEs) at
+            700 MHz, giving \(65536 \times 2 \times 700\ \text{MHz} = 92\)
+            TOPS in about 75 W, driven by a small in-order CISC front end
+            over PCIe. Weight-stationary means the roles differ from the
+            trace above: weights are preloaded into the PEs and sit still,
+            activations stream in from one edge, and partial sums flow
+            through the array into accumulators at the far edge. The paper's
+            honest accounting is as instructive as the design: on real
+            production inference the MXU often sat far below peak because
+            memory bandwidth (34 GB/s DDR3 in TPUv1) starved it, a roofline
+            lesson its successors fixed with HBM.
+          </p>
+          <p>
+            Which operand sits still is the taxonomy of accelerator design,
+            named by Chen, Emer, and Sze in the Eyeriss work.
+            Weight-stationary (TPU) amortizes weight fetches, ideal when
+            weights are reused across many inputs. Output-stationary (the
+            worked example above) keeps partial sums local, minimizing
+            accumulator traffic, which grows with deep reduction dimensions.
+            Row-stationary, Eyeriss's contribution (MIT, ISCA 2016), maps
+            rows of filter and input so that all three reuse patterns
+            (weights, inputs, partial sums) are exploited jointly within a
+            PE's register file and a NoC, and was derived by explicitly
+            optimizing energy per MAC over the loop-nest mapping space
+            rather than picking a dataflow by intuition. The general lesson,
+            elaborated by the Eyeriss group's later Timeloop-style mapping
+            tools and by accelerator generators like Berkeley's Gemmini and
+            ETH Zurich's Snitch/Occamy clusters, is that an accelerator is a
+            loop nest with a floorplan: choosing tiling, ordering, and
+            spatial unrolling of the same six-deep convolution loops
+            determines every property of the machine.
+          </p>
+          <h3>Sparsity and low precision in hardware</h3>
+          <p>
+            Two further levers multiply accelerator efficiency, both by
+            shrinking the work rather than speeding it. Low precision:
+            energy and area of a multiplier scale roughly quadratically with
+            mantissa width, so int8 or fp8 arithmetic is an order of
+            magnitude cheaper than fp32, and the measured 14.2x
+            tensor-core advantage above already includes this effect;
+            Hopper's fp8 formats (E4M3 for forward values, E5M2 for
+            gradients) double bf16 throughput again, and Blackwell extends
+            to block-scaled fp4 with per-32-element scale factors, pushing
+            precision management into the hardware. Sparsity: NVIDIA's 2:4
+            structured sparsity (at most 2 nonzeros in every 4 weights,
+            enforced at pruning time) lets the tensor core skip half the
+            multiplies with a tiny metadata index, doubling peak, and is
+            the pragmatic middle ground between dense hardware and the
+            fully sparse accelerators (MIT's Eyeriss v2 and the
+            SCNN line from NVIDIA research) that gate or skip zero operands
+            dynamically at finer granularity but pay for it in control
+            complexity and load imbalance. Both levers work exactly
+            because the customer workload, deep networks, tolerates
+            aggressive quantization and pruning, a co-design freedom that
+            general-purpose architecture never had.
+          </p>
+
+          <h2>The roofline model</h2>
+          <h3>Derivation and the machine balance of a measured H100</h3>
+          <p>
+            The roofline model (Williams, Waterman, and Patterson, CACM
+            2009) is the two-parameter summary of every machine on this
+            page. A kernel that performs F flops and moves Q bytes to and
+            from memory has arithmetic intensity \(I = F/Q\) flops per
+            byte. The machine has peak compute \(P_{peak}\) (flops/s) and
+            peak memory bandwidth \(B\) (bytes/s). Execution time is at
+            least the larger of compute time \(F/P_{peak}\) and transfer
+            time \(Q/B\) (assuming perfect overlap), so attainable
+            performance is
+          </p>
+          $$ P(I) \;=\; \min\big( P_{peak},\; I \times B \big) $$
+          <p>
+            Plotted on log-log axes against I, this is a rising line of
+            slope 1 (the memory roof) meeting a horizontal line (the
+            compute roof) at the ridge point \(I^* = P_{peak}/B\), the
+            machine balance: kernels with \(I &lt; I^*\) are memory-bound
+            and kernels with \(I &gt; I^*\) are compute-bound, and no
+            kernel may sit above either roof. For the measured H100
+            numbers, using bf16 tensor-core peak as measured at n = 8192
+            (728.7 TFLOPS) and measured copy bandwidth (2992.4 GB/s):
+          </p>
+          $$ I^*_{bf16} = \frac{728.7 \times 10^{12}}{2992.4 \times 10^9} \approx 243.5\ \text{flops/byte} $$
+          <p>
+            and for the non-tensor fp32 datapath, \(51.4 \times 10^{12} /
+            2992.4 \times 10^9 \approx 17.2\) flops/byte. These two numbers
+            explain most H100 performance mysteries. Any elementwise
+            operation has \(I\) below 1 and is doomed to under one percent
+            of tensor-core peak regardless of engineering effort; the only
+            fix is to stop going to memory, i.e. fusion. Big matmuls have
+            \(I\) in the thousands and are limited purely by the compute
+            roof. Attention sits in between and is movable: the algorithm's
+            flops are fixed but its Q depends on whether the score matrix
+            spills to HBM, so FlashAttention is precisely an
+            intensity-raising transformation, sliding the kernel rightward
+            along the roofline from the memory-bound region toward the
+            ridge. The measured numbers used throughout the worked problem
+            below confirm each regime on this machine.
+          </p>
+          <pre class="flow">TFLOPS (log)                      H100 80GB, measured
+ 728.7 ┤· · · · · · · · · ·┌────────────────────────
+       │        compute roof│   ▲ matmul bf16 n=8192 (728.7)
+       │                    │  ▲ flash attn L=16384 (640.1)
+       │      memory roof   │
+       │      slope =       │▲ flash attn L=512 (170.2)
+       │      2992.4 GB/s  ╱│
+  51.4 ┤· · · · · · · ·╱· ·│· fp32 matmul roof
+       │             ╱      │
+       │           ╱ ▲ naive attn L=4096 (23.8: score matrix
+       │         ╱     round-trips through HBM)
+  0.25 ┤· · ·╱▲ fp32 add (I = 1/12: bound at 0.25 TFLOPS)
+       │   ╱
+       └──┬───────┬─────────┬──────────┬────────── I (flops/byte)
+        1/12      17.2     243.5      2731
+                 (fp32     (bf16      (bf16 matmul
+                  ridge)    ridge)     n=8192)</pre>
+          <p>
+            The model's limits are worth stating as plainly as its power.
+            It assumes perfect overlap of compute and transfer, counts only
+            one bandwidth (extensions add rooflines for L2, shared memory,
+            and NVLink), and says nothing about latency-bound kernels with
+            too little parallelism to reach either roof, which is where
+            Little's law from the GPU section takes over. The measured
+            n = 1024 bf16 matmul makes the point: its algorithmic intensity
+            (about 341 flops/byte) predicts compute-bound operation near
+            peak, yet the measurement is 108.9 TFLOPS, 15 percent of peak,
+            because a 1024-cube matmul simply does not contain enough
+            parallel tile-work to fill 132 SMs and hide its own
+            dependencies. Roofline bounds what is attainable; it does not
+            promise attaining it.
+          </p>
+          <h2>Worked problems</h2>
+          <div class="problem">
+            <span class="plabel">Problem 6</span>
+            <p>
+              Using only the measured H100 numbers (copy bandwidth 2992.4
+              GB/s, bf16 matmul 728.7 TFLOPS at n = 8192): (a) place fp32
+              elementwise add z = x + y on the roofline and predict its
+              maximum achievable GFLOP/s; (b) compute the algorithmic
+              arithmetic intensity of a bf16 square matmul at n = 8192 and
+              confirm which roof binds; (c) find the matrix size at which a
+              bf16 matmul's intensity equals the machine balance; (d) the
+              measured fusion benchmark ran an elementwise chain at 0.911 ms
+              unfused and 0.214 ms fused; explain the 4.26x with roofline
+              reasoning.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> (a) Per element: 1 flop, 12
+                bytes (read x, read y, write z, 4 bytes each), so
+                \(I = 1/12 \approx 0.083\) flops/byte, far left of both
+                ridges. Bound: \(P = I \times B = 2992.4/12 = 249\)
+                GFLOP/s, 0.034 percent of the bf16 roof. The measured add
+                bandwidth of 3063.5 GB/s corresponds to 255 GFLOP/s,
+                confirming the kernel runs at the memory roof, i.e. it is
+                already optimal; only fusion can beat it.
+              </p>
+              <p>
+                (b) \(F = 2n^3\), and minimum traffic is reading A and B
+                and writing C once: \(Q = 3n^2 \times 2\) bytes in bf16.
+                \(I = 2n^3 / 6n^2 = n/3 = 2731\) flops/byte at n = 8192,
+                which is \(11\times\) past the ridge at 243.5: firmly
+                compute-bound, consistent with the measured 728.7 TFLOPS
+                sitting at the compute roof while implying only
+                \(728.7 \times 10^{12} / 2731 \approx 267\) GB/s of HBM
+                traffic, under 9 percent of the available bandwidth.
+              </p>
+              <p>
+                (c) Set \(n/3 = 243.5\), so \(n \approx 731\). Below
+                roughly this size (with perfect caching) a bf16 matmul
+                cannot be compute-bound on this machine, and in practice
+                the crossover is worse because launch overhead and tile
+                quantization dominate small kernels, as the measured 108.9
+                TFLOPS at n = 1024 already showed.
+              </p>
+              <p>
+                (d) An unfused chain of k elementwise ops moves its tensors
+                to and from HBM k times; fusing them into one kernel moves
+                the data once, multiplying I by roughly k while flops stay
+                fixed. Since every one of these kernels is memory-bound,
+                time scales with bytes moved, and the measured
+                \(0.911/0.214 = 4.26\times\) implies the fused kernel
+                eliminated about three quarters of the traffic, i.e. the
+                chain touched memory roughly four times more than
+                necessary. This is why compilers (XLA, torch.compile,
+                Triton) treat fusion as the first-class optimization for
+                everything that is not a matmul.
+              </p>
+            </div>
+          </div>
+          <div class="problem">
+            <span class="plabel">Problem 7</span>
+            <p>
+              For a TPUv1-style weight-stationary systolic array: 256x256
+              8-bit MACs at 700 MHz, weights preloaded. (a) Verify the 92
+              TOPS peak figure. (b) A layer multiplies a stream of M = 1024
+              activation vectors (each of length 256) by the loaded 256x256
+              weight tile; using the fill/drain analysis, compute the cycle
+              count and array utilization. (c) TPUv1's memory delivered 34
+              GB/s. For a fully-connected layer where each int8 weight is
+              used once per batch element, derive the minimum batch size at
+              which the array, rather than memory, is the bottleneck.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> (a) \(65{,}536\) MACs \(\times\)
+                2 ops per MAC \(\times 700 \times 10^6\) cycles/s
+                \(= 91.75 \times 10^{12} \approx 92\) TOPS.
+              </p>
+              <p>
+                (b) The first activation vector's result emerges after the
+                array fills, about \(2 \times 256 - 1 = 511\) cycles of
+                skew; thereafter one vector completes per cycle, so
+                \(M + 2N - 2 = 1024 + 510 = 1534\) cycles. Useful work is
+                \(1024 \times 65536\) MACs against capacity
+                \(1534 \times 65536\), so utilization \(= 1024/1534 =
+                66.8\) percent. Fill and drain overhead only amortizes
+                with long streams: at M = 100 utilization would be
+                \(100/610 = 16.4\) percent, which is a large part of why
+                small-batch inference underused the original TPU.
+              </p>
+              <p>
+                (c) With batch B, each weight byte fetched supports
+                \(2B\) ops, so \(I = 2B\) ops/byte. The machine balance
+                is \(92 \times 10^{12} / 34 \times 10^9 = 2706\)
+                ops/byte. Compute-bound requires \(2B \ge 2706\), i.e.
+                \(B \ge 1353\). Production inference batches were far
+                smaller, so the array idled on memory, exactly the
+                situation Jouppi et al. report; TPUv2 onward moved to HBM
+                precisely to lower this crossover batch by two orders of
+                magnitude.
+              </p>
+            </div>
+          </div>
+          <div class="problem">
+            <span class="plabel">Problem 8</span>
+            <p>
+              Two threads on different cores each perform \(10^8\)
+              increments of their own 8-byte counter. In layout A the
+              counters share one 64-byte line; in layout B each is alone on
+              its line. Assume an L1-resident increment sustains one
+              iteration per 2 cycles at 3 GHz, and a cross-core coherence
+              transfer costs 60 ns. Estimate the runtime of each layout,
+              stating assumptions, and bound the slowdown.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> Layout B: each thread runs
+                independently on its own M-state line; \(10^8 \times 2 /
+                (3 \times 10^9) = 0.067\) s, and the threads run
+                concurrently, so about 0.07 s total.
+              </p>
+              <p>
+                Layout A: every increment needs the line in M state
+                locally, and the other thread keeps stealing it. In the
+                worst case ownership alternates every iteration and each
+                iteration pays a 60 ns transfer, serialized across the two
+                threads: \(2 \times 10^8 \times 60\ \text{ns} = 12\) s, a
+                \(170\times\) slowdown. In practice a core retains
+                ownership for a burst of increments while the other's
+                request is in flight, so measured slowdowns land between
+                about \(3\times\) and \(20\times\) rather than the
+                adversarial bound, still catastrophic for code that looks
+                embarrassingly parallel. The false-sharing benchmark in
+                the implementation section reproduces this; the padded
+                struct differs from the unpadded one by nothing except 56
+                bytes of dead space per counter.
+              </p>
+            </div>
+          </div>
+
+          <h2>Implementation</h2>
+          <h3>Cache blocking, measured in C</h3>
+          <p>
+            The first benchmark realizes the blocking analysis: identical
+            arithmetic, reordered. The naive version walks B down a column
+            with stride N, touching a new cache line per element; the
+            blocked version keeps 48x48 tiles resident and makes the inner
+            loop unit-stride, which also hands the compiler a vectorizable
+            loop. Compile with gcc -O2 -o gemm gemm.c (deliberately -O2
+            without -march=native, to measure the memory effect rather
+            than the vectorizer); at N = 1024 the blocked version is
+            typically 3 to 8 times faster on current x86 parts, and the
+            gap widens with N as the naive version falls out of successive
+            cache levels.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="c" class="active">C</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="c" class="shl lang active"><code class="language-cpp"><span class="c">// gemm.c: naive vs cache-blocked sgemm, single-threaded.</span>
+<span class="c">// build: gcc -O2 -o gemm gemm.c   run: ./gemm</span>
+<span class="k">#include</span> <span class="s">&lt;stdio.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;stdlib.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;string.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;time.h&gt;</span>
+
+<span class="k">#define</span> <span class="m1">N</span>  <span class="n">1024</span>
+<span class="k">#define</span> <span class="m1">BS</span> <span class="n">48</span><span class="c">              // 3 * 48*48 * 4 B = 27 KiB: fits a 32 KiB L1</span>
+
+<span class="k">static</span> <span class="k">float</span> <span class="v6">A</span><span class="b0">[</span><span class="m1">N</span>*<span class="m1">N</span><span class="b0">]</span>, <span class="v0">B</span><span class="b0">[</span><span class="m1">N</span>*<span class="m1">N</span><span class="b0">]</span>, <span class="v2">C</span><span class="b0">[</span><span class="m1">N</span>*<span class="m1">N</span><span class="b0">]</span>;<span class="c">   // row-major, C = A * B</span>
+
+<span class="k">static</span> <span class="k">double</span> <span class="m1">now_s</span><span class="b0">(</span><span class="k">void</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">struct</span> <span class="m1">timespec</span> <span class="v2">ts</span>;
+    <span class="m1">clock_gettime</span><span class="b1">(</span><span class="v4">CLOCK_MONOTONIC</span>, &amp;<span class="v2">ts</span><span class="b1">)</span>;
+    <span class="k">return</span> <span class="v2">ts</span>.<span class="m2">tv_sec</span> + <span class="n">1</span><span class="k">e</span>-<span class="n">9</span> * <span class="v2">ts</span>.<span class="m2">tv_nsec</span>;
+<span class="b0">}</span>
+
+<span class="k">static</span> <span class="k">void</span> <span class="m1">matmul_naive</span><span class="b0">(</span><span class="k">void</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="m1">memset</span><span class="b1">(</span><span class="v2">C</span>, <span class="n">0</span>, <span class="v2">sizeof</span> <span class="v2">C</span><span class="b1">)</span>;
+    <span class="k">for</span> <span class="b1">(</span><span class="k">int</span> <span class="v3">i</span> = <span class="n">0</span>; <span class="v3">i</span> &lt; <span class="m1">N</span>; <span class="v3">i</span>++<span class="b1">)</span>
+        <span class="k">for</span> <span class="b1">(</span><span class="k">int</span> <span class="v4">j</span> = <span class="n">0</span>; <span class="v4">j</span> &lt; <span class="m1">N</span>; <span class="v4">j</span>++<span class="b1">)</span> <span class="b1">{</span>
+            <span class="k">float</span> <span class="v6">acc</span> = <span class="n">0.0</span><span class="k">f</span>;
+            <span class="k">for</span> <span class="b2">(</span><span class="k">int</span> <span class="v6">k</span> = <span class="n">0</span>; <span class="v6">k</span> &lt; <span class="m1">N</span>; <span class="v6">k</span>++<span class="b2">)</span><span class="c">          // B[k*N+j]: stride-N walk,</span>
+                <span class="v6">acc</span> += <span class="v6">A</span><span class="b2">[</span><span class="v3">i</span>*<span class="m1">N</span> + <span class="v6">k</span><span class="b2">]</span> * <span class="v0">B</span><span class="b2">[</span><span class="v6">k</span>*<span class="m1">N</span> + <span class="v4">j</span><span class="b2">]</span>;<span class="c">  // one cache line per element</span>
+            <span class="v2">C</span><span class="b2">[</span><span class="v3">i</span>*<span class="m1">N</span> + <span class="v4">j</span><span class="b2">]</span> = <span class="v6">acc</span>;
+        <span class="b1">}</span>
+<span class="b0">}</span>
+
+<span class="k">static</span> <span class="k">void</span> <span class="m1">matmul_blocked</span><span class="b0">(</span><span class="k">void</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="m1">memset</span><span class="b1">(</span><span class="v2">C</span>, <span class="n">0</span>, <span class="v2">sizeof</span> <span class="v2">C</span><span class="b1">)</span>;
+    <span class="k">for</span> <span class="b1">(</span><span class="k">int</span> <span class="v5">ii</span> = <span class="n">0</span>; <span class="v5">ii</span> &lt; <span class="m1">N</span>; <span class="v5">ii</span> += <span class="m1">BS</span><span class="b1">)</span>
+      <span class="k">for</span> <span class="b1">(</span><span class="k">int</span> <span class="v4">kk</span> = <span class="n">0</span>; <span class="v4">kk</span> &lt; <span class="m1">N</span>; <span class="v4">kk</span> += <span class="m1">BS</span><span class="b1">)</span><span class="c">         // tiles of A, B, C stay hot</span>
+        <span class="k">for</span> <span class="b1">(</span><span class="k">int</span> <span class="v3">jj</span> = <span class="n">0</span>; <span class="v3">jj</span> &lt; <span class="m1">N</span>; <span class="v3">jj</span> += <span class="m1">BS</span><span class="b1">)</span>
+          <span class="k">for</span> <span class="b1">(</span><span class="k">int</span> <span class="v3">i</span> = <span class="v5">ii</span>; <span class="v3">i</span> &lt; <span class="v5">ii</span> + <span class="m1">BS</span>; <span class="v3">i</span>++<span class="b1">)</span>
+            <span class="k">for</span> <span class="b1">(</span><span class="k">int</span> <span class="v6">k</span> = <span class="v4">kk</span>; <span class="v6">k</span> &lt; <span class="v4">kk</span> + <span class="m1">BS</span>; <span class="v6">k</span>++<span class="b1">)</span> <span class="b1">{</span>
+                <span class="k">float</span> <span class="v5">a</span> = <span class="v6">A</span><span class="b2">[</span><span class="v3">i</span>*<span class="m1">N</span> + <span class="v6">k</span><span class="b2">]</span>;<span class="c">            // scalar hoisted to register</span>
+                <span class="k">for</span> <span class="b2">(</span><span class="k">int</span> <span class="v4">j</span> = <span class="v3">jj</span>; <span class="v4">j</span> &lt; <span class="v3">jj</span> + <span class="m1">BS</span>; <span class="v4">j</span>++<span class="b2">)</span>
+                    <span class="v2">C</span><span class="b2">[</span><span class="v3">i</span>*<span class="m1">N</span> + <span class="v4">j</span><span class="b2">]</span> += <span class="v5">a</span> * <span class="v0">B</span><span class="b2">[</span><span class="v6">k</span>*<span class="m1">N</span> + <span class="v4">j</span><span class="b2">]</span>;<span class="c">  // unit stride: line fully used</span>
+            <span class="b1">}</span>
+<span class="b0">}</span>
+
+<span class="k">int</span> <span class="m1">main</span><span class="b0">(</span><span class="k">void</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">for</span> <span class="b1">(</span><span class="k">int</span> <span class="v3">i</span> = <span class="n">0</span>; <span class="v3">i</span> &lt; <span class="m1">N</span>*<span class="m1">N</span>; <span class="v3">i</span>++<span class="b1">)</span> <span class="b1">{</span>
+        <span class="v6">A</span><span class="b2">[</span><span class="v3">i</span><span class="b2">]</span> = <span class="b2">(</span><span class="k">float</span><span class="b2">)</span><span class="m1">rand</span><span class="b2">()</span> / <span class="v0">RAND_MAX</span>;
+        <span class="v0">B</span><span class="b2">[</span><span class="v3">i</span><span class="b2">]</span> = <span class="b2">(</span><span class="k">float</span><span class="b2">)</span><span class="m1">rand</span><span class="b2">()</span> / <span class="v0">RAND_MAX</span>;
+    <span class="b1">}</span>
+    <span class="k">double</span> <span class="v2">flops</span> = <span class="n">2.0</span> * <span class="m1">N</span> * <span class="m1">N</span> * <span class="m1">N</span>;<span class="c">              // 2n^3 = 2.147e9 flops</span>
+
+    <span class="k">double</span> <span class="v5">t0</span> = <span class="m1">now_s</span><span class="b1">()</span>; <span class="m1">matmul_naive</span><span class="b1">()</span>;   <span class="k">double</span> <span class="v1">tn</span> = <span class="m1">now_s</span><span class="b1">()</span> - <span class="v5">t0</span>;
+    <span class="v5">t0</span> = <span class="m1">now_s</span><span class="b1">()</span>;        <span class="m1">matmul_blocked</span><span class="b1">()</span>; <span class="k">double</span> <span class="v4">tb</span> = <span class="m1">now_s</span><span class="b1">()</span> - <span class="v5">t0</span>;
+
+    <span class="m1">printf</span><span class="b1">(</span><span class="s">"naive:   %.3f s  %.2f GFLOP/s\n"</span>, <span class="v1">tn</span>, <span class="v2">flops</span> / <span class="v1">tn</span> / <span class="n">1</span><span class="k">e</span><span class="n">9</span><span class="b1">)</span>;
+    <span class="m1">printf</span><span class="b1">(</span><span class="s">"blocked: %.3f s  %.2f GFLOP/s  (%.2fx)\n"</span>,
+           <span class="v4">tb</span>, <span class="v2">flops</span> / <span class="v4">tb</span> / <span class="n">1</span><span class="k">e</span><span class="n">9</span>, <span class="v1">tn</span> / <span class="v4">tb</span><span class="b1">)</span>;
+    <span class="k">return</span> <span class="n">0</span>;
+<span class="b0">}</span></code></pre>
+          </div>
+          <h3>A runnable false-sharing microbenchmark</h3>
+          <p>
+            The second benchmark makes coherence traffic visible from user
+            space. Two threads increment disjoint counters; the only
+            variable is whether the counters share a cache line. The
+            counters are volatile so the compiler must issue a store per
+            iteration rather than accumulating in a register (which would
+            measure nothing). Build with gcc -O2 -pthread -o fs
+            false_sharing.c; expect the shared-line case to run several
+            times slower, per Problem 8's arithmetic, and try perf stat -e
+            cache-misses on Linux to watch the machinery directly.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="c" class="active">C</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="c" class="shl lang active"><code class="language-cpp"><span class="c">// false_sharing.c: measure cache-line ping-pong between two cores.</span>
+<span class="c">// build: gcc -O2 -pthread -o fs false_sharing.c   run: ./fs</span>
+<span class="k">#include</span> <span class="s">&lt;pthread.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;stdio.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;stdint.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;time.h&gt;</span>
+
+<span class="k">#define</span> <span class="m1">ITERS</span> <span class="n">100000000</span><span class="k">UL</span>
+
+<span class="k">struct</span> <span class="m1">shared_line</span> <span class="b0">{</span><span class="c">                 // both counters in ONE 64 B line</span>
+    <span class="k">volatile</span> <span class="k">uint64_t</span> <span class="v5">a</span>;
+    <span class="k">volatile</span> <span class="k">uint64_t</span> <span class="v6">b</span>;
+<span class="b0">}</span>;
+<span class="k">struct</span> <span class="m1">padded</span> <span class="b0">{</span><span class="c">                      // one counter per line</span>
+    <span class="m1">_Alignas</span><span class="b1">(</span>64<span class="b1">)</span> <span class="k">volatile</span> <span class="k">uint64_t</span> <span class="v5">a</span>;
+    <span class="m1">_Alignas</span><span class="b1">(</span>64<span class="b1">)</span> <span class="k">volatile</span> <span class="k">uint64_t</span> <span class="v6">b</span>;
+<span class="b0">}</span>;
+
+<span class="k">static</span> <span class="k">void</span> <span class="k">*</span><span class="m1">bump</span><span class="b0">(</span><span class="k">void</span> <span class="k">*</span><span class="v6">p</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">volatile</span> <span class="k">uint64_t</span> *<span class="v6">ctr</span> = <span class="b1">(</span><span class="k">volatile</span> <span class="k">uint64_t</span> *<span class="b1">)</span><span class="v6">p</span>;
+    <span class="k">for</span> <span class="b1">(</span><span class="k">uint64_t</span> <span class="v3">i</span> = <span class="n">0</span>; <span class="v3">i</span> &lt; <span class="m1">ITERS</span>; <span class="v3">i</span>++<span class="b1">)</span>
+        <span class="b1">(</span>*<span class="v6">ctr</span><span class="b1">)</span>++;<span class="c">                    // load + add + store, every iteration</span>
+    <span class="k">return</span> <span class="k">NULL</span>;
+<span class="b0">}</span>
+
+<span class="k">static</span> <span class="k">double</span> <span class="m1">run_pair</span><span class="b0">(</span><span class="k">volatile</span> <span class="k">uint64_t</span> <span class="k">*</span><span class="v4">x</span>, <span class="k">volatile</span> <span class="k">uint64_t</span> <span class="k">*</span><span class="v6">y</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">struct</span> <span class="m1">timespec</span> <span class="v5">t0</span>, <span class="v0">t1</span>;
+    <span class="m1">pthread_t</span> <span class="v2">ta</span>, <span class="v4">tb</span>;
+    <span class="m1">clock_gettime</span><span class="b1">(</span><span class="v4">CLOCK_MONOTONIC</span>, &amp;<span class="v5">t0</span><span class="b1">)</span>;
+    <span class="m1">pthread_create</span><span class="b1">(</span>&amp;<span class="v2">ta</span>, <span class="k">NULL</span>, <span class="m1">bump</span>, <span class="b2">(</span><span class="k">void</span> *<span class="b2">)</span><span class="v4">x</span><span class="b1">)</span>;
+    <span class="m1">pthread_create</span><span class="b1">(</span>&amp;<span class="v4">tb</span>, <span class="k">NULL</span>, <span class="m1">bump</span>, <span class="b2">(</span><span class="k">void</span> *<span class="b2">)</span><span class="v6">y</span><span class="b1">)</span>;
+    <span class="m1">pthread_join</span><span class="b1">(</span><span class="v2">ta</span>, <span class="k">NULL</span><span class="b1">)</span>;
+    <span class="m1">pthread_join</span><span class="b1">(</span><span class="v4">tb</span>, <span class="k">NULL</span><span class="b1">)</span>;
+    <span class="m1">clock_gettime</span><span class="b1">(</span><span class="v4">CLOCK_MONOTONIC</span>, &amp;<span class="v0">t1</span><span class="b1">)</span>;
+    <span class="k">return</span> <span class="b1">(</span><span class="v0">t1</span>.<span class="m2">tv_sec</span> - <span class="v5">t0</span>.<span class="m2">tv_sec</span><span class="b1">)</span> + <span class="n">1</span><span class="k">e</span>-<span class="n">9</span> * <span class="b1">(</span><span class="v0">t1</span>.<span class="m2">tv_nsec</span> - <span class="v5">t0</span>.<span class="m2">tv_nsec</span><span class="b1">)</span>;
+<span class="b0">}</span>
+
+<span class="k">int</span> <span class="m1">main</span><span class="b0">(</span><span class="k">void</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">static</span> <span class="k">struct</span> <span class="m1">shared_line</span> <span class="v4">s</span>;<span class="c">     // s.a and s.b: same line</span>
+    <span class="k">static</span> <span class="k">struct</span> <span class="m1">padded</span> <span class="v6">p</span>;<span class="c">          // p.a and p.b: different lines</span>
+
+    <span class="k">double</span> <span class="v5">t_shared</span> = <span class="m1">run_pair</span><span class="b1">(</span>&amp;<span class="v4">s</span>.<span class="m2">a</span>, &amp;<span class="v4">s</span>.<span class="m2">b</span><span class="b1">)</span>;
+    <span class="k">double</span> <span class="v4">t_padded</span> = <span class="m1">run_pair</span><span class="b1">(</span>&amp;<span class="v6">p</span>.<span class="m2">a</span>, &amp;<span class="v6">p</span>.<span class="m2">b</span><span class="b1">)</span>;
+
+    <span class="m1">printf</span><span class="b1">(</span><span class="s">"same line:      %.3f s\n"</span>, <span class="v5">t_shared</span><span class="b1">)</span>;
+    <span class="m1">printf</span><span class="b1">(</span><span class="s">"padded (64 B):  %.3f s\n"</span>, <span class="v4">t_padded</span><span class="b1">)</span>;
+    <span class="m1">printf</span><span class="b1">(</span><span class="s">"slowdown from false sharing: %.2fx\n"</span>, <span class="v5">t_shared</span> / <span class="v4">t_padded</span><span class="b1">)</span>;
+    <span class="k">return</span> <span class="n">0</span>;
+<span class="b0">}</span></code></pre>
+          </div>
+          <h3>The GPU hierarchy in CUDA: naive versus tiled matmul</h3>
+          <p>
+            The CUDA version of blocking targets the programmer-managed
+            level of the hierarchy: each block stages 32x32 tiles of A and
+            B into shared memory, synchronizes, and computes 32
+            multiply-adds per element loaded, cutting global-memory traffic
+            by the tile width. The naive kernel's global loads of B are
+            coalesced (adjacent threadIdx.x reads adjacent columns) but
+            every element of A and B is re-fetched from L2 or HBM once per
+            output element it touches. Neither kernel approaches cuBLAS,
+            which adds register blocking, double-buffered asynchronous
+            copies, and tensor cores on top of exactly this structure; the
+            point is the traffic ratio, not peak.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="cuda" class="active">CUDA</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="cuda" class="shl lang active"><code class="language-cpp"><span class="c">// tiled.cu: shared-memory tiling on the GPU. build: nvcc -O3 -o tiled tiled.cu</span>
+<span class="k">#include</span> <span class="s">&lt;cstdio&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;cuda_runtime.h&gt;</span>
+
+<span class="k">#define</span> <span class="m1">TILE</span> <span class="n">32</span><span class="c">                       // 32x32 tile = one warp-wide square</span>
+
+<span class="k">__global__</span> <span class="k">void</span> <span class="m1">sgemm_naive</span><span class="b0">(</span><span class="k">const</span> <span class="k">float</span> *<span class="v6">A</span>, <span class="k">const</span> <span class="k">float</span> *<span class="v0">B</span>, <span class="k">float</span> *<span class="v2">C</span>, <span class="k">int</span> <span class="v5">n</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">int</span> <span class="v6">row</span> = <span class="v5">blockIdx</span>.<span class="m2">y</span> * <span class="v6">blockDim</span>.<span class="m2">y</span> + <span class="v3">threadIdx</span>.<span class="m2">y</span>;
+    <span class="k">int</span> <span class="v1">col</span> = <span class="v5">blockIdx</span>.<span class="m2">x</span> * <span class="v6">blockDim</span>.<span class="m2">x</span> + <span class="v3">threadIdx</span>.<span class="m2">x</span>;<span class="c">   // adjacent x -&gt; adjacent col:</span>
+    <span class="k">if</span> <span class="b1">(</span><span class="v6">row</span> &gt;= <span class="v5">n</span> || <span class="v1">col</span> &gt;= <span class="v5">n</span><span class="b1">)</span> <span class="k">return</span>;<span class="c">                  // loads of B, C coalesce</span>
+    <span class="k">float</span> <span class="v6">acc</span> = <span class="n">0.0</span><span class="k">f</span>;
+    <span class="k">for</span> <span class="b1">(</span><span class="k">int</span> <span class="v6">k</span> = <span class="n">0</span>; <span class="v6">k</span> &lt; <span class="v5">n</span>; ++<span class="v6">k</span><span class="b1">)</span>
+        <span class="v6">acc</span> += <span class="v6">A</span><span class="b1">[</span><span class="v6">row</span> * <span class="v5">n</span> + <span class="v6">k</span><span class="b1">]</span> * <span class="v0">B</span><span class="b1">[</span><span class="v6">k</span> * <span class="v5">n</span> + <span class="v1">col</span><span class="b1">]</span>;<span class="c">        // 2 global reads per FMA</span>
+    <span class="v2">C</span><span class="b1">[</span><span class="v6">row</span> * <span class="v5">n</span> + <span class="v1">col</span><span class="b1">]</span> = <span class="v6">acc</span>;
+<span class="b0">}</span>
+
+<span class="k">__global__</span> <span class="k">void</span> <span class="m1">sgemm_tiled</span><span class="b0">(</span><span class="k">const</span> <span class="k">float</span> *<span class="v6">A</span>, <span class="k">const</span> <span class="k">float</span> *<span class="v0">B</span>, <span class="k">float</span> *<span class="v2">C</span>, <span class="k">int</span> <span class="v5">n</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">__shared__</span> <span class="k">float</span> <span class="v5">As</span><span class="b1">[</span><span class="m1">TILE</span><span class="b1">][</span><span class="m1">TILE</span><span class="b1">]</span>;<span class="c">                   // staged in shared memory:</span>
+    <span class="k">__shared__</span> <span class="k">float</span> <span class="v2">Bs</span><span class="b1">[</span><span class="m1">TILE</span><span class="b1">][</span><span class="m1">TILE</span><span class="b1">]</span>;<span class="c">                   // ~20-30 cycle latency vs</span>
+    <span class="k">int</span> <span class="v6">row</span> = <span class="v5">blockIdx</span>.<span class="m2">y</span> * <span class="m1">TILE</span> + <span class="v3">threadIdx</span>.<span class="m2">y</span>;<span class="c">         // ~500 ns for HBM</span>
+    <span class="k">int</span> <span class="v1">col</span> = <span class="v5">blockIdx</span>.<span class="m2">x</span> * <span class="m1">TILE</span> + <span class="v3">threadIdx</span>.<span class="m2">x</span>;
+    <span class="k">float</span> <span class="v6">acc</span> = <span class="n">0.0</span><span class="k">f</span>;
+    <span class="k">for</span> <span class="b1">(</span><span class="k">int</span> <span class="v0">t</span> = <span class="n">0</span>; <span class="v0">t</span> &lt; <span class="v5">n</span> / <span class="m1">TILE</span>; ++<span class="v0">t</span><span class="b1">)</span> <span class="b1">{</span>
+        <span class="v5">As</span><span class="b2">[</span><span class="v3">threadIdx</span>.<span class="m2">y</span><span class="b2">][</span><span class="v3">threadIdx</span>.<span class="m2">x</span><span class="b2">]</span> = <span class="v6">A</span><span class="b2">[</span><span class="v6">row</span> * <span class="v5">n</span> + <span class="v0">t</span> * <span class="m1">TILE</span> + <span class="v3">threadIdx</span>.<span class="m2">x</span><span class="b2">]</span>;
+        <span class="v2">Bs</span><span class="b2">[</span><span class="v3">threadIdx</span>.<span class="m2">y</span><span class="b2">][</span><span class="v3">threadIdx</span>.<span class="m2">x</span><span class="b2">]</span> = <span class="v0">B</span><span class="b2">[</span><span class="b0">(</span><span class="v0">t</span> * <span class="m1">TILE</span> + <span class="v3">threadIdx</span>.<span class="m2">y</span><span class="b0">)</span> * <span class="v5">n</span> + <span class="v1">col</span><span class="b2">]</span>;
+        <span class="m1">__syncthreads</span><span class="b2">()</span>;<span class="c">                               // tile fully staged</span>
+        <span class="k">#pragma</span> <span class="m1">unroll</span>
+        <span class="k">for</span> <span class="b2">(</span><span class="k">int</span> <span class="v6">k</span> = <span class="n">0</span>; <span class="v6">k</span> &lt; <span class="m1">TILE</span>; ++<span class="v6">k</span><span class="b2">)</span><span class="c">                 // 32 FMAs per element</span>
+            <span class="v6">acc</span> += <span class="v5">As</span><span class="b2">[</span><span class="v3">threadIdx</span>.<span class="m2">y</span><span class="b2">][</span><span class="v6">k</span><span class="b2">]</span> * <span class="v2">Bs</span><span class="b2">[</span><span class="v6">k</span><span class="b2">][</span><span class="v3">threadIdx</span>.<span class="m2">x</span><span class="b2">]</span>;<span class="c">  // loaded: AI x32</span>
+        <span class="m1">__syncthreads</span><span class="b2">()</span>;<span class="c">                               // done before overwrite</span>
+    <span class="b1">}</span>
+    <span class="v2">C</span><span class="b1">[</span><span class="v6">row</span> * <span class="v5">n</span> + <span class="v1">col</span><span class="b1">]</span> = <span class="v6">acc</span>;
+<span class="b0">}</span>
+
+<span class="k">int</span> <span class="m1">main</span><span class="b0">()</span> <span class="b0">{</span>
+    <span class="k">const</span> <span class="k">int</span> <span class="v5">n</span> = <span class="n">4096</span>;
+    <span class="k">size_t</span> <span class="v3">bytes</span> = <span class="b1">(</span><span class="k">size_t</span><span class="b1">)</span><span class="v5">n</span> * <span class="v5">n</span> * <span class="k">sizeof</span><span class="b1">(</span><span class="k">float</span><span class="b1">)</span>;
+    <span class="k">float</span> *<span class="v6">A</span>, *<span class="v0">B</span>, *<span class="v2">C</span>;<span class="c">                                  // (n, n) each</span>
+    <span class="m1">cudaMalloc</span><span class="b1">(</span>&amp;<span class="v6">A</span>, <span class="v3">bytes</span><span class="b1">)</span>; <span class="m1">cudaMalloc</span><span class="b1">(</span>&amp;<span class="v0">B</span>, <span class="v3">bytes</span><span class="b1">)</span>; <span class="m1">cudaMalloc</span><span class="b1">(</span>&amp;<span class="v2">C</span>, <span class="v3">bytes</span><span class="b1">)</span>;
+
+    <span class="v0">dim3</span> <span class="m1">block</span><span class="b1">(</span><span class="m1">TILE</span>, <span class="m1">TILE</span><span class="b1">)</span>, <span class="m1">grid</span><span class="b1">(</span><span class="v5">n</span> / <span class="m1">TILE</span>, <span class="v5">n</span> / <span class="m1">TILE</span><span class="b1">)</span>;
+    <span class="m1">cudaEvent_t</span> <span class="v5">t0</span>, <span class="v0">t1</span>; <span class="m1">cudaEventCreate</span><span class="b1">(</span>&amp;<span class="v5">t0</span><span class="b1">)</span>; <span class="m1">cudaEventCreate</span><span class="b1">(</span>&amp;<span class="v0">t1</span><span class="b1">)</span>;
+    <span class="k">float</span> <span class="v0">ms</span>; <span class="k">double</span> <span class="v2">flops</span> = <span class="n">2.0</span> * <span class="v5">n</span> * <span class="v5">n</span> * <span class="b1">(</span><span class="k">double</span><span class="b1">)</span><span class="v5">n</span>;
+
+    <span class="m1">sgemm_naive</span>&lt;&lt;&lt;<span class="m1">grid</span>, <span class="m1">block</span>&gt;&gt;&gt;<span class="b1">(</span><span class="v6">A</span>, <span class="v0">B</span>, <span class="v2">C</span>, <span class="v5">n</span><span class="b1">)</span>;<span class="c">          // warm up</span>
+    <span class="m1">cudaEventRecord</span><span class="b1">(</span><span class="v5">t0</span><span class="b1">)</span>;
+    <span class="m1">sgemm_naive</span>&lt;&lt;&lt;<span class="m1">grid</span>, <span class="m1">block</span>&gt;&gt;&gt;<span class="b1">(</span><span class="v6">A</span>, <span class="v0">B</span>, <span class="v2">C</span>, <span class="v5">n</span><span class="b1">)</span>;
+    <span class="m1">cudaEventRecord</span><span class="b1">(</span><span class="v0">t1</span><span class="b1">)</span>; <span class="m1">cudaEventSynchronize</span><span class="b1">(</span><span class="v0">t1</span><span class="b1">)</span>;
+    <span class="m1">cudaEventElapsedTime</span><span class="b1">(</span>&amp;<span class="v0">ms</span>, <span class="v5">t0</span>, <span class="v0">t1</span><span class="b1">)</span>;
+    <span class="m1">printf</span><span class="b1">(</span><span class="s">"naive: %7.2f ms  %6.1f GFLOP/s\n"</span>, <span class="v0">ms</span>, <span class="v2">flops</span> / <span class="v0">ms</span> / <span class="n">1</span><span class="k">e</span><span class="n">6</span><span class="b1">)</span>;
+
+    <span class="m1">sgemm_tiled</span>&lt;&lt;&lt;<span class="m1">grid</span>, <span class="m1">block</span>&gt;&gt;&gt;<span class="b1">(</span><span class="v6">A</span>, <span class="v0">B</span>, <span class="v2">C</span>, <span class="v5">n</span><span class="b1">)</span>;
+    <span class="m1">cudaEventRecord</span><span class="b1">(</span><span class="v5">t0</span><span class="b1">)</span>;
+    <span class="m1">sgemm_tiled</span>&lt;&lt;&lt;<span class="m1">grid</span>, <span class="m1">block</span>&gt;&gt;&gt;<span class="b1">(</span><span class="v6">A</span>, <span class="v0">B</span>, <span class="v2">C</span>, <span class="v5">n</span><span class="b1">)</span>;
+    <span class="m1">cudaEventRecord</span><span class="b1">(</span><span class="v0">t1</span><span class="b1">)</span>; <span class="m1">cudaEventSynchronize</span><span class="b1">(</span><span class="v0">t1</span><span class="b1">)</span>;
+    <span class="m1">cudaEventElapsedTime</span><span class="b1">(</span>&amp;<span class="v0">ms</span>, <span class="v5">t0</span>, <span class="v0">t1</span><span class="b1">)</span>;
+    <span class="m1">printf</span><span class="b1">(</span><span class="s">"tiled: %7.2f ms  %6.1f GFLOP/s\n"</span>, <span class="v0">ms</span>, <span class="v2">flops</span> / <span class="v0">ms</span> / <span class="n">1</span><span class="k">e</span><span class="n">6</span><span class="b1">)</span>;
+    <span class="k">return</span> <span class="n">0</span>;
+<span class="b0">}</span></code></pre>
+          </div>
+          <h3>A roofline measurement harness</h3>
+          <p>
+            The harness below reproduces the two coordinates of the
+            roofline on whatever GPU it runs on: streaming bandwidth from a
+            large fp32 add, and compute peak from a large bf16 matmul, then
+            derives the machine balance and places both kernels. Run on the
+            H100 in this repository, it produces the numbers quoted
+            throughout this page (3063.5 GB/s for the add, 728.7 TFLOPS at
+            n = 8192, balance 243.5 flops/byte); the same script on a
+            different part maps that machine instead. Note the two
+            essentials of honest GPU timing: warmup iterations to exclude
+            compilation and clock ramp, and a device synchronize before
+            reading the host clock, since kernel launches are
+            asynchronous.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="pytorch" class="shl lang active"><code class="language-python"><span class="k">import</span> <span class="m1">time</span>
+<span class="k">import</span> <span class="m1">torch</span>
+
+<span class="k">assert</span> <span class="m1">torch</span>.<span class="m2">cuda</span>.<span class="m2">is_available</span><span class="b0">()</span>
+<span class="v0">dev</span> = <span class="m1">torch</span>.<span class="m2">device</span><span class="b0">(</span><span class="s">"cuda"</span><span class="b0">)</span>
+
+<span class="k">def</span> <span class="m1">time_fn</span><span class="b0">(</span><span class="m1">f</span>, <span class="v0">iters</span>=<span class="n">50</span>, <span class="v0">warmup</span>=<span class="n">10</span><span class="b0">)</span>:
+    <span class="k">for</span> <span class="v4">_</span> <span class="k">in</span> <span class="m1">range</span><span class="b0">(</span><span class="v0">warmup</span><span class="b0">)</span>:
+        <span class="m1">f</span><span class="b0">()</span>
+    <span class="m1">torch</span>.<span class="m2">cuda</span>.<span class="m2">synchronize</span><span class="b0">()</span>               <span class="c"># launches are async: fence first</span>
+    <span class="v5">t0</span> = <span class="m1">time</span>.<span class="m2">perf_counter</span><span class="b0">()</span>
+    <span class="k">for</span> <span class="v4">_</span> <span class="k">in</span> <span class="m1">range</span><span class="b0">(</span><span class="v0">iters</span><span class="b0">)</span>:
+        <span class="m1">f</span><span class="b0">()</span>
+    <span class="m1">torch</span>.<span class="m2">cuda</span>.<span class="m2">synchronize</span><span class="b0">()</span>
+    <span class="k">return</span> <span class="b0">(</span><span class="m1">time</span>.<span class="m2">perf_counter</span><span class="b1">()</span> - <span class="v5">t0</span><span class="b0">)</span> / <span class="v0">iters</span>
+
+<span class="c"># 1) memory roof: fp32 streaming add, 1 flop per 12 bytes</span>
+<span class="v5">n</span> = <span class="n">1</span> &lt;&lt; <span class="n">28</span>                            <span class="c"># 2^28 elems = 1 GiB per tensor</span>
+<span class="v4">x</span> = <span class="m1">torch</span>.<span class="m2">randn</span><span class="b0">(</span><span class="v5">n</span>, <span class="v6">device</span>=<span class="v0">dev</span><span class="b0">)</span>         <span class="c"># (n,)</span>
+<span class="v6">y</span> = <span class="m1">torch</span>.<span class="m2">randn</span><span class="b0">(</span><span class="v5">n</span>, <span class="v6">device</span>=<span class="v0">dev</span><span class="b0">)</span>         <span class="c"># (n,)</span>
+<span class="v0">z</span> = <span class="m1">torch</span>.<span class="m2">empty_like</span><span class="b0">(</span><span class="v4">x</span><span class="b0">)</span>                <span class="c"># (n,)</span>
+<span class="v0">t</span> = <span class="m1">time_fn</span><span class="b0">(</span><span class="k">lambda</span>: <span class="m1">torch</span>.<span class="m2">add</span><span class="b1">(</span><span class="v4">x</span>, <span class="v6">y</span>, <span class="v2">out</span>=<span class="v0">z</span><span class="b1">)</span><span class="b0">)</span>
+<span class="v3">gbs</span> = <span class="n">3</span> * <span class="n">4</span> * <span class="v5">n</span> / <span class="v0">t</span> / <span class="n">1e9</span>              <span class="c"># read x, read y, write z</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">f"add : {</span><span class="v3">gbs</span><span class="s">:7.1f} GB/s   AI = 1/12 flop/B"</span><span class="b0">)</span>
+
+<span class="c"># 2) compute roof: bf16 matmul on tensor cores</span>
+<span class="v4">m</span> = <span class="n">8192</span>
+<span class="v5">a</span> = <span class="m1">torch</span>.<span class="m2">randn</span><span class="b0">(</span><span class="v4">m</span>, <span class="v4">m</span>, <span class="v6">device</span>=<span class="v0">dev</span>, <span class="v3">dtype</span>=<span class="m1">torch</span>.<span class="m2">bfloat16</span><span class="b0">)</span>  <span class="c"># (m, m)</span>
+<span class="v6">b</span> = <span class="m1">torch</span>.<span class="m2">randn</span><span class="b0">(</span><span class="v4">m</span>, <span class="v4">m</span>, <span class="v6">device</span>=<span class="v0">dev</span>, <span class="v3">dtype</span>=<span class="m1">torch</span>.<span class="m2">bfloat16</span><span class="b0">)</span>  <span class="c"># (m, m)</span>
+<span class="v0">t</span> = <span class="m1">time_fn</span><span class="b0">(</span><span class="k">lambda</span>: <span class="v5">a</span> @ <span class="v6">b</span><span class="b0">)</span>
+<span class="v4">tflops</span> = <span class="n">2</span> * <span class="v4">m</span>**<span class="n">3</span> / <span class="v0">t</span> / <span class="n">1e12</span>
+<span class="v0">ai_mm</span> = <span class="n">2</span> * <span class="v4">m</span>**<span class="n">3</span> / <span class="b0">(</span><span class="n">3</span> * <span class="v4">m</span> * <span class="v4">m</span> * <span class="n">2</span><span class="b0">)</span>     <span class="c"># flops / min bytes (bf16 = 2 B)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">f"gemm: {</span><span class="v4">tflops</span><span class="s">:7.1f} TFLOPS  AI = {</span><span class="v0">ai_mm</span><span class="s">:.0f} flop/B"</span><span class="b0">)</span>
+
+<span class="c"># 3) machine balance and kernel placement</span>
+<span class="v5">balance</span> = <span class="v4">tflops</span> * <span class="n">1e12</span> / <span class="b0">(</span><span class="v3">gbs</span> * <span class="n">1e9</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">f"machine balance ~ {</span><span class="v5">balance</span><span class="s">:.1f} flop/B"</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">f"add is memory-bound:  bound = {</span><span class="v3">gbs</span>/<span class="n">12</span><span class="s">:.1f} GFLOP/s"</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">f"gemm is compute-bound ({</span><span class="v0">ai_mm</span>/<span class="v5">balance</span><span class="s">:.1f}x past the ridge)"</span><span class="b0">)</span></code></pre>
+            <pre data-lang="jax" class="shl lang"><code class="language-python"><span class="k">import</span> <span class="m1">time</span>
+<span class="k">import</span> <span class="m1">jax</span>
+<span class="k">import</span> <span class="m1">jax</span>.<span class="m2">numpy</span> <span class="k">as</span> <span class="m1">jnp</span>
+
+<span class="v4">key</span> = <span class="m1">jax</span>.<span class="m2">random</span>.<span class="m2">PRNGKey</span><span class="b0">(</span><span class="n">0</span><span class="b0">)</span>
+
+<span class="k">def</span> <span class="m1">time_fn</span><span class="b0">(</span><span class="m1">f</span>, <span class="v0">iters</span>=<span class="n">50</span>, <span class="v0">warmup</span>=<span class="n">10</span><span class="b0">)</span>:
+    <span class="k">for</span> <span class="v4">_</span> <span class="k">in</span> <span class="m1">range</span><span class="b0">(</span><span class="v0">warmup</span><span class="b0">)</span>:
+        <span class="v2">out</span> = <span class="m1">f</span><span class="b0">()</span>
+    <span class="m1">jax</span>.<span class="m2">block_until_ready</span><span class="b0">(</span><span class="v2">out</span><span class="b0">)</span>             <span class="c"># dispatch is async: fence first</span>
+    <span class="v5">t0</span> = <span class="m1">time</span>.<span class="m2">perf_counter</span><span class="b0">()</span>
+    <span class="k">for</span> <span class="v4">_</span> <span class="k">in</span> <span class="m1">range</span><span class="b0">(</span><span class="v0">iters</span><span class="b0">)</span>:
+        <span class="v2">out</span> = <span class="m1">f</span><span class="b0">()</span>
+    <span class="m1">jax</span>.<span class="m2">block_until_ready</span><span class="b0">(</span><span class="v2">out</span><span class="b0">)</span>
+    <span class="k">return</span> <span class="b0">(</span><span class="m1">time</span>.<span class="m2">perf_counter</span><span class="b1">()</span> - <span class="v5">t0</span><span class="b0">)</span> / <span class="v0">iters</span>
+
+<span class="c"># 1) memory roof: fp32 streaming add, 1 flop per 12 bytes</span>
+<span class="v5">n</span> = <span class="n">1</span> &lt;&lt; <span class="n">28</span>                            <span class="c"># 2^28 elems = 1 GiB per tensor</span>
+<span class="v6">k1</span>, <span class="v5">k2</span>, <span class="v3">k3</span>, <span class="v0">k4</span> = <span class="m1">jax</span>.<span class="m2">random</span>.<span class="m2">split</span><span class="b0">(</span><span class="v4">key</span>, <span class="n">4</span><span class="b0">)</span>
+<span class="v4">x</span> = <span class="m1">jax</span>.<span class="m2">random</span>.<span class="m2">normal</span><span class="b0">(</span><span class="v6">k1</span>, <span class="b1">(</span><span class="v5">n</span>,<span class="b1">)</span><span class="b0">)</span>        <span class="c"># (n,)</span>
+<span class="v6">y</span> = <span class="m1">jax</span>.<span class="m2">random</span>.<span class="m2">normal</span><span class="b0">(</span><span class="v5">k2</span>, <span class="b1">(</span><span class="v5">n</span>,<span class="b1">)</span><span class="b0">)</span>        <span class="c"># (n,)</span>
+<span class="m1">add</span> = <span class="m1">jax</span>.<span class="m2">jit</span><span class="b0">(</span><span class="k">lambda</span> <span class="v4">x</span>, <span class="v6">y</span>: <span class="v4">x</span> + <span class="v6">y</span><span class="b0">)</span>
+<span class="v0">t</span> = <span class="m1">time_fn</span><span class="b0">(</span><span class="k">lambda</span>: <span class="m1">add</span><span class="b1">(</span><span class="v4">x</span>, <span class="v6">y</span><span class="b1">)</span><span class="b0">)</span>
+<span class="v3">gbs</span> = <span class="n">3</span> * <span class="n">4</span> * <span class="v5">n</span> / <span class="v0">t</span> / <span class="n">1e9</span>              <span class="c"># read x, read y, write z</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">f"add : {</span><span class="v3">gbs</span><span class="s">:7.1f} GB/s   AI = 1/12 flop/B"</span><span class="b0">)</span>
+
+<span class="c"># 2) compute roof: bf16 matmul on tensor cores</span>
+<span class="v4">m</span> = <span class="n">8192</span>
+<span class="v5">a</span> = <span class="m1">jax</span>.<span class="m2">random</span>.<span class="m2">normal</span><span class="b0">(</span><span class="v3">k3</span>, <span class="b1">(</span><span class="v4">m</span>, <span class="v4">m</span><span class="b1">)</span>, <span class="v3">dtype</span>=<span class="m1">jnp</span>.<span class="m2">bfloat16</span><span class="b0">)</span>  <span class="c"># (m, m)</span>
+<span class="v6">b</span> = <span class="m1">jax</span>.<span class="m2">random</span>.<span class="m2">normal</span><span class="b0">(</span><span class="v0">k4</span>, <span class="b1">(</span><span class="v4">m</span>, <span class="v4">m</span><span class="b1">)</span>, <span class="v3">dtype</span>=<span class="m1">jnp</span>.<span class="m2">bfloat16</span><span class="b0">)</span>  <span class="c"># (m, m)</span>
+<span class="m1">mm</span> = <span class="m1">jax</span>.<span class="m2">jit</span><span class="b0">(</span><span class="k">lambda</span> <span class="v5">a</span>, <span class="v6">b</span>: <span class="v5">a</span> @ <span class="v6">b</span><span class="b0">)</span>
+<span class="v0">t</span> = <span class="m1">time_fn</span><span class="b0">(</span><span class="k">lambda</span>: <span class="m1">mm</span><span class="b1">(</span><span class="v5">a</span>, <span class="v6">b</span><span class="b1">)</span><span class="b0">)</span>
+<span class="v4">tflops</span> = <span class="n">2</span> * <span class="v4">m</span>**<span class="n">3</span> / <span class="v0">t</span> / <span class="n">1e12</span>
+<span class="v0">ai_mm</span> = <span class="n">2</span> * <span class="v4">m</span>**<span class="n">3</span> / <span class="b0">(</span><span class="n">3</span> * <span class="v4">m</span> * <span class="v4">m</span> * <span class="n">2</span><span class="b0">)</span>     <span class="c"># flops / min bytes (bf16 = 2 B)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">f"gemm: {</span><span class="v4">tflops</span><span class="s">:7.1f} TFLOPS  AI = {</span><span class="v0">ai_mm</span><span class="s">:.0f} flop/B"</span><span class="b0">)</span>
+
+<span class="c"># 3) machine balance and kernel placement</span>
+<span class="v5">balance</span> = <span class="v4">tflops</span> * <span class="n">1e12</span> / <span class="b0">(</span><span class="v3">gbs</span> * <span class="n">1e9</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">f"machine balance ~ {</span><span class="v5">balance</span><span class="s">:.1f} flop/B"</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">f"add is memory-bound:  bound = {</span><span class="v3">gbs</span>/<span class="n">12</span><span class="s">:.1f} GFLOP/s"</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">f"gemm is compute-bound ({</span><span class="v0">ai_mm</span>/<span class="v5">balance</span><span class="s">:.1f}x past the ridge)"</span><span class="b0">)</span></code></pre>
+          </div>
+          <h2>How it is done in practice</h2>
+          <h3>What a shipping CPU core actually contains</h3>
+          <p>
+            The distance between the five-stage teaching pipeline and a
+            shipped high-end core is roughly a factor of a thousand in
+            engineering effort, but the shipped core is recognizably the
+            same drawing with every box grown and replicated. A current
+            big core (Intel's performance cores, AMD Zen 5, Apple's
+            M-series big cores, Arm's X-series) decodes 6 to 10
+            instructions per cycle, holds an out-of-order window of
+            roughly 300 to 600 plus reorder-buffer entries backed by
+            physical register files with several hundred registers of each
+            class, sustains 6 to 8 micro-ops issued per cycle across a
+            dozen or so execution ports, and predicts with a TAGE-class
+            direction predictor plus BTB hierarchies and a return stack, at
+            a few mispredictions per kilo-instruction. The cache hierarchy
+            is 32 to 128 KiB of L1 data, roughly 1 to 3 MiB of private L2,
+            and a shared L3 of a few MiB per core, with several concurrent
+            hardware prefetchers (next-line, stride, region-based) that in
+            practice hide a large fraction of what would otherwise be
+            DRAM stalls. Two facts about the process rarely make it into
+            textbooks. First, verification, not design, is the dominant
+            cost: confirming that renaming, the LSQ, coherence, and the
+            consistency model compose correctly across corner cases
+            consumes more engineer-years than the RTL itself, which is a
+            large part of why formal memory-model specifications (the
+            x86-TSO and Arm axiomatic models, RVWMO for RISC-V) migrated
+            from academia into vendor documentation. Second, the
+            microarchitecture is increasingly a security surface: Spectre
+            class attacks weaponized branch prediction and speculative
+            loads, and every core since has shipped with predictor
+            isolation modes and speculation barriers that architects must
+            now budget for like any other structure.
+          </p>
+          <h3>The GPU software stack and measured production kernels</h3>
+          <p>
+            On the GPU side, the practice gap is bridged by kernel
+            libraries and compilers rather than by hardware alone. cuBLAS
+            and CUTLASS implement the tiled matmul of the implementation
+            section with two more levels of blocking (registers below
+            shared memory, and warp-level tensor-core tiles below that),
+            double-buffered asynchronous copies so tiles stream while
+            arithmetic proceeds, and autotuned tile shapes per problem
+            size; that stack is what turns the naive kernel's few percent
+            of peak into the measured 728.7 bf16 TFLOPS. The measured
+            transformer block numbers from this repository's H100 show
+            what production inference arithmetic looks like end to end: a
+            full multi-head attention block at batch 8, sequence 2048,
+            model width 1024, 16 heads runs in 0.503 ms at 546.6 TFLOPS,
+            with the four projection matmuls contributing half the flops,
+            and the fused-versus-unfused elementwise measurement (0.911 ms
+            to 0.214 ms, 4.26x) is precisely the win that torch.compile,
+            XLA, and Triton chase automatically across every non-matmul op
+            in a model. The division of labor has stabilized: matmuls go
+            to vendor libraries or CUTLASS-generated kernels, attention
+            goes to purpose-built fused kernels, and the long tail of
+            normalization, activation, and reshaping is fused by
+            compilers, with the roofline as the shared accounting system
+            deciding which bucket each op belongs in.
+          </p>
+          <h3>Fleet economics</h3>
+          <p>
+            At datacenter scale the objective function is performance per
+            watt per dollar over a fleet, not single-kernel latency, and
+            that objective explains the current hardware landscape better
+            than any benchmark chart. Hyperscalers design in-house silicon
+            (Google's TPU line, Amazon's Graviton CPUs and Trainium
+            accelerators, Microsoft's Maia, Meta's MTIA) not to beat
+            merchant parts at peak flops but to delete the margins and
+            tune the memory hierarchy for their actual traffic; the TPU
+            paper's cost-performance framing, rather than its
+            architecture, is its most imitated feature. Power delivery and
+            cooling now bound accelerator deployment (a single H100-class
+            part dissipates 700 W, a training pod megawatts), so
+            low-precision arithmetic is as much a facilities decision as a
+            numerical one. The consistent through-line from the Horowitz
+            ledger to a training cluster invoice is that architecture at
+            every scale is the art of not moving data.
+          </p>
+
+          <h2>The current research frontier</h2>
+          <h3>Packaging as the new scaling axis</h3>
+          <p>
+            With transistor cost improvements slowing, the last four years
+            of headroom have come mostly from packaging. Chiplet designs
+            (AMD's CPU line since Zen 2, Intel's tiled Xeons, NVIDIA's
+            two-die Blackwell) split a system across smaller dies with
+            better yield, joined by dense interconnect bridges; AMD's
+            3D V-Cache stacks an extra 64 MiB of SRAM directly on top of
+            the compute die, a pure exploitation of the AMAT arithmetic
+            above; and 2.5D CoWoS-style integration of HBM stacks beside
+            the GPU die is the enabling technology behind the measured
+            3 TB/s on this page's H100. The UCIe consortium is
+            standardizing die-to-die links so chiplets from different
+            vendors can compose, and CXL extends coherence over PCIe
+            physical layers to enable memory pooling and tiering across a
+            rack, which drags the consistency-model questions of the
+            multicore section out of the socket and into the datacenter.
+          </p>
+          <h3>Accelerator diversity and near-memory computing</h3>
+          <p>
+            The accelerator space is unusually pluralistic right now.
+            Cerebras builds wafer-scale engines (the WSE-3 spans an entire
+            300 mm wafer, with on-wafer SRAM standing in for HBM); Groq's
+            LPU removes caches, branch prediction, and dynamic scheduling
+            entirely in favor of compiler-scheduled, deterministic
+            dataflow, a bet that ML inference is regular enough to
+            software-pipeline the whole chip; Tenstorrent combines RISC-V
+            cores with matrix units and bets on open ISAs. Academic
+            generators keep the design space honest: Berkeley's Gemmini
+            produces systolic accelerators parameterized over the dataflow
+            taxonomy above; ETH Zurich's Snitch and Occamy clusters
+            explore tiny cores marshalling wide FPUs; MIT's Eyeriss v2 and
+            the Timeloop/Accelergy tooling from the same group turned
+            dataflow choice into a searchable optimization problem;
+            Cornell and Tsinghua groups, among others, push
+            high-level synthesis and processing-in-memory prototypes
+            respectively. Near-memory computing has finally shipped in
+            small volumes (UPMEM's DRAM-integrated processors, Samsung's
+            HBM-PIM prototypes), attacking the 640 pJ DRAM-access line of
+            the energy ledger directly, though programming models remain
+            the obstacle.
+          </p>
+          <h3>Precision, sparsity, and learned microarchitecture</h3>
+          <p>
+            Numerics keep descending: fp8 training is production practice
+            on Hopper-class hardware, the OCP microscaling (MX) formats
+            standardize block-scaled 4- and 6-bit types across vendors,
+            and Blackwell implements them in silicon; the open question,
+            actively contested across industrial and academic labs, is
+            where training stops tolerating quantization noise, with
+            per-block scaling and stochastic rounding as the current
+            frontier tools. Structured sparsity beyond 2:4 remains an
+            arms race between pruning algorithms and hardware
+            generality. On the CPU side, research keeps probing learned
+            components: perceptron and TAGE hybrids already ship, ML-guided
+            prefetching and cache replacement appear in top venues yearly,
+            and the practical question is whether learned structures can
+            meet timing and verification budgets rather than whether they
+            can predict. And the RISC-V wave is reaching servers: vector
+            extension (RVV 1.0) silicon, profiles standardizing
+            feature sets, and multiple vendors sampling out-of-order
+            application cores, which will test whether an open ISA can
+            sustain the software-ecosystem network effects that x86 and
+            Arm built over decades.
+          </p>
+
+          <h2>Open source to read</h2>
+          <p>
+            Architecture is unusually well served by readable production
+            code. Each entry gives the file to open first.
+          </p>
+          <ul>
+            <li>
+              <a href="https://github.com/llvm/llvm-project" target="_blank" rel="noreferrer">llvm-project</a>:
+              where ISA design meets the compiler. Open
+              llvm/lib/Target/RISCV/RISCVInstrInfo.td to see an entire ISA
+              expressed as structured data (encodings, scheduling info,
+              compression patterns), then llvm/lib/CodeGen/MachineScheduler.cpp
+              to see software instruction scheduling against a machine
+              model, the compiler's answer to the hazards on this page.
+            </li>
+            <li>
+              <a href="https://github.com/riscv/riscv-isa-manual" target="_blank" rel="noreferrer">riscv/riscv-isa-manual</a>:
+              the ISA specification itself, maintained as a living
+              document. Open the RV32I base chapter (src/rv32.adoc) and
+              read the design commentary boxes; they are a running seminar
+              on why each encoding decision was made.
+            </li>
+            <li>
+              <a href="https://github.com/gem5/gem5" target="_blank" rel="noreferrer">gem5</a>:
+              the standard cycle-level research simulator. Open
+              src/cpu/o3/rename.cc to see register renaming implemented
+              exactly as the Tomasulo section describes, then wander into
+              the LSQ and commit stages in the same directory; this is the
+              closest thing to an executable version of this page.
+            </li>
+            <li>
+              <a href="https://github.com/chipsalliance/rocket-chip" target="_blank" rel="noreferrer">chipsalliance/rocket-chip</a>:
+              a real, taped-out RISC-V core generator in Chisel. Open
+              src/main/scala/rocket/RocketCore.scala and find the
+              five-stage pipeline, the hazard logic, and the bypass muxes
+              as a few hundred lines of parameterized hardware.
+            </li>
+            <li>
+              <a href="https://github.com/verilator/verilator" target="_blank" rel="noreferrer">verilator</a>:
+              the open-source Verilog simulator that compiles RTL to C++.
+              Open examples/make_tracing_c/sim_main.cpp to see the
+              simulation driver pattern, then simulate a small core (rocket
+              or a picorv32) and watch pipeline registers change cycle by
+              cycle.
+            </li>
+            <li>
+              <a href="https://github.com/NVIDIA/cutlass" target="_blank" rel="noreferrer">NVIDIA/cutlass</a>:
+              the open implementation of GPU matmul at full performance.
+              Open media/docs/efficient_gemm.md first; it is the best
+              short document on hierarchical tiling in existence, and maps
+              one-to-one onto the blocking and roofline sections above.
+            </li>
+            <li>
+              <a href="https://github.com/triton-lang/triton" target="_blank" rel="noreferrer">triton-lang/triton</a>:
+              the tile-level GPU kernel language behind much of PyTorch 2.
+              Open python/tutorials/03-matrix-multiplication.py and compare
+              it line by line with the CUDA tiled kernel above; the tile
+              abstraction is the same, with the compiler owning shared
+              memory and scheduling.
+            </li>
+            <li>
+              <a href="https://github.com/google/XNNPACK" target="_blank" rel="noreferrer">google/XNNPACK</a>:
+              production CPU SIMD microkernels for neural inference. Open
+              any AVX-512 GEMM microkernel under src/f32-gemm/gen/ to see
+              register blocking and per-ISA specialization; the directory
+              structure itself is a map of the SIMD landscape.
+            </li>
+            <li>
+              <a href="https://github.com/ARM-software/ComputeLibrary" target="_blank" rel="noreferrer">ARM-software/ComputeLibrary</a>:
+              Arm's counterpart, NEON and SVE kernels for the same
+              workloads. Open examples/neon_sgemm.cpp and trace the call
+              down into the kernel layer to see how a vendor library
+              organizes microkernel dispatch across microarchitectures.
+            </li>
+          </ul>
+
+          <h2>Common misconceptions</h2>
+          <p>
+            <strong>"Clock frequency measures performance."</strong> The
+            iron law is time = instructions x CPI x cycle time, and all
+            three factors trade against each other: deep pipelines raise
+            frequency while raising branch penalties and hence CPI, and
+            ISAs differ in instruction counts for the same work. A 3.5 GHz
+            core with IPC 4 beats a 5 GHz core with IPC 2 by 40 percent.
+            Frequency comparisons are meaningful only within a single
+            microarchitecture.
+          </p>
+          <p>
+            <strong>"x86 is doomed by CISC decode; Arm wins because RISC
+            is faster."</strong> The execution engines of high-end x86 and
+            Arm cores are nearly identical out-of-order machines; x86 pays
+            a real but bounded front-end tax (predecode, micro-op caches),
+            a few percent of core power at the high end. Apple's
+            efficiency advantage came from process leadership, very large
+            caches and windows, and tight system integration far more than
+            from instruction encoding. At the low end the decode tax
+            matters proportionally more, which is where RISC's win is
+            real.
+          </p>
+          <p>
+            <strong>"Pipelining makes instructions execute faster."</strong>
+            Each instruction gets slower: the same logic plus per-stage
+            register overhead, rounded up to the slowest stage. Only
+            throughput improves, as Problem 1's arithmetic showed (latency
+            1050 to 1750 ps, throughput 3x). Any claim about pipelining
+            should survive substituting the words "more instructions per
+            second" for "faster".
+          </p>
+          <p>
+            <strong>"The cache is transparent, so software cannot do much
+            about it."</strong> Transparent means correct, not
+            performance-neutral. Blocking changed the matmul's memory
+            traffic from \(O(n^3)\) to \(O(n^3/b)\) without changing a
+            single arithmetic operation, an asymptotic improvement
+            available purely in software, and Hong and Kung's bound says
+            it is the best possible. Most performance engineering on CPUs
+            is exactly this: restructuring computation so the fixed
+            hardware sees locality.
+          </p>
+          <p>
+            <strong>"The hardware runs my program in the order I wrote
+            it."</strong> The compiler reorders, the out-of-order core
+            reorders, and the memory system makes some reorderings visible
+            to other cores: the store-buffer litmus test yields the
+            "impossible" result on every x86 machine, and weaker models
+            permit far more. Single-threaded code cannot tell (that is the
+            point of precise state), but any cross-thread communication
+            outside the atomics discipline is a bug in waiting, typically
+            discovered when x86 code first runs on Arm.
+          </p>
+          <p>
+            <strong>"GPUs are fast because they have thousands of
+            cores."</strong> The deeper truth is that GPUs are fast
+            because they stopped paying for latency: no large per-thread
+            caches, predictors, or windows, with memory latency hidden by
+            warp oversubscription and the saved transistors spent on
+            arithmetic and bandwidth. A single GPU thread is far slower
+            than a CPU thread; the machine wins only when tens of
+            thousands of threads exist. "Thousands of slow threads,
+            scheduled for free" explains real GPU performance behavior;
+            "thousands of cores" predicts none of it.
+          </p>
+          <p>
+            <strong>"Maximize occupancy to maximize GPU performance."</strong>
+            Occupancy is a means (enough warps to satisfy Little's law),
+            not an end. Past the point where latency is covered, more
+            resident warps shrink each thread's register budget, forcing
+            spills; the fastest matmul kernels run at modest occupancy
+            with enormous per-thread register tiles, as Problem 5's
+            trade-off showed. Chase coverage of stalls, not the occupancy
+            percentage.
+          </p>
+          <p>
+            <strong>"More TFLOPS means faster machine learning."</strong>
+            Peak flops bound only kernels right of the ridge point. On the
+            measured H100 the balance is 243.5 flops/byte; every
+            elementwise op in a model sits below intensity 1 and is bound
+            by the 3 TB/s memory system at under one percent of peak, and
+            naive attention threw away a measured 23.6x by materializing
+            its score matrix. For most workloads bandwidth and kernel
+            structure, not peak arithmetic, decide the wall clock, which
+            is why HBM capacity and bandwidth, not TFLOPS, are the scarce
+            commodities in the accelerator market.
+          </p>
+
+          <h2>Self-check</h2>
+          <div class="quiz" data-quiz>
+            <script type="application/json" class="quiz-data">[
+              {"id": "q1", "qtype": "mcq",
+               "stem": "A design fails timing with a hold violation at one flip-flop. Which fix works?",
+               "options": ["Lower the clock frequency", "Insert delay buffers on the fast path between the registers", "Raise the clock frequency", "Increase the setup time of the capturing flip-flop"],
+               "correctIndex": 1,
+               "explanation": "The hold constraint t_cq(min) + t_cd >= t_hold contains no clock-period term, so changing frequency cannot fix it; the short path must be slowed with added delay."},
+              {"id": "q2", "qtype": "mcq",
+               "stem": "Pipelining a processor into more stages primarily improves:",
+               "options": ["The latency of each instruction", "Throughput, while per-instruction latency gets slightly worse", "Both latency and throughput equally", "Energy per instruction"],
+               "correctIndex": 1,
+               "explanation": "Each stage adds register overhead and imbalance rounds stages up to the slowest, so one instruction takes longer end to end; the win is completing one instruction per short cycle."},
+              {"id": "q3", "qtype": "mcq",
+               "stem": "Why can forwarding not eliminate the load-use stall?",
+               "options": ["The register file has too few ports", "The forwarding muxes add too much delay", "The loaded value does not exist anywhere in the machine until the end of MEM, after the dependent instruction's EX has begun", "Loads do not write the register file"],
+               "correctIndex": 2,
+               "explanation": "Forwarding can only route values that already exist in pipeline registers; the load's data arrives from memory one stage too late, so one bubble is unavoidable."},
+              {"id": "q4", "qtype": "mcq",
+               "stem": "A loop branch is taken 9 times then falls through, repeatedly. Versus a 1-bit predictor, a 2-bit saturating counter:",
+               "options": ["Halves the mispredictions per loop visit from 2 to 1", "Eliminates all mispredictions", "Doubles mispredictions", "Behaves identically"],
+               "correctIndex": 0,
+               "explanation": "The 1-bit scheme mispredicts the exit and then the next entry (the exit flipped the bit); the 2-bit counter only drops to weakly-taken at the exit, so re-entry still predicts taken."},
+              {"id": "q5", "qtype": "mcq",
+               "stem": "A 32 KiB, 8-way set-associative cache with 64-byte lines: how many set-index bits?",
+               "options": ["5", "6", "9", "12"],
+               "correctIndex": 1,
+               "explanation": "Sets = 32768 / (64 x 8) = 64, and log2(64) = 6. The offset also takes 6 bits, leaving the rest as tag."},
+              {"id": "q6", "qtype": "mcq",
+               "stem": "What does the Exclusive state in MESI buy over plain MSI?",
+               "options": ["Dirty lines can be shared without writeback", "A silent, zero-traffic upgrade to Modified on the first write to private data", "Faster reads of shared data", "It removes the need for a directory"],
+               "correctIndex": 1,
+               "explanation": "E means clean and sole copy, so a write needs no invalidation broadcast; MSI would issue an upgrade transaction for every first write even to purely private data."},
+              {"id": "q7", "qtype": "truefalse",
+               "stem": "x86 hardware provides sequential consistency, so correctly synchronized-looking code cannot observe reordering.",
+               "options": ["True", "False"],
+               "correctIndex": 1,
+               "explanation": "x86 provides TSO: the store buffer lets a later load complete before an earlier store is globally visible, and the classic two-thread litmus test observably yields both threads reading 0."},
+              {"id": "q8", "qtype": "mcq",
+               "stem": "In Tomasulo's algorithm, WAR and WAW hazards disappear because:",
+               "options": ["The CDB serializes all writes", "Instructions wait in program order", "Consumers capture values or producer tags at issue, and the alias table always points to the youngest writer", "Memory disambiguation orders them"],
+               "correctIndex": 2,
+               "explanation": "Renaming decouples architectural names from storage: a reader is bound to the specific producing station at issue, and only the youngest writer owns the register's future, so the false dependences have nothing left to conflict over."},
+              {"id": "q9", "qtype": "mcq",
+               "stem": "A GPU hides a 500 ns memory latency chiefly by:",
+               "options": ["Large per-thread caches", "Out-of-order execution within each thread", "Prefetching by the driver", "Keeping enough other warps resident that the schedulers always find issuable instructions"],
+               "correctIndex": 3,
+               "explanation": "Little's law: sustaining bandwidth B at latency L requires B x L bytes in flight, which the GPU achieves through warp oversubscription rather than per-thread machinery."},
+              {"id": "q10", "qtype": "mcq",
+               "stem": "A kernel has arithmetic intensity 0.08 flops/byte on a machine whose balance point is 243 flops/byte. The most effective optimization is:",
+               "options": ["Using lower-precision arithmetic to raise peak flops", "Fusing it with adjacent operations to eliminate memory round trips", "Raising occupancy", "Unrolling the inner loop"],
+               "correctIndex": 1,
+               "explanation": "Far left of the ridge, performance equals intensity times bandwidth; only reducing bytes moved (fusion, keeping intermediates on chip) helps, since the compute roof is unreachable by orders of magnitude."},
+              {"id": "q11", "qtype": "ordering",
+               "stem": "Order the lifecycle of one instruction in a modern out-of-order core.",
+               "options": ["Fetch and decode", "Rename and allocate ROB entry in program order", "Wait in a reservation station, then execute when operands arrive", "Broadcast result; commit in order from the ROB head"],
+               "correctIndex": -1,
+               "explanation": "In-order front end, out-of-order execution, in-order commit: the sandwich structure is what delivers dataflow performance while preserving precise architectural state."},
+              {"id": "q12", "qtype": "mcq",
+               "stem": "Two threads each increment their own counter, but the program runs many times slower than expected. The likeliest cause and fix:",
+               "options": ["Lock contention; use finer locks", "False sharing of one cache line; pad or align each counter to 64 bytes", "TLB misses; use huge pages", "Branch mispredictions; unroll the loop"],
+               "correctIndex": 1,
+               "explanation": "Logically disjoint data in one line ping-pongs in Modified state between cores at coherence-transfer latency; padding restores the layout the coherence protocol needs to see the independence."}
+            ]</script>
+          </div>
+
+          <h2>References</h2>
+          <ol class="refs">
+            <li>Hennessy, J. and Patterson, D. <em>Computer Architecture: A Quantitative Approach</em>, 6th ed., Morgan Kaufmann, 2017.</li>
+            <li>Patterson, D. and Hennessy, J. <em>Computer Organization and Design: The Hardware/Software Interface, RISC-V Edition</em>, 2nd ed., Morgan Kaufmann, 2020.</li>
+            <li>Harris, S. and Harris, D. <em>Digital Design and Computer Architecture, RISC-V Edition</em>, Morgan Kaufmann, 2021.</li>
+            <li>Shen, J. P. and Lipasti, M. <em>Modern Processor Design: Fundamentals of Superscalar Processors</em>, Waveland Press, 2013 (orig. 2005).</li>
+            <li>Nagarajan, V., Sorin, D., Hill, M., and Wood, D. <em>A Primer on Memory Consistency and Cache Coherence</em>, 2nd ed., Morgan &amp; Claypool Synthesis Lectures, 2020.</li>
+            <li>Sze, V., Chen, Y.-H., Yang, T.-J., and Emer, J. "Efficient Processing of Deep Neural Networks: A Tutorial and Survey," <em>Proceedings of the IEEE</em>, 2017. <a href="https://arxiv.org/abs/1703.09039" target="_blank" rel="noreferrer">arXiv:1703.09039</a></li>
+            <li>Tomasulo, R. M. "An Efficient Algorithm for Exploiting Multiple Arithmetic Units," <em>IBM Journal of Research and Development</em> 11(1), 1967. <a href="https://doi.org/10.1147/rd.111.0025" target="_blank" rel="noreferrer">doi:10.1147/rd.111.0025</a></li>
+            <li>Smith, J. E. "A Study of Branch Prediction Strategies," <em>ISCA</em>, 1981.</li>
+            <li>Yeh, T.-Y. and Patt, Y. "Two-Level Adaptive Training Branch Prediction," <em>MICRO-24</em>, 1991.</li>
+            <li>Seznec, A. and Michaud, P. "A Case for (Partially) TAgged GEometric History Length Branch Prediction," <em>Journal of Instruction-Level Parallelism</em>, vol. 8, 2006.</li>
+            <li>Hill, M. and Smith, A. J. "Evaluating Associativity in CPU Caches," <em>IEEE Transactions on Computers</em> 38(12), 1989.</li>
+            <li>Hong, J.-W. and Kung, H. T. "I/O Complexity: The Red-Blue Pebble Game," <em>STOC</em>, 1981.</li>
+            <li>Lamport, L. "How to Make a Multiprocessor Computer That Correctly Executes Multiprocess Programs," <em>IEEE Transactions on Computers</em> C-28(9), 1979.</li>
+            <li>Adve, S. and Gharachorloo, K. "Shared Memory Consistency Models: A Tutorial," <em>IEEE Computer</em> 29(12), 1996.</li>
+            <li>Sewell, P., Sarkar, S., Owens, S., Zappa Nardelli, F., and Myreen, M. "x86-TSO: A Rigorous and Usable Programmer's Model for x86 Multiprocessors," <em>CACM</em> 53(7), 2010. <a href="https://doi.org/10.1145/1785414.1785443" target="_blank" rel="noreferrer">doi:10.1145/1785414.1785443</a></li>
+            <li>Tullsen, D., Eggers, S., and Levy, H. "Simultaneous Multithreading: Maximizing On-Chip Parallelism," <em>ISCA</em>, 1995.</li>
+            <li>Dennard, R. et al. "Design of Ion-Implanted MOSFETs with Very Small Physical Dimensions," <em>IEEE Journal of Solid-State Circuits</em> 9(5), 1974.</li>
+            <li>Esmaeilzadeh, H., Blem, E., St. Amant, R., Sankaralingam, K., and Burger, D. "Dark Silicon and the End of Multicore Scaling," <em>ISCA</em>, 2011.</li>
+            <li>Horowitz, M. "Computing's Energy Problem (and What We Can Do About It)," <em>ISSCC</em>, 2014.</li>
+            <li>Kung, H. T. "Why Systolic Architectures?" <em>IEEE Computer</em> 15(1), 1982.</li>
+            <li>Jouppi, N. et al. "In-Datacenter Performance Analysis of a Tensor Processing Unit," <em>ISCA</em>, 2017. <a href="https://arxiv.org/abs/1704.04760" target="_blank" rel="noreferrer">arXiv:1704.04760</a></li>
+            <li>Chen, Y.-H., Emer, J., and Sze, V. "Eyeriss: A Spatial Architecture for Energy-Efficient Dataflow for Convolutional Neural Networks," <em>ISCA</em>, 2016.</li>
+            <li>Williams, S., Waterman, A., and Patterson, D. "Roofline: An Insightful Visual Performance Model for Multicore Architectures," <em>CACM</em> 52(4), 2009. <a href="https://doi.org/10.1145/1498765.1498785" target="_blank" rel="noreferrer">doi:10.1145/1498765.1498785</a></li>
+            <li>Genc, H. et al. "Gemmini: Enabling Systematic Deep-Learning Architecture Evaluation via Full-Stack Integration," <em>DAC</em>, 2021. <a href="https://arxiv.org/abs/1911.09925" target="_blank" rel="noreferrer">arXiv:1911.09925</a></li>
+            <li>Waterman, A. and Asanovi&cacute;, K. (eds.) <em>The RISC-V Instruction Set Manual</em>. <a href="https://github.com/riscv/riscv-isa-manual" target="_blank" rel="noreferrer">github.com/riscv/riscv-isa-manual</a></li>
+            <li>NVIDIA. <em>NVIDIA H100 Tensor Core GPU Architecture</em> (Hopper whitepaper), 2022; AMD, <em>CDNA 3 Architecture</em> whitepaper, 2023.</li>
+            <li>Hooker, S. "The Hardware Lottery," <em>CACM</em> 64(12), 2021. <a href="https://arxiv.org/abs/2009.06489" target="_blank" rel="noreferrer">arXiv:2009.06489</a></li>
+          </ol>
+
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> computer architecture is five
+            ideas applied recursively: locality (caches, blocking,
+            systolic reuse), pipelining (from flip-flop timing to warp
+            schedulers), prediction (branches, prefetching, speculation),
+            renaming (Tomasulo, virtual memory, both substituting names to
+            break false constraints), and replication (superscalar, SIMD,
+            multicore, warps). The arithmetic that binds them is always
+            the same three computations: a clock period is a longest path,
+            a CPI or AMAT is a frequency-weighted sum of penalties, and a
+            roofline is a min of two roofs whose ridge sits at machine
+            balance, measured on this page's H100 at 243.5 flops per byte
+            against 2992.4 GB/s and 728.7 bf16 TFLOPS. Latency machines
+            (CPUs) spend transistors so one thread never waits; throughput
+            machines (GPUs, systolic arrays) admit the wait and drown it
+            in parallel work. Since voltage scaling ended, every
+            generation of performance has been bought by moving data less,
+            and the skill that transfers across every layer, from a C loop
+            to a training cluster, is reading a computation for its
+            arithmetic intensity and knowing which side of the ridge it
+            lives on.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>&copy; <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;&middot;&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/classes/math.js"></script>
+    <script defer src="/code-tabs.js"></script>
+    <script defer src="/quiz.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/code-copy.js"></script>
+  </body>
+</html>

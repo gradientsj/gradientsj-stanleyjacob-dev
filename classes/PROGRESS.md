@@ -40,11 +40,22 @@ courses only as a scope definition. If a page contains "CS 229", "Stanford",
 
 ## Build commands
 
+Node is not installed system-wide on this machine. It was installed locally to
+`~/.local/node`, so put it on PATH first:
+
 ```bash
+export PATH="$HOME/.local/node/bin:$PATH"
 node scripts/highlight.mjs          # bake syntax highlighting + copy buttons
 python tools/generate_classes.py    # relink index against pages that now exist
 python tools/add_classes_nav.py     # only if new top-level pages appear
+python tools/check_classes.py       # validate pages against AUTHORING.md
 ```
+
+`check_classes.py` enforces the no-course-reference rule, verifies the quiz JSON
+parses, checks that every tabbed `<pre>` has a matching language button, and
+warns on pages that are short on problems or references. It deliberately does
+not flag institution names: attributing a result to the group that produced it
+is the cross-referencing these pages are for.
 
 ## Measured hardware numbers
 
