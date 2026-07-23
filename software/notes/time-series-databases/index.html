@@ -7,7 +7,6 @@
     <meta name="description" content="How time-series databases combine append-only storage, Gorilla compression, and an inverted label index to store billions of metric samples cheaply, with Prometheus, M3, and InfluxDB as worked examples." />
     <link rel="stylesheet" href="/style.css" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" integrity="sha384-eFTL69TLRZTkNfYZOLM+G04821K1qZao/4QLJbet1pP4tcF+fdXq/9CdqAbWRl/L" crossorigin="anonymous" />
   </head>
   <body>
 
@@ -45,7 +44,7 @@
           <h2>Data model and how to use it</h2>
           <p>The unit of storage is the series, one per unique combination of metric name and label values. In InfluxDB's vocabulary the metric is a <strong>measurement</strong>, the labels are <strong>tags</strong>, and the measured numbers are <strong>fields</strong>. The distinction carries real weight because tags are indexed and fields are not. A tag like <code>host=web-42</code> can be filtered cheaply through the index, while a field like <code>value=45.2</code> is just payload inside a compressed block. Putting a high-cardinality identifier in a tag creates a new series per value, which is the single most common way people break these systems.</p>
           <p>Data gets in either by push or by pull. InfluxDB accepts line protocol over HTTP, and its docs recommend batching 5,000 to 10,000 points per write for throughput. Prometheus inverts the flow and scrapes HTTP endpoints on an interval, which means the database controls its own ingest rate. Queries run in a purpose-built DSL rather than SQL because the common operations, rate over a counter, quantile from a histogram, aggregation across a label dimension, are awkward to express relationally. Retention is a first-class config knob rather than a DELETE statement, with Prometheus defaulting to 15 days.</p>
-          <pre><code class="language-text"># InfluxDB line protocol: measurement,tags fields timestamp
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-text"># InfluxDB line protocol: measurement,tags fields timestamp
 cpu_usage,host=web-42,region=us-west,env=prod value=45.2 1700000000000000000
 
 # PromQL: per-service p99 latency from histogram buckets, 5 minute windows
@@ -53,10 +52,10 @@ histogram_quantile(0.99,
   sum by (service, le) (rate(http_request_duration_seconds_bucket[5m])))
 
 # PromQL: five busiest hosts by non-idle CPU over the last 5 minutes
-topk(5, avg by (host) (rate(node_cpu_seconds_total{mode!=&quot;idle&quot;}[5m])))
+topk(5, avg by (host) (rate(node_cpu_seconds_total{mode!="idle"}[5m])))
 
 # Retention is configuration, not a DELETE query (default is 15d)
-prometheus --storage.tsdb.retention.time=30d</code></pre>
+prometheus --storage.tsdb.retention.time=30d</code></pre></div>
           <h2>Why B-trees fail at append-heavy metric loads</h2>
           <p>A B-tree keeps every row in globally sorted pages and updates those pages in place. Each insert walks from root to leaf, dirties that leaf, and occasionally splits it, and every secondary index repeats the cost on its own leaves. Metrics need an index on something like <code>(host, metric_name, time)</code> to be queryable, so a stream of samples from thousands of hosts lands on thousands of different leaf pages, which is random I/O. A spinning disk manages only 100 to 200 random operations per second, and while SSDs are far better at random access they still favor sequential patterns and suffer device-level write amplification when small random writes force full page rewrites. Row overhead compounds the problem, since a Postgres heap tuple carries a 23-byte header plus alignment padding before the first byte of your 16 bytes of actual data.</p>
           <p>The read side is just as bad. Samples for one series arrive interleaved with samples from every other series, so they end up scattered across heap pages in arrival order. A query for one host's CPU over an hour fetches thousands of pages that each contain a few relevant rows. The data you want is never physically together.</p>
@@ -74,30 +73,30 @@ prometheus --storage.tsdb.retention.time=30d</code></pre>
           <p>Timestamps use <strong>delta-of-delta encoding</strong>. A block header stores a start time aligned to a two hour window, the first timestamp is stored as a 14-bit delta (enough for 16,384 seconds), and every later timestamp stores only how much its interval changed from the previous interval. A perfectly regular 10 second scrape produces a delta-of-delta of zero, encoded as a single 0 bit. Nonzero values fall into variable-length buckets, 2 bits of prefix plus 7 bits for the range -63 to 64, up through 4 bits plus 32 for arbitrary jumps. Against a sample of 440,000 production timestamps, about <strong>96 percent compressed to a single bit</strong>, because real scrapers are metronomes with occasional one second jitter.</p>
           <p>Values use <strong>XOR compression</strong>. Adjacent samples of a metric are usually close, so XORing a float with its predecessor zeroes the sign, exponent, and top mantissa bits, leaving a short run of meaningful bits between leading and trailing zeros. An identical value XORs to zero and is stored as a single 0 bit, which covered roughly 51 percent of Facebook's values. If the meaningful bits fit inside the previous value's window, a 2-bit control prefix and just those bits are stored, about 30 percent of values at 26.6 bits on average. Otherwise the encoder spends 5 bits on the leading-zero count and 6 bits on the meaningful length before the payload, the remaining 19 percent at 36.9 bits. The paper also shows why blocks span two hours, since measured compression improves as the window grows and flattens at 1.37 bytes per point near the 120 minute mark.</p>
           <p>The scheme became the industry default. Prometheus chunks use it, which is where the official capacity-planning figure of 1 to 2 bytes per sample comes from, InfluxDB applies the same XOR algorithm to float blocks alongside per-type codecs for integers, booleans, and strings, and M3 ships M3TSZ, a tuned variant that squeezes float64 values further.</p>
-          <pre><code class="language-python">def encode_timestamp(t, t_prev, t_prev2, bits):
-    d = (t - t_prev) - (t_prev - t_prev2)       # delta of deltas
-    if d == 0:
-        bits.write(&#x27;0&#x27;)                          # 96% of real samples
-    elif -63 &lt;= d &lt;= 64:
-        bits.write(&#x27;10&#x27;);   bits.int(d, 7)
-    elif -255 &lt;= d &lt;= 256:
-        bits.write(&#x27;110&#x27;);  bits.int(d, 9)
-    elif -2047 &lt;= d &lt;= 2048:
-        bits.write(&#x27;1110&#x27;); bits.int(d, 12)
-    else:
-        bits.write(&#x27;1111&#x27;); bits.int(d, 32)
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">def</span> <span class="m1">encode_timestamp</span><span class="b0">(</span><span class="v0">t</span>, <span class="v4">t_prev</span>, <span class="v0">t_prev2</span>, <span class="v2">bits</span><span class="b0">)</span>:
+    <span class="v4">d</span> = <span class="b0">(</span><span class="v0">t</span> - <span class="v4">t_prev</span><span class="b0">)</span> - <span class="b0">(</span><span class="v4">t_prev</span> - <span class="v0">t_prev2</span><span class="b0">)</span>       <span class="c"># delta of deltas</span>
+    <span class="k">if</span> <span class="v4">d</span> == <span class="n">0</span>:
+        <span class="v2">bits</span>.<span class="m2">write</span><span class="b0">(</span><span class="s">'0'</span><span class="b0">)</span>                          <span class="c"># 96% of real samples</span>
+    <span class="k">elif</span> -<span class="n">63</span> &lt;= <span class="v4">d</span> &lt;= <span class="n">64</span>:
+        <span class="v2">bits</span>.<span class="m2">write</span><span class="b0">(</span><span class="s">'10'</span><span class="b0">)</span>;   <span class="v2">bits</span>.<span class="m2">int</span><span class="b0">(</span><span class="v4">d</span>, <span class="n">7</span><span class="b0">)</span>
+    <span class="k">elif</span> -<span class="n">255</span> &lt;= <span class="v4">d</span> &lt;= <span class="n">256</span>:
+        <span class="v2">bits</span>.<span class="m2">write</span><span class="b0">(</span><span class="s">'110'</span><span class="b0">)</span>;  <span class="v2">bits</span>.<span class="m2">int</span><span class="b0">(</span><span class="v4">d</span>, <span class="n">9</span><span class="b0">)</span>
+    <span class="k">elif</span> -<span class="n">2047</span> &lt;= <span class="v4">d</span> &lt;= <span class="n">2048</span>:
+        <span class="v2">bits</span>.<span class="m2">write</span><span class="b0">(</span><span class="s">'1110'</span><span class="b0">)</span>; <span class="v2">bits</span>.<span class="m2">int</span><span class="b0">(</span><span class="v4">d</span>, <span class="n">12</span><span class="b0">)</span>
+    <span class="k">else</span>:
+        <span class="v2">bits</span>.<span class="m2">write</span><span class="b0">(</span><span class="s">'1111'</span><span class="b0">)</span>; <span class="v2">bits</span>.<span class="m2">int</span><span class="b0">(</span><span class="v4">d</span>, <span class="n">32</span><span class="b0">)</span>
 
-def encode_value(v, prev, bits):
-    x = float64_bits(v) ^ float64_bits(prev)
-    if x == 0:
-        bits.write(&#x27;0&#x27;)                          # ~51% of values
-    elif fits_previous_window(x):                # same leading/trailing zeros
-        bits.write(&#x27;10&#x27;); bits.meaningful(x)     # ~30%, avg 26.6 bits
-    else:
-        bits.write(&#x27;11&#x27;)
-        bits.int(leading_zeros(x), 5)            # new window: 5 + 6 bit header
-        bits.int(meaningful_len(x), 6)
-        bits.meaningful(x)                       # ~19%, avg 36.9 bits</code></pre>
+<span class="k">def</span> <span class="m1">encode_value</span><span class="b0">(</span><span class="v3">v</span>, <span class="v0">prev</span>, <span class="v2">bits</span><span class="b0">)</span>:
+    <span class="v4">x</span> = <span class="m1">float64_bits</span><span class="b0">(</span><span class="v3">v</span><span class="b0">)</span> ^ <span class="m1">float64_bits</span><span class="b0">(</span><span class="v0">prev</span><span class="b0">)</span>
+    <span class="k">if</span> <span class="v4">x</span> == <span class="n">0</span>:
+        <span class="v2">bits</span>.<span class="m2">write</span><span class="b0">(</span><span class="s">'0'</span><span class="b0">)</span>                          <span class="c"># ~51% of values</span>
+    <span class="k">elif</span> <span class="m1">fits_previous_window</span><span class="b0">(</span><span class="v4">x</span><span class="b0">)</span>:                <span class="c"># same leading/trailing zeros</span>
+        <span class="v2">bits</span>.<span class="m2">write</span><span class="b0">(</span><span class="s">'10'</span><span class="b0">)</span>; <span class="v2">bits</span>.<span class="m2">meaningful</span><span class="b0">(</span><span class="v4">x</span><span class="b0">)</span>     <span class="c"># ~30%, avg 26.6 bits</span>
+    <span class="k">else</span>:
+        <span class="v2">bits</span>.<span class="m2">write</span><span class="b0">(</span><span class="s">'11'</span><span class="b0">)</span>
+        <span class="v2">bits</span>.<span class="m2">int</span><span class="b0">(</span><span class="m1">leading_zeros</span><span class="b1">(</span><span class="v4">x</span><span class="b1">)</span>, <span class="n">5</span><span class="b0">)</span>            <span class="c"># new window: 5 + 6 bit header</span>
+        <span class="v2">bits</span>.<span class="m2">int</span><span class="b0">(</span><span class="m1">meaningful_len</span><span class="b1">(</span><span class="v4">x</span><span class="b1">)</span>, <span class="n">6</span><span class="b0">)</span>
+        <span class="v2">bits</span>.<span class="m2">meaningful</span><span class="b0">(</span><span class="v4">x</span><span class="b0">)</span>                       <span class="c"># ~19%, avg 36.9 bits</span></code></pre></div>
           <div class="takeaway">Regular scrape intervals make 96 percent of timestamps cost one bit, and slowly moving floats make half of all values cost one bit, which is how 16 bytes of sample becomes 1.37 bytes at rest.</div>
           <h2>The inverted label index and cardinality explosions</h2>
           <p>Compressed chunks are only useful if you can find them, and label matchers like <code>region="us-west", env="prod"</code> cannot be answered by scanning billions of series keys. The answer is the same structure that powers full-text search. An <strong>inverted index</strong> maps each label pair to a sorted postings list of series IDs, and a query intersects the lists for its matchers, so <code>region=us-west</code> giving series 1 and 2 intersected with <code>env=prod</code> giving series 1, 2, and 3 yields exactly series 1 and 2 before a single chunk is read. Sorted postings intersect in linear time with skip-ahead, the same trick search engines use. In Prometheus the head keeps this index in memory and garbage-collects postings for series that no longer exist, and every persistent block carries its own immutable index file, so on-disk index size is bounded per block.</p>
@@ -150,11 +149,6 @@ def encode_value(v, prev, bits):
       document.getElementById("yr").textContent = new Date().getFullYear();
     </script>
     <script defer src="/reader.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
-    <script>
-      window.addEventListener("DOMContentLoaded", function () {
-        if (window.hljs) hljs.highlightAll();
-      });
-    </script>
+    <script defer src="/code-copy.js"></script>
   </body>
 </html>

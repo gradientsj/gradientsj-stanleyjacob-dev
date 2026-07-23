@@ -7,7 +7,6 @@
     <meta name="description" content="A walkthrough of designing S3-like object storage: durability math, the metadata service, quorum writes, replication against erasure coding, small-object packing, and the background machinery that keeps 100 PB alive." />
     <link rel="stylesheet" href="/style.css" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" integrity="sha384-eFTL69TLRZTkNfYZOLM+G04821K1qZao/4QLJbet1pP4tcF+fdXq/9CdqAbWRl/L" crossorigin="anonymous" />
   </head>
   <body>
     <nav class="top">
@@ -50,39 +49,39 @@
 
           <h2>The API</h2>
           <p>The external interface is deliberately small, and it speaks HTTP because every language, proxy, cache, and command-line tool already does. A custom binary protocol would shave some framing overhead and lose the entire ecosystem of existing clients, which is a terrible trade for a service whose value grows with the number of things that can talk to it. Every write returns an etag, a server-computed fingerprint of the stored bytes, so a client can confirm an upload landed intact and a later conditional request can skip refetching unchanged data. Range reads matter just as much as whole-object reads, since video players and database engines routinely want a narrow slice of an enormous object. Multipart upload is the one piece with real protocol shape, in which the client initiates a session, uploads parts independently and in parallel, and then commits the ordered list of parts in a single call, so a 100 GB object becomes visible atomically or not at all:</p>
-          <pre><code class="language-http">PUT /photos/cats/whiskers.jpg          ← body is the object bytes
-→ 200 { "etag": "9b2cf535..." }
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-http"><span class="k">PUT</span> /<span class="v3">photos</span>/<span class="v3">cats</span>/<span class="v3">whiskers</span>.<span class="m2">jpg</span>          ← <span class="v5">body</span> <span class="v6">is</span> <span class="v3">the</span> <span class="v2">object</span> <span class="m1">bytes</span>
+→ 200 <span class="b0">{</span> <span class="s">"etag"</span>: <span class="s">"9b2cf535..."</span> <span class="b0">}</span>
 
-GET /photos/cats/whiskers.jpg          → 200 + bytes (Range supported)
-DELETE /photos/cats/whiskers.jpg       → 204
+<span class="v5">GET</span> /<span class="v3">photos</span>/<span class="v3">cats</span>/<span class="v3">whiskers</span>.<span class="m2">jpg</span>          → <span class="n">200</span> + <span class="m1">bytes</span> <span class="b0">(</span><span class="v3">Range</span> <span class="v0">supported</span><span class="b0">)</span>
+<span class="v5">DELETE</span> /<span class="v3">photos</span>/<span class="v3">cats</span>/<span class="v3">whiskers</span>.<span class="m2">jpg</span>       → <span class="n">204</span>
 
-GET /photos?prefix=cats/&amp;max-keys=1000 → 200 { "keys": [...], "next": "..." }
+<span class="v5">GET</span> /<span class="v3">photos</span>?<span class="v0">prefix</span>=<span class="v3">cats</span>/&amp;<span class="v2">max</span>-<span class="v4">keys</span>=<span class="n">1000</span> → <span class="n">200</span> <span class="b0">{</span> <span class="s">"keys"</span>: <span class="b1">[</span>...<span class="b1">]</span>, <span class="s">"next"</span>: <span class="s">"..."</span> <span class="b0">}</span>
 
-POST /videos/launch.mp4?uploads        → 200 { "uploadId": "Vqx91" }
-PUT  /videos/launch.mp4?partNumber=3&amp;uploadId=Vqx91   ← one 100 MB part
-POST /videos/launch.mp4?uploadId=Vqx91 ← body lists part etags, commit
-</code></pre>
+<span class="v6">POST</span> /<span class="v6">videos</span>/<span class="v4">launch</span>.<span class="m2">mp</span><span class="n">4</span>?<span class="v1">uploads</span>        → <span class="n">200</span> <span class="b0">{</span> <span class="s">"uploadId"</span>: <span class="s">"Vqx91"</span> <span class="b0">}</span>
+<span class="v1">PUT</span>  /<span class="v6">videos</span>/<span class="v4">launch</span>.<span class="m2">mp</span><span class="n">4</span>?<span class="v5">partNumber</span>=<span class="n">3</span>&amp;<span class="v5">uploadId</span>=<span class="v6">Vqx</span><span class="n">91</span>   ← <span class="v1">one</span> <span class="n">100</span> <span class="v3">MB</span> <span class="v5">part</span>
+<span class="v6">POST</span> /<span class="v6">videos</span>/<span class="v4">launch</span>.<span class="m2">mp</span><span class="n">4</span>?<span class="v5">uploadId</span>=<span class="v6">Vqx</span><span class="n">91</span> ← <span class="v5">body</span> <span class="v5">lists</span> <span class="v5">part</span> <span class="v3">etags</span>, <span class="v4">commit</span>
+</code></pre></div>
 
           <h2>The data model</h2>
           <p>Inside the metadata service, two logical tables do the work. The object table maps a fully qualified key to the object's current version, size, checksum, and the ordered layout of its data, while the chunk table maps each chunk to the physical nodes holding it. Writing the sketch as SQL keeps it concrete even though the real store is a purpose-built sharded system:</p>
-          <pre><code class="language-sql">CREATE TABLE objects (
-  bucket      VARCHAR(64)  NOT NULL,
-  key         VARCHAR(1024) NOT NULL,
-  version     BIGINT       NOT NULL,   -- newest wins; old rows kept if versioned
-  size        BIGINT       NOT NULL,
-  checksum    BYTEA        NOT NULL,   -- whole-object CRC
-  chunk_ids   BIGINT[]     NOT NULL,   -- ordered layout of the bytes
-  deleted     BOOLEAN      NOT NULL DEFAULT FALSE,  -- delete marker
-  PRIMARY KEY (bucket, key, version)
-);
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-sql"><span class="k">CREATE</span> <span class="k">TABLE</span> <span class="m1">objects</span> <span class="b0">(</span>
+  <span class="v4">bucket</span>      <span class="k">VARCHAR</span><span class="b1">(</span><span class="n">64</span><span class="b1">)</span>  <span class="k">NOT NULL</span>,
+  <span class="k">key</span>         <span class="k">VARCHAR</span><span class="b1">(</span><span class="n">1024</span><span class="b1">)</span> <span class="k">NOT NULL</span>,
+  <span class="k">version</span>     <span class="k">BIGINT</span>       <span class="k">NOT NULL</span>,   <span class="c">-- newest wins; old rows kept if versioned</span>
+  <span class="k">size</span>        <span class="k">BIGINT</span>       <span class="k">NOT NULL</span>,
+  <span class="k">checksum</span>    <span class="k">BYTEA</span>        <span class="k">NOT NULL</span>,   <span class="c">-- whole-object CRC</span>
+  <span class="v5">chunk_ids</span>   <span class="k">BIGINT</span><span class="b1">[]</span>     <span class="k">NOT NULL</span>,   <span class="c">-- ordered layout of the bytes</span>
+  <span class="v5">deleted</span>     <span class="k">BOOLEAN</span>      <span class="k">NOT NULL</span> <span class="k">DEFAULT</span> <span class="v1">FALSE</span>,  <span class="c">-- delete marker</span>
+  <span class="k">PRIMARY KEY</span> <span class="b1">(</span><span class="v4">bucket</span>, <span class="k">key</span>, <span class="k">version</span><span class="b1">)</span>
+<span class="b0">)</span>;
 
-CREATE TABLE chunks (
-  chunk_id    BIGINT PRIMARY KEY,
-  stripe_id   BIGINT,                  -- erasure-coding group, if coded
-  nodes       INT[]  NOT NULL,         -- data nodes holding this chunk
-  checksum    BYTEA  NOT NULL
-);
-</code></pre>
+<span class="k">CREATE</span> <span class="k">TABLE</span> <span class="m1">chunks</span> <span class="b0">(</span>
+  <span class="v0">chunk_id</span>    <span class="k">BIGINT</span> <span class="k">PRIMARY KEY</span>,
+  <span class="v3">stripe_id</span>   <span class="k">BIGINT</span>,                  <span class="c">-- erasure-coding group, if coded</span>
+  <span class="v0">nodes</span>       <span class="k">INT</span><span class="b1">[]</span>  <span class="k">NOT NULL</span>,         <span class="c">-- data nodes holding this chunk</span>
+  <span class="k">checksum</span>    <span class="k">BYTEA</span>  <span class="k">NOT NULL</span>
+<span class="b0">)</span>;
+</code></pre></div>
           <p>The separation matters because the two tables answer different questions at different rates. Every user request touches the object table, while the chunk table is also walked continuously by repair and garbage collection, and keeping physical placement out of the object row means the system can shuffle bytes between nodes during rebalancing without ever rewriting user-visible metadata. The alternative of one wide row holding both logical and physical truth sounds simpler, and it loses because every background data movement would then contend with foreground traffic on the same records, which is precisely the coupling that turns routine maintenance into customer-visible latency.</p>
 
           <h2>The high-level architecture</h2>
@@ -143,12 +142,7 @@ CREATE TABLE chunks (
     <script>
       document.getElementById("yr").textContent = new Date().getFullYear();
     </script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
-    <script>
-      window.addEventListener("DOMContentLoaded", function () {
-        if (window.hljs) hljs.highlightAll();
-      });
-    </script>
     <script defer src="/reader.js"></script>
+    <script defer src="/code-copy.js"></script>
   </body>
 </html>
