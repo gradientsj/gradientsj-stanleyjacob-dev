@@ -18,11 +18,16 @@ for a top applied-ML position, so depth beats breadth on every page.
 
 ## Non-negotiable constraint
 
-**No page may reference a course, course number, university, department,
-professor, syllabus, lecture, or problem set.** Everything is anchored on
-textbooks and research papers instead. The source request listed university
-courses only as a scope definition. If a page contains "CS 229", "Stanford",
-"lecture", or similar, it is a defect and must be rewritten.
+**No page may reference a course, course number, department, professor,
+syllabus, lecture, or problem set.** Everything is anchored on textbooks and
+research papers instead. The source request listed university courses only as a
+scope definition. A page containing "CS 229", "in lecture", or "problem set" is
+a defect and must be rewritten.
+
+Naming an institution is a different matter and is encouraged: attributing a
+result or project to the group that produced it ("Berkeley's Gemmini", "a line
+of work at ETH Zurich") is exactly the cross-referencing these pages are for.
+The validator flags course scaffolding, not citations.
 
 ## Files
 

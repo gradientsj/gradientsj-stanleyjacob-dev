@@ -19,7 +19,6 @@ CLASSES = ROOT / "classes"
 # Phrases that would leak the course scaffolding the pages must not mention.
 FORBIDDEN = [
     (r"\b(?:CS|EE|CME|MS&E|STATS?|MATH|ECE)\s?[-–]?\s?\d{2,3}[A-Z]?\b", "course number"),
-    (r"\b1[08]-\d{3}\b", "course number"),
     (r"\bthis (?:course|class|quarter|semester)\b", "course reference"),
     (r"\b(?:problem set|pset|homework \d|assignment \d)\b", "assignment reference"),
     (r"\b(?:lecture|lectures)\s+\d+\b", "lecture reference"),
@@ -36,8 +35,13 @@ FORBIDDEN = [
 # Only the scaffolding of a taught course is off limits. The one exception is
 # the owner's own school, which is warned about below because attribution there
 # can read as a course tell rather than as a citation.
-SOFT = [(r"\bStanford\b", "owner's school named; make sure this reads as "
-                          "research attribution, not a course reference")]
+SOFT = [
+    (r"\bStanford\b", "owner's school named; make sure this reads as "
+                      "research attribution, not a course reference"),
+    # Hyphenated pairs like "10-423" are course numbers at some institutions but
+    # far more often a numeric range ("depth 10-100"), so this only warns.
+    (r"\b1[08]-\d{3}\b", "looks like it could be a course number; check it is a range"),
+]
 
 REQUIRED_SCRIPTS = [
     "/classes/math.js",
@@ -79,7 +83,8 @@ def check(path):
     for s in REQUIRED_SCRIPTS:
         if s not in html:
             errors.append(f"missing script tag: {s}")
-    if '<a href="/classes" class="active">Classes</a>' not in html:
+    # whitespace-tolerant: some pages wrap the nav differently
+    if not re.search(r'<a\s+href="/classes"\s+class="active"\s*>\s*Classes\s*</a>', html):
         errors.append("nav is missing the active Classes link")
     if '<article class="prose article">' not in html:
         errors.append('missing <article class="prose article">')

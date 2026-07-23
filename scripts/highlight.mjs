@@ -365,9 +365,23 @@ function* htmlFiles(dir) {
   }
 }
 
+// With no arguments, walk the whole repo. With arguments, process only those
+// paths (files or directories), so a batch of finished pages can be highlighted
+// while other pages are still being edited.
+function* targets() {
+  const args = process.argv.slice(2)
+  if (!args.length) return yield* htmlFiles(ROOT)
+  for (const a of args) {
+    const p = path.resolve(a)
+    if (!fs.existsSync(p)) { console.warn(`skipping missing path: ${a}`); continue }
+    if (fs.statSync(p).isDirectory()) yield* htmlFiles(p)
+    else if (p.endsWith('.html')) yield p
+  }
+}
+
 hl = await createHighlighter({ themes: ['github-dark'], langs: SHIKI_LANGS })
 let files = 0, blocks = 0
-for (const f of htmlFiles(ROOT)) {
+for (const f of targets()) {
   const n = transformFile(f)
   if (n) files++
   blocks += n
