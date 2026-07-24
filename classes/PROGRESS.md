@@ -104,6 +104,16 @@ advanced-data-structures, modern-algorithmic-toolbox, rendering-foundations,
 physically-based-rendering. Systems and algorithms groups are both complete;
 graphics group is 2/5. 42/56 live, 0 validator errors.
 
+Batch 6 in flight (wip, claimed by agents): interactive-graphics,
+animation-and-simulation, neural-3d-representations (finishes graphics);
+robot-kinematics-and-control (also fixes data/bench_robotics.py MuJoCo call
+and regenerates data/robotics.json), advanced-manipulation,
+embodied-foundation-models. Batch 7 (remaining) will be interactive-robotics,
+collaborative-robotics + the 6 applied-domains pages. The genomics data
+script data/bench_genomics.py needs a numpy/scipy fix (scipy.optimize import
+fails under numpy 1.21); the genomics agent in batch 7 must fix it or use the
+isolated numpy venv approach the numerical-methods agent used.
+
 Remaining (14): graphics group — interactive-graphics,
 animation-and-simulation, neural-3d-representations (3); robotics group —
 robot-kinematics-and-control, advanced-manipulation, interactive-robotics,

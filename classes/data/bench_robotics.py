@@ -768,7 +768,12 @@ def mujoco_section():
         data.qvel[:] = dq
         mujoco.mj_forward(model, data)
         Mm = np.zeros((2, 2))
-        mujoco.mj_fullM(model, Mm, data.qM)
+        # MuJoCo >= 3.x signature: mj_fullM(model, data, dst)
+        try:
+            mujoco.mj_fullM(model, data, Mm)
+        except TypeError:
+            # Older binding: mj_fullM(model, dst, qM)
+            mujoco.mj_fullM(model, Mm, data.qM)
         bias = data.qfrc_bias.copy()
         mine_M = Mmat(q)
         mine_bias = Cmat(q, dq) @ dq + gvec(q)
