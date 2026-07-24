@@ -20,6 +20,26 @@
     "Microsoft David", "Google US English"
   ];
 
+  // rendered KaTeX turns "$x$" into a span whose textContent is unreadable
+  // math markup; skipping those text nodes keeps narration and highlighting on
+  // the prose. buildWordMap uses the same test so offsets stay aligned.
+  function inKatex(node) {
+    var e = node.parentNode;
+    while (e && e.nodeType === 1) {
+      if (e.classList && (e.classList.contains("katex") || e.classList.contains("katex-display"))) return true;
+      e = e.parentNode;
+    }
+    return false;
+  }
+  // element text with math stripped and whitespace collapsed
+  function readText(el) {
+    var s = "";
+    var w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+    var n;
+    while ((n = w.nextNode())) { if (!inKatex(n)) s += n.nodeValue; }
+    return s.replace(/\s+/g, " ").trim();
+  }
+
   function gather(scope, out) {
     for (var i = 0; i < scope.childNodes.length; i++) {
       var child = scope.childNodes[i];
@@ -30,7 +50,7 @@
         child.classList.contains("reader") || child.classList.contains("diagram"))) continue;
       if (READ_TAGS[tag]) {
         if (window.getComputedStyle(child).display === "none") continue; // don't read hidden text
-        var t = child.textContent.replace(/\s+/g, " ").trim();
+        var t = readText(child);
         if (t) out.push({ el: child, text: t });
         continue;
       }
@@ -42,7 +62,7 @@
   function articleChunks() {
     var out = [];
     var h1 = document.querySelector(".hero h1");
-    if (h1) out.push({ el: h1, text: h1.textContent.trim() });
+    if (h1) out.push({ el: h1, text: readText(h1) });
     gather(document.querySelector("article.prose") || document.body, out);
     return out;
   }
@@ -95,6 +115,7 @@
 
   function initReader(root) {
     var audioUrl = root.getAttribute("data-audio");
+    var narrUrl = audioUrl ? audioUrl.replace(/[^\/]*$/, "narration.json") : null;
     var bar = document.createElement("div");
     bar.className = "reader-bar";
 
@@ -113,12 +134,8 @@
     var pos = document.createElement("span");
     pos.className = "reader-pos"; pos.hidden = true;
 
-    var speed = document.createElement("button");
-    speed.type = "button"; speed.className = "reader-stop reader-speed";
-    speed.setAttribute("aria-label", "Playback speed");
-
     bar.appendChild(btn); bar.appendChild(stop);
-    bar.appendChild(range); bar.appendChild(pos); bar.appendChild(speed);
+    bar.appendChild(range); bar.appendChild(pos);
     root.appendChild(bar); root.appendChild(note);
 
     // floating controls that follow the reader down the page
@@ -136,41 +153,16 @@
     fRange.type = "range"; fRange.className = "reader-range reader-float-range";
     fRange.min = "0"; fRange.value = "0"; fRange.step = "1";
     fRange.setAttribute("aria-label", "Reading position");
-    var fSpeed = document.createElement("button");
-    fSpeed.type = "button"; fSpeed.className = "reader-stop reader-speed";
-    fSpeed.setAttribute("aria-label", "Playback speed");
     var fRow = document.createElement("div");
     fRow.className = "reader-float-row";
-    fRow.appendChild(fBtn); fRow.appendChild(fStop); fRow.appendChild(fJump); fRow.appendChild(fSpeed); fRow.appendChild(fPos);
+    fRow.appendChild(fBtn); fRow.appendChild(fStop); fRow.appendChild(fJump); fRow.appendChild(fPos);
     float_.appendChild(fRange); float_.appendChild(fRow);
     document.body.appendChild(float_);
 
     var supportsSpeech = "speechSynthesis" in window;
-    // playback rate is a single absolute value, only ever assigned from
-    // RATES, never multiplied, so speeds cannot compound across jumps
-    var RATES = [1, 1.5, 2];
-    var rate = 1;
-    try {
-      var saved = parseFloat(localStorage.getItem("reader-rate"));
-      if (RATES.indexOf(saved) >= 0) rate = saved;
-    } catch (e) {}
-    var mode = null, audio = null;
+    var mode = null, audio = null, narr = null;   // narr = per-unit start times
     var chunks = [], units = [], idx = 0, speaking = false, paused = false;
     var barVisible = true, userAway = false;
-
-    function rateLabel() {
-      var t = (rate % 1 === 0 ? rate : rate.toFixed(1)) + "x";
-      speed.textContent = t; fSpeed.textContent = t;
-    }
-    function cycleRate() {
-      rate = RATES[(RATES.indexOf(rate) + 1) % RATES.length];
-      try { localStorage.setItem("reader-rate", String(rate)); } catch (e) {}
-      rateLabel();
-      if (mode === "audio" && audio) audio.playbackRate = rate;
-      // a fresh utterance is the only way a new rate applies to speech, so
-      // respeak the current sentence at the new speed
-      if (mode === "speech" && speaking && !paused) jumpTo(idx);
-    }
     function label(playing) {
       [btn, fBtn].forEach(function (b) {
         b.textContent = "";
@@ -227,6 +219,7 @@
       var walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
       var node;
       while ((node = walker.nextNode())) {
+        if (inKatex(node)) continue;         // keep offsets aligned with readText
         var s = node.nodeValue;
         for (var i = 0; i < s.length; i++) {
           var ch = s.charAt(i);
@@ -298,10 +291,7 @@
       var myGen = gen;
       var utt = new SpeechSynthesisUtterance(u.text);
       var v = pickVoice(); if (v) utt.voice = v;
-      // a network voice cannot stay coherent much past 1.5x, so cap its
-      // effective rate there; an offline voice gets the full requested speed
-      utt.rate = (v && v.localService === false) ? Math.min(rate, 1.5) : rate;
-      utt.pitch = 1; utt.volume = 1;
+      utt.rate = 1; utt.pitch = 1; utt.volume = 1;
       utt.onboundary = function (e) {
         if (myGen !== gen) return;
         if (e.name === "word" || e.name === undefined) {
@@ -334,27 +324,66 @@
       label(true);
       speakFrom(Math.max(0, Math.min(i, units.length - 1)));
     }
+    // largest unit index whose start time is at or before t (binary search)
+    function unitAt(t) {
+      var lo = 0, hi = narr.length - 1, ans = 0;
+      while (lo <= hi) {
+        var mid = (lo + hi) >> 1;
+        if (narr[mid] <= t) { ans = mid; lo = mid + 1; } else hi = mid - 1;
+      }
+      return ans;
+    }
+    // pre-generated narration (listen.mp3) with per-sentence timings drives the
+    // same passage and sentence highlighting the speech path uses, plus a
+    // sentence-granular scrubber. Falls back to a plain time scrubber when the
+    // timings are absent or no longer match the page's units.
     function startAudio() {
-      mode = "audio"; audio = new Audio(audioUrl);
-      audio.playbackRate = rate;
-      note.textContent = "natural narration";
+      mode = "audio"; userAway = false;
+      if (narr) { chunks = articleChunks(); mapCache = {}; buildUnits(); }
+      var synced = !!(narr && units.length && narr.length === units.length);
+      audio = new Audio(audioUrl);
+      if (synced) {
+        idx = -1;
+        range.max = String(units.length - 1); range.value = "0"; showScrub(true);
+        setPos("1 / " + units.length);
+      } else {
+        note.textContent = "natural narration";
+      }
       audio.addEventListener("ended", finish);
       audio.addEventListener("loadedmetadata", function () {
+        if (synced) return;
         range.max = "1000"; range.value = "0"; showScrub(true);
         setPos(fmt(0) + " / " + fmt(audio.duration));
       });
       audio.addEventListener("timeupdate", function () {
         if (!audio.duration) return;
-        range.value = String(Math.round((audio.currentTime / audio.duration) * 1000));
-        setPos(fmt(audio.currentTime) + " / " + fmt(audio.duration));
+        if (synced) {
+          var i = unitAt(audio.currentTime);
+          if (i !== idx) {
+            idx = i;
+            var u = units[i];
+            highlight(u.ci);
+            if (!u.whole) setRange("reader-sentence", u.ci, u.start, u.end);
+            else clearRange("reader-sentence");
+            note.textContent = u.text;
+            range.value = String(i); setPos((i + 1) + " / " + units.length);
+          }
+        } else {
+          range.value = String(Math.round((audio.currentTime / audio.duration) * 1000));
+          setPos(fmt(audio.currentTime) + " / " + fmt(audio.duration));
+        }
       });
       label(true); audio.play();
     }
     function onScrub(v) {
       userAway = false;
       if (mode === "speech") jumpTo(v);
-      else if (mode === "audio" && audio && audio.duration) {
-        audio.currentTime = (v / 1000) * audio.duration;
+      else if (mode === "audio" && audio) {
+        if (narr && units.length === narr.length) {
+          audio.currentTime = narr[Math.max(0, Math.min(v, narr.length - 1))];
+        } else if (audio.duration) {
+          audio.currentTime = (v / 1000) * audio.duration;
+        }
         if (audio.paused) { audio.play(); label(true); }
       }
     }
@@ -363,6 +392,13 @@
     function haveAudio() {
       if (!audioUrl) return Promise.resolve(false);
       return fetch(audioUrl, { method: "HEAD" }).then(function (r) { return r.ok; }).catch(function () { return false; });
+    }
+    function fetchNarration() {
+      if (!narrUrl) { narr = null; return Promise.resolve(); }
+      return fetch(narrUrl)
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (j) { narr = j && j.t && j.t.length ? j.t : null; })
+        .catch(function () { narr = null; });
     }
     function togglePlay() {
       if (mode === "audio") {
@@ -375,7 +411,7 @@
         return;
       }
       haveAudio().then(function (ok) {
-        if (ok) startAudio();
+        if (ok) fetchNarration().then(startAudio);
         else if (supportsSpeech) startSpeech();
         else note.textContent = "read-aloud is not supported in this browser";
       });
@@ -386,9 +422,6 @@
       finish();
     }
 
-    speed.addEventListener("click", cycleRate);
-    fSpeed.addEventListener("click", cycleRate);
-    rateLabel();
     btn.addEventListener("click", togglePlay);
     fBtn.addEventListener("click", togglePlay);
     stop.addEventListener("click", stopAll);
