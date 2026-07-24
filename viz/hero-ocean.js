@@ -184,37 +184,32 @@
     }
 
     function drawShip() {
-      var frontLp = layerParams(LAYERS - 3); // waterline the ship rides
-      var sx = W * 0.8;
-      var wl = surfaceY(frontLp, sx);
-      // slope for rocking
-      var dy = surfaceY(frontLp, sx + 6) - surfaceY(frontLp, sx - 6);
-      var rot = Math.atan2(dy, 12) * 0.9;
-      rot = Math.max(-0.06, Math.min(0.06, rot));
-
-      var shipH = H * 0.42;
+      var frontLp = layerParams(LAYERS - 3);
+      var shipH = H * 0.38;
       var shipW = (ship.width / ship.height) * shipH;
-      var bob = Math.sin(t * 0.9) * 2;
-      // waterline sits ~ 84% down the sprite so the base submerges
-      var cy = wl + bob - shipH * 0.34;
+      // sail straight and level across the screen: x advances continuously and
+      // wraps, y is fixed at the mean water line (no bobbing, no rocking).
+      var span = W + shipW * 2;
+      // phase offset so the ship is already on-screen at load; ~60s to cross
+      var sx = ((t * (span / 40) + span * 0.55) % span) - shipW;
+      var wl = frontLp.baseY; // constant mean water level
+      var cy = wl - shipH * 0.34; // hull base sits just under the water line
 
-      // rippling reflection
+      // steady reflection that travels with the ship
       p.push();
-      p.translate(sx, wl + bob);
-      p.rotate(rot);
-      p.scale(1, -0.6);
-      p.tint(255, 46);
+      p.translate(sx, wl);
+      p.scale(1, -0.55);
+      p.tint(255, 38);
       p.imageMode(p.CENTER);
       p.image(ship, 0, -shipH * 0.16, shipW, shipH);
       p.pop();
 
-      // re-lay the very front wave over the reflection to break it up
+      // lay the very front wave over the reflection to break it up
       drawWaveLayer(LAYERS - 1);
 
-      // the ship
+      // the ship, level
       p.push();
       p.translate(sx, cy);
-      p.rotate(rot);
       p.imageMode(p.CENTER);
       p.noTint();
       p.image(ship, 0, 0, shipW, shipH);
