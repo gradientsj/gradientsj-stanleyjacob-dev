@@ -1,0 +1,1610 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Modern iOS &middot; Stanley Jacob</title>
+    <meta name="description" content="SwiftUI's declarative model derived from first principles: the view as a value-type function of state, the diffing and identity algorithm, the Observation framework, the parent-proposes child-chooses layout negotiation, Swift 6 data-race safety and actors, SwiftData, the 120Hz frame budget, and on-device machine learning with Core ML and MLX, including the memory arithmetic that caps a phone LLM at 3-4B parameters." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+      <script>(function(){try{var t=localStorage.getItem("theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes" class="active">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/classes">Classes</a></div>
+        <h1>Modern iOS: SwiftUI, concurrency, and on-device machine learning</h1>
+        <p class="lead">
+          SwiftUI is not a widget toolkit with a nicer syntax; it is a claim
+          that a user interface is a pure function of state, that the runtime
+          can compute the difference between two renderings of that function
+          cheaply enough to do it sixty or a hundred and twenty times a
+          second, and that most UI bugs are really state-ownership bugs that a
+          value-type model can prevent. This page derives that claim: how the
+          framework decides which views to re-render, why a view body must be
+          cheap and free of side effects, how the Observation framework in
+          Swift 5.9 narrowed invalidation from "the whole object changed" to
+          "this one property that this one view read changed", and how the
+          layout engine negotiates size by proposal rather than by constraint
+          solving. It then crosses into Swift 6: async/await, structured
+          concurrency, and the actor model that makes data races a compile
+          error rather than a Thursday-afternoon crash, with the underlying
+          memory model deferred to the concurrency page. It closes on the
+          hardware: the 8.3-millisecond frame budget a 120Hz display imposes,
+          and the memory-bandwidth arithmetic that explains why a 3-to-4
+          billion parameter model is the practical ceiling for a language
+          model running entirely on a phone.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+
+          <h2>Why this subject matters now</h2>
+          <p>
+            Five years ago an iOS engineer wrote imperative view controllers:
+            an object owned a tree of <code>UIView</code>s, mutated their
+            properties in response to events, and was personally responsible
+            for keeping the pixels consistent with the model. The failure mode
+            was the desynchronized view, a label that still shows the old
+            price because one of the fourteen code paths that change the price
+            forgot to call the method that updates the label. SwiftUI, shipped
+            in 2019 and mature by 2023, replaces the imperative tree with a
+            declarative function. The engineer describes what the interface
+            should look like for a given state, and the framework is
+            responsible for making the pixels match. The desynchronized view
+            becomes structurally impossible, because there is no setter to
+            forget; there is only the state, and a re-evaluation of the
+            function whenever the state changes.
+          </p>
+          <p>
+            The thing a practitioner is expected to understand today, and was
+            not expected to five years ago, is the machinery that makes this
+            affordable. Re-evaluating a function of state a hundred times a
+            second would be ruinous if it meant rebuilding the whole screen, so
+            the framework does not do that; it computes a structural diff and
+            touches only what changed. Understanding when a view re-renders,
+            and why, is now the central performance skill, the way that
+            understanding retain cycles was the central memory skill of the
+            reference-counting era. Layered on top are three shifts that all
+            landed between 2023 and 2025: the Observation framework
+            (<a href="https://github.com/apple/swift-evolution/blob/main/proposals/0395-observability.md">SE-0395</a>),
+            which replaced the coarse <code>@ObservableObject</code>
+            invalidation with per-property tracking; Swift 6's strict
+            concurrency, which turns the entire category of data races into
+            compile-time diagnostics; and the arrival of capable on-device
+            machine learning, where the Neural Engine and unified memory make
+            it realistic to run a multi-billion-parameter model on a phone,
+            subject to a memory budget this page works out in full.
+          </p>
+
+          <h2>Core theory</h2>
+
+          <h3>The view as a value-type function of state</h3>
+          <p>
+            A SwiftUI <code>View</code> is a Swift <code>struct</code>, a value
+            type, that conforms to a protocol with a single required
+            computed property, <code>body</code>. The body returns another
+            view. The type of that returned view is not erased; it is a
+            concrete, often enormous, generic type computed at compile time.
+            A stack containing a text and an image has a static type on the
+            order of <code>VStack&lt;TupleView&lt;(Text, Image)&gt;&gt;</code>,
+            and the <code>some View</code> opaque return type exists precisely
+            so the engineer does not have to write that type out while the
+            compiler still knows it exactly. This matters because the
+            framework uses the static type as the skeleton of its diffing:
+            two renders of the same view produce values of the same type, and
+            the framework compares them field by field.
+          </p>
+          <p>
+            Because a view is a value, constructing one is cheap and has no
+            identity of its own; it is a description, not the thing described.
+            The rendered interface, the persistent state, the animation
+            timers, all of that lives in a parallel tree the framework
+            maintains, sometimes called the render tree or the attribute
+            graph. The struct you write is the recipe; the framework owns the
+            cake. This separation is the reason a body must be a pure function.
+            SwiftUI may call <code>body</code> zero times if nothing that view
+            depends on changed, or many times in a single frame while it
+            settles a layout, and it may call bodies in any order. A body that
+            mutates external state, kicks off a network request, or reads the
+            wall clock will produce a UI that flickers, loops, or races,
+            because those side effects fire an unpredictable number of times.
+            The rule, then, is not stylistic: <em>a view body must be cheap and
+            idempotent</em>, a fast pure function from the view's inputs to a
+            description of its output, with every effect pushed into an
+            explicit lifecycle hook such as <code>task</code>,
+            <code>onAppear</code>, or an action closure.
+          </p>
+
+          <h3>The diffing and identity algorithm</h3>
+          <p>
+            When state changes, SwiftUI must decide which views to re-render.
+            It does this by walking the view tree and, at each node,
+            comparing the newly produced view value against the one from the
+            previous render. The comparison hinges on a concept the framework
+            calls <em>identity</em>. Two view values are "the same view across
+            time" if they occupy the same identity; the framework then diffs
+            their contents to see what animated or changed. If they have
+            different identities, the old one is torn down (its state
+            discarded, its disappearance transition run) and the new one is
+            created fresh (its state initialized, its appearance transition
+            run). Getting identity right is therefore not a cosmetic concern;
+            it determines whether state survives and whether transitions play.
+          </p>
+          <p>
+            SwiftUI derives identity two ways. The default is <em>structural
+            identity</em>: a view's identity is its position in the view tree,
+            encoded by the generic type structure. The first child of a
+            <code>VStack</code> that is a <code>Text</code> has a stable
+            structural identity as long as it stays the first child and stays
+            a <code>Text</code>. This is why a <code>ForEach</code> over an
+            array must be told how to identify its elements, through
+            <code>Identifiable</code> or an explicit <code>id</code> key path:
+            without it, the framework can only use array position, and
+            deleting the first of ten rows would make the framework believe
+            rows one through nine each turned into the row that used to be
+            below them, animating a cascade of content changes instead of one
+            deletion. The second mechanism is <em>explicit identity</em>,
+            assigned with the <code>.id(_:)</code> modifier. Giving a view an
+            explicit id that differs from its previous id forces a teardown
+            and rebuild even if its structural position is unchanged, which is
+            the supported way to reset a subtree's state, for example to clear
+            a form when the edited record changes.
+          </p>
+          <p>
+            A subtle and frequently-missed consequence concerns branches. An
+            <code>if</code> in a view builder does not select between two
+            configurations of one view; it produces two structurally distinct
+            views, one in the "then" branch and one in the "else" branch. The
+            framework models this with <code>_ConditionalContent</code>, and
+            crossing the branch is an identity change: the then-view is
+            destroyed and the else-view created. If both branches are, say, a
+            <code>TextField</code>, toggling the condition throws away the
+            first field's editing state and focus and builds a new one. When
+            the intent is one view whose configuration depends on a condition,
+            the ternary belongs inside a single modifier
+            (<code>.foregroundStyle(flag ? .red : .primary)</code>), which
+            preserves identity, rather than around two whole views. This is the
+            single most common source of "my text field keeps losing focus"
+            bug reports, and it falls directly out of the identity model.
+          </p>
+          <pre class="flow">state change
+     │
+     ▼
+re-invoke body of every view whose *inputs* changed  ──►  produce new view values
+     │
+     ▼
+for each node, match new value to old by IDENTITY
+     ├─ same identity  ──►  diff fields; animate/update the changed attributes only
+     └─ new identity   ──►  tear down old subtree (state lost, exit transition)
+                            build new subtree (state init, enter transition)</pre>
+          <p>
+            The phrase "views whose inputs changed" is doing heavy lifting,
+            and the next section is about what counts as an input.
+          </p>
+
+          <h3>The state system: ownership, and the Observation framework</h3>
+          <p>
+            A view's inputs are the stored properties it reads, but not all
+            stored properties are equal. A plain <code>let</code> is a
+            constant captured at construction; changing the value passed in
+            from the parent will, on the next parent render, produce a new
+            view value that the diff picks up. The property wrappers exist for
+            the cases a plain value cannot handle: mutable state that must
+            survive re-renders, and shared state that several views read and
+            write. Each wrapper encodes a different answer to the question of
+            <em>who owns this value and how long does it live</em>.
+          </p>
+          <p>
+            <code>@State</code> declares a piece of value-type state that the
+            view owns. The framework, not the struct, allocates the storage in
+            the render tree, so it persists across the many short-lived
+            reconstructions of the struct. Writing to a <code>@State</code>
+            property marks the view as needing re-evaluation. Because the
+            struct is thrown away and rebuilt constantly,
+            <code>@State</code> must be initialized to a value the framework
+            can use the first time and thereafter ignore; the property is
+            private by convention because nobody outside should reach into
+            another view's owned state. <code>@Binding</code> is a
+            two-way reference to state owned elsewhere: a
+            <code>Binding&lt;Bool&gt;</code> is essentially a getter/setter
+            pair, so a child can read and mutate a parent's
+            <code>@State</code> without owning it, and the parent's
+            re-evaluation is triggered on write. The <code>$</code> prefix
+            projects a wrapped value to its binding;
+            <code>$isOn</code> is the binding to the value <code>isOn</code>.
+          </p>
+          <p>
+            For reference-type models shared across a screen, the modern
+            mechanism is the <code>@Observable</code> macro from the
+            Observation framework, which in Swift 5.9 superseded the older
+            <code>ObservableObject</code> protocol with its
+            <code>@Published</code> properties. The difference is the whole
+            point. Under the old protocol, a model exposed a single
+            <code>objectWillChange</code> publisher; every <code>@Published</code>
+            property fired it, and <em>every</em> view observing that object
+            was invalidated whenever <em>any</em> published property changed. A
+            list screen whose header read only the model's <code>title</code>
+            was re-rendered every time an unrelated <code>scrollOffset</code>
+            updated sixty times a second. The Observation framework replaces
+            the object-level signal with property-level tracking. The
+            <code>@Observable</code> macro rewrites each stored property so
+            that reading it registers an access with the current tracking
+            scope and writing it notifies exactly the scopes that read it.
+            SwiftUI wraps each view's body evaluation in such a tracking scope
+            via <code>withObservationTracking</code>, so a view becomes
+            dependent on precisely the properties its body actually read on
+            the last pass, and is invalidated only when one of those changes.
+          </p>
+          <p>
+            Concretely, the macro expands a class annotated
+            <code>@Observable</code> into one conforming to the
+            <code>Observable</code> protocol, backing each stored property
+            with an access to an <code>ObservationRegistrar</code>. A read
+            becomes <code>registrar.access(self, keyPath: \.title)</code>
+            wrapped around the stored value; a write becomes a
+            <code>registrar.willSet</code>/<code>didSet</code> pair. The
+            registrar maintains, per property, the set of tracking scopes that
+            touched it, and a write notifies only that set. This is why the
+            guidance flipped: with <code>@Observable</code> you generally do
+            not scatter models into many small objects to limit invalidation,
+            because tracking is already per-property; a single well-factored
+            model is fine, and the framework will still re-render only the
+            views that read the field you changed. The related
+            <code>@Bindable</code> wrapper produces bindings into an
+            <code>@Observable</code> object's properties, the analogue of
+            <code>$</code> for these models, so a <code>TextField</code> can
+            bind two-way to <code>model.name</code>.
+          </p>
+          <p>
+            <code>@Environment</code> is the third ownership mode: dependency
+            injection down the tree. A value placed in the environment by an
+            ancestor is readable by any descendant by type or by key, without
+            being threaded through every intermediate initializer. The system
+            populates it with things like the color scheme, the locale, and
+            the dynamic-type size, and an app injects its own services and
+            <code>@Observable</code> models the same way. Reading an
+            environment value that changes invalidates the reader, and, as of
+            the Observation-aware environment, reading an observable object
+            from the environment tracks only the properties actually read,
+            same as a directly-held model. The ownership taxonomy, then, is:
+            <code>@State</code> for value state the view owns,
+            <code>@Binding</code> for value state owned above,
+            <code>@Observable</code> plus a holding <code>@State</code> for
+            reference models the view creates and owns,
+            <code>@Environment</code> for models handed down from an ancestor,
+            and a plain <code>let</code> for constants. Choosing the wrong one
+            is how state either fails to persist or fails to be shared.
+          </p>
+
+          <h3>Layout: parent proposes, child chooses</h3>
+          <p>
+            SwiftUI's layout is not a constraint solver like Auto Layout,
+            where the engine finds an assignment of frames satisfying a system
+            of inequalities. It is a single top-down/bottom-up negotiation
+            with a simple contract: the parent proposes a size to each child,
+            the child chooses its own size given that proposal, and the parent
+            then positions each child using the size it chose. Nothing is
+            solved globally; each view is asked once (in the common case) and
+            answers for itself. The proposal is a <code>ProposedViewSize</code>,
+            a width and a height that may each be a concrete number,
+            <code>nil</code> (meaning "choose your ideal"), or the sentinels
+            for zero and infinity. A child is free to ignore the proposal:
+            a fixed-size image returns its intrinsic dimensions regardless,
+            a <code>Text</code> chooses a size that fits its string within the
+            proposed width, and a <code>Color</code> or <code>Spacer</code>
+            greedily takes whatever is offered.
+          </p>
+          <p>
+            This contract composes cleanly. A <code>VStack</code> proposing to
+            its children subtracts spacing, offers each child a share of the
+            height, collects their chosen sizes, and reports its own size as
+            the union. Because each layer only reasons locally, layout is
+            close to linear in the number of views rather than the
+            superlinear cost a global solver can incur, which is part of why
+            SwiftUI can afford to run it every frame during an animation.
+            Since iOS 16 the same contract is available to application code
+            through the <code>Layout</code> protocol: a custom container
+            implements <code>sizeThatFits(proposal:subviews:cache:)</code>, in
+            which it inspects each subview's size for various proposals and
+            returns its own chosen size, and
+            <code>placeSubviews(in:proposal:subviews:cache:)</code>, in which
+            it calls <code>place(at:anchor:proposal:)</code> on each subview.
+            This is exactly the machinery the built-in stacks use, exposed. A
+            radial menu, a flow layout that wraps chips, or a masonry grid are
+            each a few dozen lines against this protocol.
+          </p>
+          <pre class="flow">parent                              child
+  │  propose (w=320, h=nil) ───────►  │
+  │                                   │  I need h=44 to fit my text at w=320
+  │  ◄─────────── choose (320, 44)    │
+  │                                   │
+  │  place child at (0,0) with size (320,44)
+  ▼</pre>
+          <p>
+            <code>GeometryReader</code> is the escape hatch for the rare case
+            that a child genuinely needs to know the concrete size it was
+            proposed before deciding its content, for instance to size a
+            custom drawing to a fraction of the available width. It is a view
+            that proposes its full received size to a closure and reports that
+            same size upward, which makes it greedy: it takes all offered
+            space, so wrapping a small piece of content in one often produces
+            surprising layouts. The idiom is to reach for it only when a
+            concrete measurement is unavoidable, and to prefer the ordinary
+            proposal mechanism, alignment guides, or the newer
+            <code>containerRelativeFrame</code> otherwise. The <code>Grid</code>
+            container, added in iOS 16, is the answer to two-dimensional
+            alignment that stacks cannot express: it lays out
+            <code>GridRow</code>s and aligns cells across rows into columns,
+            measuring in two passes so that column widths are shared, which a
+            nesting of <code>HStack</code>s inside a <code>VStack</code> cannot
+            do because each <code>HStack</code> sizes independently.
+          </p>
+
+          <h3>Navigation: value-based routing and a type-safe path</h3>
+          <p>
+            The original <code>NavigationView</code> pushed destinations
+            imperatively through <code>NavigationLink</code>s that each
+            carried a hard-wired destination view, which made programmatic
+            navigation and deep links awkward. <code>NavigationStack</code>,
+            introduced in iOS 16, reframes a navigation stack as a value: the
+            stack is driven by a <code>path</code>, an ordered collection of
+            values representing the pushed screens, and the mapping from a
+            value to the view that displays it is registered separately with
+            <code>navigationDestination(for:)</code>. A
+            <code>NavigationLink(value:)</code> then appends a value to the
+            path rather than naming a view; tapping it pushes the destination
+            the framework looks up by the value's type. Because the path is an
+            ordinary bindable collection, programmatic navigation is a
+            mutation: pushing is <code>path.append(item)</code>, popping to
+            the root is <code>path.removeAll()</code>, and restoring a saved
+            navigation state on launch is assigning a decoded array. A deep
+            link becomes: parse the URL into a value, append it. The
+            type-erased <code>NavigationPath</code> variant lets a single
+            stack hold heterogeneous destination types while remaining
+            <code>Codable</code> for state restoration. The design point is
+            that navigation state stops being hidden inside a stack of view
+            controllers and becomes plain data the app owns and can inspect,
+            serialize, and test.
+          </p>
+
+          <h3>Swift concurrency: async/await, structured tasks, and actors</h3>
+          <p>
+            A user interface has a hard real-time obligation: the main thread
+            must return to the run loop before the next frame deadline, or the
+            frame is dropped. Any work that blocks it, a synchronous network
+            call, a large JSON parse, an image decode, causes a visible hitch.
+            The classic answer was to hop to a background queue with a
+            completion handler, which fragments a linear piece of logic into a
+            pyramid of nested callbacks and makes error handling and
+            cancellation manual and error-prone. Swift's <code>async/await</code>,
+            from Swift 5.5, restores the linear shape: an <code>async</code>
+            function can <code>await</code> a suspension point, at which the
+            thread is released to do other work and the function resumes later,
+            possibly on a different thread, when its awaited result is ready.
+            The code reads top to bottom while never blocking a thread.
+          </p>
+          <p>
+            <em>Structured concurrency</em> is the discipline that keeps this
+            from degenerating into unmanaged background work. Every concurrent
+            task has a parent scope and cannot outlive it. <code>async let</code>
+            starts a child task whose result is awaited later in the same
+            function; <code>withTaskGroup</code> spawns a dynamic set of
+            children and joins them all before returning. The structural
+            guarantee is that when the scope exits, whether normally or by a
+            thrown error, all its child tasks are awaited or cancelled first,
+            so there is no orphaned work. Cancellation is cooperative and
+            propagates down the tree: cancelling a task marks all its
+            descendants cancelled, and well-behaved async APIs check
+            <code>Task.isCancelled</code> or call
+            <code>try Task.checkCancellation()</code> and unwind. SwiftUI's
+            <code>.task</code> modifier ties a task's lifetime to a view's:
+            the task starts when the view appears and is cancelled
+            automatically when it disappears, which is why network loads
+            attached with <code>.task</code> do not leak when the user
+            navigates away mid-flight.
+          </p>
+          <p>
+            The data-race problem, shared mutable state touched from two tasks
+            without synchronization, is solved by the <em>actor</em>. An actor
+            is a reference type that protects its mutable state behind an
+            isolation boundary: only one task executes inside a given actor at
+            a time, so its stored properties can never be accessed
+            concurrently. Calling an actor's method from outside is an
+            <code>async</code> call, because the caller may have to suspend
+            until the actor is free. <code>@MainActor</code> is a special
+            global actor whose executor is the main thread; annotating a type
+            or method with it guarantees that code runs on the main thread,
+            which is how SwiftUI ensures view updates never happen off-main.
+            The full memory-model justification for why single-actor execution
+            is sufficient to prevent races, and how it relates to
+            acquire/release ordering and happens-before, is developed on the
+            <a href="/classes/concurrent-systems-programming/">concurrency
+            page</a>; here it is enough that an actor serializes access and
+            establishes the ordering that makes each task see the writes of the
+            previous one.
+          </p>
+          <p>
+            Swift 6, released in 2024, makes this checking complete and
+            mandatory rather than advisory. Under the Swift 6 language mode the
+            compiler proves, at compile time, that no value crosses an
+            isolation boundary unless it is safe to do so. The mechanism is the
+            <code>Sendable</code> protocol
+            (<a href="https://github.com/apple/swift-evolution/blob/main/proposals/0302-concurrent-value-and-concurrent-closures.md">SE-0302</a>):
+            a type is <code>Sendable</code> if a value of it can be handed
+            from one isolation domain to another without introducing a race,
+            which is automatic for value types composed of sendable parts,
+            for immutable classes, and for actors, and must be asserted with
+            care (<code>@unchecked Sendable</code>) for a class that manages
+            its own locking. A non-<code>Sendable</code> value, a mutable
+            class instance, simply cannot be passed into an actor or a
+            detached task; the compiler rejects it. The naive version of this
+            rule is too strict, because a great deal of correct code passes a
+            freshly-created object to another domain and never touches it
+            again. Swift 6's <em>region-based isolation</em>
+            (<a href="https://github.com/apple/swift-evolution/blob/main/proposals/0414-region-based-isolation.md">SE-0414</a>)
+            recovers those cases: the compiler tracks disjoint regions of the
+            object graph and permits transferring a value whose region is
+            provably not referenced by the sending domain afterward, so
+            "make it here, send it there, forget it" type code compiles
+            without the value being <code>Sendable</code> at all. The result is
+            that the large class of bugs where two threads scribble on one
+            object becomes a category of code that does not build.
+          </p>
+
+          <h3>SwiftData: the modern persistence layer</h3>
+          <p>
+            SwiftData, introduced in 2023, is a persistence framework built on
+            the same storage engine as Core Data but with a Swift-native,
+            macro-driven surface. A model is an ordinary class annotated
+            <code>@Model</code>; the macro synthesizes the schema from the
+            stored properties, makes the instances managed and change-tracked,
+            and wires them into an object graph with relationships inferred
+            from property types. There is no <code>.xcdatamodeld</code> visual
+            schema file and no <code>NSManagedObject</code> subclassing; the
+            Swift type <em>is</em> the schema. A <code>ModelContainer</code>
+            owns the on-disk store and the schema, a <code>ModelContext</code>
+            is the unit of work that batches inserts, updates, and deletes and
+            flushes them on save, and the SwiftUI <code>@Query</code> property
+            wrapper runs a live fetch that re-executes and re-renders when the
+            underlying data changes. The relationship to Core Data is
+            inheritance, not replacement at the storage layer: SwiftData sits
+            on Core Data's persistence and can interoperate with an existing
+            Core Data stack, so the migration story is incremental. What it
+            buys is the elimination of the string-keyed, dynamically-typed
+            surface (<code>value(forKey:)</code>, fetch requests built from
+            <code>NSPredicate</code> strings) in favor of key paths and the
+            <code>#Predicate</code> macro that type-checks the query against
+            the model at compile time.
+          </p>
+
+          <h3>Networking, decoding, and typed errors</h3>
+          <p>
+            Networking collapses to a few lines under async/await.
+            <code>URLSession</code>'s <code>data(for:)</code> is an
+            <code>async throws</code> method returning the bytes and the
+            response; there is no delegate and no completion handler in the
+            common path. Decoding is <code>Codable</code>: a type that
+            conforms to <code>Decodable</code> is populated from JSON by a
+            <code>JSONDecoder</code> that matches keys to properties, with
+            <code>CodingKeys</code> to remap names and a
+            <code>keyDecodingStrategy</code> to convert snake_case to
+            camelCase in bulk. Errors are values thrown and caught with
+            <code>do/catch</code>, and the discipline that separates a robust
+            client from a fragile one is to model the failure space explicitly,
+            a domain <code>enum</code> distinguishing a transport failure
+            (offline, timeout) from a server error (a 500 with a body) from a
+            decoding failure (the shape changed), so the UI can react
+            differently to each rather than showing one generic alert.
+          </p>
+
+          <h3>Testing and the frame budget</h3>
+          <p>
+            Swift Testing, introduced in 2024, replaces the
+            <code>XCTest</code> assertion macros with a single
+            <code>#expect</code> macro that captures the expression's
+            structure, so a failed <code>#expect(total == 42)</code> reports
+            the actual value of <code>total</code> and the operands of the
+            comparison without the engineer writing a message. Tests are plain
+            functions annotated <code>@Test</code>, grouped into
+            <code>@Suite</code> types, and can be parameterized to run over a
+            collection of inputs as separate cases. <code>#require</code> is
+            the throwing form that unwraps an optional or aborts the test.
+            The framework runs tests in parallel by default and is built on
+            Swift concurrency, so an <code>async</code> test awaits directly.
+          </p>
+          <p>
+            Performance on iOS is governed by the frame deadline, and the
+            arithmetic is unforgiving. A 60Hz display gives
+            \( 1/60 \approx 16.67 \) ms per frame for the app to produce the
+            next image; a 120Hz ProMotion display halves that to
+            \( 1/120 \approx 8.33 \) ms. The main thread must run its layout,
+            its view-body evaluations, and hand a committed transaction to the
+            render server within that window, or the previous frame is shown
+            again and the user sees a <em>hitch</em>: a discontinuity in
+            motion. Instruments measures this directly through the Animation
+            Hitches instrument, reporting a hitch time ratio, milliseconds of
+            hitch per second of scrolling. Because ProMotion tightened the
+            budget, work that was invisible at 60Hz, an 8 ms image decode on
+            the main thread, now reliably drops a frame at 120Hz. The
+            engineering response is exactly the concurrency machinery above:
+            get everything off the main thread except the final view update,
+            keep view bodies cheap so their re-evaluation fits in a slice of
+            8.3 ms, and use Instruments' Time Profiler and the SwiftUI
+            instrument to find the body that is doing too much work or being
+            invalidated too often.
+          </p>
+
+          <h3>On-device machine learning: Core ML, the Neural Engine, and the memory wall</h3>
+          <p>
+            Running a model on the device rather than a server buys latency
+            (no round trip), privacy (data never leaves the phone), and
+            offline capability, at the cost of a fixed and modest compute and
+            memory budget. Core ML is Apple's inference runtime. A model
+            trained in PyTorch or another framework is converted to the Core
+            ML format with <code>coremltools</code>, which traces the
+            computation graph and lowers it to Core ML operations, producing a
+            <code>.mlpackage</code>. At load time Core ML compiles that to a
+            device-specific representation and, guided by the
+            <code>computeUnits</code> setting, distributes operations across
+            three backends: the CPU, the GPU, and the Apple Neural Engine
+            (ANE), a fixed-function accelerator specialized for the
+            convolution and matrix-multiply patterns of neural networks. The
+            ANE is fast and power-efficient for the operations it supports but
+            is not general; Core ML will place unsupported operations on GPU
+            or CPU, and a model that constantly bounces tensors between ANE and
+            GPU can be slower than one that stays on GPU, so the compute-unit
+            choice (<code>.all</code>, <code>.cpuAndNeuralEngine</code>,
+            <code>.cpuAndGPU</code>, <code>.cpuOnly</code>) is a real tuning
+            knob rather than "always pick all".
+          </p>
+          <p>
+            The dominant constraint on-device is memory, both capacity and
+            bandwidth. A model's weights must fit in RAM alongside the
+            operating system, the app, and everything else, and on a phone
+            with 8 GB total shared between CPU, GPU, and ANE that is a tight
+            ceiling. Two techniques from <code>coremltools</code> shrink the
+            footprint. <em>Quantization</em> stores each weight in fewer bits,
+            typically INT8 or INT4 instead of FP16, dividing the weight memory
+            by two or four at some accuracy cost. <em>Palettization</em> goes
+            further for weights that cluster: it builds a small lookup table
+            (a palette) of, say, 16 representative values and stores each
+            weight as a 4-bit index into it, which for a model whose weights
+            group tightly gives 4x compression with little loss, and generalizes
+            to per-block palettes. These are the on-device analogues of the
+            GPTQ and AWQ post-training quantization schemes derived on the
+            <a href="/classes/applied-generative-ai/">applied generative AI
+            page</a>; the mathematics of minimizing quantization error is the
+            same, and only the deployment target differs.
+          </p>
+          <p>
+            The reason a large language model is hard to run on a phone is not
+            arithmetic throughput but memory bandwidth. Autoregressive decoding
+            generates one token at a time, and generating each token requires
+            reading essentially every weight of the model once, to multiply it
+            against the single-token activation. This makes decoding
+            <em>memory-bandwidth-bound</em>: the time per token is roughly the
+            model's byte size divided by the achievable memory bandwidth, and
+            the ANE's TOPS rating is nearly irrelevant because the multipliers
+            sit idle waiting for weights to arrive. With phone memory bandwidth
+            in the tens of gigabytes per second, a multi-gigabyte model yields
+            only tens of tokens per second, and a larger model both reads more
+            bytes per token (slower) and may not fit at all (impossible). The
+            problems below work this out with numbers; the conclusion, that
+            roughly 3 to 4 billion parameters at 4-bit is the practical ceiling
+            for a usable on-device chat model on a current phone, is a memory
+            statement, not a compute one.
+          </p>
+          <p>
+            <code>MLX</code>, an array framework Apple released in 2023 for
+            Apple silicon, is the newer and lower-level alternative to Core ML
+            for exactly this workload. It is a NumPy-like API with lazy
+            evaluation and automatic differentiation, designed around unified
+            memory so that arrays live in one address space visible to CPU and
+            GPU without copies, and it targets the Metal GPU directly rather
+            than routing through Core ML's op set. For running and even
+            fine-tuning transformer models on Apple silicon it has become the
+            common choice in the open-source community, with a Swift binding
+            (<code>mlx-swift</code>) that brings the same capability to iOS and
+            macOS apps. The division of labor as of 2025 is roughly: Core ML
+            for shipping a fixed converted model efficiently across CPU, GPU,
+            and ANE inside a production app, and MLX for research, for models
+            whose operations the ANE does not support well, and for workflows
+            that want direct control of the GPU and unified memory.
+          </p>
+
+          <h2>Worked problems</h2>
+
+          <div class="problem">
+            <span class="plabel">Problem 1</span>
+            <p>
+              A screen holds one <code>@Observable</code> model with three
+              properties: <code>title: String</code>,
+              <code>unreadCount: Int</code>, and
+              <code>scrollOffset: CGFloat</code>. The view tree is a
+              <code>VStack</code> of three subviews. <code>HeaderView</code>'s
+              body reads <code>model.title</code>. <code>BadgeView</code>'s
+              body reads <code>model.unreadCount</code>.
+              <code>ScrollTracker</code>'s body reads
+              <code>model.scrollOffset</code>. During a scroll,
+              <code>scrollOffset</code> is written 90 times in one second while
+              <code>title</code> and <code>unreadCount</code> do not change.
+              How many view-body evaluations does the Observation framework
+              trigger over that second, and how many would the old
+              <code>ObservableObject</code> with three <code>@Published</code>
+              properties have triggered? Assume each write is a distinct frame.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> Under Observation, tracking is
+                per-property. On its last evaluation each view registered a
+                dependency only on the property its body read:
+                <code>HeaderView</code> on <code>title</code>,
+                <code>BadgeView</code> on <code>unreadCount</code>,
+                <code>ScrollTracker</code> on <code>scrollOffset</code>. A
+                write to <code>scrollOffset</code> notifies only the scopes
+                that read <code>scrollOffset</code>, which is
+                <code>ScrollTracker</code> alone. So each of the 90 writes
+                invalidates one view, giving
+                \( 90 \times 1 = 90 \) body evaluations over the second.
+                <code>HeaderView</code> and <code>BadgeView</code> are
+                evaluated zero times, because nothing they read changed.
+              </p>
+              <p>
+                Under <code>ObservableObject</code>, every
+                <code>@Published</code> write fires the single
+                <code>objectWillChange</code> publisher, and every view
+                observing the object is invalidated regardless of which
+                property changed. All three views observe the object, so each
+                of the 90 writes invalidates three views, giving
+                \( 90 \times 3 = 270 \) body evaluations. Two-thirds of that
+                work, the 180 evaluations of <code>HeaderView</code> and
+                <code>BadgeView</code>, is wasted: it recomputes bodies whose
+                inputs did not change and produces byte-identical view values
+                that the diff then discards. This is the concrete meaning of
+                "Observation re-renders only the views that read the changed
+                property", and on a 120Hz scroll where the budget is 8.33 ms
+                per frame, eliminating two unnecessary body evaluations per
+                frame is often the difference between a smooth scroll and a
+                hitchy one.
+              </p>
+            </div>
+          </div>
+
+          <div class="problem">
+            <span class="plabel">Problem 2</span>
+            <p>
+              A phone has 8 GB of RAM, of which about 5.5 GB is realistically
+              available to a foreground app before the system starts
+              terminating it under memory pressure. You want to run a decoder
+              transformer with 3.2 billion parameters, quantized to 4 bits per
+              weight, with the following architecture: 28 layers, hidden size
+              3072, 24 attention heads, 8 key/value heads (grouped-query
+              attention), head dimension 128. The KV cache is stored in FP16.
+              (a) How much memory do the weights occupy? (b) How much does the
+              KV cache occupy at a 4096-token context? (c) Does the model fit,
+              and what is the largest context you could support? Show the
+              arithmetic.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution. (a) Weights.</strong> At 4 bits per weight,
+                each parameter costs \( 4/8 = 0.5 \) bytes. With
+                \( 3.2 \times 10^9 \) parameters,
+              </p>
+              $$ M_{\text{weights}} = 3.2\times10^{9} \times 0.5\ \text{bytes} = 1.6\times10^{9}\ \text{bytes} \approx 1.49\ \text{GiB}. $$
+              <p>
+                (Using \( 1\ \text{GiB} = 2^{30} = 1.074\times10^{9} \) bytes.)
+                Call it about 1.5 GB. In practice quantized formats carry a
+                little overhead for per-block scales, so the on-disk and
+                in-memory size is nearer 1.7-1.8 GB; the leading term is 1.5 GB.
+              </p>
+              <p>
+                <strong>(b) KV cache.</strong> The cache stores, for every
+                layer and every past token, one key vector and one value
+                vector over the <em>key/value</em> heads (grouped-query
+                attention shares KV across query heads, which is exactly why
+                it is used: it shrinks this cache). Per token, the number of
+                cached scalars is
+              </p>
+              $$ 2 \times n_{\text{layers}} \times n_{kv} \times d_{\text{head}} = 2 \times 28 \times 8 \times 128 = 57{,}344\ \text{scalars}. $$
+              <p>
+                At FP16, 2 bytes each, that is
+                \( 57{,}344 \times 2 = 114{,}688 \) bytes \( \approx 112 \)
+                KiB per token. For a 4096-token context,
+              </p>
+              $$ M_{\text{kv}} = 114{,}688 \times 4096 = 4.70\times10^{8}\ \text{bytes} \approx 448\ \text{MiB}. $$
+              <p>
+                <strong>(c) Feasibility.</strong> Weights plus a full 4096-token
+                cache come to about \( 1.5 + 0.45 = 1.95 \) GB, well under the
+                5.5 GB ceiling, so the model fits comfortably with room for the
+                app, image buffers, and the framework. To find the largest
+                context, give the KV cache the remaining budget after weights
+                and a working reserve. Reserving, say, 2 GB for everything else
+                leaves \( 5.5 - 1.8 - 2.0 = 1.7 \) GB for the cache, so
+              </p>
+              $$ N_{\max} = \frac{1.7\times10^{9}}{114{,}688} \approx 14{,}800\ \text{tokens}. $$
+              <p>
+                The binding constraint is memory capacity, and it is generous
+                here; the model would run out of usable <em>speed</em> (next
+                problem) long before it ran out of context capacity. The
+                lesson is that at 3B-4B and 4-bit, capacity is not the wall on
+                a modern phone; the next problem shows what is.
+              </p>
+            </div>
+          </div>
+
+          <div class="problem">
+            <span class="plabel">Problem 3</span>
+            <p>
+              Take the same 3.2B model at 4 bits, in-memory size about 1.7 GB.
+              The phone's memory subsystem delivers, generously, 60 GB/s of
+              usable bandwidth. Assuming decoding is memory-bandwidth-bound and
+              each generated token requires streaming the full set of weights
+              once from memory, estimate the ceiling on tokens per second. Then
+              explain why a 13B model at the same 4 bits would be more than
+              four times slower, not merely proportionally slower in
+              arithmetic, and why the Neural Engine's TOPS rating does not
+              rescue it.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> If every token forces one full read
+                of the weights, the time per token is at least the bytes moved
+                divided by the bandwidth:
+              </p>
+              $$ t_{\text{tok}} \geq \frac{M_{\text{weights}}}{B} = \frac{1.7\times10^{9}\ \text{bytes}}{60\times10^{9}\ \text{bytes/s}} \approx 0.0283\ \text{s} = 28.3\ \text{ms}. $$
+              <p>
+                That is an upper bound on throughput of
+                \( 1 / 0.0283 \approx 35 \) tokens per second, before any
+                overhead for the KV-cache reads (which add to the bytes moved
+                and pull the real number lower), attention compute, sampling,
+                and the fact that achievable bandwidth is below peak. A real
+                measurement would land somewhere in the 15-30 tokens/second
+                range, which is around reading speed, usable but not fast.
+              </p>
+              <p>
+                <strong>The 13B comparison.</strong> A 13B model at 4 bits is
+                about \( 13/3.2 \approx 4.06 \times \) more weight bytes, so at
+                the same bandwidth it is at least \( 4\times \) slower on the
+                weight-streaming term alone: roughly
+                \( 4.06 \times 28.3 \approx 115 \) ms/token, under 9 tokens/s.
+                But it is worse than proportional for two compounding reasons.
+                First, at \( 13\times10^{9} \times 0.5 = 6.5 \) GB the weights
+                plus cache plus OS overrun a phone's usable RAM, so the system
+                pages or refuses to load, and if any weights spill to slower
+                storage the effective bandwidth for those reads collapses by an
+                order of magnitude. Second, a larger working set evicts more of
+                the caches between token steps, lowering the fraction of peak
+                bandwidth actually achieved. The Neural Engine does not help
+                because the bottleneck is not multiply-accumulate throughput:
+                at batch size one, each weight is used for exactly one
+                multiply after being fetched, so the arithmetic intensity is
+                about one FLOP per byte, far below the ratio at which a
+                35-TOPS accelerator becomes the limit. The multipliers are
+                starved. This is why the practical ceiling for an interactive
+                on-device chat model is 3-4B: it is the largest that both fits
+                in RAM and streams fast enough to feel responsive.
+              </p>
+            </div>
+          </div>
+
+          <div class="problem">
+            <span class="plabel">Problem 4</span>
+            <p>
+              A list cell's body, during a fast scroll on a 120Hz ProMotion
+              display, does the following on the main thread each time it is
+              built: formats a date with a freshly-constructed
+              <code>DateFormatter</code> (measured at 3.1 ms because allocating
+              the formatter dominates), computes a layout-dependent value in
+              0.4 ms, and produces its view value in 0.2 ms. Twelve cells are
+              built per frame during the scroll. (a) What is the per-frame main
+              thread cost from these cells, and does it fit the budget? (b) If
+              the <code>DateFormatter</code> is hoisted to a cached static
+              instance so formatting drops to 0.05 ms, what is the new
+              per-frame cost and the resulting headroom? Show the numbers.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution. (a)</strong> Per cell the main thread spends
+                \( 3.1 + 0.4 + 0.2 = 3.7 \) ms. Twelve cells per frame is
+              </p>
+              $$ 12 \times 3.7\ \text{ms} = 44.4\ \text{ms}. $$
+              <p>
+                The 120Hz budget is 8.33 ms per frame. At 44.4 ms the main
+                thread misses the deadline by more than a factor of five; the
+                frame arrives \( 44.4 / 8.33 \approx 5.3 \) frame-times late,
+                which the Animation Hitches instrument records as a large hitch
+                and the user sees as a stutter. Even the 60Hz budget of
+                16.67 ms is blown by \( 2.7\times \). The formatter allocation
+                alone, \( 12 \times 3.1 = 37.2 \) ms, is the whole problem.
+              </p>
+              <p>
+                <strong>(b)</strong> With the cached formatter, per cell cost
+                falls to \( 0.05 + 0.4 + 0.2 = 0.65 \) ms, and per frame
+              </p>
+              $$ 12 \times 0.65\ \text{ms} = 7.8\ \text{ms}. $$
+              <p>
+                That is under the 8.33 ms ProMotion budget, leaving
+                \( 8.33 - 7.8 = 0.53 \) ms of headroom, thin but passing at
+                120Hz and comfortable at 60Hz (\( 16.67 - 7.8 = 8.87 \) ms
+                spare). The general lesson is that the expensive thing was an
+                allocation hidden inside an innocuous formatting call, repeated
+                per cell per frame, and that the fix is not concurrency but
+                not doing the work: a view body must be cheap, and "cheap"
+                against an 8.3 ms budget shared across a screenful of views
+                means sub-millisecond. Anything heavier, a real image decode or
+                a network parse, belongs off the main thread entirely via
+                <code>.task</code> and an actor, with only the finished value
+                handed back to the body.
+              </p>
+            </div>
+          </div>
+
+          <div class="problem">
+            <span class="plabel">Problem 5</span>
+            <p>
+              Consider this actor and two concurrent callers. Does Swift's
+              actor model prevent a data race on <code>balance</code>? Does it
+              prevent the logical bug in which a withdrawal succeeds against a
+              balance that was already spent, given the <code>await</code>
+              between the check and the mutation? Explain what "actor
+              reentrancy" means here and how Swift 6 does or does not flag it.
+            </p>
+            <pre class="flow">actor Account {
+  var balance: Int = 100
+  func withdraw(_ amount: Int) async -&gt; Bool {
+    guard balance &gt;= amount else { return false }   // check
+    await auditLog(amount)                            // suspension point
+    balance -= amount                                 // mutate
+    return true
+  }
+}
+// Task A: await account.withdraw(80)
+// Task B: await account.withdraw(80)</pre>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> There is no <em>data race</em>. A
+                data race is unsynchronized concurrent access to the same
+                memory, and the actor forbids it: only one task runs inside
+                <code>Account</code> at a time, so the reads and writes of
+                <code>balance</code> are serialized and each is fully ordered
+                with respect to the others. The compiler guarantees this, and
+                Swift 6 would additionally reject any attempt to touch
+                <code>balance</code> from outside the actor without
+                <code>await</code>. So memory safety holds.
+              </p>
+              <p>
+                There is nonetheless a <em>logical</em> bug, and it comes from
+                <em>reentrancy</em>. When <code>withdraw</code> hits the
+                <code>await auditLog(amount)</code> suspension point, the
+                actor is released: it does not stay locked across the
+                suspension. While task A is suspended awaiting the audit log,
+                the actor is free, so task B can enter <code>withdraw</code>,
+                pass its own guard (balance is still 100, because A has not yet
+                subtracted), and suspend at its own audit call. Now both tasks
+                have passed the check. They resume in some order and each
+                executes <code>balance -= 80</code>, driving the balance to
+                \( 100 - 80 - 80 = -60 \): an overdraft that the guard was
+                supposed to prevent. This is the classic reentrancy hazard,
+                an invariant checked before an <code>await</code> and relied
+                upon after it, when the state can change during the
+                suspension.
+              </p>
+              <p>
+                Swift 6 does <strong>not</strong> flag this, and it is
+                important to know why. The concurrency checker proves the
+                absence of data races, not the preservation of application
+                invariants; a released-across-await actor is behaving exactly
+                as specified. The bug is a correctness error the type system
+                does not see. The fix is to not straddle a suspension with an
+                invariant: perform the check and the mutation with no
+                <code>await</code> between them (subtract first, then log
+                after), or re-check the balance after resuming, or restructure
+                so the audit does not sit on the critical path. The takeaway
+                for interviews is precise: actors give you race freedom for
+                free, but reentrancy means they do not give you atomicity
+                across suspension points for free, and Swift 6's compile-time
+                guarantees stop at the former.
+              </p>
+            </div>
+          </div>
+
+          <div class="problem">
+            <span class="plabel">Problem 6</span>
+            <p>
+              A form view contains a <code>TextField</code> for a note. The
+              parent shows it inside a branch:
+              <code>if isEditing { EditRow() } else { EditRow() }</code>, where
+              both branches are the same <code>EditRow</code> containing the
+              field, and <code>isEditing</code> toggles when the user taps a
+              button. Users report that toggling the button clears whatever
+              they had typed and dismisses the keyboard. Explain the cause in
+              terms of the identity algorithm, and give the one-line fix.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> An <code>if/else</code> in a view
+                builder does not configure one view; it constructs two
+                structurally distinct views wrapped in
+                <code>_ConditionalContent</code>, the then-branch and the
+                else-branch, which occupy <em>different</em> structural
+                identities even though both happen to be an
+                <code>EditRow</code>. When <code>isEditing</code> flips, the
+                framework sees the active child change identity from
+                "then-branch <code>EditRow</code>" to "else-branch
+                <code>EditRow</code>". By the diffing rule, a change of
+                identity is a teardown and rebuild: the old
+                <code>EditRow</code>'s subtree is destroyed, discarding the
+                <code>TextField</code>'s editing state and its first-responder
+                (keyboard focus) status, and a brand-new <code>EditRow</code>
+                is created with empty state. Hence the cleared text and
+                dismissed keyboard, on every toggle.
+              </p>
+              <p>
+                The fix is to keep a single view with one identity and move the
+                condition inside, so nothing crosses a branch boundary. Since
+                both branches were identical, delete the branch entirely and
+                render <code>EditRow()</code> unconditionally, pushing whatever
+                <code>isEditing</code> actually controls into a modifier or a
+                property on <code>EditRow</code>, for example
+                <code>EditRow().disabled(!isEditing)</code>. One view, one
+                stable structural identity, no teardown; the field keeps its
+                text and its focus across the toggle. The general rule this
+                illustrates: use <code>if</code> to add or remove a view, and a
+                ternary inside a modifier to reconfigure a view that must
+                persist.
+              </p>
+            </div>
+          </div>
+
+          <h2>Implementation</h2>
+          <p>
+            The first block is a complete, idiomatic Swift 6 feature slice: an
+            <code>@Observable</code> view model that loads data off the main
+            actor, an <code>actor</code> that owns a cache, a SwiftData model,
+            and the SwiftUI view that binds to all of it. It compiles under the
+            Swift 6 language mode with strict concurrency. The comments mark the
+            isolation of each piece, since isolation is the thing a reader most
+            needs to see.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="swift" class="active">Swift</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="swift" class="shl lang active"><code class="language-swift"><span class="k">import</span> <span class="m1">SwiftUI</span>
+<span class="k">import</span> <span class="m1">SwiftData</span>
+
+<span class="c">// A SwiftData model: the @Model macro synthesizes the schema and change</span>
+<span class="c">// tracking. The Swift type IS the persisted schema; no .xcdatamodeld file.</span>
+<span class="k">@Model</span>
+<span class="k">final</span> <span class="k">class</span> <span class="m1">Note</span> <span class="b0">{</span>
+    <span class="k">var</span> <span class="m1">title</span>: <span class="m1">String</span>
+    <span class="k">var</span> <span class="m1">body</span>: <span class="m1">String</span>
+    <span class="k">var</span> <span class="m1">updatedAt</span>: <span class="v6">Date</span>
+
+    <span class="k">init</span><span class="b1">(</span><span class="m1">title</span>: <span class="m1">String</span>, <span class="m1">body</span>: <span class="m1">String</span>, <span class="m1">updatedAt</span>: <span class="v6">Date</span> = .<span class="m2">now</span><span class="b1">)</span> <span class="b1">{</span>
+        <span class="k">self</span>.<span class="m2">title</span> = <span class="m1">title</span>
+        <span class="k">self</span>.<span class="m2">body</span> = <span class="m1">body</span>
+        <span class="k">self</span>.<span class="m2">updatedAt</span> = <span class="m1">updatedAt</span>
+    <span class="b1">}</span>
+<span class="b0">}</span>
+
+<span class="c">// An actor: it owns a mutable cache and serializes all access, so concurrent</span>
+<span class="c">// callers can never race on `store`. Calls from outside are `await`ed.</span>
+<span class="k">actor</span> <span class="m1">SummaryCache</span> <span class="b0">{</span>
+    <span class="k">private</span> <span class="k">var</span> <span class="v3">store</span>: <span class="b1">[</span><span class="v1">PersistentIdentifier</span>: <span class="m1">String</span><span class="b1">]</span> = <span class="b1">[</span>:<span class="b1">]</span>
+
+    <span class="k">func</span> <span class="m1">summary</span><span class="b1">(</span><span class="m1">for</span> <span class="m1">id</span>: <span class="v1">PersistentIdentifier</span>,
+                 <span class="m1">compute</span>: <span class="k">@Sendable</span> <span class="b2">()</span> <span class="k">async</span> -&gt; <span class="m1">String</span><span class="b1">)</span> <span class="k">async</span> -&gt; <span class="m1">String</span> <span class="b1">{</span>
+        <span class="k">if</span> <span class="k">let</span> <span class="v5">hit</span> = <span class="v3">store</span><span class="b2">[</span><span class="m1">id</span><span class="b2">]</span> <span class="b2">{</span> <span class="k">return</span> <span class="v5">hit</span> <span class="b2">}</span>        <span class="c">// fast path, no await between</span>
+        <span class="k">let</span> <span class="m1">value</span> = <span class="k">await</span> <span class="m1">compute</span><span class="b2">()</span>                  <span class="c">// suspension: actor is released</span>
+        <span class="v3">store</span><span class="b2">[</span><span class="m1">id</span><span class="b2">]</span> = <span class="m1">value</span>                            <span class="c">// re-enters; last writer wins (fine here)</span>
+        <span class="k">return</span> <span class="m1">value</span>
+    <span class="b1">}</span>
+<span class="b0">}</span>
+
+<span class="c">// An @Observable view model, isolated to the main actor because it drives UI.</span>
+<span class="c">// Only the properties a given view's body READS become that view's dependencies,</span>
+<span class="c">// so writing `isLoading` invalidates only views that read `isLoading`.</span>
+<span class="k">@MainActor</span>
+<span class="k">@Observable</span>
+<span class="k">final</span> <span class="k">class</span> <span class="m1">NotesViewModel</span> <span class="b0">{</span>
+    <span class="k">var</span> <span class="v1">notes</span>: <span class="b1">[</span><span class="m1">Note</span><span class="b1">]</span> = <span class="b1">[]</span>
+    <span class="k">var</span> <span class="v2">isLoading</span> = <span class="k">false</span>
+    <span class="k">var</span> <span class="v4">errorText</span>: <span class="m1">String</span>?
+
+    <span class="k">private</span> <span class="k">let</span> <span class="v5">cache</span> = <span class="m1">SummaryCache</span><span class="b1">()</span>
+
+<span class="c">    // async, structured: the network work suspends without blocking the main</span>
+<span class="c">    // thread; the final assignments run back on the main actor.</span>
+    <span class="k">func</span> <span class="m1">refresh</span><span class="b1">(</span><span class="m1">using</span> <span class="v1">service</span>: <span class="v6">NotesService</span><span class="b1">)</span> <span class="k">async</span> <span class="b1">{</span>
+        <span class="v2">isLoading</span> = <span class="k">true</span>
+        <span class="k">defer</span> <span class="b2">{</span> <span class="v2">isLoading</span> = <span class="k">false</span> <span class="b2">}</span>
+        <span class="k">do</span> <span class="b2">{</span>
+            <span class="k">let</span> <span class="v3">fetched</span> = <span class="k">try</span> <span class="k">await</span> <span class="v1">service</span>.<span class="m1">fetchNotes</span><span class="b0">()</span>   <span class="c">// off-main, awaits I/O</span>
+            <span class="v1">notes</span> = <span class="v3">fetched</span>                                <span class="c">// back on main actor</span>
+            <span class="v4">errorText</span> = <span class="k">nil</span>
+        <span class="b2">}</span> <span class="k">catch</span> <span class="b2">{</span>
+            <span class="v4">errorText</span> = <span class="k">Self</span>.<span class="m1">describe</span><span class="b0">(</span><span class="v6">error</span><span class="b0">)</span>
+        <span class="b2">}</span>
+    <span class="b1">}</span>
+
+    <span class="k">nonisolated</span> <span class="k">static</span> <span class="k">func</span> <span class="m1">describe</span><span class="b1">(</span><span class="m1">_</span> <span class="v6">error</span>: <span class="m1">Error</span><span class="b1">)</span> -&gt; <span class="m1">String</span> <span class="b1">{</span>
+        <span class="k">switch</span> <span class="v6">error</span> <span class="b2">{</span>
+        <span class="k">case</span> <span class="k">is</span> <span class="v6">CancellationError</span>: <span class="k">return</span> <span class="s">"Cancelled."</span>
+        <span class="k">case</span> <span class="k">let</span> <span class="v1">urlError</span> <span class="k">as</span> <span class="v4">URLError</span> <span class="k">where</span> <span class="v1">urlError</span>.<span class="m2">code</span> == .<span class="m2">notConnectedToInternet</span>:
+            <span class="k">return</span> <span class="s">"You appear to be offline."</span>
+        <span class="k">default</span>: <span class="k">return</span> <span class="s">"Something went wrong."</span>
+        <span class="b2">}</span>
+    <span class="b1">}</span>
+<span class="b0">}</span>
+
+<span class="k">struct</span> <span class="m1">NotesScreen</span>: <span class="m1">View </span><span class="b0">{</span>
+<span class="c">    // The view owns the view model; @State keeps it alive across rebuilds.</span>
+    <span class="k">@State</span> <span class="k">private</span> <span class="k">var</span> <span class="v0">model</span> = <span class="m1">NotesViewModel</span><span class="b1">()</span>
+    <span class="k">@Environment</span><span class="b1">(</span>\.<span class="v0">notesService</span><span class="b1">)</span> <span class="k">private</span> <span class="k">var</span> <span class="v1">service</span>   <span class="c">// injected dependency</span>
+
+    <span class="k">var</span> <span class="m1">body</span>: <span class="k">some</span> <span class="m1">View</span> <span class="b1">{</span>
+<span class="c">        // NavigationStack: the path is a value the view owns; destinations</span>
+<span class="c">        // are registered by type, so navigation is type-safe data.</span>
+        <span class="m1">NavigationStack</span> <span class="b2">{</span>
+            <span class="m1">List</span><span class="b0">(</span><span class="v0">model</span>.<span class="m2">notes</span><span class="b0">)</span> <span class="b0">{</span> <span class="v2">note</span> <span class="k">in</span>
+                <span class="m1">NavigationLink</span><span class="b1">(</span><span class="m1">value</span>: <span class="v2">note</span>.<span class="m2">persistentModelID</span><span class="b1">)</span> <span class="b1">{</span>
+<span class="c">                    // This row's body reads note.title and note.updatedAt only.</span>
+                    <span class="m1">NoteRow</span><span class="b2">(</span><span class="m1">title</span>: <span class="v2">note</span>.<span class="m2">title</span>, <span class="m1">date</span>: <span class="v2">note</span>.<span class="m2">updatedAt</span><span class="b2">)</span>
+                <span class="b1">}</span>
+            <span class="b0">}</span>
+            .<span class="m1">overlay</span> <span class="b0">{</span> <span class="k">if</span> <span class="v0">model</span>.<span class="m2">isLoading</span> <span class="b1">{</span> <span class="m1">ProgressView</span><span class="b2">()</span> <span class="b1">}</span> <span class="b0">}</span>
+            .<span class="m1">navigationDestination</span><span class="b0">(</span><span class="m1">for</span>: <span class="v1">PersistentIdentifier</span>.<span class="k">self</span><span class="b0">)</span> <span class="b0">{</span> <span class="m1">id</span> <span class="k">in</span>
+                <span class="m1">NoteDetail</span><span class="b1">(</span><span class="m1">id</span>: <span class="m1">id</span><span class="b1">)</span>
+            <span class="b0">}</span>
+            .<span class="m1">navigationTitle</span><span class="b0">(</span><span class="s">"Notes"</span><span class="b0">)</span>
+<span class="c">            // .task ties the load's lifetime to the view: auto-cancelled on disappear.</span>
+            .<span class="m1">task</span> <span class="b0">{</span> <span class="k">await</span> <span class="v0">model</span>.<span class="m1">refresh</span><span class="b1">(</span><span class="m1">using</span>: <span class="v1">service</span><span class="b1">)</span> <span class="b0">}</span>
+        <span class="b2">}</span>
+    <span class="b1">}</span>
+<span class="b0">}</span></code></pre>
+          </div>
+          <p>
+            The second block is the Core ML inference path: loading a compiled
+            model, choosing compute units, and running a prediction, followed
+            by the <code>coremltools</code> conversion and palettization step
+            in Python that produces the model in the first place. The Swift
+            side treats the model as an async, cancellable unit of work behind
+            an actor so that inference never blocks the UI.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="swift" class="active">Swift</button>
+              <button data-lang="python">Python (coremltools)</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="swift" class="shl lang active"><code class="language-swift"><span class="k">import</span> <span class="m1">CoreML</span>
+
+<span class="c">// Wrap the model in an actor so predictions are serialized and off-main.</span>
+<span class="k">actor</span> <span class="m1">Classifier</span> <span class="b0">{</span>
+    <span class="k">private</span> <span class="k">let</span> <span class="v0">model</span>: <span class="m1">MLModel</span>
+
+    <span class="k">init</span><span class="b1">()</span> <span class="k">throws</span> <span class="b1">{</span>
+        <span class="k">let</span> <span class="v4">config</span> = <span class="m1">MLModelConfiguration</span><span class="b2">()</span>
+<span class="c">        // Let Core ML place ops across CPU, GPU, and the Neural Engine.</span>
+<span class="c">        // For an LLM decode you might force .cpuAndGPU instead, since the ANE</span>
+<span class="c">        // helps little on a bandwidth-bound, batch-1 matmul and op-hopping hurts.</span>
+        <span class="v4">config</span>.<span class="m2">computeUnits</span> = .<span class="m2">all</span>
+<span class="c">        // `compiledModelURL` points at a .mlmodelc produced at build or first run.</span>
+        <span class="k">self</span>.<span class="m2">model</span> = <span class="k">try</span> <span class="m1">MLModel</span><span class="b2">(</span><span class="m1">contentsOf</span>: <span class="k">Self</span>.<span class="m2">compiledModelURL</span>, <span class="m1">configuration</span>: <span class="v4">config</span><span class="b2">)</span>
+    <span class="b1">}</span>
+
+    <span class="k">func</span> <span class="m1">predict</span><span class="b1">(</span><span class="m1">features</span>: <span class="v4">MLFeatureProvider</span><span class="b1">)</span> <span class="k">async</span> <span class="k">throws</span> -&gt; <span class="v4">MLFeatureProvider</span> <span class="b1">{</span>
+        <span class="k">try</span> <span class="v0">Task</span>.<span class="m1">checkCancellation</span><span class="b2">()</span>                 <span class="c">// cooperative cancellation</span>
+<span class="c">        // MLModel.prediction is synchronous work; running it inside the actor</span>
+<span class="c">        // keeps it off the main thread and serialized against other calls.</span>
+        <span class="k">return</span> <span class="k">try</span> <span class="v0">model</span>.<span class="m1">prediction</span><span class="b2">(</span><span class="m1">from</span>: <span class="m1">features</span><span class="b2">)</span>
+    <span class="b1">}</span>
+
+    <span class="k">static</span> <span class="k">let</span> <span class="v1">compiledModelURL</span>: <span class="v1">URL</span> = <span class="b1">{</span>
+        <span class="v1">Bundle</span>.<span class="m2">main</span>.<span class="m2">url</span><span class="b2">(</span><span class="m1">forResource</span>: <span class="s">"TextClassifier"</span>, <span class="m1">withExtension</span>: <span class="s">"mlmodelc"</span><span class="b2">)</span>!
+    <span class="b1">}()</span>
+<span class="b0">}</span>
+
+<span class="c">// Calling it from a view model, isolated to the main actor:</span>
+<span class="k">@MainActor</span>
+<span class="k">@Observable</span>
+<span class="k">final</span> <span class="k">class</span> <span class="m1">InferenceViewModel</span> <span class="b0">{</span>
+    <span class="k">var</span> <span class="v4">label</span>: <span class="m1">String</span> = <span class="s">""</span>
+    <span class="k">private</span> <span class="k">let</span> <span class="v3">classifier</span> = <span class="k">try</span>? <span class="m1">Classifier</span><span class="b1">()</span>
+
+    <span class="k">func</span> <span class="m1">classify</span><span class="b1">(</span><span class="m1">_</span> <span class="v2">input</span>: <span class="v4">MLFeatureProvider</span><span class="b1">)</span> <span class="k">async</span> <span class="b1">{</span>
+        <span class="k">guard</span> <span class="k">let</span> <span class="v3">classifier</span> <span class="k">else</span> <span class="b2">{</span> <span class="k">return</span> <span class="b2">}</span>
+        <span class="k">do</span> <span class="b2">{</span>
+            <span class="k">let</span> <span class="v2">out</span> = <span class="k">try</span> <span class="k">await</span> <span class="v3">classifier</span>.<span class="m1">predict</span><span class="b0">(</span><span class="m1">features</span>: <span class="v2">input</span><span class="b0">)</span>  <span class="c">// awaits off-main</span>
+            <span class="v4">label</span> = <span class="v2">out</span>.<span class="m1">featureValue</span><span class="b0">(</span><span class="m1">for</span>: <span class="s">"label"</span><span class="b0">)</span>?.<span class="m2">stringValue</span> ?? <span class="s">""</span> <span class="c">// resumes on main</span>
+        <span class="b2">}</span> <span class="k">catch</span> <span class="k">is</span> <span class="m1">CancellationError</span> <span class="b2">{</span>
+<span class="c">            // view disappeared; nothing to do</span>
+        <span class="b2">}</span> <span class="k">catch</span> <span class="b2">{</span>
+            <span class="v4">label</span> = <span class="s">"error"</span>
+        <span class="b2">}</span>
+    <span class="b1">}</span>
+<span class="b0">}</span></code></pre>
+            <pre data-lang="python" class="shl lang"><code class="language-python"><span class="c"># coremltools: convert a traced PyTorch model to Core ML and palettize the</span>
+<span class="c"># weights to 4-bit so it fits and streams faster on device.</span>
+<span class="k">import</span> <span class="m1">torch</span>
+<span class="k">import</span> <span class="m1">coremltools</span> <span class="k">as</span> <span class="m1">ct</span>
+<span class="k">from</span> <span class="m1">coremltools</span>.<span class="m2">optimize</span>.<span class="m2">coreml</span> <span class="k">import</span> <span class="b0">(</span>
+    <span class="m1">OpPalettizerConfig</span>, <span class="m1">OptimizationConfig</span>, <span class="m1">palettize_weights</span>,
+<span class="b0">)</span>
+
+<span class="c"># 1. Trace the PyTorch model to a graph coremltools can lower.</span>
+<span class="v3">example</span> = <span class="m1">torch</span>.<span class="m2">rand</span><span class="b0">(</span><span class="n">1</span>, <span class="n">3</span>, <span class="n">224</span>, <span class="n">224</span><span class="b0">)</span>                 <span class="c"># (N, C, H, W)</span>
+<span class="v4">traced</span> = <span class="m1">torch</span>.<span class="m2">jit</span>.<span class="m2">trace</span><span class="b0">(</span><span class="v0">model</span>.<span class="m2">eval</span><span class="b1">()</span>, <span class="v3">example</span><span class="b0">)</span>
+
+<span class="c"># 2. Convert to an ML program (.mlpackage), the modern Core ML container.</span>
+<span class="v6">mlmodel</span> = <span class="m1">ct</span>.<span class="m2">convert</span><span class="b0">(</span>
+    <span class="v4">traced</span>,
+    <span class="v0">inputs</span>=<span class="b1">[</span><span class="m1">ct</span>.<span class="m2">TensorType</span><span class="b2">(</span><span class="v2">name</span>=<span class="s">"image"</span>, <span class="v4">shape</span>=<span class="v3">example</span>.<span class="m2">shape</span><span class="b2">)</span><span class="b1">]</span>,
+    <span class="v0">convert_to</span>=<span class="s">"mlprogram"</span>,
+    <span class="v4">compute_precision</span>=<span class="m1">ct</span>.<span class="m2">precision</span>.<span class="m2">FLOAT16</span>,          <span class="c"># FP16 activations</span>
+    <span class="v0">minimum_deployment_target</span>=<span class="m1">ct</span>.<span class="m2">target</span>.<span class="m2">iOS18</span>,
+<span class="b0">)</span>
+
+<span class="c"># 3. Palettize: build a 16-entry lookup table per weight tensor and store each</span>
+<span class="c">#    weight as a 4-bit index (log2(16) = 4 bits). ~4x smaller than FP16 weights.</span>
+<span class="v4">config</span> = <span class="m1">OptimizationConfig</span><span class="b0">(</span>
+    <span class="v3">global_config</span>=<span class="m1">OpPalettizerConfig</span><span class="b1">(</span><span class="v5">mode</span>=<span class="s">"kmeans"</span>, <span class="v3">nbits</span>=<span class="n">4</span><span class="b1">)</span>
+<span class="b0">)</span>
+<span class="v3">compressed</span> = <span class="m1">palettize_weights</span><span class="b0">(</span><span class="v6">mlmodel</span>, <span class="v4">config</span><span class="b0">)</span>
+
+<span class="v3">compressed</span>.<span class="m2">save</span><span class="b0">(</span><span class="s">"TextClassifier.mlpackage"</span><span class="b0">)</span>
+<span class="c"># Xcode compiles the .mlpackage to a .mlmodelc; on device Core ML JIT-compiles</span>
+<span class="c"># that to the specific chip's ANE/GPU/CPU representation at load time.</span></code></pre>
+          </div>
+          <p>
+            The last block shows Swift Testing: a parameterized async test with
+            <code>#expect</code> reporting operand values on failure, and a
+            <code>#require</code> that unwraps or aborts. Note the absence of a
+            failure message; the macro captures the expression.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="swift" class="active">Swift</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="swift" class="shl lang active"><code class="language-swift"><span class="k">import</span> <span class="m1">Testing</span>
+<span class="k">@testable</span> <span class="k">import</span> <span class="m1">NotesApp</span>
+
+<span class="k">@Suite</span> <span class="k">struct</span> <span class="m1">ErrorDescriptionTests</span> <span class="b0">{</span>
+<span class="c">    // Parameterized: runs as three separate cases, one per input.</span>
+    <span class="k">@Test</span><span class="b1">(</span><span class="v0">arguments</span>: <span class="b2">[</span>
+        <span class="b0">(</span><span class="m1">URLError</span><span class="b1">(</span>.<span class="m2">notConnectedToInternet</span><span class="b1">)</span>, <span class="s">"You appear to be offline."</span><span class="b0">)</span>,
+        <span class="b0">(</span><span class="m1">CancellationError</span><span class="b1">()</span>, <span class="s">"Cancelled."</span><span class="b0">)</span>,
+        <span class="b0">(</span><span class="m1">URLError</span><span class="b1">(</span>.<span class="m2">badServerResponse</span><span class="b1">)</span>, <span class="s">"Something went wrong."</span><span class="b0">)</span>,
+    <span class="b2">]</span><span class="b1">)</span>
+    <span class="k">func</span> <span class="m1">describesError</span><span class="b1">(</span><span class="m1">_</span> <span class="v6">error</span>: <span class="m1">Error</span>, <span class="m1">_</span> <span class="v3">expected</span>: <span class="m1">String</span><span class="b1">)</span> <span class="b1">{</span>
+<span class="c">        // On failure this reports the actual string and `expected`, no message.</span>
+        <span class="m1">#expect</span><span class="b2">(</span><span class="v4">NotesViewModel</span>.<span class="m1">describe</span><span class="b0">(</span><span class="v6">error</span><span class="b0">)</span> == <span class="v3">expected</span><span class="b2">)</span>
+    <span class="b1">}</span>
+
+    <span class="k">@Test</span> <span class="k">func</span> <span class="m1">decodesNote</span><span class="b1">()</span> <span class="k">throws</span> <span class="b1">{</span>
+        <span class="k">let</span> <span class="m1">json</span> = <span class="m1">Data</span><span class="b2">(</span><span class="s">#"{"title":"A","body":"B"}"#</span>.<span class="m2">utf8</span><span class="b2">)</span>
+<span class="c">        // #require unwraps or aborts the test with a captured diagnostic.</span>
+        <span class="k">let</span> <span class="v2">note</span> = <span class="k">try</span> <span class="m1">#require</span><span class="b2">(</span><span class="k">try</span>? <span class="m1">JSONDecoder</span><span class="b0">()</span>.<span class="m1">decode</span><span class="b0">(</span><span class="v4">NotePayload</span>.<span class="k">self</span>, <span class="m1">from</span>: <span class="m1">json</span><span class="b0">)</span><span class="b2">)</span>
+        <span class="m1">#expect</span><span class="b2">(</span><span class="v2">note</span>.<span class="m2">title</span> == <span class="s">"A"</span><span class="b2">)</span>
+    <span class="b1">}</span>
+
+    <span class="k">@Test</span> <span class="k">func</span> <span class="m1">cacheReturnsStoredValueWithoutRecomputing</span><span class="b1">()</span> <span class="k">async</span> <span class="b1">{</span>
+        <span class="k">let</span> <span class="v5">cache</span> = <span class="m1">SummaryCache</span><span class="b2">()</span>
+        <span class="k">var</span> <span class="v6">calls</span> = <span class="n">0</span>
+        <span class="k">let</span> <span class="v3">id</span> = <span class="v1">PersistentIdentifier</span>.<span class="m2">mock</span>
+        <span class="m1">_</span> = <span class="k">await</span> <span class="v5">cache</span>.<span class="m2">summary</span><span class="b2">(</span><span class="m1">for</span>: <span class="v3">id</span><span class="b2">)</span> <span class="b2">{</span> <span class="v6">calls</span> += <span class="n">1</span>; <span class="k">return</span> <span class="s">"s"</span> <span class="b2">}</span>
+        <span class="m1">_</span> = <span class="k">await</span> <span class="v5">cache</span>.<span class="m2">summary</span><span class="b2">(</span><span class="m1">for</span>: <span class="v3">id</span><span class="b2">)</span> <span class="b2">{</span> <span class="v6">calls</span> += <span class="n">1</span>; <span class="k">return</span> <span class="s">"s"</span> <span class="b2">}</span>
+        <span class="m1">#expect</span><span class="b2">(</span><span class="v6">calls</span> == <span class="n">1</span><span class="b2">)</span>          <span class="c">// second call hit the cache</span>
+    <span class="b1">}</span>
+<span class="b0">}</span></code></pre>
+          </div>
+
+          <h2>How it is done in practice</h2>
+          <p>
+            A shipped iOS app is not just the code above; it is a signed,
+            provisioned artifact that passes a human and automated review
+            before it reaches users, and the release path has its own
+            engineering surface. Every build is code-signed against a
+            certificate tied to an Apple Developer account, and every install
+            is authorized by a <em>provisioning profile</em> that binds the
+            app's bundle identifier, the signing certificate, the entitlements
+            it requests (push notifications, associated domains, App Groups,
+            and so on), and, for development builds, the specific device UDIDs
+            allowed to run it. Xcode's automatic signing manages most of this,
+            but understanding the pieces matters when a build fails to install
+            with a provisioning error, which is almost always a mismatch
+            between the entitlements in the code and the capabilities enabled
+            on the profile.
+          </p>
+          <p>
+            Distribution goes through App Store Connect. A build uploaded there
+            is first available through <em>TestFlight</em>, Apple's beta
+            channel: internal testers (members of the team) get builds
+            immediately, while external testers (up to 10,000) receive builds
+            only after a lighter-weight beta review. TestFlight is where crash
+            reports and real-device feedback arrive before public release, and
+            builds expire after 90 days, which enforces a cadence. Promotion to
+            the public App Store requires passing App Review against the App
+            Store Review Guidelines, an evaluation that is part automated and
+            part human and that checks for crashes, privacy-policy compliance,
+            correct use of entitlements, the presence of required privacy
+            manifests declaring data collection and any use of certain
+            system APIs, and adherence to the Human Interface Guidelines for
+            things like navigation patterns and accessibility. Rejections are
+            common and specific; the practical skill is reading the resolution
+            center note, mapping it to a guideline number, and resubmitting.
+          </p>
+          <p>
+            On the performance side, the production discipline is measurement
+            in Instruments against real devices, because the simulator runs on
+            Mac silicon with desktop memory bandwidth and cannot reproduce the
+            frame budget or the thermal and memory ceilings of a phone. The
+            Time Profiler attributes main-thread time to symbols; the SwiftUI
+            instrument shows which views were re-evaluated and how often, which
+            is how an over-invalidating <code>@Observable</code> read or a
+            body doing real work is caught; the Animation Hitches instrument
+            reports the hitch time ratio directly; and Core Animation's commit
+            timing shows whether the render server, not the app, is the
+            bottleneck. For on-device ML, the Core ML Instruments template
+            reports per-op timing and which compute unit each op ran on, which
+            is the only reliable way to discover that a model is thrashing
+            between ANE and GPU rather than staying on one.
+          </p>
+
+          <h2>The current research frontier</h2>
+          <p>
+            The most active area as of 2024-2025 is on-device language models,
+            where Apple's own work and the open-source community are pushing in
+            parallel. Apple described a family of on-device and server
+            foundation models in 2024, using low-bit palettization and a
+            mixed 2-to-4-bit weight scheme with per-layer bit allocation to fit
+            a capable model in a phone's memory while holding quality, together
+            with task-specific LoRA adapters swapped in at runtime so one base
+            model serves many features. The community line of work centers on
+            <code>MLX</code> from Apple's machine-learning research group, which
+            has become the default framework for running and fine-tuning
+            transformers on Apple silicon, and on <code>llama.cpp</code>'s
+            Metal backend, which brought aggressive GGUF quantization
+            (2-to-8-bit, k-quants) to Mac and iOS. The competing tension is
+            Core ML and the Neural Engine, which are the most power-efficient
+            path but constrain the operation set, versus MLX and Metal, which
+            are more flexible and give direct GPU control but forgo the ANE's
+            efficiency; which wins depends on whether a model's operations map
+            cleanly onto the ANE.
+          </p>
+          <p>
+            On the framework side, the trajectory since SwiftUI's introduction
+            has been to move guarantees from runtime to compile time. The
+            Observation framework moved invalidation precision from a runtime
+            publisher to macro-generated per-property tracking; Swift 6's
+            strict concurrency moved data-race detection from ThreadSanitizer,
+            a runtime tool that only catches races it happens to observe, to
+            the type checker, which proves their absence for all executions.
+            Region-based isolation (SE-0414) is the notable research result
+            there: it makes the sender/receiver transfer of non-<code>Sendable</code>
+            values sound without whole-program analysis, by a local region
+            inference that is both decidable and permissive enough for
+            idiomatic code. The open question the community is still working
+            through in 2025 is ergonomics: strict concurrency surfaces a large
+            number of diagnostics when migrating existing codebases, and the
+            evolution process has been adding affordances
+            (<code>sending</code> parameters, isolated conformances, default
+            actor isolation for a module) to reduce the annotation burden
+            without weakening the guarantee.
+          </p>
+
+          <h2>Open source to read</h2>
+          <p>
+            These repositories are the primary sources for the material above.
+            Each note says what it is good for and which file rewards a first
+            read.
+          </p>
+          <ul>
+            <li>
+              <a href="https://github.com/apple/swift">apple/swift</a> — the
+              compiler and standard library. The concurrency runtime under
+              <code>stdlib/public/Concurrency</code> is where actors, tasks,
+              and the executor model live; reading the actor and task-group
+              sources demystifies what <code>await</code> compiles to.
+            </li>
+            <li>
+              <a href="https://github.com/apple/swift-syntax">apple/swift-syntax</a>
+              — the macro infrastructure. <code>@Observable</code>,
+              <code>@Model</code>, and <code>#Predicate</code> are all macros;
+              this is the library they are implemented against, and the macro
+              examples show how the expansions in this page are produced.
+            </li>
+            <li>
+              <a href="https://github.com/ml-explore/mlx">ml-explore/mlx</a> —
+              the array framework for Apple silicon. Start with the unified-memory
+              array and the lazy-evaluation graph; it is the clearest small
+              codebase for understanding on-device tensor computation without
+              Core ML's abstraction.
+            </li>
+            <li>
+              <a href="https://github.com/ml-explore/mlx-swift-examples">ml-explore/mlx-swift-examples</a>
+              — runnable Swift examples including LLM and vision-model inference.
+              The LLM generation loop is the concrete answer to "how do I run a
+              language model in a SwiftUI app", token streaming included.
+            </li>
+            <li>
+              <a href="https://github.com/apple/ml-stable-diffusion">apple/ml-stable-diffusion</a>
+              — Stable Diffusion converted to Core ML. The conversion scripts
+              are a real, non-toy example of <code>coremltools</code> lowering
+              a large model and splitting it across compute units.
+            </li>
+            <li>
+              <a href="https://github.com/huggingface/swift-transformers">huggingface/swift-transformers</a>
+              — tokenizers and model utilities in Swift. Read the tokenizer to
+              see the unglamorous but essential preprocessing an on-device LLM
+              needs before the first matmul.
+            </li>
+            <li>
+              <a href="https://github.com/pointfreeco/swift-composable-architecture">pointfreeco/swift-composable-architecture</a>
+              — a widely-used state-management library that formalizes the
+              reducer pattern on top of SwiftUI. Worth reading as the most
+              rigorous community answer to structuring state, effects, and
+              navigation as testable data.
+            </li>
+            <li>
+              <a href="https://github.com/apple/swift-async-algorithms">apple/swift-async-algorithms</a>
+              — <code>AsyncSequence</code> operators (debounce, merge, combine).
+              The <code>debounce</code> and <code>throttle</code> implementations
+              are the canonical examples of structured concurrency applied to
+              streams, directly useful for search-as-you-type UIs.
+            </li>
+          </ul>
+
+          <h2>Common misconceptions</h2>
+          <p>
+            <strong>"A SwiftUI view is expensive to create, so I should avoid
+            rebuilding it."</strong> A view is a value-type description, and
+            constructing one is nearly free; what is expensive is the
+            <em>body evaluation</em> if that body does real work, and the
+            <em>diff</em> if identity is unstable. The optimization target is
+            cheap idempotent bodies and stable identity, not fewer struct
+            allocations.
+          </p>
+          <p>
+            <strong>"<code>@Observable</code> re-renders every view that holds
+            the model."</strong> It re-renders only the views whose last body
+            evaluation actually read the property that changed. A view that
+            holds the model but never reads the changed property is not
+            invalidated; this per-property precision is the entire reason
+            Observation replaced <code>ObservableObject</code>.
+          </p>
+          <p>
+            <strong>"Actors make my code thread-safe, so concurrency bugs are
+            gone."</strong> Actors eliminate data races on the actor's own
+            state, but they release across every <code>await</code>, so
+            invariants that must hold across a suspension are not protected.
+            Reentrancy can violate a logical invariant with no data race and no
+            compiler complaint, as Problem 5 shows.
+          </p>
+          <p>
+            <strong>"Swift 6 strict concurrency guarantees my program is
+            correct."</strong> It guarantees the absence of data races, a
+            memory-safety property. It says nothing about deadlocks (two actors
+            awaiting each other), livelocks, ordering bugs, or the reentrancy
+            hazard; those remain the programmer's responsibility.
+          </p>
+          <p>
+            <strong>"The Neural Engine's high TOPS makes on-device LLMs
+            fast."</strong> Batch-1 autoregressive decoding is
+            memory-bandwidth-bound, not compute-bound: each weight is fetched to
+            be used once, so the accelerator's multipliers sit idle waiting on
+            memory. Tokens per second track model-bytes over memory-bandwidth,
+            and TOPS is nearly irrelevant, which is why model size, not the
+            ANF's arithmetic rating, sets the ceiling.
+          </p>
+          <p>
+            <strong>"<code>GeometryReader</code> is the normal way to size a
+            view."</strong> It is a greedy escape hatch that takes all offered
+            space and reports it back, which distorts layouts when wrapped
+            around small content. The normal mechanism is the
+            parent-proposes/child-chooses negotiation; reach for
+            <code>GeometryReader</code> only when a concrete measurement is
+            genuinely unavoidable.
+          </p>
+          <p>
+            <strong>"An <code>if</code> in a view builder just toggles a
+            view's visibility."</strong> It creates two structurally distinct
+            views with different identities, and crossing the branch tears down
+            one subtree and builds the other, discarding state and focus. To
+            reconfigure a persistent view, put the condition inside a modifier,
+            not around two views.
+          </p>
+          <p>
+            <strong>"SwiftData is just a rename of Core Data."</strong> It is a
+            new Swift-native API (the <code>@Model</code> macro, type-checked
+            <code>#Predicate</code>, the <code>@Query</code> wrapper) built on
+            Core Data's storage engine. The persistence layer is shared and
+            interoperable, but the programming surface, and its compile-time
+            type safety, are genuinely different.
+          </p>
+
+          <h2>Self-check</h2>
+          <div class="quiz" data-quiz>
+            <script type="application/json" class="quiz-data">[
+              {"id": "q1", "qtype": "mcq",
+               "stem": "A view's body must be cheap and idempotent primarily because:",
+               "options": [
+                 "Swift structs cannot contain side effects",
+                 "the framework may call it zero or many times per frame, in any order, so side effects would fire unpredictably",
+                 "the compiler rejects any body longer than a few lines",
+                 "bodies run on a background thread where mutation is unsafe"],
+               "correctIndex": 1,
+               "explanation": "SwiftUI treats body as a pure function of state and may evaluate it any number of times while settling layout, so effects must be pushed into lifecycle hooks."},
+              {"id": "q2", "qtype": "mcq",
+               "stem": "With @Observable, writing one property invalidates:",
+               "options": [
+                 "every view holding the model",
+                 "no views until the next frame",
+                 "only views whose last body evaluation read that specific property",
+                 "only the view that owns the model with @State"],
+               "correctIndex": 2,
+               "explanation": "The Observation framework tracks reads per property via withObservationTracking, so a write notifies exactly the scopes that read that property."},
+              {"id": "q3", "qtype": "truefalse",
+               "stem": "An if/else in a view builder produces two structurally distinct views, so crossing the branch tears down one subtree and builds the other.",
+               "options": ["True", "False"],
+               "correctIndex": 0,
+               "explanation": "The two branches have different structural identities; changing branch is an identity change, which discards state and runs transitions."},
+              {"id": "q4", "qtype": "mcq",
+               "stem": "In SwiftUI layout, the sizing contract is:",
+               "options": [
+                 "the framework solves a global system of constraints",
+                 "the child proposes a size and the parent must accept it",
+                 "the parent proposes a size and the child chooses its own size, then the parent places it",
+                 "every view is sized to the screen and clipped"],
+               "correctIndex": 2,
+               "explanation": "Parent proposes, child chooses, parent places. Each view reasons locally, which keeps layout near-linear."},
+              {"id": "q5", "qtype": "mcq",
+               "stem": "Decoding one token from an LLM on a phone is bounded mainly by:",
+               "options": [
+                 "the Neural Engine's TOPS rating",
+                 "memory bandwidth, since every weight is read once per token",
+                 "the CPU clock speed",
+                 "the display refresh rate"],
+               "correctIndex": 1,
+               "explanation": "Batch-1 decode is memory-bandwidth-bound: tokens/second is roughly model bytes over bandwidth, so TOPS is nearly irrelevant."},
+              {"id": "q6", "qtype": "mcq",
+               "stem": "A 3.2B-parameter model at 4 bits per weight occupies roughly:",
+               "options": ["0.4 GB", "1.5 GB", "6.4 GB", "12.8 GB"],
+               "correctIndex": 1,
+               "explanation": "4 bits = 0.5 bytes/param; 3.2e9 x 0.5 = 1.6e9 bytes, about 1.5 GiB (nearer 1.7-1.8 GB with scale overhead)."},
+              {"id": "q7", "qtype": "truefalse",
+               "stem": "Swift 6's strict concurrency will flag the actor-reentrancy overdraft bug where a balance check and mutation straddle an await.",
+               "options": ["True", "False"],
+               "correctIndex": 1,
+               "explanation": "The checker proves the absence of data races, not preservation of application invariants. Reentrancy across await is a logical bug it does not see."},
+              {"id": "q8", "qtype": "mcq",
+               "stem": "A 120Hz ProMotion display gives the app a per-frame budget of about:",
+               "options": ["33.3 ms", "16.7 ms", "8.3 ms", "4.2 ms"],
+               "correctIndex": 2,
+               "explanation": "1/120 second is about 8.33 ms, half the 16.67 ms of a 60Hz display, which is why work invisible at 60Hz can drop frames at 120Hz."},
+              {"id": "q9", "qtype": "mcq",
+               "stem": "The purpose of region-based isolation (SE-0414) is to:",
+               "options": [
+                 "make every type Sendable automatically",
+                 "allow transferring a non-Sendable value across isolation boundaries when its region is provably not used afterward by the sender",
+                 "remove actors from the language",
+                 "run view bodies on a background thread"],
+               "correctIndex": 1,
+               "explanation": "It tracks disjoint regions of the object graph so 'make here, send there, forget' code compiles without the value being Sendable."},
+              {"id": "q10", "qtype": "mcq",
+               "stem": "SwiftData's relationship to Core Data is best described as:",
+               "options": [
+                 "a completely independent storage engine",
+                 "a new Swift-native API built on Core Data's storage, interoperable with it",
+                 "a wrapper that generates SQL directly",
+                 "an in-memory-only cache with no persistence"],
+               "correctIndex": 1,
+               "explanation": "SwiftData provides the @Model macro and type-checked queries over Core Data's persistence engine, and can interoperate with an existing Core Data stack."},
+              {"id": "q11", "qtype": "ordering",
+               "stem": "Order the App Store release path from earliest to latest.",
+               "options": [
+                 "Code-sign the build against a certificate and provisioning profile",
+                 "Upload to App Store Connect and distribute via TestFlight",
+                 "Pass App Review against the Review Guidelines",
+                 "Release to the public App Store"],
+               "correctIndex": -1,
+               "explanation": "Sign, then TestFlight beta, then App Review, then public release."},
+              {"id": "q12", "qtype": "truefalse",
+               "stem": "GeometryReader is greedy: it takes all the space offered by its parent and reports that size back up.",
+               "options": ["True", "False"],
+               "correctIndex": 0,
+               "explanation": "That greediness is why wrapping small content in a GeometryReader often distorts layout; it is an escape hatch, not the default sizing tool."}
+            ]</script>
+          </div>
+
+          <h2>References</h2>
+          <ol class="refs">
+            <li>Apple, <em>The SwiftUI framework documentation</em>. developer.apple.com/documentation/swiftui (accessed 2025). The authoritative reference for views, state, layout, and navigation.</li>
+            <li>Apple, <em>The Observation framework documentation</em> and "Discover Observation in SwiftUI", WWDC23. developer.apple.com/documentation/observation.</li>
+            <li>Apple, "Meet SwiftUI" and "Data Essentials in SwiftUI", WWDC. The original derivation of views as functions of state and the state ownership model.</li>
+            <li>Apple, <em>The SwiftData documentation</em> and "Meet SwiftData", WWDC23. developer.apple.com/documentation/swiftdata.</li>
+            <li>Apple, <em>The Core ML documentation</em>, developer.apple.com/documentation/coreml, and the Human Interface Guidelines, developer.apple.com/design/human-interface-guidelines.</li>
+            <li>Apple, "Meet Swift Testing" and the <em>Swift Testing documentation</em>, WWDC24. developer.apple.com/documentation/testing.</li>
+            <li>Apple, "Explore Swift performance" / "Demystify SwiftUI performance" and the Instruments Animation Hitches documentation, WWDC. The frame-budget and hitch model.</li>
+            <li>Apple Machine Learning Research, "Introducing Apple's On-Device and Server Foundation Models", 2024. machinelearning.apple.com. Low-bit palettization and runtime LoRA adapters on device.</li>
+            <li>The Swift Programming Language (Swift 6), the Concurrency chapter. docs.swift.org/swift-book. Actors, async/await, Sendable, structured concurrency.</li>
+            <li>Gregorczyk, Grynspan, et al. (Swift Evolution), SE-0395 "Observation", 2023. github.com/apple/swift-evolution.</li>
+            <li>McCall, et al., SE-0414 "Region-based isolation", 2024. github.com/apple/swift-evolution.</li>
+            <li>SE-0302 "Sendable and @Sendable closures", 2021, and SE-0306 "Actors", 2021. github.com/apple/swift-evolution.</li>
+            <li>SE-0401 "Remove actor isolation inference caused by property wrappers", 2023, and SE-0304 "Structured concurrency", 2021. github.com/apple/swift-evolution.</li>
+            <li>Apple, <em>coremltools documentation</em>, including the optimize.coreml palettization and quantization APIs. apple.github.io/coremltools.</li>
+            <li>Apple Machine Learning Research, <em>MLX documentation</em> and the ml-explore/mlx repository, 2023-2025. ml-explore.github.io/mlx.</li>
+            <li>Hudson, P., <em>Hacking with Swift</em> and the "100 Days of SwiftUI" reference. hackingwithswift.com. Widely-used practitioner reference for SwiftUI and Swift concurrency.</li>
+            <li>Kodeco (formerly Ray Wenderlich), <em>SwiftUI by Tutorials</em> and <em>Modern Concurrency in Swift</em>. kodeco.com.</li>
+            <li>Point-Free (Brandon Williams, Stephen Celis), the Composable Architecture and the accompanying essays on SwiftUI state and navigation. pointfree.co and github.com/pointfreeco/swift-composable-architecture.</li>
+            <li>Apple, <em>URLSession</em> and <em>Codable</em> documentation, developer.apple.com/documentation/foundation. The async networking and decoding APIs.</li>
+            <li>Apple, <em>App Store Review Guidelines</em> and <em>TestFlight documentation</em>, developer.apple.com. The provisioning, beta-distribution, and review path.</li>
+            <li>Gerganov, G., et al., <em>llama.cpp</em> and the GGUF k-quant scheme, github.com/ggerganov/llama.cpp, 2023-2025. The community reference for aggressive on-device quantization, including the Metal backend.</li>
+          </ol>
+
+          <div class="takeaway">
+            SwiftUI is the claim that a UI is a pure value-type function of
+            state, made affordable by a diff that touches only what changed;
+            the two questions a practitioner must always be able to answer are
+            "what is this view's identity" and "which properties did its body
+            read", because those determine what survives and what re-renders.
+            The Observation framework narrowed invalidation to the exact
+            property a view reads, and Swift 6 turned data races into compile
+            errors through Sendable and region-based isolation, but neither
+            gives correctness for free: identity mistakes still lose state, and
+            actor reentrancy still breaks invariants across an await with no
+            compiler complaint. The hardware sets hard budgets that arithmetic,
+            not intuition, must respect: 8.3 ms per frame at 120Hz means view
+            bodies must be sub-millisecond, and the memory-bandwidth wall means
+            a phone LLM is capped near 3-4B parameters because decoding streams
+            every weight once per token and the Neural Engine's TOPS cannot
+            outrun memory. Master the identity algorithm, the isolation model,
+            and the memory arithmetic, and the rest of the platform is detail.
+          </div>
+
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>&copy; <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;&middot;&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/classes/math.js"></script>
+    <script defer src="/code-tabs.js"></script>
+    <script defer src="/quiz.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/code-copy.js"></script>
+      <script defer src="/theme.js"></script>
+  </body>
+</html>

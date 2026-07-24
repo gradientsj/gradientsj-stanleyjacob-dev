@@ -24,6 +24,58 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# scipy.optimize (and therefore scipy.stats and sklearn) will not import under
+# this host's NumPy 1.21: a numpy/scipy typing incompatibility raises
+# "'numpy._DTypeMeta' object is not subscriptable". scipy.special imports
+# independently and is fine, so the few distribution functions we need are
+# rebuilt from special functions and the classifier baseline is written in
+# plain torch. Verified against known values.
+from scipy.special import betainc as _betainc, ndtri as _ndtri, gammaln as _gammaln
+
+# Median of the chi-square distribution with one degree of freedom,
+# equal to Phi^{-1}(0.75)^2 = 0.45493642...; the genomic-control lambda divides
+# the median observed chi-square by this.
+_CHI2_1_MEDIAN = float(_ndtri(0.75) ** 2)
+
+
+def t_sf(t, df):
+    """Upper-tail survival function P(T > |t|) of Student's t with df degrees of
+    freedom, via the regularized incomplete beta: P(T>t) = 1/2 I_x(df/2, 1/2)
+    with x = df/(df + t^2). Exact; replaces scipy.stats.t.sf."""
+    t = np.abs(np.asarray(t, dtype=np.float64))
+    x = df / (df + t * t)
+    return 0.5 * _betainc(df / 2.0, 0.5, x)
+
+
+def torch_logreg_auroc(Ftr, ytr, Fte, yte, l2=20.0):
+    """L2-regularized logistic regression fit with LBFGS in torch, returning the
+    test AUROC of its decision function. Replaces sklearn LogisticRegression,
+    which cannot import here. The l2 coefficient is scaled to match sklearn's
+    C=0.05 on n=8000 (per-sample mean loss + l2/n * 1/2 ||w||^2)."""
+    seed_all(99)
+    Xtr = torch.from_numpy(Ftr).to(DEV)
+    Xte = torch.from_numpy(Fte).to(DEV)
+    yt = torch.from_numpy(ytr.astype(np.float32)).to(DEV)
+    n, d = Xtr.shape
+    w = torch.zeros(d, device=DEV, requires_grad=True)
+    b = torch.zeros(1, device=DEV, requires_grad=True)
+    opt = torch.optim.LBFGS([w, b], lr=0.5, max_iter=400,
+                            line_search_fn="strong_wolfe")
+
+    def closure():
+        opt.zero_grad()
+        logit = Xtr @ w + b
+        loss = (F.binary_cross_entropy_with_logits(logit, yt)
+                + (l2 / n) * 0.5 * (w * w).sum())
+        loss.backward()
+        return loss
+
+    opt.step(closure)
+    with torch.no_grad():
+        s = (Xte @ w + b).cpu().numpy()
+    return auroc(yte, s)
+
+
 OUT = pathlib.Path(__file__).resolve().parent / "genomics.json"
 DEV = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 ALPHA = "ACGT"
@@ -382,7 +434,6 @@ def exp_motif_recovery():
     ism_r = float(np.corrcoef(ism_c.ravel(), lo_c.ravel())[0, 1])
 
     # --- k-mer logistic regression baseline (the pre-2015 way)
-    from sklearn.linear_model import LogisticRegression
     K = 6
     def kmer_feats(seqs, K=6):
         n, L = seqs.shape
@@ -397,10 +448,8 @@ def exp_motif_recovery():
     Ftr = kmer_feats(str_[:8000], K)
     Fte = kmer_feats(ste, K)
     t0 = time.time()
-    lr = LogisticRegression(max_iter=300, C=0.05)
-    lr.fit(Ftr, ytr_[:8000])
+    auc_kmer = torch_logreg_auroc(Ftr, ytr_[:8000], Fte, yte_)
     kmer_s = time.time() - t0
-    auc_kmer = auroc(yte_, lr.decision_function(Fte))
 
     return {
         "task": "binary: sequence contains one draw from a planted 8bp PWM",
@@ -809,7 +858,7 @@ def exp_count_models():
     mu_hat = tr.mean(0) + 1e-8
     var_hat = tr.var(0) + 1e-8
 
-    from scipy.special import gammaln
+    gammaln = _gammaln
     def ll_pois(x, m):
         return float(np.mean(x * np.log(m) - m - gammaln(x + 1)))
     def ll_nb(x, m, th):
@@ -857,7 +906,6 @@ def exp_gwas():
     chunk = 50_000
     hits05 = hits_bonf = 0
     minp = 1.0
-    from scipy import stats
     y0 = rng.normal(size=n)
     y0 = (y0 - y0.mean()) / y0.std()
     thr = 0.05 / m
@@ -868,7 +916,7 @@ def exp_gwas():
         sd = G.std(0) + 1e-12
         r = (y0 @ G) / (n * sd)
         t = r * np.sqrt((n - 2) / np.maximum(1 - r ** 2, 1e-12))
-        p = 2 * stats.t.sf(np.abs(t), n - 2)
+        p = 2 * t_sf(t, n - 2)
         hits05 += int((p < 0.05).sum())
         hits_bonf += int((p < thr).sum())
         minp = min(minp, float(p.min()))
@@ -902,9 +950,9 @@ def exp_gwas():
     def scan(resid):
         r = (resid @ Gc) / (n * sd * resid.std())
         t = r * np.sqrt((n - 2) / np.maximum(1 - r ** 2, 1e-12))
-        p = 2 * stats.t.sf(np.abs(t), n - 2)
+        p = 2 * t_sf(t, n - 2)
         chi2 = t ** 2
-        lam = float(np.median(chi2) / stats.chi2.ppf(0.5, 1))
+        lam = float(np.median(chi2) / _CHI2_1_MEDIAN)
         return p, lam
 
     p_raw, lam_raw = scan(y - y.mean())
