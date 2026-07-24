@@ -90,14 +90,24 @@ history.
 | Group | Pages | Done |
 | --- | --- | --- |
 | Machine learning foundations | 5 | 5 (group complete) |
-| Language, generative, multimodal | 11 | 5 |
+| Language, generative, multimodal | 11 | 8 |
 | Reinforcement learning and decisions | 7 | 4 |
-| Systems, architecture, data at scale | 10 | 6 |
-| Algorithms, theory, optimization, security | 7 | 2 |
+| Systems, architecture, data at scale | 10 | 7 |
+| Algorithms, theory, optimization, security | 7 | 4 |
 | Graphics, rendering, 3D | 5 | 0 |
 | Robotics and embodied intelligence | 5 | 0 |
 | Applied domains, product, interfaces | 6 | 0 |
-| **Total** | **56** | **23** |
+| **Total** | **56** | **30** |
+
+Remaining (26): language group — natural-language-understanding,
+speech-and-spoken-language, generative-adversarial-networks; RL group —
+advanced-rl-topics, decision-making-under-uncertainty, general-game-playing;
+systems group — compilers-and-program-analysis, programming-languages,
+computer-security is DONE; algorithms group — advanced-data-structures,
+modern-algorithmic-toolbox; graphics group (5, all todo); robotics group
+(5, all todo); applied-domains group (6, all todo). See classes_data.py for
+slugs. sequence-models-state-spaces is live but leaner than siblings
+(951 lines) — expand if time allows.
 
 Complete and validated: algorithm-design-and-analysis, computer-architecture,
 computer-networks, concurrent-systems-programming, deep-generative-models,
