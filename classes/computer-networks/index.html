@@ -1,0 +1,2202 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Computer Networks &middot; Stanley Jacob</title>
+    <meta name="description" content="From the end-to-end argument and sliding windows to the 1/sqrt(p) TCP throughput law derived from the AIMD sawtooth, CUBIC, BBR, bufferbloat and CoDel, fat-tree fabrics, DCTCP, RDMA and PFC storms, ring allreduce with measured NCCL numbers on two H100s, and QUIC." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes" class="active">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/classes">Classes</a></div>
+        <h1>Computer networks: congestion control, datacenter fabrics, and modern transport</h1>
+        <p class="lead">
+          A network is a distributed system whose participants cannot see each
+          other's state, and everything interesting about it follows from that
+          blindness. This page builds the subject from the layered model and
+          the end-to-end argument up through sliding windows and retransmission
+          timers, derives TCP's \(1/\sqrt{p}\) throughput law from the AIMD
+          sawtooth rather than asserting it, works through CUBIC and BBR,
+          queueing delay and bufferbloat, Clos fabrics and ECMP, DCTCP and the
+          lossless-Ethernet bargain behind RDMA, and the ring-allreduce
+          arithmetic that sets the pace of distributed training, calibrated
+          against measured loopback and NCCL numbers from the two-H100 machine
+          this repository benchmarks on. The goal is to leave a reader able to
+          compute, not recite: bandwidth-delay products, loss rates, queue
+          depths, bisection bandwidths, and collective costs, with real numbers
+          at every step.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Why this subject matters now</h2>
+          <p>
+            For most of its history, networking was a subject practitioners
+            could treat as infrastructure: TCP was tuned for the wide-area
+            Internet, the wide-area Internet changed slowly, and the interesting
+            engineering happened above the socket. Three shifts ended that
+            comfort. First, the datacenter became the dominant network
+            environment, and it inverted every assumption the classical
+            transport stack was built on: round-trip times of tens of
+            microseconds instead of tens of milliseconds, loss caused by
+            switch-buffer overflow in microbursts rather than by congested
+            long-haul links, topologies with thousands of equal-cost paths
+            instead of one, and applications (storage disaggregation, RPC
+            fanout, distributed training) that are sensitive to the tail of the
+            latency distribution rather than its mean. A congestion controller
+            that needs a packet loss to learn anything, on a path where a loss
+            costs a retransmission timeout longer than the entire request, is
+            the wrong tool, and the field responded with ECN-based control
+            (DCTCP), rate-based control (BBR, DCQCN), and hardware transport
+            (RDMA over lossless Ethernet), each with its own failure modes that
+            an engineer is now expected to understand.
+          </p>
+          <p>
+            Second, the transport layer itself became a competitive, evolving
+            artifact again. QUIC moved reliability, congestion control, and
+            encryption into userspace over UDP, was deployed to billions of
+            users by 2017, and was standardized as RFC 9000 in 2021; a third of
+            web traffic now runs on a transport that did not exist fifteen
+            years ago. Third, machine learning made the network a first-order
+            term in the cost of computation. When a training step must
+            allreduce gradients across thousands of accelerators
+            between optimizer updates, the difference between a ring schedule
+            and a naive gather-broadcast, or between an oversubscribed and a
+            full-bisection fabric, shows up directly as idle GPU seconds, and
+            GPU seconds are the most expensive commodity in the building. The
+            arithmetic on this page, bandwidth-delay products, \(2(N-1)/N\)
+            collective costs, bisection counts for a \(k\)-ary fat tree, is
+            the arithmetic that decides whether a cluster design is sound
+            before anyone racks a switch.
+          </p>
+
+          <h2>Layering and the end-to-end argument</h2>
+          <h3>What layering actually buys</h3>
+          <p>
+            The layered model is best understood not as a taxonomy but as a
+            contract structure. Each layer offers a service to the layer above
+            and makes demands of the layer below, and the value of the
+            arrangement is that the parties can change independently: Ethernet
+            became 40 years faster without TCP noticing, and TCP's congestion
+            control was replaced several times without applications noticing.
+            The working set of layers in practice is five: the physical layer
+            moves bits over a medium; the link layer moves frames between
+            directly connected interfaces and handles medium access; the
+            network layer (IP) moves datagrams end to end with no promises,
+            best-effort delivery, possibly reordered, duplicated, or dropped;
+            the transport layer turns that raw datagram service into something
+            applications can use, either a reliable ordered byte stream (TCP)
+            or tagged datagrams (UDP); and the application layer is everything
+            above the socket. The thin waist of the hourglass is IP: a single,
+            minimal, universal interconnection layer, with diversity above it
+            and below it. The design bet, made in the 1970s and still paying
+            out, is that the network core should be as dumb as possible and
+            the intelligence should live at the edges.
+          </p>
+          <pre class="flow">application   HTTP/3, RPC, NCCL, SSH          (edges only)
+transport     TCP, UDP, QUIC                  (edges only)
+   ─────────────── the thin waist ───────────────
+network       IP: best-effort datagrams       (every router)
+link          Ethernet, InfiniBand, WiFi      (per hop)
+physical      SerDes, DSP, optics, radio      (per hop)</pre>
+          <h3>The end-to-end argument</h3>
+          <p>
+            The classic justification for that bet is the end-to-end argument
+            of Saltzer, Reed, and Clark (1984). Stated carefully: a function
+            (reliability, ordering, deduplication, security) can be completely
+            and correctly implemented only with the knowledge and help of the
+            application standing at the endpoints; therefore, implementing it
+            inside the network can at best be an optimization, never a
+            replacement for the endpoint implementation, and it should be
+            pushed into the network only when the performance win justifies
+            the cost every other user of the network pays for it. The file
+            transfer example from the paper makes it concrete. Suppose every
+            link performs hop-by-hop error detection and retransmission, so
+            packets are never corrupted in flight. The transfer can still fail:
+            the file can be corrupted reading from the source disk, in the
+            sender's buffer, in a router's memory between two perfectly
+            reliable links, or writing to the destination disk. A careful
+            application must therefore verify an end-to-end checksum and be
+            prepared to retry the whole transfer regardless of what the links
+            do, and once it does, the hop-by-hop machinery is redundant for
+            correctness. It may still be worth having, on a link with a high
+            error rate, as a performance optimization: that is exactly the
+            status of link-layer retransmission in WiFi.
+          </p>
+          <p>
+            The argument is the single most reused piece of reasoning in
+            systems design, and both of its edges matter. It explains why TCP
+            checksums, sequence numbers, and retransmission live in end hosts
+            and why the Internet core keeps no per-connection state. It also
+            explains, run in reverse, most of the datacenter material later on
+            this page: when the performance cost of endpoint-only
+            implementation became intolerable (software TCP burning CPU at
+            100 Gb/s), the industry moved reliability into NIC hardware (RDMA)
+            and paid the predicted price, a network that now must carry
+            correctness-critical state (lossless flow control) in its core,
+            with failure modes (PFC storms, deadlocks) exactly of the kind the
+            1984 paper warned about.
+          </p>
+
+          <h2>Reliable delivery and sliding windows</h2>
+          <h3>Stop-and-wait, and why it fails</h3>
+          <p>
+            The primitive problem: deliver a byte stream, in order, exactly
+            once, over a channel that drops, reorders, duplicates, and delays.
+            Every solution is built from three parts: sequence numbers to name
+            data, acknowledgments to report receipt, and timers to recover
+            from silence. The simplest protocol, stop-and-wait, sends one
+            packet and waits for its ACK before sending the next. Its
+            throughput is bounded by one packet per round trip,
+            \( \text{rate} \le S/\text{RTT} \) for packet size \(S\), which is
+            catastrophic on any modern path: 1500 bytes per 70 ms
+            transcontinental round trip is 171 kb/s regardless of link speed.
+            The fix is pipelining: keep a window of \(W\) packets in flight
+            simultaneously, so the rate becomes
+          </p>
+          $$ \text{rate} \;=\; \frac{W \cdot S}{\text{RTT}} \quad\text{until it saturates the bottleneck bandwidth } B. $$
+          <p>
+            Setting the two equal gives the most important number in transport
+            engineering, the bandwidth-delay product: the window needed to
+            fill a path is \(W \cdot S = B \times \text{RTT}\), the number of
+            bytes that fit in the pipe. Everything about window sizing,
+            buffer sizing, and congestion control is a negotiation about who
+            gets to fill how much of the BDP.
+          </p>
+          <div class="tbl-wrap"><table class="data">
+            <thead><tr><th>Path</th><th>Bandwidth</th><th>RTT</th><th>BDP</th><th>BDP in 1500 B packets</th></tr></thead>
+            <tbody>
+              <tr><td>Intra-rack datacenter</td><td>100 Gb/s</td><td>10 &mu;s</td><td>125 kB</td><td>83.3</td></tr>
+              <tr><td>Cross-datacenter fabric</td><td>100 Gb/s</td><td>100 &mu;s</td><td>1.25 MB</td><td>833.3</td></tr>
+              <tr><td>Metro WAN</td><td>10 Gb/s</td><td>5 ms</td><td>6.25 MB</td><td>4,166.7</td></tr>
+              <tr><td>Transcontinental</td><td>10 Gb/s</td><td>70 ms</td><td>87.5 MB</td><td>58,333.3</td></tr>
+              <tr><td>Transatlantic</td><td>1 Gb/s</td><td>90 ms</td><td>11.25 MB</td><td>7,500</td></tr>
+              <tr><td>GEO satellite</td><td>100 Mb/s</td><td>600 ms</td><td>7.5 MB</td><td>5,000</td></tr>
+            </tbody>
+          </table></div>
+          <p>
+            The table (computed for this page, arithmetic verifiable by hand:
+            \(100\times 10^9 \,\text{b/s} \times 10^{-5}\,\text{s} / 8 =
+            125{,}000\) bytes) shows why no single window default can be
+            right: the datacenter path needs 83 packets in flight, the
+            transcontinental path needs 58,333. It also shows why TCP's
+            original 16-bit window field (max 65,535 bytes) became a hard
+            ceiling, and why RFC 7323 window scaling, which left-shifts the
+            advertised window by up to 14 bits for a maximum of 1 GiB, is
+            mandatory on every fast path today.
+          </p>
+          <h3>Sliding-window mechanics</h3>
+          <p>
+            The sender maintains two pointers into the byte stream: the oldest
+            unacknowledged byte and the next byte to send; their difference is
+            bounded by the window \(W = \min(\text{cwnd}, \text{rwnd})\), the
+            lesser of the congestion window (the sender's estimate of what the
+            network can absorb, the subject of the next section) and the
+            receive window (what the receiver's buffer can absorb). The
+            receiver acknowledges cumulatively: an ACK for sequence number
+            \(x\) means every byte before \(x\) has arrived. Cumulative ACKs
+            are robust (any ACK loss is repaired by the next ACK) but
+            information-poor: a single hole blocks the ACK number from
+            advancing even as later data arrives. Selective acknowledgment
+            (SACK, RFC 2018) fixes this by letting the receiver report up to
+            three received blocks beyond the hole, so the sender can
+            retransmit exactly what is missing rather than guessing.
+            Go-Back-N, the textbook alternative that retransmits everything
+            from the hole forward, wastes a full window of transmission on a
+            single loss; with the transcontinental window above, one lost
+            packet would trigger 87.5 MB of redundant retransmission.
+          </p>
+          <h3>The retransmission timer: Jacobson-Karels estimation</h3>
+          <p>
+            Timers back up everything else, and the retransmission timeout
+            (RTO) must be computed, not configured: too short and spurious
+            retransmissions waste bandwidth and confuse loss-based congestion
+            control; too long and every genuine loss stalls the connection.
+            The 1988 solution, due to Jacobson with Karels, is two coupled
+            exponentially weighted moving averages over RTT samples \(m\):
+            a smoothed RTT and a smoothed mean deviation,
+          </p>
+          $$ \text{SRTT} \leftarrow (1-\tfrac{1}{8})\,\text{SRTT} + \tfrac{1}{8}\, m, \qquad
+             \text{RTTVAR} \leftarrow (1-\tfrac{1}{4})\,\text{RTTVAR} + \tfrac{1}{4}\, \lvert \text{SRTT} - m \rvert, $$
+          $$ \text{RTO} = \text{SRTT} + 4\,\text{RTTVAR}. $$
+          <p>
+            The deviation term is the insight: an RTO set at a multiple of the
+            mean (the pre-1988 practice, \(2\times\text{SRTT}\)) fires
+            constantly on paths with high RTT variance, which congested paths
+            are by definition. Scaling the margin by measured variance makes
+            the timer adapt to exactly the paths that need slack. The gains
+            \(1/8\) and \(1/4\) are powers of two so the update is two shifts
+            and two adds, a 1988 constraint that survives unchanged in every
+            modern stack. A worked trace, computed for this page with
+            \(\text{RTTVAR}\) initialized to \(m/2\): feed the estimator a
+            steady 100 ms RTT and the RTO converges downward through 300,
+            250, 212.5, 184.4, 163.3 ms; then a single 300 ms outlier sample
+            jolts SRTT only to 125 ms but RTTVAR to 61.9 ms, snapping the RTO
+            up to 372.5 ms in one step, after which it decays again through
+            332.5, 299.0, 270.8 ms as calm returns. The estimator is
+            deliberately asymmetric in effect: one bad sample buys a large
+            safety margin immediately, and confidence is rebuilt slowly. Karn's
+            algorithm supplies the last necessary rule: never take an RTT
+            sample from a retransmitted segment (the ACK is ambiguous), and
+            double the RTO on each successive timeout (exponential backoff) so
+            a dead path costs exponentially decreasing traffic.
+          </p>
+          <h3>What a round trip costs on a real host</h3>
+          <p>
+            It is worth grounding "RTT" in measured numbers before building
+            theory on it. The benchmarks in this repository were run on this
+            machine, a 52-CPU Xeon Platinum 8480+ host with two H100s, and the
+            caveats recorded with the data apply: it is a shared,
+            multi-tenant, virtualized host, so every syscall and scheduler
+            wakeup pays virtualization overhead, and no second host is
+            reachable, so all socket measurements are loopback. Treat them as
+            this machine's numbers, not the best achievable. A null syscall
+            costs 140.8 ns. A 64-byte TCP ping-pong over loopback, 200,000
+            iterations, measures a mean RTT of 24,596 ns with p50 24,405 ns,
+            p99 32,153 ns, and p99.9 37,138 ns; pinning sender and echo
+            threads to distinct cores with TCP_NODELAY brings the p50 to
+            23,380 ns with a minimum of 13,922 ns. The same ping-pong over a
+            Unix domain socket takes 15,788 ns, cheaper because it skips the
+            TCP/IP stack entirely. So a "zero-distance" RTT through two
+            sockets is roughly 15 to 25 microseconds on this host, hundreds
+            of syscall times: the cost is wakeups and stack traversals, not
+            wires. Real datacenter RTTs of 10 to 50 &mu;s are therefore
+            dominated by end-host software, which is the entire motivation for
+            kernel-bypass transports later on this page.
+          </p>
+          <p>
+            Throughput has the same syscall-dominated structure. Streaming
+            over loopback TCP on this machine with 64-byte writes achieves
+            1.07 Gb/s at 477 ns per write call; 1024-byte writes reach
+            9.55 Gb/s; 64 KiB writes reach 31.77 Gb/s; and 1 MiB writes reach
+            48.73 Gb/s at 172.1 &mu;s per call. The per-call cost grows far
+            more slowly than the payload, so amortizing the syscall over big
+            writes is worth 45x in throughput. A Unix socket shows the same
+            shape more sharply: 0.51 Gb/s at 64-byte writes, 55.49 Gb/s at
+            64 KiB. Every high-performance networking design, from
+            <code>writev</code> and <code>sendfile</code> through io_uring to
+            DPDK, is a variation on this one measured fact: the boundary
+            crossing costs more than the copy.
+          </p>
+
+          <div class="problem">
+            <span class="plabel">Problem 1</span>
+            <p>
+              A bulk transfer runs over a transcontinental path: 10 Gb/s
+              bottleneck, 70 ms RTT, 1500-byte packets. (a) What window, in
+              bytes and in packets, is needed to saturate the path? (b) Can
+              an unscaled TCP window (16-bit field) achieve it, and what
+              window-scale shift is required? (c) What throughput does a
+              64 KiB window actually deliver? (d) If the receiver instead
+              uses Go-Back-N and one packet in the middle of a full window is
+              lost, how many bytes are retransmitted, versus with SACK?
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> (a) The BDP is
+                \(10^{10} \,\text{b/s} \times 0.07\,\text{s} = 7\times 10^{8}\)
+                bits \(= 87.5\) MB, which is \(87{,}500{,}000 / 1500 =
+                58{,}333\) packets. Any smaller window leaves the pipe partly
+                empty.
+              </p>
+              <p>
+                (b) No: the unscaled maximum is 65,535 bytes, short of the
+                requirement by a factor of \(87{,}500{,}000/65{,}535 \approx
+                1335\). The scale factor must satisfy \(65{,}535 \times 2^{s}
+                \ge 87{,}500{,}000\), so \(2^s \ge 1335.2\) and \(s = 11\)
+                (giving 134.2 MB); the protocol maximum \(s=14\) also works.
+              </p>
+              <p>
+                (c) Throughput is window per RTT:
+                \(65{,}535 \times 8 / 0.07 = 7.49\) Mb/s, under 0.1 percent
+                of the link. This is the classic long-fat-network failure:
+                the link is idle 99.9 percent of the time while the sender
+                waits for ACKs.
+              </p>
+              <p>
+                (d) Go-Back-N retransmits from the loss forward: on average
+                half a window, here \(87.5/2 \approx 43.75\) MB, and in the
+                worst case (loss at the window's front) nearly the whole
+                87.5 MB. SACK retransmits the single 1500-byte packet, a
+                ratio of about 29,000x. At datacenter scale the same
+                arithmetic is why every serious transport, including QUIC and
+                NVMe-oF, carries selective acknowledgment information.
+              </p>
+            </div>
+          </div>
+
+          <h2>Congestion control: from collapse to the sawtooth</h2>
+          <h3>Why the network needs it at all</h3>
+          <p>
+            Flow control (the receive window) protects the receiver; nothing
+            so far protects the network. In 1986 the NSFnet backbone
+            demonstrated what happens without that protection: congestion
+            collapse, throughput between Lawrence Berkeley Lab and UC Berkeley
+            dropping from 32 kb/s to 40 b/s, a factor of a thousand, as
+            documented in Jacobson's 1988 paper. The mechanism is
+            self-reinforcing: queues fill, RTTs grow, naive timers expire,
+            senders retransmit data that is still in flight, the duplicates
+            deepen the queues, and eventually the network carries almost
+            nothing but retransmissions of retransmissions. The cure has to be
+            distributed: each sender must infer, from the only signals it can
+            see (ACK timing, loss, and later ECN marks), how much traffic the
+            path can carry, and the collective result of every sender's
+            private rule must converge to a state that is efficient (the
+            bottleneck stays busy) and fair (competing flows get comparable
+            shares). That is a distributed control problem, and it deserves
+            the control-theoretic treatment the next subsection gives it.
+          </p>
+          <h3>Why AIMD, and not the alternatives: the Chiu-Jain analysis</h3>
+          <p>
+            Model two flows sharing one bottleneck of capacity \(C\), with
+            rates \(x\) and \(y\). Once per round trip, each flow receives the
+            same one-bit feedback: the sum \(x+y\) is over or under \(C\). A
+            linear control rule has the form: on "under", set
+            \(x \leftarrow a_I + b_I x\); on "over", set
+            \(x \leftarrow a_D + b_D x\). Chiu and Jain (1989) asked which
+            choices of the four constants converge to the fair, efficient
+            point \(x = y = C/2\), and the answer is visible in the geometry
+            of the \((x,y)\) plane. Additive changes (\(a \ne 0\),
+            \(b = 1\)) move the state along the 45-degree line, preserving the
+            difference \(x - y\). Multiplicative changes (\(a = 0\),
+            \(b \ne 1\)) move it along the ray through the origin, preserving
+            the ratio \(x/y\). To converge to fairness, the difference must
+            shrink; only the decrease step can shrink it while also reducing
+            total load, and it does so only if the decrease is
+            multiplicative: halving both rates halves their difference, while
+            subtracting a constant from both leaves it intact. Symmetrically,
+            the increase must be additive: multiplying both rates by a
+            constant preserves their ratio and never improves fairness.
+            Additive increase, multiplicative decrease is not one reasonable
+            choice among several; within linear rules with binary feedback it
+            is the only combination that converges to fair efficiency.
+          </p>
+          <p>
+            The numeric trace computed for this page makes the convergence
+            concrete. Two AIMD flows with \(\alpha = 1\), \(\beta = 1/2\)
+            start at the unfair allocation \((40, 5)\) on a link of capacity
+            100. Their difference is 35 and stays exactly 35 through every
+            additive-increase round (both grow to \((41,6), (42,7), \dots\)),
+            then halves to 17.5 at the first multiplicative decrease, then to
+            8.75, and after ten decrease events sits at 0.547: the difference
+            trace 35, 35, 17.5, 8.75, 8.75, 4.375, 2.1875, 1.09375, 0.546875
+            is a pure geometric decay clocked by loss events. Jain's fairness
+            index \( J = (x+y)^2 / (2(x^2+y^2)) \) climbs 0.623, 0.855,
+            0.945, 0.979, 0.992, 0.998, 0.9996, converging to 0.999988. Run
+            the wrong rules on the same start and the geometry's verdict is
+            confirmed: multiplicative-increase/multiplicative-decrease ends at
+            \((77.3, 9.7)\), the initial 8:1 ratio frozen forever, and
+            additive-increase/additive-decrease ends at \((68, 33)\), the
+            initial difference frozen forever.
+          </p>
+          <pre class="flow">   y (flow 2 rate)
+   │        efficiency line x+y=C
+   │       ╲
+   │  fair  ╲          AIMD trajectory:
+   │  line   ╲         additive ↗ along 45°  (difference constant)
+   │   x=y ╲  ╲        multiplicative ↙ toward origin (ratio constant)
+   │        ╲  ╲       net drift → toward the fair point x=y=C/2
+   │      ↗ ╲↙ ╲
+   │    ↗    ╳  ╲
+   │  ↗    ╱  ╲  ╲
+   └─────────────────── x (flow 1 rate)</pre>
+          <h3>Slow start, congestion avoidance, and Reno</h3>
+          <p>
+            Jacobson's 1988 implementation turned the AIMD principle into the
+            machinery that still structures every TCP. The congestion window
+            cwnd starts at a few segments and must find a path's capacity,
+            which may be anywhere across five orders of magnitude; additive
+            increase alone would take hours to open 58,000 segments. Slow
+            start solves the search problem: cwnd grows by one segment per
+            ACK, doubling per RTT, an exponential probe that overshoots the
+            capacity by at most 2x and finds it in \(\log_2\) time. The
+            self-clocking observation makes this safe: ACKs return at the rate
+            the bottleneck forwards data, so a sender that transmits only on
+            ACK arrival automatically paces itself to the bottleneck rate.
+            Once cwnd crosses the threshold ssthresh (set to half the window
+            that last overflowed), growth switches to congestion avoidance,
+            the additive regime: one segment per RTT (implemented as
+            \(\text{cwnd} \mathrel{+}= 1/\text{cwnd}\) per ACK). On loss
+            detected by three duplicate ACKs, Reno performs fast retransmit
+            (resend the missing segment immediately, no timeout) and fast
+            recovery: halve cwnd and continue in avoidance, the multiplicative
+            decrease. Only a retransmission timeout, meaning the ACK clock
+            itself died, resets cwnd to 1 and re-enters slow start. The
+            steady state of a long Reno flow is therefore a sawtooth: climb
+            linearly from \(W/2\) to \(W\), lose one packet, halve, repeat.
+          </p>
+          <h3>Deriving the \(1/\sqrt{p}\) law from the sawtooth</h3>
+          <p>
+            The sawtooth's geometry fixes the relationship between loss rate
+            and throughput, and it is worth deriving carefully because the
+            result governs everything from CDN tuning to why CUBIC exists.
+            Assume a long-lived flow in steady state with segment size
+            \(S\) (MSS), round-trip time \(R\), and a network that drops
+            exactly one packet each time the window reaches its peak \(W\);
+            let \(p\) be the resulting per-packet loss probability. One
+            sawtooth cycle runs from window \(W/2\) (just after a halving) to
+            window \(W\) (the next loss). Additive increase adds one segment
+            per RTT, so the climb takes \(W/2\) round trips, and the cycle
+            duration is
+          </p>
+          $$ T_{\text{cycle}} = \frac{W}{2}\, R . $$
+          <p>
+            The number of packets delivered in one cycle is the area under
+            the sawtooth: the window averages \(\tfrac{1}{2}(W/2 + W) =
+            \tfrac{3}{4}W\) over the cycle, one window's worth per RTT, so
+          </p>
+          $$ N_{\text{cycle}} \;=\; \underbrace{\tfrac{3}{4}W}_{\text{mean window}} \times \underbrace{\tfrac{W}{2}}_{\text{RTTs}} \;=\; \frac{3W^2}{8}. $$
+          <p>
+            Exactly one packet is lost per cycle, so the loss probability is
+            the reciprocal:
+          </p>
+          $$ p = \frac{1}{N_{\text{cycle}}} = \frac{8}{3W^2}
+             \quad\Longrightarrow\quad
+             W = \sqrt{\frac{8}{3p}}. $$
+          <p>
+            Throughput is packets per cycle over cycle time (equivalently,
+            mean window over RTT):
+          </p>
+          $$ B \;=\; \frac{N_{\text{cycle}}\, S}{T_{\text{cycle}}}
+               \;=\; \frac{\tfrac{3}{8}W^2 S}{\tfrac{W}{2}R}
+               \;=\; \frac{3W}{4}\cdot\frac{S}{R}
+               \;=\; \frac{3S}{4R}\sqrt{\frac{8}{3p}}
+               \;=\; \frac{S}{R}\sqrt{\frac{3}{2p}}
+               \;\approx\; \frac{1.2247\, S}{R\sqrt{p}} . $$
+          <p>
+            This is the Mathis-Semke-Mahdavi-Ott equation (1997). Padhye,
+            Firoiu, Towsley, and Kurose (1998) extended it to include delayed
+            ACKs (\(b\) packets per ACK, stretching the climb) and, crucially,
+            retransmission timeouts, giving the full model
+            \( B \approx S \big/ \big( R\sqrt{2bp/3} + T_0 \min(1,
+            3\sqrt{3bp/8})\, p (1+32p^2) \big) \), which matches real traces
+            even at loss rates above a few percent where timeouts dominate.
+            But the scaling content is already in the square root: throughput
+            degrades as \(1/\sqrt{p}\), not \(1/p\), because a loss costs
+            only half the window and the window itself shrinks as losses grow;
+            and throughput is inversely proportional to RTT, which means AIMD
+            is systematically unfair to long paths sharing a bottleneck with
+            short ones, a bias that datacenter incast and CDN placement both
+            exploit and suffer from.
+          </p>
+          <p>
+            A packet-level simulation run for this page checks the formula's
+            accuracy. Each row simulates a Reno sawtooth with random per-packet
+            loss at rate \(p\), MSS 1460 bytes, RTT 50 ms, and compares
+            delivered throughput to the Mathis prediction:
+          </p>
+          <div class="tbl-wrap"><table class="data">
+            <thead><tr><th>Loss rate \(p\)</th><th>Simulated (Mb/s)</th><th>Mathis \(\frac{S}{R}\sqrt{3/2p}\) (Mb/s)</th><th>Mean peak cwnd (segments)</th></tr></thead>
+            <tbody>
+              <tr><td>10<sup>-2</sup></td><td>2.596</td><td>2.861</td><td>16.0</td></tr>
+              <tr><td>10<sup>-3</sup></td><td>8.819</td><td>9.047</td><td>50.9</td></tr>
+              <tr><td>10<sup>-4</sup></td><td>28.406</td><td>28.61</td><td>162.4</td></tr>
+              <tr><td>10<sup>-5</sup></td><td>90.113</td><td>90.473</td><td>516.0</td></tr>
+              <tr><td>10<sup>-6</sup></td><td>285.028</td><td>286.1</td><td>1,632.0</td></tr>
+              <tr><td>10<sup>-7</sup></td><td>894.213</td><td>904.729</td><td>5,163.5</td></tr>
+            </tbody>
+          </table></div>
+          <p>
+            The agreement is within about 1 percent at low loss and 9 percent
+            at \(p = 10^{-2}\), where the neglected timeout term begins to
+            matter; each decade of loss buys the predicted
+            \(\sqrt{10} \approx 3.16\)x of throughput. The peak-window column
+            confirms the derivation's other prediction,
+            \(W = \sqrt{8/(3p)}\): at \(p = 10^{-4}\) the formula gives 163.3
+            against the simulated 162.4.
+          </p>
+
+          <div class="problem">
+            <span class="plabel">Problem 2</span>
+            <p>
+              A flow needs to sustain 10 Gb/s over a 100 ms RTT path with
+              MSS 1460 bytes using Reno. (a) What congestion window, in
+              segments, does this require? (b) What per-packet loss rate does
+              the Mathis equation permit? (c) How many packets, and how much
+              wall-clock time, pass between allowed losses? (d) What does the
+              answer imply about Reno on long fat networks?
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> (a) The window must cover the BDP:
+                \(W = B\cdot R / (S \cdot 8) = 10^{10} \times 0.1 / (1460
+                \times 8) = 10^9 / 11{,}680 = 85{,}616\) segments.
+              </p>
+              <p>
+                (b) Invert Mathis: from \(B = \frac{S}{R}\sqrt{3/(2p)}\), the
+                required loss rate is \(p = \frac{3}{2}\left(\frac{S}{R\,B}\right)^2
+                = 1.5/W^2 = 1.5 / 85{,}616^2 = 1.5/7.33\times 10^9 =
+                2.05\times 10^{-10}\). At 1 Gb/s the same arithmetic gives
+                \(2.05\times 10^{-8}\).
+              </p>
+              <p>
+                (c) The flow sends \(B/(8S) = 10^{10}/11{,}680 = 856{,}164\)
+                packets per second, so losses must be at least \(1/p =
+                4.89\times 10^{9}\) packets apart, which is \(4.89\times
+                10^9 / 856{,}164 \approx 5{,}708\) seconds, about 95 minutes
+                between losses. Equivalently: one bit error in roughly
+                \(5.9\times 10^{13}\) bits, cleaner than the underlying
+                fiber's specified error rate in many deployments.
+              </p>
+              <p>
+                (d) The requirement is physically unreasonable: no real path
+                delivers 95 loss-free minutes on demand, and a single loss
+                costs Reno \(W/2 = 42{,}808\) additive-increase round trips,
+                \(42{,}808 \times 0.1 \approx 4{,}281\) seconds, to recover
+                the window. Reno cannot fill long fat pipes; this exact
+                arithmetic is the design brief for CUBIC and BBR below.
+              </p>
+            </div>
+          </div>
+
+          <h2>CUBIC and BBR: the two modern answers</h2>
+          <h3>CUBIC: decouple growth from RTT</h3>
+          <p>
+            CUBIC (Ha, Rhee, and Xu, 2008), the Linux default since 2.6.19
+            and still the majority congestion controller on the Internet,
+            keeps loss as the congestion signal but replaces the
+            one-segment-per-RTT climb with a cubic function of wall-clock
+            time since the last loss. With \(W_{max}\) the window at the last
+            loss event and \(\beta = 0.7\) the multiplicative-decrease factor
+            (gentler than Reno's 0.5), the window \(t\) seconds after the
+            loss is
+          </p>
+          $$ W(t) = C\,(t - K)^3 + W_{max}, \qquad
+             K = \sqrt[3]{\frac{W_{max}(1-\beta)}{C}}, \qquad C = 0.4 . $$
+          <p>
+            The constant \(K\) is chosen so that \(W(0) = \beta W_{max}\):
+            substituting \(t=0\) gives \(W(0) = W_{max} - CK^3 = W_{max} -
+            W_{max}(1-\beta) = \beta W_{max}\), as required. The shape is the
+            point. Growth is fast when far below \(W_{max}\) (the cubic's
+            steep left arm), flattens to a plateau precisely at the old
+            \(W_{max}\) (cautious probing near the level that last caused
+            loss), then accelerates again if no loss occurs (the right arm,
+            probing for newly freed capacity). Because \(W(t)\) depends on
+            elapsed time and not on ACK count, two CUBIC flows with different
+            RTTs sharing a bottleneck grow at the same rate, removing most of
+            Reno's RTT bias; a TCP-friendly region makes CUBIC fall back to
+            Reno-equivalent behavior where Reno would be faster (short RTT,
+            small windows).
+          </p>
+          <p>
+            The recovery arithmetic from Problem 2 shows the win. After a
+            loss at \(W_{max} = 85{,}616\) segments (the 10 Gb/s, 100 ms
+            operating point), CUBIC returns to \(W_{max}\) at \(t = K =
+            \sqrt[3]{85{,}616 \times 0.3 / 0.4} = \sqrt[3]{64{,}212} =
+            40.04\) seconds, independent of RTT. Reno needs \(W_{max}/2 =
+            42{,}808\) round trips, 4,280.8 seconds at 100 ms: CUBIC recovers
+            106.9x faster, and the gap widens with bandwidth.
+          </p>
+          <h3>BBR: replace the signal, not the schedule</h3>
+          <p>
+            BBR (Cardwell, Cheng, Gunn, Yeganeh, and Jacobson, 2016, from
+            Google) rejects the premise both Reno and CUBIC share: that loss,
+            or any queue-overflow event, is the right congestion signal. On a
+            path with bottleneck bandwidth \(BtlBw\) and minimum round trip
+            \(RTprop\), the optimal operating point, identified by Kleinrock
+            in 1979, keeps exactly one BDP in flight: delivery rate
+            \(BtlBw\), RTT \(RTprop\), queue empty. Loss-based control
+            instead pushes inflight data up to BDP plus the bottleneck buffer,
+            operating at the point where the queue is full: with the deep
+            buffers of edge routers this inflates RTT by seconds (the
+            bufferbloat section next), and with the shallow buffers of
+            datacenter switches it converts every capacity probe into loss.
+            BBR therefore estimates the two path parameters directly:
+            \(BtlBw\) as the windowed maximum of the measured delivery rate
+            (ACKed bytes over time, over roughly ten RTTs), and \(RTprop\) as
+            the windowed minimum RTT (over roughly ten seconds). The two
+            cannot be measured simultaneously, which is the algorithm's
+            central subtlety: measuring \(BtlBw\) requires filling the pipe,
+            which builds queue and hides \(RTprop\); measuring \(RTprop\)
+            requires draining the queue, which idles the pipe and hides
+            \(BtlBw\). BBR sequences the measurements: it paces at
+            \(gain \times BtlBw\) with a gain cycle of 1.25 (probe for more
+            bandwidth), then 0.75 (drain the queue the probe built), then six
+            RTTs at 1.0, and every ten seconds enters a brief ProbeRTT phase,
+            cutting inflight to four packets to expose the bare propagation
+            delay. Startup uses gain \(2/\ln 2 \approx 2.885\), the smallest
+            gain that still doubles the delivery rate each RTT, matching slow
+            start's search speed while measuring rather than crashing.
+          </p>
+          <p>
+            The consequences follow from the model. BBR ignores isolated
+            losses, so it sustains throughput on paths with modest random
+            loss where the \(1/\sqrt{p}\) law strangles Reno and CUBIC
+            (Google reported multi-thousand-fold improvements on lossy
+            long-haul paths when deploying it on B4). It holds queues near
+            empty, so latency under load drops. The costs are equally real:
+            BBRv1 paced at its bandwidth estimate regardless of loss, and
+            when sharing a shallow buffer with loss-based flows it could
+            starve them (its estimate stayed high while Reno-family flows
+            kept halving), and multiple BBR flows could sustain persistent
+            queues on deep-buffered links. BBRv2 and the current v3 add
+            explicit reaction to loss above a threshold and to ECN, trading
+            some of v1's aggression for coexistence; the pacing-plus-model
+            architecture is unchanged. BBR carries a large fraction of
+            Google's traffic, including YouTube, and ships in mainline Linux
+            as <code>tcp_bbr.c</code>.
+          </p>
+
+          <h2>Queueing, bufferbloat, and AQM</h2>
+          <h3>M/M/1 intuition, derived</h3>
+          <p>
+            Every hop on a path is a queue in front of a transmitter, and the
+            single most useful mental model for one is M/M/1: Poisson packet
+            arrivals at rate \(\lambda\), exponential service times at rate
+            \(\mu\), one server, infinite buffer. Its stationary distribution
+            follows from a one-line balance argument. In steady state, the
+            probability flow from state \(n\) (n packets in system) to
+            \(n+1\) must equal the reverse flow:
+            \(\lambda P_n = \mu P_{n+1}\), so \(P_{n+1} = \rho P_n\) with
+            \(\rho = \lambda/\mu\), giving the geometric distribution
+            \(P_n = (1-\rho)\rho^n\) after normalizing (the sum
+            \(\sum \rho^n = 1/(1-\rho)\) requires \(\rho &lt; 1\)). The mean
+            occupancy is the geometric mean
+          </p>
+          $$ L \;=\; \sum_{n=0}^{\infty} n\,(1-\rho)\rho^{n} \;=\; \frac{\rho}{1-\rho}, $$
+          <p>
+            and Little's law \(L = \lambda W\), which holds for any stable
+            queueing system regardless of distributions, converts occupancy
+            to delay:
+          </p>
+          $$ W \;=\; \frac{L}{\lambda} \;=\; \frac{\rho}{\lambda(1-\rho)} \;=\; \frac{1}{\mu - \lambda} \;=\; \frac{1/\mu}{1-\rho}. $$
+          <p>
+            The reading matters more than the formula: total delay is the
+            bare service time \(1/\mu\) multiplied by \(1/(1-\rho)\), and
+            that factor is a wall. Going from 50 percent to 90 percent
+            utilization quintuples delay; 90 to 99 multiplies it by another
+            ten. Real switch traffic is burstier than Poisson, which makes
+            the wall worse, not better; M/M/1 is the optimistic case, and it
+            already forbids running links hot if latency matters. The
+            concrete table, computed for this page for a 10 Gb/s link with
+            1500-byte packets (service rate \(\mu = 10^{10}/(1500\times 8) =
+            833{,}333\) packets/s, service time 1.2 &mu;s):
+          </p>
+          <div class="tbl-wrap"><table class="data">
+            <thead><tr><th>\(\rho\)</th><th>Mean queue+service occupancy \(L\) (packets)</th><th>Total delay \(W\) (&mu;s)</th><th>Waiting time \(W_q\) (&mu;s)</th></tr></thead>
+            <tbody>
+              <tr><td>0.1</td><td>0.111</td><td>1.333</td><td>0.133</td></tr>
+              <tr><td>0.3</td><td>0.429</td><td>1.714</td><td>0.514</td></tr>
+              <tr><td>0.5</td><td>1.0</td><td>2.4</td><td>1.2</td></tr>
+              <tr><td>0.7</td><td>2.333</td><td>4.0</td><td>2.8</td></tr>
+              <tr><td>0.9</td><td>9.0</td><td>12.0</td><td>10.8</td></tr>
+              <tr><td>0.95</td><td>19.0</td><td>24.0</td><td>22.8</td></tr>
+              <tr><td>0.99</td><td>99.0</td><td>120.0</td><td>118.8</td></tr>
+              <tr><td>0.995</td><td>199.0</td><td>240.0</td><td>238.8</td></tr>
+            </tbody>
+          </table></div>
+
+          <div class="problem">
+            <span class="plabel">Problem 3</span>
+            <p>
+              A 10 Gb/s switch port carries 1500-byte packets, modeled as
+              M/M/1. (a) Derive the service rate and service time. (b) An
+              operator plans to run the port at \(\rho = 0.9\); a colleague
+              argues 0.99 "only wastes 9 percent less capacity". Compute mean
+              occupancy and mean delay at both points. (c) A latency SLO
+              requires mean queueing delay under 5 &mu;s; what is the highest
+              admissible \(\rho\)?
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> (a) \(\mu = 10^{10} \,\text{b/s} /
+                (1500 \times 8 \,\text{b/pkt}) = 833{,}333\) packets/s;
+                service time \(1/\mu = 1.2\) &mu;s.
+              </p>
+              <p>
+                (b) At \(\rho = 0.9\): \(L = 0.9/0.1 = 9\) packets,
+                \(W = 1.2/0.1 = 12\) &mu;s. At \(\rho = 0.99\):
+                \(L = 0.99/0.01 = 99\) packets, \(W = 1.2/0.01 = 120\)
+                &mu;s. The extra 9 points of utilization cost 10x the delay
+                and 11x the buffer occupancy; near saturation, capacity and
+                latency trade at catastrophic exchange rates.
+              </p>
+              <p>
+                (c) Waiting time is \(W_q = W - 1/\mu = \frac{1.2\rho}{1-\rho}\)
+                &mu;s. Requiring \(W_q \le 5\): \(1.2\rho \le 5(1-\rho)\),
+                so \(6.2\rho \le 5\) and \(\rho \le 0.806\). The SLO caps the
+                port at about 81 percent, and since real traffic is burstier
+                than Poisson, a deployed system needs more headroom still.
+                This is the quantitative core of the rule that latency-scoped
+                links are provisioned at 60 to 80 percent.
+              </p>
+            </div>
+          </div>
+
+          <h3>Bufferbloat</h3>
+          <p>
+            Queueing theory assumed buffers drain; the deployed Internet
+            broke the assumption. Memory got cheap, vendors sized buffers for
+            worst-case burst absorption, and loss-based TCP does not stop
+            sending until the buffer overflows, so oversized buffers become
+            standing queues: full pipes and full buffers, with every packet
+            paying the whole queue's delay. Gettys and Nichols named the
+            pathology bufferbloat in 2011. The arithmetic is one division,
+            delay = buffer size / drain rate, and computed for this page:
+            1 MB of buffer at a 10 Mb/s home uplink is 0.8 seconds of queue;
+            128 kB at classic 1.5 Mb/s DSL is 0.683 seconds; a 12 MB shared
+            switch buffer at 100 Gb/s is 0.96 ms; a properly BDP-sized buffer
+            for a 100 Gb/s, 10 &mu;s datacenter path is 10 &mu;s. The first
+            two numbers explain a decade of "the internet is slow while
+            uploading": one saturating TCP flow inflates every other flow's
+            RTT, including 20 ms videoconference and DNS packets, to nearly a
+            second. Note what the third number says about datacenters: even a
+            large shared buffer at 100 Gb/s is only a millisecond, so
+            datacenter bloat is measured against 10 &mu;s expectations, a
+            hundredfold degradation from a fraction of the buffer.
+          </p>
+          <h3>AQM: RED, and why CoDel superseded it</h3>
+          <p>
+            Active queue management drops or marks packets before the buffer
+            is full, restoring the early feedback that loss-based control
+            needs. RED (Floyd and Jacobson, 1993) maintains an EWMA of queue
+            length and, between thresholds \(min_{th}\) and \(max_{th}\),
+            drops arrivals with probability rising linearly from 0 to
+            \(max_p\); above \(max_{th}\) it drops everything. RED deployed
+            poorly for a specific reason: its thresholds are in queue-length
+            units, but the harm is delay, and the same 100-packet queue is
+            1.2 ms at 1 Gb/s and 120 ms at 10 Mb/s. Tuning had to track link
+            rate and traffic mix, operators got it wrong or turned it off,
+            and twenty years of AQM deployment stalled. CoDel (Nichols and
+            Jacobson, 2012) reframed the problem in the only unit that
+            matters: sojourn time, the measured delay each packet actually
+            experienced in the queue, timestamped on entry and checked on
+            exit. If sojourn time stays above a target (5 ms) for a full
+            interval (100 ms), CoDel drops one packet at the head of the
+            queue and schedules the next drop at \(t + \text{interval}/\sqrt{n}\)
+            for the \(n\)-th consecutive drop, the square-root control law
+            chosen so the drop rate ramps until the sender's
+            \(1/\sqrt{p}\) response brings the queue down; the moment sojourn
+            time falls below target, dropping stops. The design distinguishes
+            good queues (bursts draining within an RTT, which are the
+            network doing its job) from bad queues (standing delay), needs no
+            per-link tuning, and head-drop delivers the congestion signal a
+            full queue-drain time earlier than tail-drop. FQ-CoDel, its
+            flow-queuing extension, hashes flows into separate queues so a
+            bulk upload cannot bloat a videoconference at all; it is the
+            default qdisc in most Linux distributions and the heart of the
+            router firmware that fixed home bufferbloat.
+          </p>
+
+          <h2>Datacenter fabrics: Clos, fat-trees, and ECMP</h2>
+          <h3>Why the datacenter abandoned the tree</h3>
+          <p>
+            The traditional enterprise network was a tree: hosts into edge
+            switches, edges into a pair of aggregation boxes, aggregation
+            into a core router, with each level oversubscribed and the top
+            built from the largest, most expensive chassis money could buy.
+            Trees fail at datacenter scale for two independent reasons.
+            Capacity: the root carries all cross-tree traffic, so bisection
+            bandwidth is whatever one chassis can switch, and by the
+            mid-2000s a warehouse of commodity servers could generate more
+            traffic than any router that existed. Economics: the tree
+            concentrates capacity into low-volume, high-margin big iron
+            instead of high-volume commodity parts. Al-Fares, Loukissas, and
+            Vahdat (2008) showed that a fat-tree built from identical
+            commodity \(k\)-port switches provides full bisection bandwidth
+            at a fraction of the cost, resurrecting Clos's 1953 telephone
+            switching construction: any large non-blocking switch can be
+            composed from small crossbars in three stages, trading switch
+            size for path multiplicity.
+          </p>
+          <h3>The \(k\)-ary fat-tree, counted</h3>
+          <p>
+            The construction from \(k\)-port switches: \(k\) pods, each pod
+            containing \(k/2\) edge switches and \(k/2\) aggregation
+            switches. Each edge switch spends \(k/2\) ports on hosts and
+            \(k/2\) ports on the pod's aggregation switches; each aggregation
+            switch spends \(k/2\) ports downward on edges and \(k/2\) upward
+            on core switches. The core layer has \((k/2)^2\) switches, each
+            with one port to every one of the \(k\) pods. The counts follow
+            directly:
+          </p>
+          $$ \text{hosts} = k \cdot \frac{k}{2} \cdot \frac{k}{2} = \frac{k^3}{4}, \qquad
+             \text{switches} = \underbrace{k\cdot\tfrac{k}{2}}_{\text{edge}} + \underbrace{k\cdot\tfrac{k}{2}}_{\text{agg}} + \underbrace{(\tfrac{k}{2})^2}_{\text{core}} = \frac{5k^2}{4}. $$
+          <p>
+            Every host-to-host path crosses at most five switches
+            (edge, agg, core, agg, edge), every layer has as much aggregate
+            uplink as downlink capacity, and between any pair of hosts in
+            different pods there are \((k/2)^2\) equal-cost core paths. The
+            worked table:
+          </p>
+          <div class="tbl-wrap"><table class="data">
+            <thead><tr><th>\(k\)</th><th>Hosts \(k^3/4\)</th><th>Edge</th><th>Agg</th><th>Core \((k/2)^2\)</th><th>Total switches \(5k^2/4\)</th><th>Bisection (host pairs) \(k^3/8\)</th></tr></thead>
+            <tbody>
+              <tr><td>4</td><td>16</td><td>8</td><td>8</td><td>4</td><td>20</td><td>8</td></tr>
+              <tr><td>8</td><td>128</td><td>32</td><td>32</td><td>16</td><td>80</td><td>64</td></tr>
+              <tr><td>16</td><td>1,024</td><td>128</td><td>128</td><td>64</td><td>320</td><td>512</td></tr>
+              <tr><td>32</td><td>8,192</td><td>512</td><td>512</td><td>256</td><td>1,280</td><td>4,096</td></tr>
+              <tr><td>48</td><td>27,648</td><td>1,152</td><td>1,152</td><td>576</td><td>2,880</td><td>13,824</td></tr>
+              <tr><td>64</td><td>65,536</td><td>2,048</td><td>2,048</td><td>1,024</td><td>5,120</td><td>32,768</td></tr>
+            </tbody>
+          </table></div>
+          <pre class="flow">            core        (k/2)² switches, 1 port per pod each
+         ┌──┬──┬──┬──┐
+         c1 c2 c3 c4          k=4 example: 4 core
+        ╱│╲ ╱│╲ ╱│╲ ╱│╲
+   ┌────┴────┐   ┌────┴────┐
+   │ agg agg │   │ agg agg │   ... k pods, k/2 agg each
+   │  │╲ ╱│  │   │  │╲ ╱│  │
+   │ edge edge│  │ edge edge│  ... k/2 edge each
+   │  ││  ││ │   │  ││  ││ │
+   │  hh  hh │   │  hh  hh │   k/2 hosts per edge switch
+   └─ pod 1 ─┘   └─ pod 2 ─┘</pre>
+
+          <div class="problem">
+            <span class="plabel">Problem 4</span>
+            <p>
+              A cluster is built as a full fat-tree from 48-port switches
+              with 25 Gb/s ports. (a) How many hosts does it support, and
+              how many switches of each type does it need? (b) Compute the
+              bisection bandwidth in Tb/s and verify it is full (equal to
+              half the hosts times the host link rate). (c) The operator
+              instead wires each edge switch with 32 host ports and 16
+              uplinks. What is the oversubscription ratio, and what does a
+              host see when the fabric is busy?
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> (a) \(k = 48\): hosts
+                \(= 48^3/4 = 110{,}592/4 = 27{,}648\). Edge switches
+                \(= 48 \times 24 = 1{,}152\), aggregation the same, 1,152,
+                core \(= 24^2 = 576\); total \(5 \times 48^2 / 4 = 2{,}880\)
+                switches, every one an identical commodity part.
+              </p>
+              <p>
+                (b) Cut the fabric into two halves of 13,824 hosts. In a full
+                fat-tree the cut is limited by host access links:
+                \(13{,}824 \times 25\,\text{Gb/s} = 345.6\) Tb/s. Check
+                against the core: 576 core switches, each with 24 ports
+                facing each half of the fabric... more directly, total core
+                capacity is \(576 \times 48 \times 25 = 691.2\) Tb/s, of
+                which half, 345.6 Tb/s, can cross any bisection, matching
+                the host-side limit exactly: oversubscription 1:1, full
+                bisection.
+              </p>
+              <p>
+                (c) With 32 hosts and 16 uplinks per edge switch, host
+                demand into the switch is \(32 \times 25 = 800\) Gb/s
+                against \(16 \times 25 = 400\) Gb/s of uplink:
+                oversubscription 2:1. When traffic is fabric-crossing and
+                all hosts are active, each host's effective bandwidth out of
+                the rack is 12.5 Gb/s, half its NIC. Oversubscription is not
+                wrong, most workloads have rack locality, but for allreduce
+                traffic, which is all-fabric-crossing by construction, the
+                2:1 shows up directly as a halved bandwidth term in the
+                collective cost model later on this page.
+              </p>
+            </div>
+          </div>
+
+          <h3>ECMP and the collision problem</h3>
+          <p>
+            A fat-tree's \((k/2)^2\) equal-cost paths are useless without a
+            mechanism to spread traffic across them. The deployed mechanism,
+            equal-cost multi-path (ECMP), hashes each packet's five-tuple
+            (addresses, ports, protocol) and uses the hash to pick an uplink,
+            so all packets of one flow take one path (preserving intra-flow
+            ordering, which TCP punishes reordering for) while different
+            flows scatter. The weakness is statistical: ECMP balances flow
+            counts, not bytes, and hashing a few large flows onto a few
+            paths is a birthday problem. Simulation computed for this page,
+            hashing \(n\) equal-rate flows onto 8 paths and reporting the
+            most-loaded path relative to the mean: with 8 flows on 8 paths,
+            the expected maximum is 2.60x the mean (p95 4.0x), so some link
+            typically carries almost triple its share while others sit idle;
+            with 16 flows, 2.11x; 32 flows, 1.76x; 64 flows, 1.52x; only at
+            256 flows does the imbalance settle to 1.26x. Wider fabrics make
+            it worse before better: 32 flows on 32 paths gives 3.53x
+            (p95 5.0x), and even 1,024 flows on 32 paths still shows 1.38x.
+            The practical readings: ECMP works well for many small flows and
+            badly for the elephant flows that dominate storage and training
+            traffic; VL2 (Greenberg et al., 2009) built its fabric around
+            Valiant load balancing (randomize each flow through an
+            intermediate switch) for exactly this reason; and modern
+            fabrics add flowlet switching (re-hash on gaps in a flow's packet
+            train), packet spraying with reorder-tolerant transports, or
+            centralized elephant scheduling (Hedera) to recover the stranded
+            capacity. NCCL's own rings, later on this page, sidestep ECMP
+            entirely when they can by using a rail-optimized topology, one
+            NIC per GPU per fabric plane.
+          </p>
+          <h3>The tail at scale</h3>
+          <p>
+            Datacenter latency is judged at the tail because fanout
+            multiplies rare events. If a request touches \(F\) servers in
+            parallel and waits for all, and each server is independently slow
+            with probability \(q\), the request is slow with probability
+            \(1 - (1-q)^F\). Computed for this page: with \(q = 0.01\) (each
+            server slow one time in a hundred), fanout 1 gives 1 percent
+            slow requests, fanout 10 gives 9.6 percent, fanout 100 gives
+            63.4 percent, and fanout 2000, a realistic web-search leaf count,
+            gives essentially 100 percent. Even at \(q = 10^{-3}\), fanout
+            2000 yields 86.5 percent. This is why Dean and Barroso's "The
+            Tail at Scale" (2013) is the most operationally consequential
+            paper in the area: at fanout, the p99 of the parts becomes
+            the median of the whole, and every technique in the paper
+            (hedged requests that duplicate a straggling RPC after the p95
+            mark, tied requests, micro-partitioning) exists to break the
+            multiplication. Transport work like DCTCP feeds the same goal:
+            the queueing delay eliminated at the switch is bought back
+            directly as tail budget.
+          </p>
+
+          <h2>DCTCP and ECN: congestion control rebuilt for the datacenter</h2>
+          <p>
+            Inside a datacenter, Reno-family control fails structurally.
+            Commodity switch buffers are shallow and shared; RTTs are tens of
+            microseconds, so the feedback loop is fast but a retransmission
+            timeout (minimum 1 to 5 ms in most stacks at the time DCTCP was
+            designed, against a 100 &mu;s RTT) is an eternity; and the killer
+            workload is incast: a partition-aggregate request fans out to
+            dozens of workers whose responses arrive at one switch port in
+            the same window, overflowing the buffer in microseconds. Losing
+            the last packet of a short response means a timeout that costs
+            10 to 100x the entire flow's lifetime. The deeper problem is that
+            loss arrives too late: by the time the buffer overflows, the
+            queue, and everyone's latency, is already maximal.
+          </p>
+          <p>
+            DCTCP (Alizadeh et al., 2010, developed at Microsoft Research
+            with university collaborators) replaces the binary loss signal with a proportional one
+            built from ECN. Switches mark rather than drop: any packet
+            arriving to a queue deeper than a threshold \(K\) gets its ECN
+            bit set, an instantaneous, single-packet-granularity signal. The
+            receiver echoes marks back precisely (one ACK state machine
+            change from standard ECN), and the sender maintains an EWMA of
+            the marked fraction \(F\) of each window:
+          </p>
+          $$ \alpha \leftarrow (1-g)\,\alpha + g\,F, \qquad g = \tfrac{1}{16}, $$
+          $$ \text{on a marked window:}\quad \text{cwnd} \leftarrow \text{cwnd}\,\Big(1 - \frac{\alpha}{2}\Big). $$
+          <p>
+            The window cut is proportional to the congestion's extent:
+            \(\alpha \to 1\) (every packet marked, serious congestion)
+            recovers Reno's halving; \(\alpha = 0.1\) (mild congestion) cuts
+            only 5 percent. The sender therefore trims gently and
+            continuously instead of sawing violently, which lets the switch
+            run its queue at the marking threshold \(K\) rather than at
+            buffer capacity. The paper's guideline puts \(K &gt;
+            C\times\text{RTT}/7\) in packets, roughly 20 packets at 1 Gb/s
+            and 65 at 10 Gb/s, a few percent of a shared buffer, so the
+            fabric holds microsecond queues while still absorbing bursts.
+            The EWMA's time constant is worth feeling numerically (computed
+            for this page): starting from \(\alpha = 0\) with every packet
+            suddenly marked, \(\alpha\) reaches only \(1-(1-1/16)^{16} =
+            0.644\) after 16 round trips and 0.994 after 80, so DCTCP needs
+            tens of RTTs to learn about severe congestion, one reason it
+            coexists poorly with conventional TCP (which must be kept in
+            separate queues) and one cost of the smooth response. At
+            datacenter RTTs, 80 round trips is under 10 ms, so the slowness
+            is acceptable where it is deployed. DCTCP variants are the
+            standard fabric transport at Microsoft, and the marking-threshold
+            idea propagated into Linux (<code>tcp_dctcp.c</code>), into
+            RDMA congestion control as DCQCN, and into the HPCC and Swift
+            line of work that replaced marks with measured delay or in-band
+            telemetry.
+          </p>
+
+          <h2>RDMA, RoCE, and why lossless fabrics are hard</h2>
+          <h3>What RDMA changes</h3>
+          <p>
+            The loopback measurements earlier made the case numerically: a
+            socket round trip costs 15 to 25 &mu;s on this host, nearly all
+            of it software. RDMA (remote direct memory access) removes the
+            software: the NIC implements the transport in hardware, applications
+            post work requests to queue pairs mapped into userspace, and the
+            NIC reads and writes application memory directly on both ends,
+            no syscall, no interrupt, no copy on the data path. One-sided
+            operations (RDMA read, RDMA write) complete without the remote
+            CPU's involvement at all. Round trips drop to 1 to 2 &mu;s and a
+            single NIC saturates 400 Gb/s with a few percent of one core,
+            which is why RDMA in its InfiniBand form has owned HPC since the
+            1990s and why the hyperscalers brought it onto Ethernet as RoCE
+            (RDMA over Converged Ethernet; v2 encapsulates InfiniBand
+            transport headers over UDP/IP so it can route). GPU-direct RDMA
+            extends the path end to end: the NIC DMAs into GPU HBM directly,
+            and NCCL's cross-host path is exactly this.
+          </p>
+          <h3>The lossless bargain and PFC</h3>
+          <p>
+            The historical InfiniBand-derived RoCE NICs implemented
+            go-back-N retransmission in hardware: a single lost packet
+            forces retransmission of the entire window, the 29,000x
+            penalty from Problem 1's arithmetic. The design assumption was a
+            network that never drops, and Ethernet was made to imitate one
+            with Priority Flow Control (PFC, 802.1Qbb): when a switch
+            ingress queue crosses a threshold, it sends a PAUSE frame
+            upstream for that priority class, and the upstream port stops
+            transmitting that class entirely until resumed. This converts
+            loss into backpressure, and it works, but it purchases
+            losslessness with exactly the coupling the end-to-end argument
+            warns about: correctness-critical control state now lives in
+            every switch, and pausing is a hop-scoped hammer with no notion
+            of flows.
+          </p>
+          <p>
+            The failure modes are well documented from production, most
+            thoroughly in Guo et al.'s account of RDMA deployment at
+            Microsoft scale (2016). Head-of-line blocking: PFC pauses a whole
+            class on a port, so one congested flow stalls every flow sharing
+            the class, and the pause propagates upstream hop by hop
+            (congestion spreading), freezing parts of the fabric far from
+            the hotspot. Pause storms: a malfunctioning NIC that emits
+            continuous PFC frames can freeze its top-of-rack switch, whose
+            queues fill and emit their own pauses, cascading a single sick
+            host into a fabric-wide outage; Guo et al. describe exactly this
+            propagation and the watchdogs (pause-storm detection, PFC
+            timeouts that re-enable dropping) deployed against it. Deadlock:
+            PFC dependencies plus a cyclic buffer dependency, which
+            transient routing loops or specific multi-path wirings can
+            create, can produce a cycle of ports each waiting for the next
+            to unpause, a permanent standstill requiring intervention.
+            The engineering response is layered: DCQCN (Zhu et al., 2015)
+            adds ECN-based per-flow rate control so PFC becomes a rarely
+            touched last resort rather than the primary control; careful
+            buffer headroom arithmetic bounds in-flight data per hop; and
+            the current generation moves away from the lossless requirement
+            altogether, with selective-repeat retransmission in NIC hardware
+            (ConnectX-6 and later), Amazon's SRD transport for EFA spraying
+            packets across paths with out-of-order delivery, and the Ultra
+            Ethernet Consortium standardizing a datacenter transport that
+            tolerates loss. The arc is a clean end-to-end-argument case
+            study: reliability moved into the network for performance,
+            the predicted fragility arrived at scale, and the fix is moving
+            reliability back toward the endpoints with better hardware.
+          </p>
+
+          <h2>Collective communication for distributed training</h2>
+          <h3>The allreduce problem and the ring construction</h3>
+          <p>
+            Data-parallel training gives every one of \(N\) workers a full
+            model replica; each step, every worker computes gradients on its
+            shard of the batch, and all workers must end the step holding the
+            same summed gradient vector of \(M\) bytes. That operation,
+            elementwise sum then broadcast of the result, is allreduce, and
+            at 70B-parameter scale \(M\) is 140 GB of bf16 gradients per
+            step, so its cost structure is worth deriving exactly. The naive
+            schedule, gather everything to one root and broadcast the sum,
+            moves \((N-1)M\) bytes into one node and \((N-1)M\) out: the
+            root's links are the bottleneck and cost grows linearly with
+            \(N\). A binary tree improves the latency to \(O(\log N)\)
+            rounds, reduce up then broadcast down, but each round still moves
+            the full \(M\) through every participating link, giving time
+            roughly \(2\log_2 N \cdot M/B\) on link bandwidth \(B\): the
+            bandwidth term grows with \(\log N\).
+          </p>
+          <p>
+            The ring algorithm (analyzed as bandwidth-optimal by Patarasuk
+            and Yuan, 2009, with roots in the MPI collective work of Thakur,
+            Rabenseifner, and Gropp) removes the \(N\)-dependence from the
+            bandwidth term almost entirely. Arrange the \(N\) workers in a
+            ring and split the buffer into \(N\) equal chunks of \(M/N\)
+            bytes. Phase one, reduce-scatter, runs \(N-1\) steps: in each
+            step, every worker sends one chunk to its right neighbor and
+            receives one from its left, adding what it receives into its
+            local copy; the chunk indices are staggered so that after
+            \(N-1\) steps each worker holds the complete sum of exactly one
+            chunk. Phase two, allgather, runs \(N-1\) more steps in which
+            the completed chunks circulate, each worker forwarding the
+            newest chunk it received, until everyone holds all \(N\) summed
+            chunks. Each worker sends exactly \(2(N-1)\) chunks of
+            \(M/N\) bytes, so with per-link bandwidth \(B\) and per-step
+            latency \(\alpha\):
+          </p>
+          $$ \text{bytes sent per worker} \;=\; 2(N-1)\cdot\frac{M}{N} \;=\; \frac{2(N-1)}{N}\,M
+             \;\xrightarrow{\;N\to\infty\;}\; 2M, $$
+          $$ T_{\text{ring}} \;=\; 2(N-1)\,\alpha \;+\; \frac{2(N-1)}{N}\cdot\frac{M}{B}. $$
+          <p>
+            Every link in the ring is busy in every step (the schedule is
+            perfectly load-balanced, which is why no algorithm can beat the
+            \(2(N-1)/N \cdot M/B\) bandwidth term for a full allreduce on
+            unidirectional links), and the bandwidth term saturates at
+            \(2M/B\) regardless of \(N\): a thousand GPUs pay essentially the
+            same bandwidth cost as eight. What grows with \(N\) is the
+            latency term, \(2(N-1)\alpha\), which is why rings are the wrong
+            choice for small messages on large rings, and why NCCL switches
+            to tree algorithms (latency \(O(\log N)\), bandwidth
+            \(2\log_2 N \cdot M/B\)) below a message-size crossover, and to
+            hierarchical schedules (rings inside a node over NVLink,
+            trees or rings across nodes over the NIC) at cluster scale.
+          </p>
+          <h3>Measured: NCCL on two H100s over NVLink</h3>
+          <p>
+            The numbers below are real NCCL 2.26.2 measurements from this
+            machine: two H100 80GB GPUs connected by an 18-lane NVLink
+            (NV18), PyTorch 2.7.0. The stated caveat applies: only two GPUs
+            are present, so these measurements cover \(N = 2\) only, and all
+            larger-\(N\) figures on this page are analytical model output,
+            labeled as such. Raw peer-to-peer device-to-device copy
+            bandwidth measures 388.28 GB/s. Allreduce:
+          </p>
+          <div class="tbl-wrap"><table class="data">
+            <thead><tr><th>Message size</th><th>Time (ms)</th><th>Algorithm bandwidth (GB/s)</th><th>Bus bandwidth (GB/s)</th></tr></thead>
+            <tbody>
+              <tr><td>1 MiB</td><td>0.0252</td><td>41.68</td><td>41.68</td></tr>
+              <tr><td>4 MiB</td><td>0.0347</td><td>120.97</td><td>120.97</td></tr>
+              <tr><td>16 MiB</td><td>0.0782</td><td>214.5</td><td>214.5</td></tr>
+              <tr><td>64 MiB</td><td>0.2521</td><td>266.23</td><td>266.23</td></tr>
+              <tr><td>256 MiB</td><td>0.8944</td><td>300.14</td><td>300.14</td></tr>
+              <tr><td>1024 MiB</td><td>3.2522</td><td>330.15</td><td>330.15</td></tr>
+            </tbody>
+          </table></div>
+          <p>
+            The table is a textbook \(\alpha\)-\(\beta\) curve. At 1 MiB the
+            operation takes 25.2 &mu;s and achieves 41.68 GB/s, an eighth of
+            what the wire can do, because fixed costs (kernel launch,
+            protocol steps) dominate; a 4-byte allreduce takes 23.62 &mu;s,
+            almost exactly the 1 MiB time, confirming that everything below
+            a megabyte is pure latency, and a bare barrier costs 35.87 &mu;s.
+            By 1 GiB the collective sustains 330.15 GB/s, 85 percent of the
+            measured 388.28 GB/s point-to-point ceiling. Note also that
+            algorithm bandwidth equals bus bandwidth in every row: NCCL's
+            bus-bandwidth metric multiplies algbw by \(2(N-1)/N\), which at
+            \(N = 2\) is exactly 1, a small live confirmation of the ring
+            factor just derived. The neighboring collectives measured on the
+            same pair behave consistently: allgather 244.86 GB/s and
+            reduce-scatter 239.66 GB/s at 256 MiB (each is one phase of the
+            allreduce, \((N-1)/N\) of the traffic), and alltoall moves
+            266.79 GB/s at 256 MiB per rank. The practical moral for
+            training code: gradient bucketing exists because of the left
+            half of this table. A 7B-parameter model whose gradients were
+            allreduced tensor-by-tensor in 100 kB pieces would pay the
+            25 &mu;s floor thousands of times per step; fusing into 25 to
+            100 MB buckets, as PyTorch DDP does by default, moves every
+            transfer into the flat right half of the curve.
+          </p>
+          <h3>Modeled: scaling the ring to a training cluster</h3>
+          <p>
+            Applying the derived cost model at cluster scale (analytical
+            model output, per the \(N=2\) caveat; \(\alpha = 5\) &mu;s per
+            step, \(B = 50\) GB/s for a 400 Gb/s NIC path): allreducing
+            \(M = 140\) GB of 70B-model bf16 gradients takes
+            \(T = 2(N-1)\alpha + \frac{2(N-1)}{N} M/B\), which evaluates to
+            4.90 s at \(N=8\), 5.51 s at \(N=64\), 5.58 s at \(N=256\), and
+            5.64 s at \(N=4096\): the bandwidth term's \(2(N-1)/N\) factor
+            climbs from 1.75 toward its asymptote 2, and five thousand GPUs
+            pay only 15 percent more than eight. The same model with tree
+            schedules gives 16.8 s at \(N=8\) and 67.2 s at \(N=4096\),
+            the \(\log N\) growth visible. The latency-bandwidth crossover
+            matters at the other end of the size axis: at \(N=256\), the
+            model's fixed cost is \(2 \times 255 \times 5\,\mu s = 2.55\) ms,
+            which is 100 percent of the total for any message under 100 kB,
+            86.5 percent at 10 MB, and only 6 percent at 1 GB. Small
+            collectives are latency; large ones are bandwidth; the entire
+            craft of overlap scheduling lives in that split.
+          </p>
+          <div class="problem">
+            <span class="plabel">Problem 5</span>
+            <p>
+              A data-parallel job trains a 70B-parameter model in bf16
+              (gradient buffer \(M = 140\) GB) on \(N = 256\) GPUs, each
+              with a 400 Gb/s NIC (\(B = 50\) GB/s), per-step latency
+              \(\alpha = 5\) &mu;s. Per optimizer step each GPU performs
+              \(6.5625 \times 10^{15}\) FLOPs and sustains 400 TFLOP/s.
+              (a) Compute the ring allreduce time. (b) Compute the compute
+              time per step and the communication-to-compute ratio with no
+              overlap. (c) The global batch is then cut 8x (compute per step
+              drops 8x, gradients unchanged). Recompute the ratio and
+              interpret. (d) Verify the per-worker bytes-sent formula for
+              this configuration.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> (a) Bandwidth term:
+                \(\frac{2 \times 255}{256} \times \frac{140}{50} =
+                1.9922 \times 2.8 = 5.578\) s. Latency term: \(2 \times 255
+                \times 5\,\mu\text{s} = 2.55\) ms, negligible here. Total
+                \(T_{\text{comm}} \approx 5.578\) s.
+              </p>
+              <p>
+                (b) \(T_{\text{compute}} = 6.5625\times 10^{15} / 4\times
+                10^{14} = 16.406\) s. Ratio \(= 5.578/16.406 = 0.34\): with
+                perfect overlap of the backward pass and the allreduce, the
+                network hides entirely (0.34 &lt; 1); without overlap the
+                step slows by 34 percent.
+              </p>
+              <p>
+                (c) Compute drops to \(16.406/8 = 2.051\) s while
+                communication stays 5.578 s: ratio \(= 5.578/2.051 = 2.72\).
+                Even perfect overlap cannot hide a ratio above 1; the job is
+                communication-bound and GPUs idle at least
+                \((5.578-2.051)/5.578 = 63\) percent of each step. Shrinking
+                the batch, or equivalently scaling \(N\) at fixed global
+                batch, moves data-parallel training from compute-bound to
+                network-bound with the gradient volume constant; the exits
+                are gradient compression, more bandwidth, or sharded
+                optimizers that reduce-scatter instead of allreduce.
+              </p>
+              <p>
+                (d) Each worker sends \(2(N-1)/N \times M = 1.9922 \times
+                140 = 278.9\) GB per allreduce, just under the \(2M = 280\)
+                GB asymptote: at \(N=256\), the ring is within 0.4 percent
+                of its large-\(N\) bandwidth cost, confirming that the
+                bandwidth term has effectively stopped growing.
+              </p>
+            </div>
+          </div>
+
+          <h2>QUIC and HTTP/3</h2>
+          <p>
+            QUIC is what a transport looks like when it is designed after
+            the lessons of thirty years of TCP deployment, with the freedom
+            to ignore middleboxes. Its carriers built it (Langley et al.,
+            2017, describes the Google deployment; the IETF standardized it
+            as RFC 9000 in 2021 with Iyengar and Thomson as editors) on
+            three architectural decisions. First, run over UDP in userspace:
+            TCP's wire format is ossified because millions of middleboxes
+            parse and "normalize" it, so any TCP extension (SACK took a
+            decade; Fast Open never fully deployed) rolls out at the pace of
+            the slowest firewall; UDP passes through, and QUIC encrypts
+            everything above the UDP header, including its own transport
+            headers, so middleboxes cannot ossify what they cannot read.
+            An update to loss recovery ships in a browser release instead of
+            a kernel upgrade. Second, streams as a first-class transport
+            primitive: a QUIC connection multiplexes many independent
+            ordered byte streams, and a lost packet blocks only the streams
+            whose data it carried. HTTP/2 over TCP had multiplexed streams
+            above a single ordered byte stream, so one lost TCP segment
+            head-of-line-blocked every stream in the connection; QUIC's
+            per-stream ordering removes exactly that, which is most of why
+            HTTP/3 outperforms HTTP/2 on lossy mobile paths. Third, fold the
+            security handshake into the transport handshake: QUIC integrates
+            TLS 1.3, so a new connection completes crypto and transport
+            setup in one round trip, and a resumed connection can send
+            0-RTT application data in the first flight (with replay caveats:
+            0-RTT data must be idempotent because a network attacker can
+            replay the flight). TCP+TLS1.3 needs two round trips fresh;
+            on the 70 ms path from Problem 1, QUIC saves 70 to 140 ms of
+            handshake before the first byte of response, which is larger
+            than many entire page budgets.
+          </p>
+          <p>
+            The engineering details repay attention. Connections are named
+            by connection IDs rather than the five-tuple, so a phone
+            migrating from WiFi to cellular keeps its connections alive, and
+            a load balancer can route by connection ID through NAT rebinding.
+            Loss detection is cleaner than TCP's: every packet, including
+            retransmissions, gets a fresh monotonic packet number, so the
+            retransmission ambiguity behind Karn's algorithm never arises,
+            and ACK frames carry receive timestamps and up to 32 ranges,
+            giving the sender a far sharper view than SACK's three blocks.
+            Congestion control is pluggable per-connection in userspace
+            (Reno-family, CUBIC, and BBR implementations ship in production
+            stacks). The price is CPU: kernel TCP enjoys segmentation
+            offload, and encrypting every packet's headers costs
+            more per byte than TLS-over-TCP's bulk path, an actively
+            optimized gap (UDP GSO, crypto batching). As of the mid-2020s,
+            on the order of a third of web traffic is HTTP/3, and the
+            transport research it unblocked (MASQUE proxying, WebTransport,
+            unreliable datagrams in RFC 9221) is a direct dividend of
+            de-ossification.
+          </p>
+
+          <h2>Software-defined networking, briefly</h2>
+          <p>
+            Classical routers bundle three things per box: forwarding
+            hardware, the distributed protocols that compute routes (OSPF,
+            BGP), and the vendor's configuration surface. SDN's claim
+            (McKeown et al.'s OpenFlow paper, 2008, gave it a concrete
+            interface) is that the second and third belong in a logically
+            centralized controller with a global view, leaving switches as
+            fast, dumb match-action tables. The datacenter is where the
+            claim proved out, because a single operator owns the whole
+            fabric and the topology is regular: Google's B4 WAN ran
+            centralized traffic engineering at near-100 percent link
+            utilization, versus the 30 to 40 percent that decentralized
+            protocols need as headroom, precisely because a controller that
+            sees all demands can pack paths deliberately, and Jupiter
+            (Singh et al., 2015) manages a 1.3 Pb/s fabric the same way.
+            The counterweight is the end-to-end argument's cousin: a
+            centralized controller is a single conceptual point of failure,
+            so production designs are logically centralized but physically
+            replicated, and the failure domain analysis (what happens when
+            the controller partitions from the switches it programs) is the
+            hard part of every deployment. The programmable-dataplane line
+            (P4, Barefoot/Intel Tofino) pushed the idea one level down,
+            letting operators define the match-action pipeline itself; its
+            datacenter legacy is in-band network telemetry and in-network
+            aggregation experiments (SwitchML, ATP) that sum gradients in
+            the switch, a live research thread for the collective workloads
+            above.
+          </p>
+
+          <h2>Worked problems</h2>
+          <div class="problem">
+            <span class="plabel">Problem 6</span>
+            <p>
+              Two senders share a bottleneck. Sender A uses CUBIC with
+              \(C = 0.4\), \(\beta = 0.7\); sender B uses Reno. Both
+              experience a loss at a window of 1,000 segments on a 100 ms
+              RTT path. (a) Compute each sender's window immediately after
+              the loss. (b) Compute the time for each to regrow to 1,000
+              segments. (c) At what \(W_{max}\) would Reno and CUBIC take
+              equally long, and what does the answer say about where CUBIC
+              behaves Reno-like?
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> (a) CUBIC: \(0.7 \times 1000 =
+                700\) segments. Reno: \(0.5 \times 1000 = 500\) segments.
+              </p>
+              <p>
+                (b) CUBIC reaches \(W_{max}\) at \(K = \sqrt[3]{W_{max}
+                (1-\beta)/C} = \sqrt[3]{1000 \times 0.3/0.4} =
+                \sqrt[3]{750} = 9.09\) s, independent of RTT. Reno climbs
+                one segment per RTT from 500 to 1,000: 500 RTTs
+                \(\times\) 0.1 s = 50 s. CUBIC recovers 5.5x faster here.
+              </p>
+              <p>
+                (c) Set \(\left(\frac{0.3\,W}{0.4}\right)^{1/3} =
+                \frac{W}{2} R\) with \(R = 0.1\): \(0.75\,W = (0.05\,W)^3
+                = 1.25\times 10^{-4} W^3\), so \(W^2 = 6000\) and \(W =
+                77.5\) segments. Below roughly 78 segments (window under
+                117 kB at MSS 1460), Reno's recovery is as fast or faster,
+                which is why CUBIC includes an explicit TCP-friendly region
+                and only engages its cubic growth on paths with large
+                windows: CUBIC is Reno for small BDPs and something much
+                more aggressive for large ones.
+              </p>
+            </div>
+          </div>
+          <div class="problem">
+            <span class="plabel">Problem 7</span>
+            <p>
+              A DCTCP sender with \(g = 1/16\) has been running on an
+              uncongested path (\(\alpha = 0\)). A hotspot forms and every
+              packet in every window is marked from now on (\(F = 1\)).
+              (a) Derive the closed form for \(\alpha\) after \(n\) fully
+              marked round trips and evaluate it at \(n = 16\) and
+              \(n = 80\). (b) After 16 round trips, what fraction of cwnd
+              does one window cut remove, and how does it compare with
+              Reno's response to a single loss? (c) With cwnd 100 segments
+              and \(\alpha\) at its steady state 1.0, compute the windows
+              after three successive marked-window cuts.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> (a) With \(F=1\):
+                \(\alpha_{n} = (1-g)\alpha_{n-1} + g\), a contraction toward
+                1; substituting \(\alpha_0 = 0\) and unrolling,
+                \(\alpha_n = 1-(1-g)^n\). At \(n=16\):
+                \(1 - (15/16)^{16} = 1 - 0.3561 = 0.6439\). At \(n=80\):
+                \(1 - (15/16)^{80} = 0.9943\). The gain \(g=1/16\) means
+                "memory" of about 16 RTTs; full alarm takes about 80.
+              </p>
+              <p>
+                (b) Cut fraction \(= \alpha/2 = 0.6439/2 = 0.322\): a 32.2
+                percent reduction, versus Reno's immediate 50 percent from
+                one loss. Sixteen round trips into total congestion, DCTCP
+                is still responding more gently than Reno does to a single
+                drop; the smoothing that makes DCTCP stable on mild
+                congestion makes it slow on severe congestion.
+              </p>
+              <p>
+                (c) Each cut multiplies by \(1 - 1.0/2 = 0.5\): 100
+                \(\to\) 50 \(\to\) 25 \(\to\) 12.5 segments. At
+                \(\alpha = 1\), DCTCP degenerates to exactly Reno's
+                halving, as the formula promises: the proportional response
+                contains the classical one as its worst case.
+              </p>
+            </div>
+          </div>
+          <div class="problem">
+            <span class="plabel">Problem 8</span>
+            <p>
+              A storage front-end fans a request out to \(F\) backends and
+              answers when the last one responds. Each backend is
+              independently "slow" (over the latency SLO) with probability
+              \(q = 0.01\). (a) Derive and compute the probability the
+              request is slow for \(F = 1, 10, 100\). (b) How small must
+              \(q\) be to keep 95 percent of requests fast at \(F = 100\)?
+              (c) The operator adds hedging: any backend still silent at
+              the p99 mark gets a duplicate request to a second server, and
+              the duplicate is also slow with probability \(q' = 0.01\)
+              independently. Recompute the slow probability at \(F = 100\)
+              and comment.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> (a) The request is fast only if
+                all \(F\) backends are fast:
+                \(\P(\text{slow}) = 1-(1-q)^F\). \(F=1\): 0.01. \(F=10\):
+                \(1-0.99^{10} = 0.0956\). \(F=100\): \(1-0.99^{100} =
+                0.634\). At fanout 100, a 1-in-100 tail event hits nearly
+                two requests in three.
+              </p>
+              <p>
+                (b) Require \((1-q)^{100} \ge 0.95\):
+                \(1-q \ge 0.95^{1/100} = e^{\ln(0.95)/100} =
+                e^{-0.000513}\), so \(q \le 5.13\times 10^{-4}\). The
+                per-server tail budget is 20x tighter than the whole-request
+                budget; fanout compresses tolerances.
+              </p>
+              <p>
+                (c) A backend's slot is slow only if the original is slow
+                (probability 0.01) and its hedge is also slow (0.01), so
+                per-slot \(q_{\text{eff}} = 10^{-4}\) (ignoring the small
+                added hedge delay). Then \(\P(\text{slow}) = 1 -
+                (1-10^{-4})^{100} = 1 - 0.99005 = 0.995\times 10^{-2}
+                \approx 0.01\): hedging returns the fanout-100 request to
+                roughly the single-server tail, at a cost of duplicating
+                only the roughly 1 percent of RPCs that straggle. This is
+                Dean and Barroso's hedged-request arithmetic, and it is why
+                the technique is standard in fanout systems.
+              </p>
+            </div>
+          </div>
+
+          <h2>Implementation</h2>
+          <p>
+            Four programs, each small enough to read in one sitting and each
+            demonstrating one load-bearing idea from above. The first
+            measures what this page's loopback numbers measure: RTT
+            percentiles and the syscall-size throughput curve, so the
+            measured tables can be reproduced on any host.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="python" class="active">Python</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="python" class="shl lang active"><code class="language-python"><span class="c"># latency_bench.py: TCP loopback RTT percentiles and write-size sweep.</span>
+<span class="c"># Reproduces the methodology behind this page's measured host numbers.</span>
+<span class="k">import</span> <span class="m1">socket</span>, <span class="m1">threading</span>, <span class="m1">time</span>, <span class="m1">statistics</span>
+
+<span class="k">def</span> <span class="m1">echo_server</span><span class="b0">(</span><span class="v6">sock</span><span class="b0">)</span>:
+    <span class="v3">conn</span>, <span class="v4">_</span> = <span class="v6">sock</span>.<span class="m2">accept</span><span class="b0">()</span>
+    <span class="v3">conn</span>.<span class="m2">setsockopt</span><span class="b0">(</span><span class="m1">socket</span>.<span class="m2">IPPROTO_TCP</span>, <span class="m1">socket</span>.<span class="m2">TCP_NODELAY</span>, <span class="n">1</span><span class="b0">)</span>
+    <span class="k">while</span> <span class="k">True</span>:
+        <span class="v1">data</span> = <span class="v3">conn</span>.<span class="m2">recv</span><span class="b0">(</span><span class="n">65536</span><span class="b0">)</span>
+        <span class="k">if</span> <span class="k">not</span> <span class="v1">data</span>:
+            <span class="k">break</span>
+        <span class="v3">conn</span>.<span class="m2">sendall</span><span class="b0">(</span><span class="v1">data</span><span class="b0">)</span>
+
+<span class="k">def</span> <span class="m1">rtt_bench</span><span class="b0">(</span><span class="v5">port</span>=<span class="n">9101</span>, <span class="v0">iters</span>=<span class="n">50000</span>, <span class="v1">payload</span>=<span class="n">64</span><span class="b0">)</span>:
+    <span class="v2">srv</span> = <span class="m1">socket</span>.<span class="m2">socket</span><span class="b0">()</span>
+    <span class="v2">srv</span>.<span class="m2">setsockopt</span><span class="b0">(</span><span class="m1">socket</span>.<span class="m2">SOL_SOCKET</span>, <span class="m1">socket</span>.<span class="m2">SO_REUSEADDR</span>, <span class="n">1</span><span class="b0">)</span>
+    <span class="v2">srv</span>.<span class="m2">bind</span><span class="b0">(</span><span class="b1">(</span><span class="s">"127.0.0.1"</span>, <span class="v5">port</span><span class="b1">)</span><span class="b0">)</span>; <span class="v2">srv</span>.<span class="m2">listen</span><span class="b0">(</span><span class="n">1</span><span class="b0">)</span>
+    <span class="m1">threading</span>.<span class="m2">Thread</span><span class="b0">(</span><span class="v4">target</span>=<span class="m1">echo_server</span>, <span class="v2">args</span>=<span class="b1">(</span><span class="v2">srv</span>,<span class="b1">)</span>, <span class="v2">daemon</span>=<span class="k">True</span><span class="b0">)</span>.<span class="m2">start</span><span class="b0">()</span>
+
+    <span class="v3">cli</span> = <span class="m1">socket</span>.<span class="m2">create_connection</span><span class="b0">(</span><span class="b1">(</span><span class="s">"127.0.0.1"</span>, <span class="v5">port</span><span class="b1">)</span><span class="b0">)</span>
+    <span class="v3">cli</span>.<span class="m2">setsockopt</span><span class="b0">(</span><span class="m1">socket</span>.<span class="m2">IPPROTO_TCP</span>, <span class="m1">socket</span>.<span class="m2">TCP_NODELAY</span>, <span class="n">1</span><span class="b0">)</span>  <span class="c"># no Nagle:</span>
+    <span class="c"># Nagle would hold small writes waiting for ACKs and serialize the pingpong.</span>
+    <span class="v1">msg</span> = <span class="s">b"x"</span> * <span class="v1">payload</span>
+    <span class="v5">samples</span> = <span class="b0">[]</span>
+    <span class="k">for</span> <span class="v4">_</span> <span class="k">in</span> <span class="m1">range</span><span class="b0">(</span><span class="v0">iters</span><span class="b0">)</span>:
+        <span class="v5">t0</span> = <span class="m1">time</span>.<span class="m2">perf_counter_ns</span><span class="b0">()</span>
+        <span class="v3">cli</span>.<span class="m2">sendall</span><span class="b0">(</span><span class="v1">msg</span><span class="b0">)</span>
+        <span class="v6">got</span> = <span class="n">0</span>
+        <span class="k">while</span> <span class="v6">got</span> &lt; <span class="v1">payload</span>:            <span class="c"># loopback may still split reads</span>
+            <span class="v6">got</span> += <span class="m1">len</span><span class="b0">(</span><span class="v3">cli</span>.<span class="m2">recv</span><span class="b1">(</span><span class="v1">payload</span> - <span class="v6">got</span><span class="b1">)</span><span class="b0">)</span>
+        <span class="v5">samples</span>.<span class="m2">append</span><span class="b0">(</span><span class="m1">time</span>.<span class="m2">perf_counter_ns</span><span class="b1">()</span> - <span class="v5">t0</span><span class="b0">)</span>
+    <span class="v5">samples</span>.<span class="m2">sort</span><span class="b0">()</span>
+    <span class="m1">q</span> = <span class="k">lambda</span> <span class="v6">p</span>: <span class="v5">samples</span><span class="b0">[</span><span class="m1">int</span><span class="b1">(</span><span class="v6">p</span> * <span class="m1">len</span><span class="b2">(</span><span class="v5">samples</span><span class="b2">)</span><span class="b1">)</span><span class="b0">]</span>
+    <span class="m1">print</span><span class="b0">(</span><span class="s">f"RTT ns: p50={</span><span class="m1">q</span><span class="b1">(</span><span class="n">.5</span><span class="b1">)</span><span class="s">} p99={</span><span class="m1">q</span><span class="b1">(</span><span class="n">.99</span><span class="b1">)</span><span class="s">} p99.9={</span><span class="m1">q</span><span class="b1">(</span><span class="n">.999</span><span class="b1">)</span><span class="s">} "</span>
+          <span class="s">f"mean={</span><span class="m1">statistics</span>.<span class="m2">mean</span><span class="b1">(</span><span class="v5">samples</span><span class="b1">)</span><span class="s">:.0f}"</span><span class="b0">)</span>
+    <span class="c"># On the host this page benchmarks (shared, virtualized), 64B pingpong</span>
+    <span class="c"># measured p50=24405ns, p99=32153ns, p99.9=37138ns over 200k iters.</span>
+
+<span class="k">def</span> <span class="m1">throughput_sweep</span><span class="b0">(</span><span class="v5">port</span>=<span class="n">9102</span>, <span class="v4">total</span>=<span class="n">1</span> &lt;&lt; <span class="n">28</span><span class="b0">)</span>:
+    <span class="v2">srv</span> = <span class="m1">socket</span>.<span class="m2">socket</span><span class="b0">()</span>
+    <span class="v2">srv</span>.<span class="m2">setsockopt</span><span class="b0">(</span><span class="m1">socket</span>.<span class="m2">SOL_SOCKET</span>, <span class="m1">socket</span>.<span class="m2">SO_REUSEADDR</span>, <span class="n">1</span><span class="b0">)</span>
+    <span class="v2">srv</span>.<span class="m2">bind</span><span class="b0">(</span><span class="b1">(</span><span class="s">"127.0.0.1"</span>, <span class="v5">port</span><span class="b1">)</span><span class="b0">)</span>; <span class="v2">srv</span>.<span class="m2">listen</span><span class="b0">(</span><span class="n">1</span><span class="b0">)</span>
+    <span class="k">def</span> <span class="m1">sink</span><span class="b0">(</span><span class="v4">s</span><span class="b0">)</span>:
+        <span class="v1">c</span>, <span class="v4">_</span> = <span class="v4">s</span>.<span class="m2">accept</span><span class="b0">()</span>
+        <span class="k">while</span> <span class="v1">c</span>.<span class="m2">recv</span><span class="b0">(</span><span class="n">1</span> &lt;&lt; <span class="n">20</span><span class="b0">)</span>:
+            <span class="k">pass</span>
+    <span class="m1">threading</span>.<span class="m2">Thread</span><span class="b0">(</span><span class="v4">target</span>=<span class="m1">sink</span>, <span class="v2">args</span>=<span class="b1">(</span><span class="v2">srv</span>,<span class="b1">)</span>, <span class="v2">daemon</span>=<span class="k">True</span><span class="b0">)</span>.<span class="m2">start</span><span class="b0">()</span>
+    <span class="k">for</span> <span class="v6">size</span> <span class="k">in</span> <span class="b0">(</span><span class="n">64</span>, <span class="n">1024</span>, <span class="n">65536</span>, <span class="n">1</span> &lt;&lt; <span class="n">20</span><span class="b0">)</span>:
+        <span class="v3">cli</span> = <span class="m1">socket</span>.<span class="m2">create_connection</span><span class="b0">(</span><span class="b1">(</span><span class="s">"127.0.0.1"</span>, <span class="v5">port</span><span class="b1">)</span><span class="b0">)</span>
+        <span class="v6">buf</span> = <span class="s">b"x"</span> * <span class="v6">size</span>
+        <span class="v5">n</span> = <span class="v4">total</span> // <span class="v6">size</span>
+        <span class="v5">t0</span> = <span class="m1">time</span>.<span class="m2">perf_counter</span><span class="b0">()</span>
+        <span class="k">for</span> <span class="v4">_</span> <span class="k">in</span> <span class="m1">range</span><span class="b0">(</span><span class="v5">n</span><span class="b0">)</span>:
+            <span class="v3">cli</span>.<span class="m2">sendall</span><span class="b0">(</span><span class="v6">buf</span><span class="b0">)</span>            <span class="c"># one syscall per iteration:</span>
+        <span class="v2">dt</span> = <span class="m1">time</span>.<span class="m2">perf_counter</span><span class="b0">()</span> - <span class="v5">t0</span>   <span class="c"># the syscall, not the copy, dominates</span>
+        <span class="m1">print</span><span class="b0">(</span><span class="s">f"{</span><span class="v6">size</span><span class="s">:&gt;8}B writes: {</span><span class="v4">total</span>*<span class="n">8</span>/<span class="v2">dt</span>/<span class="n">1e9</span><span class="s">:6.2f} Gb/s "</span>
+              <span class="s">f"({</span><span class="v2">dt</span>/<span class="v5">n</span>*<span class="n">1e9</span><span class="s">:8.0f} ns/write)"</span><span class="b0">)</span>
+        <span class="v3">cli</span>.<span class="m2">close</span><span class="b0">()</span>
+    <span class="c"># Host measured: 64B -&gt; 1.07 Gb/s (477 ns/write); 1 MiB -&gt; 48.73 Gb/s.</span>
+
+<span class="k">if</span> <span class="v1">__name__</span> == <span class="s">"__main__"</span>:
+    <span class="m1">rtt_bench</span><span class="b0">()</span>
+    <span class="m1">throughput_sweep</span><span class="b0">()</span>
+</code></pre>
+          </div>
+          <p>
+            The second is a miniature reliable transport over an unreliable
+            channel: sliding window, cumulative ACKs, Jacobson-Karels RTO,
+            and Karn's rule, in about eighty lines. Running it with different
+            loss rates reproduces the Go-Back-N-versus-selective-repeat gap
+            and the timer dynamics from the theory sections; the channel is
+            a lossy in-process queue so the whole system is deterministic
+            under a seed.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="python" class="active">Python</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="python" class="shl lang active"><code class="language-python"><span class="c"># minitransport.py: sliding-window reliable delivery over a lossy channel,</span>
+<span class="c"># with Jacobson-Karels RTO estimation and Karn's rule.</span>
+<span class="k">import</span> <span class="m1">random</span>, <span class="m1">heapq</span>
+
+<span class="k">class</span> <span class="m1">LossyChannel</span>:
+    <span class="s">"""Delivers (time, packet) events; drops with prob p, delays ~ rtt/2."""</span>
+    <span class="k">def</span> <span class="m1">__init__</span><span class="b0">(</span><span class="k">self</span>, <span class="v6">loss</span>, <span class="v2">one_way</span>, <span class="v1">jitter</span>, <span class="v1">seed</span>=<span class="n">0</span><span class="b0">)</span>:
+        <span class="k">self</span>.<span class="m2">loss</span>, <span class="k">self</span>.<span class="m2">one_way</span>, <span class="k">self</span>.<span class="m2">jitter</span> = <span class="v6">loss</span>, <span class="v2">one_way</span>, <span class="v1">jitter</span>
+        <span class="k">self</span>.<span class="m2">rng</span> = <span class="m1">random</span>.<span class="m2">Random</span><span class="b0">(</span><span class="v1">seed</span><span class="b0">)</span>
+        <span class="k">self</span>.<span class="m2">events</span> = <span class="b0">[]</span>                      <span class="c"># min-heap of (deliver_time, pkt)</span>
+    <span class="k">def</span> <span class="m1">send</span><span class="b0">(</span><span class="k">self</span>, <span class="v4">now</span>, <span class="v5">pkt</span><span class="b0">)</span>:
+        <span class="k">if</span> <span class="k">self</span>.<span class="m2">rng</span>.<span class="m2">random</span><span class="b0">()</span> &gt;= <span class="k">self</span>.<span class="m2">loss</span>:    <span class="c"># survives with prob 1-p</span>
+            <span class="v2">dt</span> = <span class="k">self</span>.<span class="m2">one_way</span> + <span class="k">self</span>.<span class="m2">rng</span>.<span class="m2">uniform</span><span class="b0">(</span><span class="n">0</span>, <span class="k">self</span>.<span class="m2">jitter</span><span class="b0">)</span>
+            <span class="m1">heapq</span>.<span class="m2">heappush</span><span class="b0">(</span><span class="k">self</span>.<span class="m2">events</span>, <span class="b1">(</span><span class="v4">now</span> + <span class="v2">dt</span>, <span class="v5">pkt</span><span class="b1">)</span><span class="b0">)</span>
+    <span class="k">def</span> <span class="m1">poll</span><span class="b0">(</span><span class="k">self</span>, <span class="v4">now</span><span class="b0">)</span>:
+        <span class="v2">out</span> = <span class="b0">[]</span>
+        <span class="k">while</span> <span class="k">self</span>.<span class="m2">events</span> <span class="k">and</span> <span class="k">self</span>.<span class="m2">events</span><span class="b0">[</span><span class="n">0</span><span class="b0">][</span><span class="n">0</span><span class="b0">]</span> &lt;= <span class="v4">now</span>:
+            <span class="v2">out</span>.<span class="m2">append</span><span class="b0">(</span><span class="m1">heapq</span>.<span class="m2">heappop</span><span class="b1">(</span><span class="k">self</span>.<span class="m2">events</span><span class="b1">)[</span><span class="n">1</span><span class="b1">]</span><span class="b0">)</span>
+        <span class="k">return</span> <span class="v2">out</span>
+
+<span class="k">class</span> <span class="m1">Sender</span>:
+    <span class="k">def</span> <span class="m1">__init__</span><span class="b0">(</span><span class="k">self</span>, <span class="v6">n_packets</span>, <span class="v5">window</span>, <span class="v0">ch_data</span>, <span class="v6">ch_ack</span><span class="b0">)</span>:
+        <span class="k">self</span>.<span class="m2">n</span>, <span class="k">self</span>.<span class="m2">W</span> = <span class="v6">n_packets</span>, <span class="v5">window</span>
+        <span class="k">self</span>.<span class="m2">data</span>, <span class="k">self</span>.<span class="m2">acks</span> = <span class="v0">ch_data</span>, <span class="v6">ch_ack</span>
+        <span class="k">self</span>.<span class="m2">base</span> = <span class="n">0</span>                  <span class="c"># oldest unacked seq</span>
+        <span class="k">self</span>.<span class="m2">next</span> = <span class="n">0</span>                  <span class="c"># next seq to send</span>
+        <span class="k">self</span>.<span class="m2">sent_at</span> = <span class="b0">{}</span>              <span class="c"># seq -&gt; (time, retransmitted?)</span>
+        <span class="k">self</span>.<span class="m2">srtt</span>, <span class="k">self</span>.<span class="m2">rttvar</span>, <span class="k">self</span>.<span class="m2">rto</span> = <span class="k">None</span>, <span class="k">None</span>, <span class="n">1.0</span>   <span class="c"># RFC 6298 init</span>
+        <span class="k">self</span>.<span class="m2">timer</span> = <span class="k">None</span>
+        <span class="k">self</span>.<span class="m2">retx</span> = <span class="n">0</span>
+    <span class="k">def</span> <span class="m1">rtt_sample</span><span class="b0">(</span><span class="k">self</span>, <span class="v4">m</span><span class="b0">)</span>:
+        <span class="k">if</span> <span class="k">self</span>.<span class="m2">srtt</span> <span class="k">is</span> <span class="k">None</span>:
+            <span class="k">self</span>.<span class="m2">srtt</span>, <span class="k">self</span>.<span class="m2">rttvar</span> = <span class="v4">m</span>, <span class="v4">m</span> / <span class="n">2</span>
+        <span class="k">else</span>:
+            <span class="k">self</span>.<span class="m2">rttvar</span> = <span class="n">0.75</span> * <span class="k">self</span>.<span class="m2">rttvar</span> + <span class="n">0.25</span> * <span class="m1">abs</span><span class="b0">(</span><span class="k">self</span>.<span class="m2">srtt</span> - <span class="v4">m</span><span class="b0">)</span>
+            <span class="k">self</span>.<span class="m2">srtt</span> = <span class="n">0.875</span> * <span class="k">self</span>.<span class="m2">srtt</span> + <span class="n">0.125</span> * <span class="v4">m</span>
+        <span class="k">self</span>.<span class="m2">rto</span> = <span class="m1">max</span><span class="b0">(</span><span class="n">0.2</span>, <span class="k">self</span>.<span class="m2">srtt</span> + <span class="n">4</span> * <span class="k">self</span>.<span class="m2">rttvar</span><span class="b0">)</span>
+    <span class="k">def</span> <span class="m1">tick</span><span class="b0">(</span><span class="k">self</span>, <span class="v4">now</span><span class="b0">)</span>:
+        <span class="k">for</span> <span class="v1">ack</span> <span class="k">in</span> <span class="k">self</span>.<span class="m2">acks</span>.<span class="m2">poll</span><span class="b0">(</span><span class="v4">now</span><span class="b0">)</span>:        <span class="c"># cumulative: ack = next expected</span>
+            <span class="k">if</span> <span class="v1">ack</span> &gt; <span class="k">self</span>.<span class="m2">base</span>:
+                <span class="k">for</span> <span class="v4">s</span> <span class="k">in</span> <span class="m1">range</span><span class="b0">(</span><span class="k">self</span>.<span class="m2">base</span>, <span class="v1">ack</span><span class="b0">)</span>:
+                    <span class="v0">t</span>, <span class="v1">retx</span> = <span class="k">self</span>.<span class="m2">sent_at</span>.<span class="m2">pop</span><span class="b0">(</span><span class="v4">s</span>, <span class="b1">(</span><span class="k">None</span>, <span class="k">True</span><span class="b1">)</span><span class="b0">)</span>
+                    <span class="k">if</span> <span class="v0">t</span> <span class="k">is</span> <span class="k">not</span> <span class="k">None</span> <span class="k">and</span> <span class="k">not</span> <span class="v1">retx</span>:   <span class="c"># Karn: never sample</span>
+                        <span class="k">self</span>.<span class="m2">rtt_sample</span><span class="b0">(</span><span class="v4">now</span> - <span class="v0">t</span><span class="b0">)</span>     <span class="c"># a retransmitted seq</span>
+                <span class="k">self</span>.<span class="m2">base</span> = <span class="v1">ack</span>
+                <span class="k">self</span>.<span class="m2">timer</span> = <span class="v4">now</span> + <span class="k">self</span>.<span class="m2">rto</span> <span class="k">if</span> <span class="k">self</span>.<span class="m2">base</span> &lt; <span class="k">self</span>.<span class="m2">next</span> <span class="k">else</span> <span class="k">None</span>
+        <span class="k">if</span> <span class="k">self</span>.<span class="m2">timer</span> <span class="k">is</span> <span class="k">not</span> <span class="k">None</span> <span class="k">and</span> <span class="v4">now</span> &gt;= <span class="k">self</span>.<span class="m2">timer</span>:  <span class="c"># timeout:</span>
+            <span class="k">self</span>.<span class="m2">rto</span> = <span class="m1">min</span><span class="b0">(</span><span class="n">60.0</span>, <span class="k">self</span>.<span class="m2">rto</span> * <span class="n">2</span><span class="b0">)</span>             <span class="c"># exponential backoff</span>
+            <span class="v0">seq</span> = <span class="k">self</span>.<span class="m2">base</span>                                <span class="c"># go-back: resend base</span>
+            <span class="k">self</span>.<span class="m2">data</span>.<span class="m2">send</span><span class="b0">(</span><span class="v4">now</span>, <span class="v0">seq</span><span class="b0">)</span>
+            <span class="k">self</span>.<span class="m2">sent_at</span><span class="b0">[</span><span class="v0">seq</span><span class="b0">]</span> = <span class="b0">(</span><span class="v4">now</span>, <span class="k">True</span><span class="b0">)</span>
+            <span class="k">self</span>.<span class="m2">timer</span> = <span class="v4">now</span> + <span class="k">self</span>.<span class="m2">rto</span>
+            <span class="k">self</span>.<span class="m2">retx</span> += <span class="n">1</span>
+        <span class="k">while</span> <span class="k">self</span>.<span class="m2">next</span> &lt; <span class="m1">min</span><span class="b0">(</span><span class="k">self</span>.<span class="m2">base</span> + <span class="k">self</span>.<span class="m2">W</span>, <span class="k">self</span>.<span class="m2">n</span><span class="b0">)</span>:  <span class="c"># fill the window</span>
+            <span class="k">self</span>.<span class="m2">data</span>.<span class="m2">send</span><span class="b0">(</span><span class="v4">now</span>, <span class="k">self</span>.<span class="m2">next</span><span class="b0">)</span>
+            <span class="k">self</span>.<span class="m2">sent_at</span><span class="b0">[</span><span class="k">self</span>.<span class="m2">next</span><span class="b0">]</span> = <span class="b0">(</span><span class="v4">now</span>, <span class="k">False</span><span class="b0">)</span>
+            <span class="k">if</span> <span class="k">self</span>.<span class="m2">timer</span> <span class="k">is</span> <span class="k">None</span>:
+                <span class="k">self</span>.<span class="m2">timer</span> = <span class="v4">now</span> + <span class="k">self</span>.<span class="m2">rto</span>
+            <span class="k">self</span>.<span class="m2">next</span> += <span class="n">1</span>
+    <span class="k">def</span> <span class="m1">done</span><span class="b0">(</span><span class="k">self</span><span class="b0">)</span>:
+        <span class="k">return</span> <span class="k">self</span>.<span class="m2">base</span> &gt;= <span class="k">self</span>.<span class="m2">n</span>
+
+<span class="k">def</span> <span class="m1">run</span><span class="b0">(</span><span class="v6">loss</span>=<span class="n">0.02</span>, <span class="v5">window</span>=<span class="n">64</span>, <span class="v5">n</span>=<span class="n">5000</span>, <span class="v1">rtt</span>=<span class="n">0.10</span><span class="b0">)</span>:
+    <span class="v1">data</span> = <span class="m1">LossyChannel</span><span class="b0">(</span><span class="v6">loss</span>, <span class="v1">rtt</span> / <span class="n">2</span>, <span class="v1">rtt</span> * <span class="n">0.1</span>, <span class="v1">seed</span>=<span class="n">1</span><span class="b0">)</span>
+    <span class="v4">acks</span> = <span class="m1">LossyChannel</span><span class="b0">(</span><span class="v6">loss</span>, <span class="v1">rtt</span> / <span class="n">2</span>, <span class="v1">rtt</span> * <span class="n">0.1</span>, <span class="v1">seed</span>=<span class="n">2</span><span class="b0">)</span>
+    <span class="v4">s</span> = <span class="m1">Sender</span><span class="b0">(</span><span class="v5">n</span>, <span class="v5">window</span>, <span class="v1">data</span>, <span class="v4">acks</span><span class="b0">)</span>
+    <span class="v3">expected</span>, <span class="v4">now</span>, <span class="v2">dt</span> = <span class="n">0</span>, <span class="n">0.0</span>, <span class="n">0.001</span>
+    <span class="k">while</span> <span class="k">not</span> <span class="v4">s</span>.<span class="m2">done</span><span class="b0">()</span>:
+        <span class="v4">s</span>.<span class="m2">tick</span><span class="b0">(</span><span class="v4">now</span><span class="b0">)</span>
+        <span class="k">for</span> <span class="v0">seq</span> <span class="k">in</span> <span class="v1">data</span>.<span class="m2">poll</span><span class="b0">(</span><span class="v4">now</span><span class="b0">)</span>:             <span class="c"># receiver: cumulative ACK</span>
+            <span class="k">if</span> <span class="v0">seq</span> == <span class="v3">expected</span>:
+                <span class="v3">expected</span> += <span class="n">1</span>
+            <span class="v4">acks</span>.<span class="m2">send</span><span class="b0">(</span><span class="v4">now</span>, <span class="v3">expected</span><span class="b0">)</span>           <span class="c"># ack = next expected seq</span>
+        <span class="v4">now</span> += <span class="v2">dt</span>
+    <span class="v6">goodput</span> = <span class="v5">n</span> * <span class="n">1460</span> * <span class="n">8</span> / <span class="v4">now</span> / <span class="n">1e6</span>
+    <span class="m1">print</span><span class="b0">(</span><span class="s">f"loss={</span><span class="v6">loss</span><span class="s">:.3f} W={</span><span class="v5">window</span><span class="s">}: {</span><span class="v4">now</span><span class="s">:.1f}s, {</span><span class="v6">goodput</span><span class="s">:.2f} Mb/s, "</span>
+          <span class="s">f"{</span><span class="v4">s</span>.<span class="m2">retx</span><span class="s">} timeouts, final rto={</span><span class="v4">s</span>.<span class="m2">rto</span><span class="s">:.3f}s srtt={</span><span class="v4">s</span>.<span class="m2">srtt</span><span class="s">:.3f}s"</span><span class="b0">)</span>
+
+<span class="k">if</span> <span class="v1">__name__</span> == <span class="s">"__main__"</span>:
+    <span class="k">for</span> <span class="v6">loss</span> <span class="k">in</span> <span class="b0">(</span><span class="n">0.0</span>, <span class="n">0.01</span>, <span class="n">0.05</span><span class="b0">)</span>:
+        <span class="m1">run</span><span class="b0">(</span><span class="v6">loss</span>=<span class="v6">loss</span><span class="b0">)</span>
+    <span class="c"># Window 64 over 100ms RTT caps goodput at 64*1460*8/0.1 = 7.5 Mb/s;</span>
+    <span class="c"># losses convert to timeouts and the Mathis-style collapse is visible.</span>
+</code></pre>
+          </div>
+          <p>
+            The third is the C server pattern underneath every
+            high-connection-count system: a single-threaded epoll event loop,
+            edge-cases handled the way production loops (libuv, nginx) handle
+            them, nonblocking sockets and EAGAIN-driven reads. Compare its
+            structure with the thread-per-connection model: the loop holds
+            one small state record per connection instead of a stack, which
+            is what makes a million concurrent connections a memory problem
+            instead of a scheduler problem.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="c" class="active">C</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="c" class="shl lang active"><code class="language-cpp"><span class="c">/* epoll_echo.c: single-threaded event-driven echo server.</span>
+<span class="c"> * build: gcc -O2 -o epoll_echo epoll_echo.c    test: nc 127.0.0.1 9200 */</span>
+<span class="k">#include</span> <span class="s">&lt;stdio.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;stdlib.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;string.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;unistd.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;errno.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;fcntl.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;netinet/in.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;netinet/tcp.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;sys/epoll.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;sys/socket.h&gt;</span>
+
+<span class="k">#define</span> <span class="m1">MAX_EVENTS</span> <span class="n">1024</span>
+
+<span class="k">static</span> <span class="k">int</span> <span class="m1">set_nonblocking</span><span class="b0">(</span><span class="k">int</span> <span class="v5">fd</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">int</span> <span class="v0">fl</span> = <span class="m1">fcntl</span><span class="b1">(</span><span class="v5">fd</span>, <span class="v4">F_GETFL</span>, <span class="n">0</span><span class="b1">)</span>;
+    <span class="k">return</span> <span class="m1">fcntl</span><span class="b1">(</span><span class="v5">fd</span>, <span class="v3">F_SETFL</span>, <span class="v0">fl</span> | <span class="v3">O_NONBLOCK</span><span class="b1">)</span>;
+<span class="b0">}</span>
+
+<span class="k">int</span> <span class="m1">main</span><span class="b0">(</span><span class="k">void</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">int</span> <span class="v2">lfd</span> = <span class="m1">socket</span><span class="b1">(</span><span class="v4">AF_INET</span>, <span class="v0">SOCK_STREAM</span>, <span class="n">0</span><span class="b1">)</span>;
+    <span class="k">int</span> <span class="v1">one</span> = <span class="n">1</span>;
+    <span class="m1">setsockopt</span><span class="b1">(</span><span class="v2">lfd</span>, <span class="v2">SOL_SOCKET</span>, <span class="v3">SO_REUSEADDR</span>, &amp;<span class="v1">one</span>, <span class="v2">sizeof</span> <span class="v1">one</span><span class="b1">)</span>;
+
+    <span class="k">struct</span> <span class="m1">sockaddr_in</span> <span class="v1">addr</span> = <span class="b1">{</span><span class="n">0</span><span class="b1">}</span>;
+    <span class="v1">addr</span>.<span class="m2">sin_family</span> = <span class="v4">AF_INET</span>;
+    <span class="v1">addr</span>.<span class="m2">sin_addr</span>.<span class="m2">s_addr</span> = <span class="m1">htonl</span><span class="b1">(</span><span class="v1">INADDR_LOOPBACK</span><span class="b1">)</span>;
+    <span class="v1">addr</span>.<span class="m2">sin_port</span> = <span class="m1">htons</span><span class="b1">(</span><span class="n">9200</span><span class="b1">)</span>;
+    <span class="k">if</span> <span class="b1">(</span><span class="m1">bind</span><span class="b2">(</span><span class="v2">lfd</span>, <span class="b0">(</span><span class="k">struct</span> <span class="m1">sockaddr</span> <span class="k">*</span><span class="b0">)</span>&amp;<span class="v1">addr</span>, <span class="v2">sizeof</span> <span class="v1">addr</span><span class="b2">)</span> &lt; <span class="n">0</span><span class="b1">)</span> <span class="b1">{</span>
+        <span class="m1">perror</span><span class="b2">(</span><span class="s">"bind"</span><span class="b2">)</span>; <span class="k">return</span> <span class="n">1</span>;
+    <span class="b1">}</span>
+    <span class="m1">listen</span><span class="b1">(</span><span class="v2">lfd</span>, <span class="v1">SOMAXCONN</span><span class="b1">)</span>;
+    <span class="m1">set_nonblocking</span><span class="b1">(</span><span class="v2">lfd</span><span class="b1">)</span>;
+
+    <span class="k">int</span> <span class="v4">ep</span> = <span class="m1">epoll_create1</span><span class="b1">(</span><span class="n">0</span><span class="b1">)</span>;
+    <span class="k">struct</span> <span class="m1">epoll_event</span> <span class="v6">ev</span> = <span class="b1">{</span> .<span class="m2">events</span> = <span class="v6">EPOLLIN</span>, .<span class="m2">data</span>.<span class="m2">fd</span> = <span class="v2">lfd</span> <span class="b1">}</span>;
+    <span class="m1">epoll_ctl</span><span class="b1">(</span><span class="v4">ep</span>, <span class="v2">EPOLL_CTL_ADD</span>, <span class="v2">lfd</span>, &amp;<span class="v6">ev</span><span class="b1">)</span>;
+
+    <span class="k">struct</span> <span class="m1">epoll_event</span> <span class="v6">events</span><span class="b1">[</span><span class="m1">MAX_EVENTS</span><span class="b1">]</span>;
+    <span class="k">char</span> <span class="v6">buf</span><span class="b1">[</span><span class="n">65536</span><span class="b1">]</span>;
+
+    <span class="k">for</span> <span class="b1">(</span>;;<span class="b1">)</span> <span class="b1">{</span>
+<span class="c">        /* one blocking point for the whole server: the kernel parks us</span>
+<span class="c">         * until any registered fd is ready. */</span>
+        <span class="k">int</span> <span class="v5">n</span> = <span class="m1">epoll_wait</span><span class="b2">(</span><span class="v4">ep</span>, <span class="v6">events</span>, <span class="m1">MAX_EVENTS</span>, -<span class="n">1</span><span class="b2">)</span>;
+        <span class="k">if</span> <span class="b2">(</span><span class="v5">n</span> &lt; <span class="n">0</span><span class="b2">)</span> <span class="b2">{</span> <span class="k">if</span> <span class="b0">(</span><span class="v2">errno</span> == <span class="v6">EINTR</span><span class="b0">)</span> <span class="k">continue</span>; <span class="m1">perror</span><span class="b0">(</span><span class="s">"epoll_wait"</span><span class="b0">)</span>; <span class="k">break</span>; <span class="b2">}</span>
+
+        <span class="k">for</span> <span class="b2">(</span><span class="k">int</span> <span class="v3">i</span> = <span class="n">0</span>; <span class="v3">i</span> &lt; <span class="v5">n</span>; <span class="v3">i</span>++<span class="b2">)</span> <span class="b2">{</span>
+            <span class="k">int</span> <span class="v5">fd</span> = <span class="v6">events</span><span class="b0">[</span><span class="v3">i</span><span class="b0">]</span>.<span class="m2">data</span>.<span class="m2">fd</span>;
+
+            <span class="k">if</span> <span class="b0">(</span><span class="v5">fd</span> == <span class="v2">lfd</span><span class="b0">)</span> <span class="b0">{</span><span class="c">                       /* accept until EAGAIN: */</span>
+                <span class="k">for</span> <span class="b1">(</span>;;<span class="b1">)</span> <span class="b1">{</span><span class="c">                          /* level-triggered would */</span>
+                    <span class="k">int</span> <span class="v1">cfd</span> = <span class="m1">accept</span><span class="b2">(</span><span class="v2">lfd</span>, <span class="k">NULL</span>, <span class="k">NULL</span><span class="b2">)</span>;<span class="c"> /* re-arm, but drain  */</span>
+                    <span class="k">if</span> <span class="b2">(</span><span class="v1">cfd</span> &lt; <span class="n">0</span><span class="b2">)</span> <span class="k">break</span>;<span class="c">             /* anyway for burstiness */</span>
+                    <span class="m1">set_nonblocking</span><span class="b2">(</span><span class="v1">cfd</span><span class="b2">)</span>;
+                    <span class="m1">setsockopt</span><span class="b2">(</span><span class="v1">cfd</span>, <span class="v2">IPPROTO_TCP</span>, <span class="v5">TCP_NODELAY</span>,
+                               &amp;<span class="v1">one</span>, <span class="v2">sizeof</span> <span class="v1">one</span><span class="b2">)</span>;
+                    <span class="k">struct</span> <span class="m1">epoll_event</span> <span class="v5">cev</span> = <span class="b2">{</span> .<span class="m2">events</span> = <span class="v6">EPOLLIN</span>,
+                                               .<span class="m2">data</span>.<span class="m2">fd</span> = <span class="v1">cfd</span> <span class="b2">}</span>;
+                    <span class="m1">epoll_ctl</span><span class="b2">(</span><span class="v4">ep</span>, <span class="v2">EPOLL_CTL_ADD</span>, <span class="v1">cfd</span>, &amp;<span class="v5">cev</span><span class="b2">)</span>;
+                <span class="b1">}</span>
+                <span class="k">continue</span>;
+            <span class="b0">}</span>
+<span class="c">            /* data or hangup on a connection */</span>
+            <span class="k">for</span> <span class="b0">(</span>;;<span class="b0">)</span> <span class="b0">{</span>
+                <span class="k">ssize_t</span> <span class="v2">r</span> = <span class="m1">read</span><span class="b1">(</span><span class="v5">fd</span>, <span class="v6">buf</span>, <span class="v2">sizeof</span> <span class="v6">buf</span><span class="b1">)</span>;
+                <span class="k">if</span> <span class="b1">(</span><span class="v2">r</span> &gt; <span class="n">0</span><span class="b1">)</span> <span class="b1">{</span>
+<span class="c">                    /* real servers must handle short writes by buffering</span>
+<span class="c">                     * and waiting for EPOLLOUT; echo payloads are small</span>
+<span class="c">                     * enough that a short write is rare. */</span>
+                    <span class="k">ssize_t</span> <span class="v2">off</span> = <span class="n">0</span>;
+                    <span class="k">while</span> <span class="b2">(</span><span class="v2">off</span> &lt; <span class="v2">r</span><span class="b2">)</span> <span class="b2">{</span>
+                        <span class="k">ssize_t</span> <span class="v5">w</span> = <span class="m1">write</span><span class="b0">(</span><span class="v5">fd</span>, <span class="v6">buf</span> + <span class="v2">off</span>, <span class="v2">r</span> - <span class="v2">off</span><span class="b0">)</span>;
+                        <span class="k">if</span> <span class="b0">(</span><span class="v5">w</span> &lt; <span class="n">0</span><span class="b0">)</span> <span class="k">break</span>;
+                        <span class="v2">off</span> += <span class="v5">w</span>;
+                    <span class="b2">}</span>
+                <span class="b1">}</span> <span class="k">else</span> <span class="k">if</span> <span class="b1">(</span><span class="v2">r</span> == <span class="n">0</span> ||
+                           <span class="b2">(</span><span class="v2">r</span> &lt; <span class="n">0</span> &amp;&amp; <span class="v2">errno</span> != <span class="v4">EAGAIN</span> &amp;&amp; <span class="v2">errno</span> != <span class="v6">EWOULDBLOCK</span><span class="b2">)</span><span class="b1">)</span> <span class="b1">{</span>
+                    <span class="m1">close</span><span class="b2">(</span><span class="v5">fd</span><span class="b2">)</span>;<span class="c">                      /* peer closed or error */</span>
+                    <span class="k">break</span>;
+                <span class="b1">}</span> <span class="k">else</span> <span class="b1">{</span>
+                    <span class="k">break</span>;<span class="c">                          /* EAGAIN: drained */</span>
+                <span class="b1">}</span>
+            <span class="b0">}</span>
+        <span class="b2">}</span>
+    <span class="b1">}</span>
+    <span class="k">return</span> <span class="n">0</span>;
+<span class="b0">}</span>
+</code></pre>
+          </div>
+          <p>
+            The fourth reproduces the NCCL allreduce measurements from this
+            page: torch.distributed with the NCCL backend, one process per
+            GPU, CUDA-event timing around a bus-synchronized loop. Run on
+            this machine's two H100s, this methodology produced the 41.68 to
+            330.15 GB/s curve in the collectives table.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="pytorch" class="shl lang active"><code class="language-python"><span class="c"># allreduce_bench.py: measure NCCL allreduce bandwidth across local GPUs.</span>
+<span class="c"># run: torchrun --nproc_per_node=2 allreduce_bench.py</span>
+<span class="k">import</span> <span class="m1">os</span>, <span class="m1">torch</span>
+<span class="k">import</span> <span class="m1">torch</span>.<span class="m2">distributed</span> <span class="k">as</span> <span class="m1">dist</span>
+
+<span class="k">def</span> <span class="m1">main</span><span class="b0">()</span>:
+    <span class="m1">dist</span>.<span class="m2">init_process_group</span><span class="b0">(</span><span class="s">"nccl"</span><span class="b0">)</span>             <span class="c"># NCCL: GPU rings over NVLink</span>
+    <span class="v5">rank</span> = <span class="m1">dist</span>.<span class="m2">get_rank</span><span class="b0">()</span>
+    <span class="v0">world</span> = <span class="m1">dist</span>.<span class="m2">get_world_size</span><span class="b0">()</span>
+    <span class="m1">torch</span>.<span class="m2">cuda</span>.<span class="m2">set_device</span><span class="b0">(</span><span class="v5">rank</span><span class="b0">)</span>
+    <span class="v0">dev</span> = <span class="m1">torch</span>.<span class="m2">device</span><span class="b0">(</span><span class="s">"cuda"</span>, <span class="v5">rank</span><span class="b0">)</span>
+
+    <span class="k">for</span> <span class="v6">mib</span> <span class="k">in</span> <span class="b0">(</span><span class="n">1</span>, <span class="n">4</span>, <span class="n">16</span>, <span class="n">64</span>, <span class="n">256</span>, <span class="n">1024</span><span class="b0">)</span>:
+        <span class="v3">numel</span> = <span class="v6">mib</span> * <span class="b0">(</span><span class="n">1</span> &lt;&lt; <span class="n">20</span><span class="b0">)</span> // <span class="n">4</span>            <span class="c"># fp32 elements  [numel]</span>
+        <span class="v4">x</span> = <span class="m1">torch</span>.<span class="m2">ones</span><span class="b0">(</span><span class="v3">numel</span>, <span class="v6">device</span>=<span class="v0">dev</span><span class="b0">)</span>       <span class="c"># [numel] on this rank's GPU</span>
+
+        <span class="k">for</span> <span class="v4">_</span> <span class="k">in</span> <span class="m1">range</span><span class="b0">(</span><span class="n">5</span><span class="b0">)</span>:                      <span class="c"># warmup: cudagraph/algo setup</span>
+            <span class="m1">dist</span>.<span class="m2">all_reduce</span><span class="b0">(</span><span class="v4">x</span><span class="b0">)</span>
+        <span class="m1">torch</span>.<span class="m2">cuda</span>.<span class="m2">synchronize</span><span class="b0">()</span>
+
+        <span class="v0">iters</span> = <span class="n">20</span>
+        <span class="v6">start</span> = <span class="m1">torch</span>.<span class="m2">cuda</span>.<span class="m2">Event</span><span class="b0">(</span><span class="v0">enable_timing</span>=<span class="k">True</span><span class="b0">)</span>
+        <span class="v3">stop</span> = <span class="m1">torch</span>.<span class="m2">cuda</span>.<span class="m2">Event</span><span class="b0">(</span><span class="v0">enable_timing</span>=<span class="k">True</span><span class="b0">)</span>
+        <span class="v6">start</span>.<span class="m2">record</span><span class="b0">()</span>
+        <span class="k">for</span> <span class="v4">_</span> <span class="k">in</span> <span class="m1">range</span><span class="b0">(</span><span class="v0">iters</span><span class="b0">)</span>:
+            <span class="m1">dist</span>.<span class="m2">all_reduce</span><span class="b0">(</span><span class="v4">x</span><span class="b0">)</span>                  <span class="c"># sum across all ranks, inplace</span>
+        <span class="v3">stop</span>.<span class="m2">record</span><span class="b0">()</span>
+        <span class="m1">torch</span>.<span class="m2">cuda</span>.<span class="m2">synchronize</span><span class="b0">()</span>
+        <span class="v0">ms</span> = <span class="v6">start</span>.<span class="m2">elapsed_time</span><span class="b0">(</span><span class="v3">stop</span><span class="b0">)</span> / <span class="v0">iters</span>
+
+        <span class="v0">bytes_</span> = <span class="v3">numel</span> * <span class="n">4</span>
+        <span class="v4">algbw</span> = <span class="v0">bytes_</span> / <span class="b0">(</span><span class="v0">ms</span> / <span class="n">1e3</span><span class="b0">)</span> / <span class="n">1e9</span>       <span class="c"># data size / time</span>
+        <span class="v6">busbw</span> = <span class="v4">algbw</span> * <span class="n">2</span> * <span class="b0">(</span><span class="v0">world</span> - <span class="n">1</span><span class="b0">)</span> / <span class="v0">world</span> <span class="c"># ring factor 2(N-1)/N:</span>
+        <span class="k">if</span> <span class="v5">rank</span> == <span class="n">0</span>:                           <span class="c"># at N=2 busbw == algbw</span>
+            <span class="m1">print</span><span class="b0">(</span><span class="s">f"{</span><span class="v6">mib</span><span class="s">:5d} MiB  {</span><span class="v0">ms</span><span class="s">:8.4f} ms  "</span>
+                  <span class="s">f"algbw {</span><span class="v4">algbw</span><span class="s">:7.2f} GB/s  busbw {</span><span class="v6">busbw</span><span class="s">:7.2f} GB/s"</span><span class="b0">)</span>
+    <span class="c"># Measured on this host (2x H100 80GB, NV18, NCCL 2.26.2):</span>
+    <span class="c">#     1 MiB  0.0252 ms   41.68 GB/s     (latency floor: 4B takes 23.62us)</span>
+    <span class="c">#  1024 MiB  3.2522 ms  330.15 GB/s     (85% of 388.28 GB/s p2p ceiling)</span>
+    <span class="m1">dist</span>.<span class="m2">destroy_process_group</span><span class="b0">()</span>
+
+<span class="k">if</span> <span class="v1">__name__</span> == <span class="s">"__main__"</span>:
+    <span class="m1">main</span><span class="b0">()</span>
+</code></pre>
+          </div>
+
+          <h2>How it is done in practice</h2>
+          <p>
+            The distance between this page's models and a production fabric
+            is mostly in the places where clean abstractions meet shared
+            hardware. A few load-bearing realities. Congestion control in a
+            real datacenter is an ecosystem, not an algorithm: the storage
+            fleet may run DCTCP variants in dedicated ECN-marked queues, the
+            RDMA fabric runs DCQCN or Swift-style delay-based control below
+            PFC, WAN-facing traffic runs BBR, and the switch QoS
+            configuration that keeps them from starving each other, queue
+            weights, ECN thresholds per queue, PFC headroom per priority, is
+            some of the most carefully reviewed configuration in the
+            company, because a wrong threshold turns into a fleet-wide
+            latency regression. The training-cluster fabric is increasingly
+            its own network, physically separate from the frontend
+            datacenter network: rail-optimized topologies give each GPU its
+            own NIC and its own fabric plane, so the eight NCCL rings of an
+            8-GPU node never share a link and ECMP hashing is bypassed by
+            construction; NVIDIA's reference designs and the large public
+            clusters (Meta's 24k-GPU RoCE and InfiniBand clusters described
+            in their Llama 3 infrastructure work) are built this way.
+          </p>
+          <p>
+            Overlap is the discipline that keeps the network off the
+            critical path. The Problem 5 arithmetic, communication-to-compute
+            ratio 0.34 at the healthy operating point, only helps if the
+            allreduce actually runs concurrently with the backward pass, so
+            every serious training framework buckets gradients (25 MB
+            default in PyTorch DDP) and launches collectives as buckets
+            complete, reverse-topological order, hiding the 5.6 s behind the
+            16.4 s. Sharded data parallelism (ZeRO, FSDP) changes the
+            collective mix, reduce-scatter plus allgather instead of
+            allreduce, same total bytes but half per phase, and pipeline and
+            tensor parallelism trade collective volume against latency
+            sensitivity: tensor-parallel allreduces sit on the critical path
+            of every layer's forward pass, which is why they stay inside the
+            NVLink domain where this machine measures 330 GB/s and 24 &mu;s
+            latency, while data-parallel traffic crosses the slower NIC
+            fabric where bandwidth, not latency, is the binding constraint.
+            The numbers compose: a practitioner sizing a cluster works this
+            page's arithmetic, BDP for the transport, \(2(N-1)/N\) for the
+            collectives, bisection for the fabric, \(1-(1-q)^F\) for the
+            tail, before any hardware is ordered, and the measured tables
+            here are the sanity anchors for the model's constants.
+          </p>
+
+          <h2>The current research frontier</h2>
+          <p>
+            Transport for AI fabrics is the loudest thread. The Ultra
+            Ethernet Consortium (AMD, Arista, Broadcom, Cisco, Meta,
+            Microsoft, and others) is standardizing a transport that drops
+            the lossless requirement, embraces packet spraying and
+            out-of-order delivery, and targets million-endpoint scale;
+            Amazon's SRD (Shalev et al., 2020) demonstrated the approach in
+            production EFA, and NVIDIA's Spectrum-X couples adaptive routing
+            with direct data placement to the same end. In-network
+            aggregation keeps advancing from research (SwitchML from KAUST
+            and Microsoft Research collaborators, ATP from Wisconsin and
+            CMU-adjacent groups) into product (NVIDIA SHARP performs
+            reductions in InfiniBand switches, cutting the allreduce
+            bandwidth term roughly in half by summing in the fabric), though
+            it fights the end-to-end argument on every deployment question:
+            state in switches, failure semantics, multi-tenancy. Congestion
+            control research has moved delay-first: Google's Swift showed
+            hardware-timestamped delay targets working fleet-wide, HPCC
+            (Alibaba) used in-band telemetry for near-instant convergence,
+            and the BBR line continues through v3 in the IETF ccwg.
+            Learned and formally analyzed control both remain active, from
+            MIT's Remy and the PCC utility-driven line from UIUC and the
+            Hebrew University to the ongoing effort to characterize BBR's
+            fairness envelope analytically (CMU, EPFL, and others).
+          </p>
+          <p>
+            At the host boundary, the syscall-cost problem this page
+            measured is being attacked from three directions: io_uring
+            batching submission and completion in shared rings inside the
+            kernel; kernel-bypass frameworks maturing from research
+            (DPDK, and academic lines like Snap at Google, Demikernel from
+            Microsoft Research) into standard deployment; and smartNIC/DPU
+            offload (NVIDIA BlueField, AWS Nitro, Intel IPU) moving the
+            hypervisor's entire network stack off the host CPU. QUIC
+            research continues on the performance gap with kernel TCP
+            (hardware offload of QUIC crypto, MASQUE-based proxying,
+            multipath QUIC in RFC 9761-adjacent work), and the
+            programmable-dataplane community (P4, Tofino's successors, and
+            eBPF/XDP inside Linux) keeps eroding the line between endpoint
+            and network, which is where the next round of the end-to-end
+            argument will be litigated.
+          </p>
+
+          <h2>Open source to read</h2>
+          <p>
+            The canonical implementations of nearly everything above are
+            readable. Each entry names the file to open first.
+          </p>
+          <ul>
+            <li>
+              <a href="https://github.com/torvalds/linux" target="_blank" rel="noreferrer">torvalds/linux</a>:
+              the reference congestion-control implementations. Open
+              net/ipv4/tcp_cubic.c, find <code>cubictcp_update</code>, and
+              match it line by line against the \(W(t) = C(t-K)^3 +
+              W_{max}\) derivation above (the fixed-point cube root is a
+              pleasure); then net/ipv4/tcp_bbr.c, whose 100-line header
+              comment is the best compact BBR specification anywhere.
+            </li>
+            <li>
+              <a href="https://github.com/NVIDIA/nccl" target="_blank" rel="noreferrer">NVIDIA/nccl</a>:
+              the collectives that produced this page's measured numbers.
+              Open src/device/all_reduce.h for the ring reduce-scatter and
+              allgather phases as templated device code, and
+              src/graph/search.cc to see how NCCL discovers rings and trees
+              through NVLink and NIC topology at init time.
+            </li>
+            <li>
+              <a href="https://github.com/cloudflare/quiche" target="_blank" rel="noreferrer">cloudflare/quiche</a>:
+              a production QUIC in Rust with unusually clean separation.
+              Open quiche/src/recovery/mod.rs to see loss detection and the
+              pluggable congestion controllers (Reno, CUBIC, BBR) behind
+              one trait; the RFC 9002 machinery reads like the RFC.
+            </li>
+            <li>
+              <a href="https://github.com/microsoft/msquic" target="_blank" rel="noreferrer">microsoft/msquic</a>:
+              the QUIC that ships in Windows and SMB. Open
+              src/core/loss_detection.c, then src/core/congestion_control.c
+              to see how a kernel-grade implementation organizes the same
+              state machines with allocation discipline quiche leaves to
+              Rust.
+            </li>
+            <li>
+              <a href="https://github.com/h2o/quicly" target="_blank" rel="noreferrer">h2o/quicly</a>
+              with <a href="https://github.com/h2o/picotls" target="_blank" rel="noreferrer">h2o/picotls</a>:
+              the minimal readable QUIC and TLS 1.3 pair. Open
+              lib/quicly.c and trace one packet from
+              <code>quicly_receive</code> through decryption to stream
+              delivery; it is the shortest path to understanding how QUIC's
+              layers actually nest.
+            </li>
+            <li>
+              <a href="https://github.com/libuv/libuv" target="_blank" rel="noreferrer">libuv/libuv</a>:
+              the event loop under Node.js. Open src/unix/linux.c and find
+              the epoll_wait loop; compare with the C server above to see
+              what production adds: timer heaps, deferred close semantics,
+              and the thundering-herd accept dance.
+            </li>
+            <li>
+              <a href="https://github.com/facebookincubator/gloo" target="_blank" rel="noreferrer">facebookincubator/gloo</a>:
+              PyTorch's CPU collective backend, where the algorithms are
+              legible without CUDA. Open gloo/allreduce_ring.cc and
+              gloo/allreduce_halving_doubling.cc: the two files are the
+              ring-versus-recursive-halving trade-off as code.
+            </li>
+            <li>
+              <a href="https://github.com/openucx/ucx" target="_blank" rel="noreferrer">openucx/ucx</a>:
+              the HPC communication layer over RDMA verbs. Open
+              src/uct/ib/rc/base/rc_ep.c to see what programming an RDMA
+              queue pair actually involves, and how much machinery
+              "the NIC does the transport" hides.
+            </li>
+            <li>
+              <a href="https://github.com/google/bbr" target="_blank" rel="noreferrer">google/bbr</a>:
+              the BBR development tree, including v3 ahead of mainline.
+              Open the README for deployment status, then
+              net/ipv4/tcp_bbr.c in the v3 branch to diff v3's loss and ECN
+              responses against v1's pure model.
+            </li>
+          </ul>
+
+          <h2>Common misconceptions</h2>
+          <p>
+            <strong>"More buffer is always safer."</strong> Buffers exist to
+            absorb bursts, not to store standing queues; a buffer that
+            never drains adds its full depth to every packet's latency, and
+            loss-based TCP will fill whatever exists. The arithmetic is one
+            division: 1 MB at 10 Mb/s is 0.8 seconds of delay. Sizing is
+            bounded by the BDP the buffer serves, and past that,
+            AQM, not memory, is the tool. The reflex "we saw drops, add
+            buffer" is how a network acquires bufferbloat.
+          </p>
+          <p>
+            <strong>"Throughput is set by the link speed."</strong> A
+            transport is limited by \(\min\) of link rate, receive window
+            over RTT, and the congestion regime, and the last two dominate
+            more often than not. A 64 KiB window over 70 ms delivers
+            7.49 Mb/s over any link, and Reno at \(p = 10^{-6}\), 50 ms
+            RTT delivers 285 Mb/s (simulated on this page's model) no
+            matter how much fiber is underneath. Fast links change the
+            question from "how fast is the wire" to "who is filling the
+            BDP".
+          </p>
+          <p>
+            <strong>"Packet loss means the network is broken."</strong> For
+            loss-based congestion control, loss is the protocol working: it
+            is the only feedback signal the design has, produced
+            deliberately by probing until the bottleneck queue overflows.
+            The pathological cases are the extremes: zero loss with rising
+            RTT (bufferbloat: the signal is being withheld) and random
+            non-congestive loss (wireless corruption), which the
+            \(1/\sqrt{p}\) law punishes as if it were congestion. Whether
+            loss is information or damage depends entirely on which
+            controller is listening.
+          </p>
+          <p>
+            <strong>"ECMP spreads traffic evenly across equal-cost
+            paths."</strong> ECMP balances flow placements, not bytes.
+            Hashing 8 equal flows onto 8 paths leaves the busiest path at
+            2.6x the mean load in expectation (computed above); a few
+            elephant flows can collide on one uplink while others idle.
+            Even load requires many small flows, flowlet or packet-level
+            spraying, or explicit scheduling; assuming ECMP equals balance
+            is how fabrics end up mysteriously slow at 40 percent average
+            utilization.
+          </p>
+          <p>
+            <strong>"Lossless fabrics remove congestion problems."</strong>
+            PFC removes drops, not congestion; it converts overflow into
+            backpressure that spreads hop by hop, blocks innocent flows
+            sharing the paused class, and in the limit deadlocks or storms.
+            The congestion still has to be controlled by something (DCQCN,
+            delay-based control), and the lossless machinery adds its own
+            failure modes on top. "Lossless" describes the packet's fate,
+            not the tail latency's.
+          </p>
+          <p>
+            <strong>"Allreduce cost scales linearly with the number of
+            GPUs."</strong> The ring's bandwidth term is
+            \(2(N-1)/N \cdot M/B\), which saturates at \(2M/B\): 4,096
+            GPUs pay 15 percent more than 8 in the model above, not 500x.
+            What grows with \(N\) is the latency term and the exposure to
+            stragglers and failures. The linear-scaling intuition comes
+            from the naive gather-broadcast schedule, which no production
+            collective uses.
+          </p>
+          <p>
+            <strong>"QUIC is faster because UDP is faster than TCP."</strong>
+            UDP is not faster; it is emptier. QUIC's wins come from what it
+            builds in the empty space: one-round-trip combined handshakes,
+            per-stream ordering that removes cross-stream head-of-line
+            blocking, richer ACKs, unambiguous packet numbering, and
+            deployability of new control algorithms in userspace. Indeed
+            QUIC pays more CPU per byte than kernel TCP with offloads; it
+            wins on round trips and loss behavior, not on datapath cost.
+          </p>
+          <p>
+            <strong>"The p99 only matters for the last 1 percent of
+            users."</strong> Under fanout, the tail is the median: at
+            fanout 100 with 1-percent-slow servers, 63.4 percent of
+            requests hit the tail (computed above). Any system that
+            aggregates parallel RPCs inherits its dependencies' p99 as its
+            own typical case, which is why tail budgets, hedging, and
+            DCTCP-class queue control are mainstream engineering rather
+            than perfectionism.
+          </p>
+
+          <h2>Self-check</h2>
+          <div class="quiz" data-quiz>
+            <script type="application/json" class="quiz-data">[
+              {"id": "q1", "qtype": "mcq",
+               "stem": "The end-to-end argument says reliability belongs at the endpoints because:",
+               "options": ["Links cannot detect bit errors", "Only the endpoints can verify the function across every failure between source and destination, so in-network implementations are at best optimizations", "Routers are too slow to compute checksums", "It minimizes total bandwidth usage"],
+               "correctIndex": 1,
+               "explanation": "Hop-by-hop reliability cannot cover corruption in buffers, router memory, or disks beyond the links, so the endpoints must check anyway; anything in the network is then redundant for correctness and justified only by performance."},
+              {"id": "q2", "qtype": "mcq",
+               "stem": "A path has 100 Gb/s bottleneck and 100 us RTT. The window needed to fill it is closest to:",
+               "options": ["125 kB", "1.25 MB", "12.5 MB", "125 MB"],
+               "correctIndex": 1,
+               "explanation": "BDP = 100e9 b/s x 1e-4 s = 1e7 bits = 1.25 MB. Windows below the BDP leave the pipe partly idle."},
+              {"id": "q3", "qtype": "mcq",
+               "stem": "In the AIMD fairness plane, why must the decrease be multiplicative rather than additive?",
+               "options": ["Multiplicative decrease reacts faster", "Subtracting a constant from both flows preserves their difference, so unfairness would never shrink; scaling both shrinks the difference each event", "Additive decrease can produce negative rates", "Multiplicative decrease preserves the ratio of rates"],
+               "correctIndex": 1,
+               "explanation": "Additive steps move parallel to the fair line, leaving x - y unchanged; only scaling both rates contracts the difference (it halves per event with beta = 1/2), which is exactly the convergence the trace shows."},
+              {"id": "q4", "qtype": "mcq",
+               "stem": "Halving a path's random loss rate changes long-run Reno throughput by a factor of about:",
+               "options": ["2", "sqrt(2), about 1.41", "4", "It depends on the link speed"],
+               "correctIndex": 1,
+               "explanation": "Throughput scales as 1/sqrt(p) from the sawtooth geometry: one loss per cycle of 3W^2/8 packets gives W proportional to 1/sqrt(p)."},
+              {"id": "q5", "qtype": "mcq",
+               "stem": "CUBIC's key structural change versus Reno is that its window growth is:",
+               "options": ["A function of elapsed time since the last loss, not of ACK counts, making growth largely RTT-independent", "Exponential instead of linear", "Driven by delay measurements instead of loss", "Bounded by the receive window"],
+               "correctIndex": 0,
+               "explanation": "W(t) = C(t-K)^3 + Wmax depends on wall-clock time, so flows with different RTTs grow together and recovery time after loss is independent of RTT (40 s at Wmax = 85,616 regardless of path length)."},
+              {"id": "q6", "qtype": "mcq",
+               "stem": "BBR must alternate between measuring bottleneck bandwidth and measuring propagation RTT because:",
+               "options": ["The kernel cannot timestamp both", "Measuring BtlBw requires a full pipe, which builds queue and inflates RTT samples; measuring RTprop requires an empty queue, which underuses the pipe", "ACKs arrive too infrequently", "The two quantities change on the same timescale"],
+               "correctIndex": 1,
+               "explanation": "The two observables are mutually exclusive at one instant, so BBR time-multiplexes: gain cycling probes bandwidth and drains, and ProbeRTT periodically empties the pipe to refresh the RTprop floor."},
+              {"id": "q7", "qtype": "truefalse",
+               "stem": "CoDel's central design change versus RED is to act on measured per-packet sojourn time rather than on queue length.",
+               "options": ["True", "False"],
+               "correctIndex": 0,
+               "explanation": "Queue length in packets means different delays at different link rates, which made RED untunable in practice; sojourn time is the harm itself, needs no per-link configuration, and distinguishes draining bursts from standing queues."},
+              {"id": "q8", "qtype": "mcq",
+               "stem": "A k=48 fat-tree built from identical 48-port switches supports how many hosts at full bisection?",
+               "options": ["2,304", "13,824", "27,648", "110,592"],
+               "correctIndex": 2,
+               "explanation": "Hosts = k^3/4 = 48^3/4 = 27,648, using 2,880 switches (1,152 edge, 1,152 aggregation, 576 core)."},
+              {"id": "q9", "qtype": "mcq",
+               "stem": "DCTCP cuts cwnd by a factor (1 - alpha/2) where alpha tracks the marked fraction. What behavior does this produce?",
+               "options": ["A response proportional to the extent of congestion: mild marking trims a few percent, full marking recovers Reno's halving", "Faster slow start", "Immunity to incast", "Fair sharing with Reno in the same queue"],
+               "correctIndex": 0,
+               "explanation": "The proportional cut lets senders hold the switch queue near the marking threshold K instead of sawing between empty and full; at alpha = 1 it degenerates to exactly Reno's response."},
+              {"id": "q10", "qtype": "mcq",
+               "stem": "PFC-based lossless Ethernet can freeze traffic far from a hotspot because:",
+               "options": ["ECN marks are broadcast", "PAUSE frames act per port and class, so backpressure propagates hop by hop and blocks all flows sharing the class, not just the congested one", "Switch CPUs are overloaded", "RDMA NICs retransmit too aggressively"],
+               "correctIndex": 1,
+               "explanation": "PFC has no flow granularity: a paused class stops innocent flows, the pause condition spreads upstream as queues fill, and pathological cases escalate to pause storms and cyclic deadlock."},
+              {"id": "q11", "qtype": "ordering",
+               "stem": "Order the phases of one ring allreduce of a buffer split into N chunks.",
+               "options": ["Partition the buffer into N chunks across N ranks", "N-1 reduce-scatter steps: each rank sends a chunk right, receives from left, and accumulates", "Each rank holds the fully reduced copy of exactly one chunk", "N-1 allgather steps circulate the completed chunks until all ranks hold all sums"],
+               "correctIndex": -1,
+               "explanation": "Reduce-scatter then allgather, each moving (N-1)/N of the buffer per rank, gives the 2(N-1)/N x M total that saturates at 2M and makes ring bandwidth cost nearly independent of N."},
+              {"id": "q12", "qtype": "mcq",
+               "stem": "A service fans out to 100 backends and waits for all; each is slow with probability 0.01. Roughly what fraction of requests are slow?",
+               "options": ["1 percent", "10 percent", "63 percent", "100 percent"],
+               "correctIndex": 2,
+               "explanation": "1 - 0.99^100 = 0.634: fanout turns a per-server tail event into the request's typical case, which is the entire motivation for hedged requests and tail-oriented queue control."}
+            ]</script>
+          </div>
+
+          <h2>References</h2>
+          <ol class="refs">
+            <li>Kurose, J. and Ross, K. <em>Computer Networking: A Top-Down Approach</em>, 8th ed., Pearson, 2021.</li>
+            <li>Peterson, L. and Davie, B. <em>Computer Networks: A Systems Approach</em>, 6th ed., Morgan Kaufmann, 2021. <a href="https://github.com/SystemsApproach/book" target="_blank" rel="noreferrer">github.com/SystemsApproach/book</a></li>
+            <li>Saltzer, J., Reed, D., and Clark, D. "End-to-End Arguments in System Design," <em>ACM Transactions on Computer Systems</em> 2(4), 1984. <a href="https://doi.org/10.1145/357401.357402" target="_blank" rel="noreferrer">doi:10.1145/357401.357402</a></li>
+            <li>Jacobson, V. "Congestion Avoidance and Control," <em>SIGCOMM</em>, 1988. <a href="https://doi.org/10.1145/52324.52356" target="_blank" rel="noreferrer">doi:10.1145/52324.52356</a></li>
+            <li>Chiu, D.-M. and Jain, R. "Analysis of the Increase and Decrease Algorithms for Congestion Avoidance in Computer Networks," <em>Computer Networks and ISDN Systems</em> 17(1), 1989. <a href="https://doi.org/10.1016/0169-7552(89)90019-6" target="_blank" rel="noreferrer">doi:10.1016/0169-7552(89)90019-6</a></li>
+            <li>Mathis, M., Semke, J., Mahdavi, J., and Ott, T. "The Macroscopic Behavior of the TCP Congestion Avoidance Algorithm," <em>ACM SIGCOMM Computer Communication Review</em> 27(3), 1997. <a href="https://doi.org/10.1145/263932.264023" target="_blank" rel="noreferrer">doi:10.1145/263932.264023</a></li>
+            <li>Padhye, J., Firoiu, V., Towsley, D., and Kurose, J. "Modeling TCP Throughput: A Simple Model and Its Empirical Validation," <em>SIGCOMM</em>, 1998. <a href="https://doi.org/10.1145/285237.285291" target="_blank" rel="noreferrer">doi:10.1145/285237.285291</a></li>
+            <li>Ha, S., Rhee, I., and Xu, L. "CUBIC: A New TCP-Friendly High-Speed TCP Variant," <em>ACM SIGOPS Operating Systems Review</em> 42(5), 2008. <a href="https://doi.org/10.1145/1400097.1400105" target="_blank" rel="noreferrer">doi:10.1145/1400097.1400105</a></li>
+            <li>Cardwell, N., Cheng, Y., Gunn, C. S., Yeganeh, S. H., and Jacobson, V. "BBR: Congestion-Based Congestion Control," <em>ACM Queue</em> 14(5), 2016. <a href="https://doi.org/10.1145/3012426.3022184" target="_blank" rel="noreferrer">doi:10.1145/3012426.3022184</a></li>
+            <li>Floyd, S. and Jacobson, V. "Random Early Detection Gateways for Congestion Avoidance," <em>IEEE/ACM Transactions on Networking</em> 1(4), 1993. <a href="https://doi.org/10.1109/90.251892" target="_blank" rel="noreferrer">doi:10.1109/90.251892</a></li>
+            <li>Nichols, K. and Jacobson, V. "Controlling Queue Delay," <em>ACM Queue</em> 10(5), 2012. <a href="https://doi.org/10.1145/2208917.2209336" target="_blank" rel="noreferrer">doi:10.1145/2208917.2209336</a></li>
+            <li>Gettys, J. and Nichols, K. "Bufferbloat: Dark Buffers in the Internet," <em>ACM Queue</em> 9(11), 2011. <a href="https://doi.org/10.1145/2063166.2071893" target="_blank" rel="noreferrer">doi:10.1145/2063166.2071893</a></li>
+            <li>Alizadeh, M., Greenberg, A., Maltz, D., Padhye, J., Patel, P., Prabhakar, B., Sengupta, S., and Sridharan, M. "Data Center TCP (DCTCP)," <em>SIGCOMM</em>, 2010. <a href="https://doi.org/10.1145/1851182.1851192" target="_blank" rel="noreferrer">doi:10.1145/1851182.1851192</a></li>
+            <li>Clos, C. "A Study of Non-Blocking Switching Networks," <em>Bell System Technical Journal</em> 32(2), 1953.</li>
+            <li>Al-Fares, M., Loukissas, A., and Vahdat, A. "A Scalable, Commodity Data Center Network Architecture," <em>SIGCOMM</em>, 2008. <a href="https://doi.org/10.1145/1402958.1402967" target="_blank" rel="noreferrer">doi:10.1145/1402958.1402967</a></li>
+            <li>Greenberg, A., Hamilton, J., Jain, N., Kandula, S., Kim, C., Lahiri, P., Maltz, D., Patel, P., and Sengupta, S. "VL2: A Scalable and Flexible Data Center Network," <em>SIGCOMM</em>, 2009. <a href="https://doi.org/10.1145/1592568.1592576" target="_blank" rel="noreferrer">doi:10.1145/1592568.1592576</a></li>
+            <li>Singh, A. et al. "Jupiter Rising: A Decade of Clos Topologies and Centralized Control in Google's Datacenter Network," <em>SIGCOMM</em>, 2015. <a href="https://doi.org/10.1145/2785956.2787508" target="_blank" rel="noreferrer">doi:10.1145/2785956.2787508</a></li>
+            <li>Dean, J. and Barroso, L. A. "The Tail at Scale," <em>Communications of the ACM</em> 56(2), 2013. <a href="https://doi.org/10.1145/2408776.2408794" target="_blank" rel="noreferrer">doi:10.1145/2408776.2408794</a></li>
+            <li>Guo, C., Wu, H., Deng, Z., Soni, G., Ye, J., Padhye, J., and Lipshteyn, M. "RDMA over Commodity Ethernet at Scale," <em>SIGCOMM</em>, 2016. <a href="https://doi.org/10.1145/2934872.2934908" target="_blank" rel="noreferrer">doi:10.1145/2934872.2934908</a></li>
+            <li>Zhu, Y., Eran, H., Firestone, D., Guo, C., Lipshteyn, M., Liron, Y., Padhye, J., Raindel, S., Yahia, M. H., and Zhang, M. "Congestion Control for Large-Scale RDMA Deployments (DCQCN)," <em>SIGCOMM</em>, 2015. <a href="https://doi.org/10.1145/2785956.2787484" target="_blank" rel="noreferrer">doi:10.1145/2785956.2787484</a></li>
+            <li>Patarasuk, P. and Yuan, X. "Bandwidth Optimal All-reduce Algorithms for Clusters of Workstations," <em>Journal of Parallel and Distributed Computing</em> 69(2), 2009. <a href="https://doi.org/10.1016/j.jpdc.2008.09.002" target="_blank" rel="noreferrer">doi:10.1016/j.jpdc.2008.09.002</a></li>
+            <li>Thakur, R., Rabenseifner, R., and Gropp, W. "Optimization of Collective Communication Operations in MPICH," <em>International Journal of High Performance Computing Applications</em> 19(1), 2005. <a href="https://doi.org/10.1177/1094342005051521" target="_blank" rel="noreferrer">doi:10.1177/1094342005051521</a></li>
+            <li>Sergeev, A. and Del Balso, M. "Horovod: Fast and Easy Distributed Deep Learning in TensorFlow," 2018. <a href="https://arxiv.org/abs/1802.05799" target="_blank" rel="noreferrer">arXiv:1802.05799</a></li>
+            <li>Langley, A. et al. "The QUIC Transport Protocol: Design and Internet-Scale Deployment," <em>SIGCOMM</em>, 2017. <a href="https://doi.org/10.1145/3098822.3098842" target="_blank" rel="noreferrer">doi:10.1145/3098822.3098842</a></li>
+            <li>Iyengar, J. and Thomson, M. (eds.) "QUIC: A UDP-Based Multiplexed and Secure Transport," RFC 9000, IETF, 2021. <a href="https://www.rfc-editor.org/rfc/rfc9000" target="_blank" rel="noreferrer">rfc-editor.org/rfc/rfc9000</a></li>
+            <li>McKeown, N., Anderson, T., Balakrishnan, H., Parulkar, G., Peterson, L., Rexford, J., Shenker, S., and Turner, J. "OpenFlow: Enabling Innovation in Campus Networks," <em>ACM SIGCOMM Computer Communication Review</em> 38(2), 2008. <a href="https://doi.org/10.1145/1355734.1355746" target="_blank" rel="noreferrer">doi:10.1145/1355734.1355746</a></li>
+          </ol>
+
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> networking is distributed
+            resource allocation under a one-bit budget of honesty: every
+            sender must infer the state of shared queues it cannot see from
+            signals (loss, marks, delay) that arrive a round trip late, and
+            every design on this page is a position on how to spend that
+            round trip. The arithmetic that organizes the whole subject is
+            small: a window is a bandwidth-delay product; the AIMD sawtooth
+            fixes throughput at \((S/R)\sqrt{3/2p}\), which is why loss
+            rates, not link rates, bound fast flows; queueing delay is
+            service time times \(1/(1-\rho)\), which is why hot links and
+            deep buffers are latency disasters; a fat-tree moves \(k^3/4\)
+            hosts at full bisection with \(5k^2/4\) commodity switches; and
+            a ring allreduce moves \(2(N-1)/N \cdot M\) bytes per worker,
+            which is why cluster size barely changes gradient-sync cost
+            while batch size changes everything. The measured numbers keep
+            the theory honest: on this repository's host a socket round
+            trip costs 24.6 &mu;s of software, and NCCL on two NVLinked
+            H100s spans 23.6 &mu;s of latency floor to 330 GB/s of
+            sustained bandwidth, the two poles, latency and bandwidth,
+            between which every protocol, fabric, and training job on this
+            page is an interpolation.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>&copy; <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;&middot;&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/classes/math.js"></script>
+    <script defer src="/code-tabs.js"></script>
+    <script defer src="/quiz.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/code-copy.js"></script>
+  </body>
+</html>

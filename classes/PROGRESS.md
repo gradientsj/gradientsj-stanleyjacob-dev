@@ -89,27 +89,28 @@ history.
 
 | Group | Pages | Done |
 | --- | --- | --- |
-| Machine learning foundations | 5 | 2 |
-| Language, generative, multimodal | 11 | 4 |
+| Machine learning foundations | 5 | 3 |
+| Language, generative, multimodal | 11 | 5 |
 | Reinforcement learning and decisions | 7 | 3 |
-| Systems, architecture, data at scale | 10 | 2 |
-| Algorithms, theory, optimization, security | 7 | 0 |
+| Systems, architecture, data at scale | 10 | 5 |
+| Algorithms, theory, optimization, security | 7 | 1 |
 | Graphics, rendering, 3D | 5 | 0 |
 | Robotics and embodied intelligence | 5 | 0 |
 | Applied domains, product, interfaces | 6 | 0 |
-| **Total** | **56** | **11** |
+| **Total** | **56** | **17** |
 
-Complete and validated: computer-architecture, deep-generative-models,
+Complete and validated: algorithm-design-and-analysis, computer-architecture,
+computer-networks, concurrent-systems-programming, deep-generative-models,
 deep-learning-engineering, deep-reinforcement-learning,
 diffusion-and-large-vision-models, graph-machine-learning,
-meta-learning-and-multitask, mining-massive-datasets, nlp-deep-learning,
-probabilistic-graphical-models, reinforcement-learning-fundamentals.
+language-models-from-scratch, meta-learning-and-multitask,
+mining-massive-datasets, nlp-deep-learning, parallel-computing,
+probabilistic-graphical-models, reinforcement-learning-fundamentals,
+statistical-learning.
 
-Partial stubs on disk from agents killed mid-write (resume these first, do not
-trust their current contents as finished): algorithm-design-and-analysis,
-concurrent-systems-programming, statistical-learning. The index generator
-treats a page as live only when it contains both a reference list and a
-closing takeaway, so partial pages are not linked from the index.
+The index generator treats a page as live only when it contains both a
+reference list and a closing takeaway, so partial pages are not linked from
+the index.
 
 ## Log
 
@@ -124,6 +125,13 @@ closing takeaway, so partial pages are not linked from the index.
   above. Coordinator loop per batch: validate with `tools/check_classes.py`,
   bake highlighting with `node scripts/highlight.mjs`, regenerate the index,
   update this file, commit, push.
+- Batch 1 complete: algorithm-design-and-analysis (2461 lines, finished the
+  cut-off stub), parallel-computing (2112), concurrent-systems-programming
+  (2538, with fresh Xeon benchmarks recorded in `data/concurrency.json`),
+  computer-networks (2203), language-models-from-scratch (1958),
+  statistical-learning (1578). All arithmetic in worked problems was verified
+  by running Python; CUDA snippets compiled with nvcc sm_90; PyTorch/JAX tabs
+  executed before inclusion. 17/56 live, 0 validator errors.
 
 ### Session 1 (2026-07-23)
 

@@ -1,0 +1,2298 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Parallel Computing &middot; Stanley Jacob</title>
+    <meta name="description" content="Amdahl and Gustafson worked numerically, work-depth analysis of scan and reduce, the CUDA execution model with measured coalescing and occupancy data, the full matmul tiling progression, warp shuffles, Triton kernels, FlashAttention, and the roofline model, all calibrated against real H100 80GB measurements." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes" class="active">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/classes">Classes</a></div>
+        <h1>Parallel computing: from Amdahl's law to CUDA kernels that saturate an H100</h1>
+        <p class="lead">
+          Parallel computing is the discipline of trading one long dependency
+          chain for many short ones, and then paying honestly for the
+          communication that trade creates. This page derives the speedup
+          laws and the work-depth framework, analyzes scan, reduce, and sort
+          as parallel algorithms, then descends into the CUDA execution
+          model: warps, coalescing, occupancy, shared-memory tiling, warp
+          shuffles, and the transformer's building blocks written as CUDA
+          and Triton kernels, each step checked against kernels written for
+          this page and measured on an NVIDIA H100 80GB in this repository.
+          By the end, a reduction that started at 358.0 GB/s runs at
+          3034.7 GB/s, a matmul climbs from 5.9 to 25.1 TFLOPS on the way
+          to cuBLAS at 51.2, a full causal multi-head attention block drops
+          from 24.044 ms to 1.352 ms, and attention at sequence length 8192
+          drops from 98.946 ms to 3.575 ms without changing a single flop.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Why this subject matters now</h2>
+          <p>
+            Single-thread performance stopped scaling around 2005, but the
+            economic pressure that used to push clock frequency now pushes
+            parallel width, and the numbers have become extreme. The H100
+            measured throughout this page exposes 132 streaming
+            multiprocessors, each holding up to 2048 resident threads, so a
+            fully occupied chip is juggling 270,336 threads at once; its
+            HBM3 stack delivers a measured 3063.5 GB/s and its tensor cores
+            a measured 744.6 bf16 TFLOPS. No sequential abstraction
+            survives contact with a machine like this. The programmer who
+            treats it as a fast serial processor gets a fraction of a
+            percent of what the silicon can do; the one who understands
+            decomposition, communication cost, and the memory hierarchy
+            gets factors of ten to a hundred, and this page measures those
+            factors rather than asserting them.
+          </p>
+          <p>
+            The subject has also changed shape. Twenty years ago parallel
+            computing meant MPI clusters and OpenMP loops for scientific
+            codes; the canonical textbook problems were stencils and sparse
+            solvers. Today the dominant parallel workload is the training
+            and serving of neural networks, and the practitioner's daily
+            objects are CUDA kernels, Triton programs, collective
+            communication over NVLink, and attention kernels whose design
+            is constrained by memory traffic rather than arithmetic. The
+            theory did not change: Amdahl's argument from 1967, Brent's
+            scheduling bound from 1974, and Blelloch's scan constructions
+            from 1990 predict the behavior of every kernel measured below.
+            What changed is that the theory is now applied at a scale where
+            getting it wrong costs real money, and where a single
+            well-understood kernel, FlashAttention being the canonical
+            example, can shift the economics of an entire industry. The
+            interview version of this subject is quantitative: given a
+            kernel, say what bounds it, predict its runtime from first
+            principles, and name the transformation that moves the bound.
+          </p>
+
+          <h3>The end of frequency scaling</h3>
+          <p>
+            Parallelism is not a preference; it is what was left after a physical
+            argument closed. Dennard scaling, stated in 1974, observed that shrinking a
+            transistor's linear dimension by \(1/\kappa\) also shrinks its voltage and
+            current by \(1/\kappa\), so dynamic power per transistor, \(P \propto C V^2
+            f\), falls exactly as fast as transistor density rises. Power per unit area
+            stays constant while both density and frequency go up: free performance,
+            every generation, for thirty years. It ended when threshold voltage stopped
+            following, because subthreshold leakage grows exponentially as \(V_{th}\)
+            falls, so \(V_{dd}\) had to stall near 1 volt around 2005. With \(V\) fixed
+            and \(C\) still falling only linearly, the cubic term in the classic
+            frequency-voltage relationship vanishes and power becomes roughly linear in
+            \(f\) at constant area, which at a fixed cooling budget of order 100 to 700
+            watts pins clocks near 3 to 5 GHz. Everything since has spent the still-growing
+            transistor budget on width instead of speed: more cores, wider vector units,
+            more independent memory channels, and finally the fixed-function matrix
+            datapaths of a tensor core. <mark>The H100's arithmetic peak is roughly four
+            orders of magnitude above a single scalar CPU core's, and essentially none of
+            that came from clock rate.</mark> A programmer's only access to it is through
+            explicit parallel structure.
+          </p>
+
+          <h3>Throughput versus latency, strong versus weak scaling</h3>
+          <p>
+            Two distinctions decide which of the laws below applies to a given problem.
+            The first is architectural. A latency-optimized processor minimizes the time
+            to finish one operation and spends its area on the machinery that shortens a
+            single dependent chain: deep out-of-order windows, branch predictors,
+            aggressive prefetchers, large private caches. A throughput-optimized processor
+            maximizes operations completed per second across many independent chains and
+            spends its area on the operations themselves, tolerating latency by having
+            other work ready. That is precisely the H100's bargain: a memory access costs
+            several hundred nanoseconds, roughly what it costs on a CPU, but the SM holds
+            up to 64 resident warps and switches among them for free, so the latency is
+            never on the critical path as long as parallelism exists. The consequence is
+            asymmetric. Give a GPU a single dependent chain and it is slower than a
+            laptop; give it \(10^5\) independent chains and nothing else competes.
+          </p>
+          <p>
+            The second distinction is about how the problem grows. <em>Strong scaling</em>
+            holds the problem size fixed and adds processors, asking how much the wall
+            clock shrinks; it is the regime of interactive latency, of a single inference
+            request, and of any deadline that does not move. <em>Weak scaling</em> grows
+            the problem in proportion to the machine and asks whether the wall clock stays
+            constant; it is the regime of training runs, simulations, and search. Strong
+            scaling is governed by Amdahl's law and is brutally hard, because the serial
+            residue and the communication term stay fixed while the parallel work per
+            processor shrinks toward them. Weak scaling is governed by Gustafson's
+            accounting and is comparatively easy, because the parallel work per processor
+            stays constant and only the communication term grows, usually logarithmically.
+            Both laws are derived next; the practical skill is knowing which question is
+            being asked before quoting either.
+          </p>
+          <pre class="flow">                        strong scaling            weak scaling
+ problem size           fixed                     grows with p
+ question               how much faster?          can we stay on time?
+ governing law          Amdahl (asymptote 1/f)    Gustafson (linear in p)
+ what breaks first      serial residue, latency   bandwidth, collectives
+ canonical workload     one inference request     a training run
+ GPU analogue           small batch, launch gaps  big batch, saturated SMs</pre>
+
+          <h2>Speedup, efficiency, and the two laws</h2>
+          <h3>Definitions and the honest baseline</h3>
+          <p>
+            Let \(T_1\) be the runtime of the <em>best serial
+            implementation</em> and \(T_p\) the runtime on \(p\) processors.
+            Speedup and efficiency are
+          </p>
+          $$ S(p) = \frac{T_1}{T_p}, \qquad E(p) = \frac{S(p)}{p} . $$
+          <p>
+            The baseline matters more than the parallel code. A parallel
+            program timed against itself running on one thread hides the
+            overhead the parallelization added: partitioning logic, atomic
+            operations, restructured data layouts. Published speedups that
+            beat \(p\) (superlinear speedup) are almost always a cache
+            effect, the aggregate L2 and L3 of \(p\) cores holding a working
+            set that thrashed on one core, and occasionally a search
+            algorithm getting lucky on work order; they are not evidence
+            that the law below is wrong, because the law is about a fixed
+            amount of work at fixed per-operation cost.
+          </p>
+
+          <h3>Amdahl's law, derived</h3>
+          <p>
+            Split the serial runtime into a fraction \(f\) that cannot be
+            parallelized and a fraction \(1-f\) that parallelizes
+            perfectly. Normalizing \(T_1 = 1\),
+          </p>
+          $$ T_p = f + \frac{1-f}{p}
+             \quad\Longrightarrow\quad
+             S(p) = \frac{1}{f + \dfrac{1-f}{p}},
+             \qquad
+             \lim_{p \to \infty} S(p) = \frac{1}{f}. $$
+          <p>
+            The derivation is three lines, but the consequences are brutal
+            and worth internalizing numerically. The serial fraction is a
+            <em>hard asymptote</em>: with \(f = 0.05\), infinite hardware
+            yields at most \(20\times\). Worse, the approach to the
+            asymptote is slow, because the parallel term \((1-f)/p\) must
+            shrink well below \(f\) before the asymptote is felt, which
+            happens around \(p \approx (1-f)/f\). Past that point,
+            additional processors buy almost nothing, and efficiency
+            \(E(p)\) collapses toward zero. In practice \(f\) is not a
+            constant of the program but of the program <em>plus</em> its
+            environment: kernel launch latency, the serial part of an
+            optimizer step, a data loader, a Python interpreter dispatching
+            work. On GPUs, Amdahl's law usually arrives disguised as "the
+            GPU is idle between kernels."
+          </p>
+          <pre class="flow">S(p) for f = 0.05, drawn to scale.  Asymptote 1/f = 20 is the dashed line.
+
+ 20 ┤- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -  1/f = 20
+ 16 ┤                                          ●━━━━━━━━━●  p=1024: 19.3
+ 12 ┤                        ●  p=64: 15.4
+  8 ┤          ●  p=16: 9.14
+  4 ┤   ●  p=4: 3.48
+  0 ┼───┴──────┴─────────────┴────────────────────────────┴──────►  p
+     1   4     16            64                          1024
+
+ p_(1/2) = (1-f)/f = 19 processors reach S = 10, half the asymptote.
+ Doubling 64 -> 128 buys 15.4 -> 17.4.  Doubling 512 -> 1024 buys 19.0 -> 19.3.
+ Efficiency E(p) = S(p)/p:  87% at p=4, 57% at p=16, 24% at p=64, 1.9% at p=1024.</pre>
+          <p>
+            The efficiency row is the one to internalize. Efficiency is the fraction of
+            purchased processor-seconds that do useful work, \(E(p) = S(p)/p\), and under
+            Amdahl it equals \(1/(fp + 1 - f)\), decaying like \(1/(fp)\) once \(fp \gg
+            1\). At \(f = 0.05\) a 1024-way machine returns 1.9 percent of its capacity.
+            Nothing about the code is wrong; the workload simply ran out of parallelism,
+            and the only remedies are shrinking \(f\) or growing the problem, which is
+            the door Gustafson walks through next.
+          </p>
+
+          <div class="problem">
+            <span class="plabel">Problem 1</span>
+            <p>
+              A renderer spends 92 percent of its serial runtime in a ray
+              tracing loop that parallelizes perfectly and 8 percent in
+              scene setup that does not. Compute the speedup on 8, 64, and
+              1024 processors, the efficiency at 64, and the asymptotic
+              speedup. At what processor count does the machine reach half
+              of the asymptotic speedup?
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> With \(f = 0.08\):
+                \(S(8) = 1/(0.08 + 0.92/8) = 1/0.195 = 5.13\).
+                \(S(64) = 1/(0.08 + 0.92/64) = 1/0.094375 = 10.60\), so
+                efficiency at 64 is \(10.60/64 = 16.6\) percent: five of
+                every six processor-seconds are wasted.
+                \(S(1024) = 1/(0.08 + 0.92/1024) = 1/0.080898 = 12.36\).
+                The asymptote is \(1/0.08 = 12.5\), so going from 64 to
+                1024 processors, a \(16\times\) increase in hardware, buys
+                a factor of \(12.36/10.60 = 1.17\).
+              </p>
+              <p>
+                Half the asymptote is \(S = 6.25\), reached when
+                \(f + (1-f)/p = 0.16\), i.e. \(0.92/p = 0.08\), giving
+                \(p = 11.5\): the machine is half saturated at just 12
+                processors. This "half-performance point" at
+                \(p_{1/2} = (1-f)/f\) is the single most useful number to
+                extract from a serial profile before buying hardware, and
+                the same functional form reappears below as the
+                half-bandwidth message size of a communication link.
+              </p>
+            </div>
+          </div>
+
+          <h3>Gustafson's rebuttal: scale the problem with the machine</h3>
+          <p>
+            Amdahl fixes the problem size and asks how runtime shrinks;
+            Gustafson (1988) observed that real users fix the runtime and
+            grow the problem. Suppose a run on \(p\) processors spends,
+            <em>of its own wall clock</em>, a fraction \(s\) in serial code
+            and \(1-s\) in parallel code. Normalize that wall clock to 1.
+            A single processor executing the same (scaled) workload would
+            need the serial part unchanged plus \(p\) times the parallel
+            part:
+          </p>
+          $$ T_1^{scaled} = s + p\,(1-s)
+             \quad\Longrightarrow\quad
+             S_{scaled}(p) = s + p\,(1-s), $$
+          <p>
+            which is linear in \(p\) with slope \(1-s\): no asymptote. The
+            two laws do not contradict each other; they answer different
+            questions with different definitions of the serial fraction
+            (Amdahl's \(f\) is a fraction of the <em>serial</em> run,
+            Gustafson's \(s\) a fraction of the <em>parallel</em> run).
+            The deeper point is that parallel machines are worth building
+            because workloads scale: weather models add resolution,
+            language models add parameters and tokens. Training a modern
+            network across thousands of GPUs is a Gustafson regime,
+            which is why data parallelism works at all; inference latency
+            on a single prompt, in contrast, is an Amdahl regime, which is
+            why serving is so much harder to parallelize than training.
+          </p>
+
+          <div class="problem">
+            <span class="plabel">Problem 2</span>
+            <p>
+              A simulation running on 128 processors spends 5 percent of
+              its wall clock in serial code. (a) Compute the Gustafson
+              scaled speedup. (b) Find the Amdahl serial fraction \(f\)
+              that would give the same speedup at \(p = 128\), and explain
+              the gap between \(f\) and \(s = 0.05\).
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> (a) \(S_{scaled} = 0.05 + 128
+                \times 0.95 = 121.65\), an efficiency of \(121.65/128 =
+                95\) percent.
+              </p>
+              <p>
+                (b) Set \(1/(f + (1-f)/128) = 121.65\) and solve:
+                \(f + (1-f)/128 = 1/121.65 = 0.008220\), so
+                \(f\,(1 - 1/128) = 0.008220 - 0.0078125\), giving
+                \(f = 0.000411\). Check: \(1/(0.000411 + 0.999589/128) =
+                121.65\). The two fractions differ by a factor of about
+                120 because they are measured against different
+                denominators: 5 percent of a short parallel run is the
+                same absolute serial time as 0.04 percent of the
+                \(\sim\!122\times\) longer serial run of the scaled
+                problem. Stating a serial fraction without stating the
+                denominator is how speedup claims mislead.
+              </p>
+            </div>
+          </div>
+
+          <h3>Decomposition, assignment, orchestration, mapping</h3>
+          <p>
+            Between "this problem has parallelism" and "this program runs fast" sit four
+            decisions, and naming them separately is what keeps a performance discussion
+            from becoming a guessing game. <strong>Decomposition</strong> exposes
+            concurrency: it breaks the computation into tasks whose dependency graph has
+            small depth. The constraint is Amdahl's, so the target is enough tasks to keep
+            every unit busy, typically several times the processor count so that load
+            imbalance can be absorbed. <strong>Assignment</strong> distributes tasks to
+            workers, statically (a compile-time or launch-time partition, cheap and
+            predictable, correct when task costs are uniform) or dynamically (a shared
+            queue or work-stealing deque, robust to irregular costs at the price of
+            synchronization). <strong>Orchestration</strong> is the communication and
+            synchronization that assignment created: which barriers exist, which data
+            moves, how messages are batched, how communication overlaps computation. It is
+            where most performance is won or lost, because it is the only stage that
+            touches the memory system directly. <strong>Mapping</strong> binds workers to
+            hardware: which core, which socket, which NUMA node, which SM, which GPU in
+            which node of which rack.
+          </p>
+          <p>
+            A CUDA kernel makes the four visible in a single launch. Decomposition is the
+            choice of what one thread computes, one output element for the naive matmul
+            and an \(8 \times 8\) register tile for the fast one. Assignment is the grid
+            and block shape, which is static; the grid-stride loop is a static assignment
+            deliberately coarsened so that each thread's share is long enough to amortize
+            setup. Orchestration is <code>__syncthreads</code>, shared-memory staging, and
+            the atomics at the end of a reduction. Mapping is the hardware's job at block
+            granularity, but the programmer still controls the part that matters, which
+            blocks share an SM and therefore its shared memory and L1, through occupancy.
+            When a kernel underperforms, the diagnosis is almost always naming which of
+            the four is wrong, and the measured progressions later on this page are
+            exactly this: reduce0 to reduce4 changes decomposition and orchestration
+            without touching the algorithm and gains \(8.5\times\).
+          </p>
+          <p>
+            The orthogonal axis is what is being split. <em>Data parallelism</em> applies
+            the same operation to many elements: the tasks are homogeneous, the dependency
+            graph is shallow and regular, and the code is a loop over an index space. It is
+            the form GPUs, vector units, and collective libraries are built for, and nearly
+            everything in deep learning is a data-parallel program. <em>Task parallelism</em>
+            runs different operations concurrently: a decode stage feeding a compute stage
+            feeding a write stage, or the independent branches of a divide-and-conquer
+            recursion. Its parallelism is bounded by the number of distinct tasks rather
+            than by the data size, so it saturates early, and its natural expression is a
+            thread pool or a fork-join scheduler rather than a kernel launch. Real systems
+            are hybrids: a training step is data-parallel inside each kernel, task-parallel
+            across the data loader, the forward compute, and the gradient all-reduce, and
+            the pipelining of those three is a task-parallel schedule wrapped around
+            data-parallel work. <em>Pipeline parallelism</em> is the special case that
+            deserves its own name because its efficiency has a closed form, derived in the
+            practice section below.
+          </p>
+
+          <h3>Communication cost: the alpha-beta model</h3>
+          <p>
+            Decomposing a computation creates messages, and messages have a
+            fixed cost and a marginal cost. The standard model charges
+          </p>
+          $$ T(m) = \alpha + \frac{m}{\beta} $$
+          <p>
+            for a message of \(m\) bytes, where \(\alpha\) is latency
+            (software stack, link traversal, synchronization) and
+            \(\beta\) is asymptotic bandwidth. Two derived quantities do
+            most of the work in practice. The <em>half-bandwidth message
+            size</em> \(m_{1/2} = \alpha\beta\) is the size at which half
+            the link's bandwidth is achieved (setting \(m/T(m) =
+            \beta/2\) gives \(m = \alpha\beta\)); messages far below it are
+            latency-bound and should be batched. And for collectives, the
+            relevant metric is <em>bus bandwidth</em>, which normalizes
+            algorithm traffic so it can be compared to the link speed: a
+            ring all-reduce of \(m\) bytes on \(N\) devices moves
+            \(2(N-1)/N \cdot m\) bytes through each link, so
+            \(\text{busbw} = 2(N-1)/N \cdot m / T\). Richer models exist
+            and are worth knowing by name: BSP (Valiant 1990) charges
+            supersteps with global barriers, and LogP (Culler et al. 1993)
+            separates latency, overhead, and gap; the alpha-beta form is
+            the one used daily to size messages.
+          </p>
+          <p>
+            The numbers below are measured on this machine: a
+            torch.distributed all-reduce (NCCL) between two H100s over
+            NVLink, whose hardware limit is 450 GB/s per direction, median
+            of 20 runs.
+          </p>
+          <div class="tbl-wrap"><table class="data">
+            <thead><tr><th>Message size</th><th>Time (ms)</th><th>Bus bandwidth (GB/s)</th><th>Fraction of NVLink peak</th></tr></thead>
+            <tbody>
+              <tr><td>1 MB</td><td>0.036</td><td>28.8</td><td>6.4%</td></tr>
+              <tr><td>16 MB</td><td>0.097</td><td>173.5</td><td>38.6%</td></tr>
+              <tr><td>256 MB</td><td>0.924</td><td>290.7</td><td>64.6%</td></tr>
+              <tr><td>1024 MB</td><td>3.271</td><td>328.3</td><td>73.0%</td></tr>
+            </tbody>
+          </table></div>
+
+          <div class="problem">
+            <span class="plabel">Problem 3</span>
+            <p>
+              Fit the alpha-beta model to the measured 1 MB and 1024 MB
+              all-reduce points above (with \(N=2\), each byte crosses the
+              link once, so treat \(T(m) = \alpha + m/\beta\) directly).
+              Report \(\alpha\), \(\beta\), and the half-bandwidth message
+              size, then use the fit to predict the 16 MB point and
+              compare with the measurement.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> Two points determine the line:
+                \(\beta = (m_2 - m_1)/(T_2 - T_1) = (1024 - 1) \times
+                2^{20} \,/\, (3.271 - 0.036)\,\text{ms} = 331.6\)
+                GB/s, and \(\alpha = T_1 - m_1/\beta = 36\,\mu s -
+                1\,\text{MiB}/331.6\,\text{GB/s} = 36 - 3.2 = 32.8\)
+                \(\mu s\). The half-bandwidth size is \(m_{1/2} =
+                \alpha\beta = 32.8\,\mu s \times 331.6\,\text{GB/s}
+                \approx 10.4\) MiB: any gradient bucket much smaller than
+                about 10 MB is paying mostly latency, which is exactly why
+                data-parallel trainers coalesce gradients into buckets of
+                tens of megabytes before reducing.
+              </p>
+              <p>
+                Prediction at 16 MiB: \(T = 32.8\,\mu s + 16\,\text{MiB} /
+                331.6\,\text{GB/s} = 32.8 + 50.6 = 83.4\,\mu s\), versus
+                97 \(\mu s\) measured. The model underpredicts by 14
+                percent because NCCL switches protocols and channel counts
+                with message size, so \(\alpha\) and \(\beta\) are not
+                truly constant; a two-parameter fit is a design tool, not
+                a simulator. Note also that the asymptotic \(\beta\) is 74
+                percent of the 450 GB/s link: protocol overhead and the
+                fact that all-reduce must also add the numbers keep even
+                giant messages off the hardware roof.
+              </p>
+            </div>
+          </div>
+
+          <h3>Message passing and the collectives</h3>
+          <p>
+            When memory is not shared, communication becomes explicit, and the interface
+            that standardized it is MPI: point-to-point <code>MPI_Send</code> and
+            <code>MPI_Recv</code>, their nonblocking <code>Isend</code>/<code>Irecv</code>
+            forms that return immediately so computation can overlap the transfer, and
+            above them a small algebra of <em>collectives</em> that every rank in a
+            communicator enters together. Six carry almost all of the traffic in practice.
+            <code>Broadcast</code> sends one rank's buffer to all. <code>Reduce</code>
+            combines all ranks' buffers with an associative operator into one rank;
+            <code>Allreduce</code> leaves the result on every rank. <code>Scatter</code>
+            cuts one buffer into pieces, one per rank, and <code>Gather</code> inverts it;
+            <code>Allgather</code> leaves the concatenation everywhere.
+            <code>ReduceScatter</code> reduces and then leaves rank \(i\) holding only the
+            \(i\)-th slice of the result, which is the piece that makes the fast
+            all-reduce work. The value of the collective interface is that the
+            <em>algorithm</em> is the library's choice: the same call becomes a tree at
+            small sizes and a ring at large ones, and the topology detection that picks
+            between them is why nobody should hand-roll these.
+          </p>
+          <p>
+            <strong>Tree all-reduce.</strong> Reduce up a binary tree of \(N\) ranks, then
+            broadcast down. Each phase has \(\log_2 N\) rounds and each round moves \(m\)
+            bytes on the links that are active, so under the alpha-beta model
+          </p>
+          $$ T_{\text{tree}} \;=\; 2\log_2 N \left( \alpha + \frac{m}{\beta} \right)
+             \;+\; \log_2 N \cdot \gamma m , $$
+          <p>
+            with \(\gamma\) the per-byte cost of the reduction arithmetic. The latency term
+            is only \(2\alpha\log_2 N\), the best available, but the bandwidth term carries
+            a factor \(\log_2 N\): every byte crosses \(\log_2 N\) links on the way up and
+            \(\log_2 N\) on the way down. Trees win when \(m\) is small.
+          </p>
+          <p>
+            <strong>Ring all-reduce.</strong> Arrange the ranks in a ring and split each
+            buffer into \(N\) chunks of \(m/N\) bytes. Phase one is a reduce-scatter:
+            \(N-1\) steps, in each of which every rank simultaneously sends one chunk to
+            its successor and receives one from its predecessor, adding what it receives
+            into its own copy. After \(N-1\) steps, rank \(i\) holds the fully reduced
+            chunk \(i\) and nobody holds any other complete chunk. Phase two is an
+            allgather with the identical communication pattern and no arithmetic: another
+            \(N-1\) steps circulate the completed chunks until every rank has all of them.
+            Counting bytes on any one link,
+          </p>
+          $$ T_{\text{ring}} \;=\; 2(N-1)\left( \alpha + \frac{m/N}{\beta} \right)
+             \;+\; (N-1)\,\gamma\,\frac{m}{N}
+             \;=\; 2(N-1)\alpha \;+\; \frac{2(N-1)}{N}\cdot\frac{m}{\beta}
+             \;+\; \frac{N-1}{N}\gamma m . $$
+          <p>
+            <mark>The factor \(2(N-1)/N\) is the whole point: it is bounded above by 2 for
+            every \(N\), so a ring all-reduce moves at most twice the buffer size through
+            each link no matter how many ranks participate, while the tree's cost grows
+            like \(\log_2 N\).</mark> This is Patarasuk and Yuan's bandwidth-optimal
+            result, and it is also the reason the community reports <em>bus bandwidth</em>
+            rather than raw throughput: dividing the achieved \(m/T\) by that same
+            \(2(N-1)/N\) yields a number directly comparable to the link speed, which is
+            how the measured table above was computed. The trade is latency: ring pays
+            \(2(N-1)\alpha\), linear in \(N\), against the tree's \(2\alpha\log_2 N\). The
+            crossover is where \(2(N-1)\alpha\) exceeds the tree's extra bandwidth term,
+            which for the measured \(\alpha \approx 33\,\mu s\) and \(\beta \approx 332\)
+            GB/s lands in the low megabytes. NCCL implements exactly this dichotomy, plus a
+            double binary tree construction that keeps every link busy in both directions,
+            and selects among them by message size and detected topology; the same
+            algorithms appear in Open MPI's <code>coll</code> components.
+          </p>
+          <pre class="flow">ring all-reduce, N = 4, buffer split into 4 chunks per rank
+
+ reduce-scatter, 3 steps        allgather, 3 steps
+ r0: [a0 a1 a2 a3]              each completed chunk circulates
+ r1: [b0 b1 b2 b3]              r0 ends with chunk 0 complete
+ r2: [c0 c1 c2 c3]              r1 ends with chunk 1 complete   ──►  then
+ r3: [d0 d1 d2 d3]              ...                                  all-to-all
+                                                                     completion
+ each step: rank i sends chunk (i-step) mod N to rank i+1, adds what arrives
+ bytes on one link = 2(N-1)/N * m = 1.5m at N=4, 1.75m at N=8, -> 2m as N grows</pre>
+          <p>
+            In distributed training this maps onto NCCL one-for-one. Data-parallel gradient
+            synchronization is an all-reduce, bucketed to tens of megabytes so it sits on
+            the bandwidth side of the crossover and overlapped with the backward pass so
+            the communication hides under compute. Fully-sharded data parallelism replaces
+            it with reduce-scatter on gradients plus all-gather on parameters, which is the
+            same two phases the ring already runs, exposed separately so that the parameter
+            copy need not be replicated. Tensor parallelism issues an all-reduce or
+            reduce-scatter after each partitioned matmul, at a frequency high enough that
+            it is only viable inside one NVLink domain. Expert-parallel mixture-of-experts
+            layers use all-to-all, whose cost model has no \(\log\) at all and whose
+            performance is set by the worst-case pairing in the topology.
+          </p>
+
+          <div class="problem">
+            <span class="plabel">Problem 4</span>
+            <p>
+              A 1.5-billion-parameter model is trained with bf16 gradients (2 bytes each)
+              across \(N = 64\) GPUs. The interconnect has \(\alpha = 5\,\mu s\) and
+              \(\beta = 200\) GB/s per link; ignore the reduction arithmetic term.
+              (a) Compute the ring all-reduce time for the whole gradient in one message.
+              (b) Compute the tree all-reduce time for the same message. (c) Repeat both
+              for a single 512 KB bucket and state which algorithm each size prefers.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> The gradient is \(m = 1.5 \times 10^9 \times 2
+                = 3.0\) GB.
+              </p>
+              <p>
+                (a) Ring: \(T = 2(N-1)\alpha + \frac{2(N-1)}{N}\frac{m}{\beta}
+                = 2 \times 63 \times 5\,\mu s + \frac{126}{64} \times \frac{3.0\,
+                \text{GB}}{200\,\text{GB/s}}
+                = 630\,\mu s + 1.969 \times 15{,}000\,\mu s = 630 + 29{,}531 = 30.2\) ms.
+                The latency term is 2 percent of the total.
+              </p>
+              <p>
+                (b) Tree: \(T = 2\log_2 N (\alpha + m/\beta) = 12 \times (5 + 15{,}000)\,
+                \mu s = 180.1\) ms, \(6.0\times\) worse. The ratio is
+                \(2\log_2 N \big/ \frac{2(N-1)}{N} = 12/1.969 = 6.1\), matching: at large
+                \(m\) the two algorithms differ by exactly the ratio of their bandwidth
+                coefficients.
+              </p>
+              <p>
+                (c) At \(m = 512\) KB \(= 5.24 \times 10^5\) bytes, \(m/\beta = 2.62\,\mu
+                s\). Ring: \(630 + 1.969 \times 2.62 = 630 + 5.2 = 635\,\mu s\), of which
+                99 percent is latency. Tree: \(12 \times (5 + 2.62) = 91.4\,\mu s\),
+                \(6.9\times\) better. The crossover, where \(2(N-1)\alpha = (2\log_2 N -
+                2(N-1)/N)\,m/\beta\), is at \(m = 630\,\mu s \times 200\,\text{GB/s} /
+                10.03 = 12.6\) MB. Below that use a tree, above it use a ring, and this is
+                the switch NCCL makes automatically. It is also why gradient bucketing has
+                two opposing pressures: buckets must be large enough to escape the latency
+                regime but small enough that the last bucket's transfer still overlaps
+                real backward-pass compute.
+              </p>
+            </div>
+          </div>
+
+          <h2>Work, depth, and parallel algorithms</h2>
+          <h3>The work-depth model and Brent's bound</h3>
+          <p>
+            Machine-independent analysis of a parallel algorithm uses two
+            numbers. The <em>work</em> \(W\) is the total operation count,
+            what a serial machine would execute. The <em>depth</em> (or
+            span) \(D\) is the length of the longest chain of dependent
+            operations, the runtime on infinitely many processors. Both
+            are properties of the algorithm's dependency DAG, not of any
+            machine. Two bounds are immediate: \(T_p \ge W/p\) (the
+            processors cannot do more than \(p\) operations per step) and
+            \(T_p \ge D\) (dependencies must be respected). Brent's
+            theorem (1974) says greedy scheduling gets within a factor of
+            two of both:
+          </p>
+          $$ T_p \;\le\; \frac{W}{p} + D . $$
+          <p>
+            The proof is short enough to give in full. Level the DAG by
+            longest path from an input: level \(t\) holds the \(m_t\)
+            operations whose longest dependency chain has length \(t\),
+            for \(t = 1, \dots, D\), with \(\sum_t m_t = W\). A greedy
+            scheduler can execute all of level \(t\) in
+            \(\lceil m_t / p \rceil\) steps, because every operation in
+            the level has all its inputs ready. Summing and using
+            \(\lceil x \rceil &lt; x + 1\):
+          </p>
+          $$ T_p \;\le\; \sum_{t=1}^{D} \left\lceil \frac{m_t}{p} \right\rceil
+             \;&lt;\; \sum_{t=1}^{D} \left( \frac{m_t}{p} + 1 \right)
+             \;=\; \frac{W}{p} + D . $$
+          <p>
+            The ratio \(W/D\) is the algorithm's average parallelism: the
+            largest \(p\) for which the \(W/p\) term still dominates and
+            processors remain useful. A GPU makes the model concrete: the
+            H100's 132 SMs at 2048 threads each want \(p\) on the order of
+            \(10^5\), so an algorithm needs \(W/D \gg 10^5\) before the
+            chip is even in its operating regime. The design tension of
+            the whole field lives in these two numbers: transformations
+            that cut depth usually add work, and the right trade depends
+            on how much parallel hardware is actually available.
+          </p>
+
+          <h3>Reduction: the canonical tree</h3>
+          <p>
+            Summing \(n\) numbers serially is \(W = n - 1\), \(D = n - 1\):
+            no parallelism, because each partial sum depends on the last.
+            Associativity is the license to re-parenthesize. Pair the
+            inputs into a balanced binary tree: \(n/2\) additions in the
+            first round, \(n/4\) in the second, and so on, giving
+          </p>
+          $$ W = \frac{n}{2} + \frac{n}{4} + \cdots + 1 = n - 1,
+             \qquad D = \log_2 n . $$
+          <p>
+            Same work, exponentially smaller depth; parallelism \(W/D =
+            (n-1)/\log_2 n\), which at \(n = 2^{28}\) is about \(9.6
+            \times 10^6\), comfortably above what the H100 needs. For
+            floating point, re-parenthesization changes rounding, so a
+            parallel sum is not bitwise equal to a serial sum; the tree
+            order is actually <em>more</em> accurate on average (error
+            grows like \(O(\log n)\) rather than \(O(n)\) in the naive
+            bound), but it is a different number, which is one root cause
+            of run-to-run nondeterminism in floating-point training jobs
+            when atomics decide the order instead of a fixed tree. The
+            measured seven-kernel reduction progression later on this page
+            is this tree meeting real hardware.
+          </p>
+
+          <h3>Scan: Hillis-Steele versus Blelloch</h3>
+          <p>
+            The prefix sum (scan) of \(x_1, \dots, x_n\) under an
+            associative operator \(\oplus\) produces all prefixes
+            \(y_k = x_1 \oplus \cdots \oplus x_k\). It looks inherently
+            serial, \(y_k = y_{k-1} \oplus x_k\), and it is the standard
+            demonstration that "looks serial" means nothing. It is also,
+            following Blelloch (1990), the workhorse primitive of
+            data-parallel programming: stream compaction, radix sort,
+            sparse-matrix layouts, recurrences \(z_k = a_k z_{k-1} +
+            b_k\) (scan over \(2\times 2\) matrix products, the same trick
+            that parallelizes linear state-space models), and quicksort
+            partitioning all reduce to scan.
+          </p>
+          <p>
+            <strong>Hillis-Steele (1986), step-efficient.</strong> In round
+            \(d = 1, 2, \dots, \log_2 n\), every element at index \(k \ge
+            2^{d-1}\) updates \(y_k \leftarrow y_k \oplus y_{k - 2^{d-1}}\).
+            After round \(d\), each \(y_k\) holds the sum of the
+            \(\min(k, 2^d)\) elements ending at \(k\); induction on \(d\)
+            makes this precise. Depth is \(\log_2 n\) rounds. Work: round
+            \(d\) performs \(n - 2^{d-1}\) additions, so
+          </p>
+          $$ W_{HS} = \sum_{d=1}^{\log_2 n} \big(n - 2^{d-1}\big)
+             = n \log_2 n - (n - 1) . $$
+          <p>
+            <strong>Blelloch (1990), work-efficient.</strong> Two sweeps
+            over a conceptual balanced tree. The <em>up-sweep</em> is the
+            reduction tree, \(n - 1\) additions, leaving each internal
+            node holding the sum of its leaves. The <em>down-sweep</em>
+            replaces the root with the identity and, at each node, passes
+            its own value to its left child and (its value \(\oplus\) the
+            left child's stored sum) to its right child, another \(n - 1\)
+            operations; what arrives at each leaf is exactly the sum of
+            everything to its left, the exclusive scan. Total:
+          </p>
+          $$ W_{B} = 2(n-1) = O(n), \qquad D_B = 2\log_2 n . $$
+          <p>
+            Blelloch does asymptotically optimal work at twice the depth;
+            Hillis-Steele does \(\log_2 n\) times more work at half the
+            depth. Which wins on a real GPU depends on whether the machine
+            is saturated: below saturation, extra work is free and lower
+            depth wins, which is why warp-level scans in production
+            libraries (CUB's warp scan) are Hillis-Steele across 32 lanes,
+            while the block and device levels are work-efficient
+            structures glued together in the three-phase pattern:
+            scan blocks locally, scan the block sums, add the carries.
+            Merrill and Garland's decoupled look-back (2016) turns the
+            middle phase into a single pass, reaching memcpy-rate scans;
+            it is the algorithm inside CUB's DeviceScan today.
+          </p>
+
+          <div class="problem">
+            <span class="plabel">Problem 4</span>
+            <p>
+              For \(n = 2^{20}\): (a) count the additions performed by
+              Hillis-Steele and by Blelloch scan; (b) using Brent's bound
+              with \(p = 2^{15}\) lanes, estimate the step counts of both
+              and decide which is faster in that regime; (c) repeat with
+              \(p = 2^{20}\) (one lane per element).
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> (a) \(W_{HS} = n\log_2 n - (n-1)
+                = 20 \times 1{,}048{,}576 - 1{,}048{,}575 =
+                19{,}922{,}945\) additions. \(W_B = 2(n-1) =
+                2{,}097{,}150\). Hillis-Steele does \(9.5\times\) more
+                work.
+              </p>
+              <p>
+                (b) Brent: \(T_p \le W/p + D\). Hillis-Steele:
+                \(19{,}922{,}945/32{,}768 + 20 = 608 + 20 = 628\) steps.
+                Blelloch: \(2{,}097{,}150/32{,}768 + 40 = 64 + 40 = 104\)
+                steps. With the machine oversubscribed (\(n \gg p\)), the
+                work term dominates and the work-efficient algorithm wins
+                by roughly \(6\times\).
+              </p>
+              <p>
+                (c) With \(p = n = 2^{20}\): Hillis-Steele \(\le 19 + 20
+                = 39\) steps (the work term is \(19{,}922{,}945 /
+                1{,}048{,}576 = 19\)), Blelloch \(\le 2 + 40 = 42\) steps,
+                and the true step counts are just the depths, 20 versus
+                40. At full saturation the step-efficient algorithm wins
+                despite doing \(9.5\times\) the work, because the extra
+                work rides in otherwise idle lanes. This crossover is the
+                whole design argument in miniature, and it is why
+                production scans are hybrids: Hillis-Steele inside a warp,
+                work-efficient composition across warps and blocks.
+              </p>
+            </div>
+          </div>
+
+          <h3>Sorting and the scan-centric toolkit</h3>
+          <p>
+            Parallel sorting shows how primitives compose. The
+            <em>split</em> operation sends elements with bit 0 before
+            elements with bit 1, stably, using two scans: an exclusive
+            scan of the zero-flags gives each zero its destination; the
+            total zero count plus an exclusive scan of the one-flags
+            places the ones. Radix sort is \(b\) successive splits for
+            \(b\)-bit keys, so its work is \(O(bn)\) with depth
+            \(O(b \log n)\), and in practice GPUs process 4 to 8 bits per
+            pass with per-block histograms and a scan over histogram
+            columns; CUB's radix sort holds the practical crown for keys
+            of moderate width. Comparison-based alternatives matter when
+            keys are wide or comparisons are custom: bitonic networks do
+            \(O(n \log^2 n)\) work at \(O(\log^2 n)\) depth and are the
+            standard choice <em>inside</em> a block where their
+            obliviousness (fixed compare-exchange pattern, no data-dependent
+            control flow) fits SIMD lanes perfectly, while sample sort,
+            which splits the input by \(p-1\) sampled pivots into
+            independently sorted buckets, wins at device scale. The
+            theoretical benchmark is Cole's merge sort at \(O(n\log n)\)
+            work and \(O(\log n)\) depth, rarely implemented but the proof
+            that comparison sorting has no inherent depth barrier above
+            \(\log n\).
+          </p>
+
+          <h2>SPMD: one program, many lanes</h2>
+          <h3>The model, and why compilers cannot do this alone</h3>
+          <p>
+            Nearly all parallel code today is written in the single
+            program, multiple data style: one program text, executed by
+            many workers, each discovering its identity through an index
+            (an MPI rank, a thread id, a CUDA thread coordinate) and using
+            it to claim a slice of the data. SPMD is a contract about
+            <em>divergence</em>: workers may take different branches, and
+            the model defines what that costs. On multicore CPUs the
+            workers are threads and divergence is free. Inside a vector
+            unit, the workers are SIMD lanes and divergence is emulated
+            with masks: both sides of a branch execute, with lanes
+            disabled on the side they did not take. The ISPC compiler
+            (Pharr and Mark, 2012) made this explicit and ergonomic on
+            CPUs: a "gang" of program instances maps to the lanes of an
+            AVX register, <em>varying</em> values live one-per-lane,
+            <em>uniform</em> values are shared, and the compiler inserts
+            the masks. CUDA's SIMT model is the same idea with the mask
+            management moved into hardware, which is the correct
+            one-sentence relationship between ISPC and CUDA. Automatic
+            vectorization of scalar loops fails not because compilers are
+            weak but because the <em>semantics</em> of scalar C demand
+            proofs (no aliasing, no cross-iteration dependence) that the
+            SPMD contract simply grants by construction.
+          </p>
+          <h3>Measured: a CPU reduction, and the false-sharing tax</h3>
+          <p>
+            Two CPU measurements from this machine (a 26-core Xeon
+            Platinum 8480+) calibrate the model before the GPU sections.
+            A scalar OpenMP sum over \(2^{28}\) floats runs at 5.6 GB/s on
+            one thread and 111.3 GB/s on 26 threads, a \(19.9\times\)
+            scaling that stops at the socket's memory bandwidth, not at
+            its arithmetic; adding hyperthreads makes it <em>worse</em>
+            (74.1 GB/s at 52 threads) because sibling hyperthreads share
+            load ports on an already bandwidth-bound loop. And a
+            false-sharing microbenchmark, 8 threads doing relaxed atomic
+            increments to per-thread counters, runs in 4.245 s when the
+            counters share one 64-byte cache line and 0.304 s when each is
+            padded to its own line: a \(14.0\times\) penalty for a layout
+            detail that no line of algorithm pseudocode would ever show.
+            Communication cost on a shared-memory machine is implicit,
+            levied by the coherence protocol in units of cache lines, and
+            the first skill of multicore performance work is making that
+            invisible traffic visible.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="cpp" class="active">C++</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="cpp" class="shl lang active"><code class="language-cpp"><span class="c">// Scalar OpenMP reduction over 2^28 floats (1 GiB).</span>
+<span class="c">// Measured on the 26-core Xeon 8480+ in this repository:</span>
+<span class="c">//   1 thread: 5.6 GB/s    26 threads: 111.3 GB/s    52 threads: 74.1 GB/s</span>
+<span class="c">// build: g++ -O3 -fopenmp -o sum sum.cpp</span>
+<span class="k">#include</span> <span class="s">&lt;omp.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;cstddef&gt;</span>
+
+<span class="k">float</span> <span class="m1">parallel_sum</span><span class="b0">(</span><span class="k">const</span> <span class="k">float</span> <span class="k">*</span><span class="v4">x</span>, <span class="k">size_t</span> <span class="v5">n</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">float</span> <span class="m1">s</span> = <span class="n">0.0</span><span class="k">f</span>;
+<span class="c">    // The reduction clause gives each thread a private accumulator and</span>
+<span class="c">    // combines them in a tree at the end: W = n-1, D = O(n/p + log p).</span>
+<span class="c">    // Without it, a shared "s += x[i]" would be both a data race and a</span>
+<span class="c">    // serialization point.</span>
+    <span class="k">#pragma</span> <span class="m1">omp</span> <span class="m1">parallel</span> <span class="m1">for</span> <span class="m1">reduction</span><span class="b1">(</span>+:<span class="m1">s</span><span class="b1">)</span> <span class="m1">schedule</span><span class="b1">(</span><span class="m1">static</span><span class="b1">)</span>
+    <span class="k">for</span> <span class="b1">(</span><span class="k">size_t</span> <span class="v3">i</span> = <span class="n">0</span>; <span class="v3">i</span> &lt; <span class="v5">n</span>; ++<span class="v3">i</span><span class="b1">)</span>
+        <span class="m1">s</span> += <span class="v4">x</span><span class="b1">[</span><span class="v3">i</span><span class="b1">]</span>;
+    <span class="k">return</span> <span class="m1">s</span>;
+<span class="b0">}</span></code></pre>
+          </div>
+
+          <h2>The CUDA execution model</h2>
+          <h3>Grids, blocks, warps: the three-level contract</h3>
+          <p>
+            A CUDA kernel launch names a <em>grid</em> of thread
+            <em>blocks</em>, each block up to 1024 threads. The hardware
+            adds a third level the programmer does not declare but must
+            design around: the <em>warp</em>, 32 threads that execute in
+            lockstep on a SIMD datapath. The three levels have distinct
+            guarantees, and the entire model is those guarantees. Threads
+            in one block run on one SM, can share its shared memory, and
+            can barrier with __syncthreads. Blocks are independent and
+            schedulable in any order, which is the property that makes a
+            kernel scale across any number of SMs and is why inter-block
+            cooperation within a kernel requires either atomics or the
+            newer cooperative-launch machinery. Warps are where SIMT meets
+            physics: divergence within a warp serializes the branch paths,
+            and memory requests are issued per warp, which is what makes
+            coalescing (next subsection) the dominant performance rule.
+          </p>
+          <pre class="flow">grid (kernel launch)
+ ├── block (0,0) ──► scheduled on some SM, shares 228 KB smem/L1,
+ │     ├── warp 0: threads 0-31    ─┐  __syncthreads() barrier scope
+ │     ├── warp 1: threads 32-63    ├─ resident together, zero-cost
+ │     └── ...                     ─┘  context switch between warps
+ ├── block (1,0) ──► any other SM, no ordering vs block (0,0)
+ └── ...                H100: 132 SMs x up to 64 resident warps each</pre>
+          <p>
+            The reason GPUs tolerate a 500-nanosecond memory latency
+            without the machinery a CPU needs (out-of-order windows,
+            prefetchers) is oversubscription: each SM holds up to 64
+            resident warps and switches among them every cycle at zero
+            cost, so while one warp waits on memory, others issue. This is
+            Little's law in silicon: to sustain bandwidth \(B\) at latency
+            \(L\), the machine must keep \(B \times L\) bytes in flight,
+            and at \(B = 3\) TB/s, \(L = 500\) ns that is 1.5 MB of
+            outstanding requests, far more than any single thread can
+            generate. Warps are the mechanism that generates it.
+          </p>
+
+          <h3>Coalescing, measured</h3>
+          <p>
+            When a warp issues a load, the hardware merges the 32
+            addresses into as few 32-byte sectors as possible. Thirty-two
+            consecutive floats occupy \(32 \times 4 = 128\) bytes, four
+            sectors: perfectly coalesced, every fetched byte used. A
+            strided access pattern touches more sectors for the same
+            useful bytes; at stride 8 floats and beyond, every lane's
+            4-byte load drags in its own 32-byte sector and the useful
+            fraction is at most \(4/32 = 12.5\) percent. The kernel
+            measured here reads \(2^{28}\) floats with a template stride
+            (counting only useful bytes in the bandwidth number), on the
+            H100 80GB:
+          </p>
+          <div class="tbl-wrap"><table class="data">
+            <thead><tr><th>Stride (floats)</th><th>Effective bandwidth (GB/s)</th><th>Fraction of stride-1</th><th>Sector-model prediction</th></tr></thead>
+            <tbody>
+              <tr><td>1</td><td>2380.5</td><td>1.00</td><td>1.00</td></tr>
+              <tr><td>2</td><td>1856.3</td><td>0.78</td><td>0.50</td></tr>
+              <tr><td>4</td><td>1218.3</td><td>0.51</td><td>0.25</td></tr>
+              <tr><td>8</td><td>674.3</td><td>0.28</td><td>0.125</td></tr>
+              <tr><td>16</td><td>352.9</td><td>0.15</td><td>0.125</td></tr>
+              <tr><td>32</td><td>325.2</td><td>0.14</td><td>0.125</td></tr>
+            </tbody>
+          </table></div>
+          <p>
+            The measurements sit above the pure sector model at small
+            strides because the L2 (50 MB on H100) catches part of the
+            overfetch when neighboring warps want the skipped words, and
+            they approach the \(1/8\) floor from above once the stride
+            exceeds the sector. The engineering rule falls out directly:
+            structure-of-arrays layouts keep each field contiguous per
+            warp and coalesce; array-of-structures layouts are a built-in
+            stride equal to the struct size. A \(7.3\times\) bandwidth
+            difference (2380.5 versus 325.2 GB/s) for identical useful
+            bytes is the largest single factor a data-layout decision
+            controls on this machine.
+          </p>
+          <p>
+            Shared memory has the analogous rule with banks instead of
+            sectors: 32 banks, 4 bytes wide, and a warp conflicts when two
+            lanes hit different addresses in one bank, serializing the
+            access. The measured matrix transpose on this machine walks
+            the whole lesson: a naive transpose (coalesced reads,
+            strided writes) reaches 451.1 GB/s; staging 32x32 tiles
+            through shared memory so both global accesses coalesce lifts
+            it to 1702.9 GB/s; padding the tile to 33 columns so the
+            transposed read hits 32 different banks lifts it to 2694.0
+            GB/s, against 2837.4 GB/s for a pure copy. One byte of
+            padding per row recovers a further 1.58x; the padded
+            transpose runs at 95 percent of copy speed.
+          </p>
+
+          <h3>Occupancy: the resource-partitioning arithmetic</h3>
+          <p>
+            Each SM has a fixed budget: 65,536 32-bit registers, up to 228
+            KB of shared memory (48 KB per block without opt-in), a
+            maximum of 2048 resident threads (64 warps), and a maximum
+            number of resident blocks. A kernel's per-thread register
+            count and per-block shared memory determine how many blocks
+            fit, and <em>occupancy</em> is the resulting fraction of the
+            2048-thread ceiling. The calculation is integer division three
+            ways, taking the minimum; it is worked in full in Problem 5.
+            Occupancy matters only insofar as it feeds Little's law:
+            enough resident warps to cover latency. Volkov's classic
+            argument (2010) showed that past that coverage point,
+            <em>lower</em> occupancy is often faster, because fewer
+            resident threads means more registers per thread, which buys
+            instruction-level parallelism and register-blocked data reuse
+            worth more than additional warps. The measured matmul
+            progression below lands exactly on this point: the fastest
+            custom kernel on this page runs at 25 percent occupancy.
+          </p>
+
+          <h2>Reductions on the GPU: a measured seven-step progression</h2>
+          <p>
+            The parallel reduction is the standard vehicle for learning
+            GPU optimization, following the structure of Harris's NVIDIA
+            reduction notes, and this page's version was written and
+            measured fresh on the H100: summing \(n = 2^{28}\) floats
+            (1.074 GB read), correctness checked against torch.sum, median
+            of 30 runs. A reduction reads \(n\) floats and writes one, so
+            its arithmetic intensity is \(1/4\) flop per byte and the only
+            meaningful score is bandwidth: time is bytes over GB/s, and
+            the finish line is the memcpy rate.
+          </p>
+          <div class="tbl-wrap"><table class="data">
+            <thead><tr><th>Kernel</th><th>Key change</th><th>Time (ms)</th><th>GB/s</th><th>vs first</th></tr></thead>
+            <tbody>
+              <tr><td>reduce0</td><td>interleaved tree, modulo indexing</td><td>3.000</td><td>358.0</td><td>1.0x</td></tr>
+              <tr><td>reduce1</td><td>sequential addressing, no divergence/conflicts</td><td>1.229</td><td>873.6</td><td>2.4x</td></tr>
+              <tr><td>reduce2</td><td>first add during load (halve blocks)</td><td>0.658</td><td>1631.5</td><td>4.6x</td></tr>
+              <tr><td>reduce3</td><td>warp shuffles replace shared memory</td><td>0.478</td><td>2245.6</td><td>6.3x</td></tr>
+              <tr><td>reduce4</td><td>grid-stride loop, few blocks, more per thread</td><td>0.357</td><td>3009.7</td><td>8.4x</td></tr>
+              <tr><td>reduce5</td><td>vectorized float4 loads</td><td>0.354</td><td>3034.7</td><td>8.5x</td></tr>
+              <tr><td>torch.sum</td><td>library baseline</td><td>&mdash;</td><td>2974.4</td><td>8.3x</td></tr>
+            </tbody>
+          </table></div>
+          <p>
+            Each row is one idea. reduce0 pairs elements at interleaved
+            offsets with a modulo test, so within every warp half the
+            lanes fail the predicate each round (divergence) and the
+            shared-memory access pattern conflicts; it manages 12 percent
+            of memory bandwidth. reduce1 renumbers so that active threads
+            are contiguous: the same tree, no divergence, \(2.4\times\).
+            reduce2 notes that a tree over a block leaves half the threads
+            idle after the first step, so each thread should first add two
+            (or more) global elements while loading: the tree shrinks and
+            the load loop, which is the bandwidth-bound part, does more of
+            the work. reduce3 replaces the last five tree levels with
+            register-to-register warp shuffles. reduce4 is the structural
+            insight worth generalizing: launch only enough blocks to fill
+            the machine and let each thread loop over a grid-sized stride,
+            so the bandwidth-critical loop is long, fully coalesced
+            (consecutive threads read consecutive addresses each
+            iteration), and amortizes all setup; it reaches 99 percent of
+            the 3034.7 GB/s ceiling that reduce5's float4 loads then
+            touch. The final kernel beats torch.sum by 2 percent, and the
+            whole progression is \(8.5\times\) without changing the
+            algorithm's work or depth at all: every factor came from the
+            memory system.
+          </p>
+          <h3>Warp shuffles</h3>
+          <p>
+            The __shfl_down_sync(mask, v, d) intrinsic returns lane
+            \(i+d\)'s value of \(v\) to lane \(i\) within a warp, register
+            to register, no shared memory and no barrier: the warp's
+            lockstep execution <em>is</em> the synchronization. Five
+            shuffle-adds with offsets 16, 8, 4, 2, 1 reduce a warp; the
+            mask argument (0xffffffff for a full warp) exists because
+            post-Volta GPUs execute divergent lanes independently, and the
+            sync suffix forces reconvergence of the named lanes first. The
+            same primitive family (shfl_up for scans, shfl_xor for
+            butterfly exchanges) makes the warp a 32-wide register file
+            visible to the programmer, and warp-level scan plus shuffle
+            reduction is the base case of essentially every CUB block
+            primitive.
+          </p>
+          <h3>Atomics and privatization: the measured histogram</h3>
+          <p>
+            Reductions to <em>many</em> cells, a histogram being the pure
+            case, add contention to the analysis. One measured kernel bins
+            \(2^{28}\) bytes into 256 bins with a global atomicAdd per
+            element: 57.902 ms, because popular bins serialize. The
+            privatized version gives each block a 256-entry shared-memory
+            histogram (1 KB), accumulates locally with shared-memory
+            atomics, then merges 256 values per block into the global
+            histogram: 0.401 ms, a measured \(144.6\times\), running at
+            670.1 GB/s of input. The general principle: atomics are cheap
+            when contention is low, so restructure to make contention low.
+            Privatization trades a factor of (blocks) more merge traffic
+            for a factor of (elements per block) less contended traffic,
+            the same shape of trade as the reduction tree itself.
+          </p>
+
+          <h2>Matmul: the tiling progression, measured</h2>
+          <h3>Arithmetic intensity is a property you choose</h3>
+          <p>
+            An \(n \times n\) matmul does \(2n^3\) flops on \(3n^2\)
+            values (read \(A\), \(B\), write \(C\)): the algorithm has
+            \(O(n)\) intrinsic flops per byte, so it <em>can</em> be
+            compute-bound. Whether a given kernel is depends entirely on
+            how much of \(A\) and \(B\) it re-reads. A kernel that loads
+            both operands from global memory for every multiply-add moves
+            8 bytes per 2 flops: intensity \(1/4\), hopelessly
+            memory-bound. Tiling is the act of buying intensity with
+            on-chip memory, and Problem 6 derives the exchange rate: a
+            \(T \times T\) shared-memory tile yields \(T/4\) flops per
+            global byte in fp32. The measured progression, all fp32 at
+            \(n = 4096\) (137.4 GFLOP per multiply), each kernel verified
+            against cuBLAS output:
+          </p>
+          <div class="tbl-wrap"><table class="data">
+            <thead><tr><th>Kernel</th><th>Time (ms)</th><th>TFLOPS</th><th>ptxas: regs/thread</th><th>smem/block</th><th>Occupancy</th></tr></thead>
+            <tbody>
+              <tr><td>naive (1 output/thread, global only)</td><td>23.48</td><td>5.9</td><td>32</td><td>0</td><td>100%</td></tr>
+              <tr><td>tiled32 (32x32 smem tiles)</td><td>17.04</td><td>8.1</td><td>32</td><td>8192 B</td><td>100%</td></tr>
+              <tr><td>blocked128 (128x128 block tile, 8x8 register tile/thread)</td><td>5.48</td><td>25.1</td><td>112</td><td>8192 B</td><td>25%</td></tr>
+              <tr><td>cuBLAS SGEMM</td><td>2.68</td><td>51.2</td><td colspan="3">library (register double-buffering, wider tiles)</td></tr>
+              <tr><td>cuBLAS fp16 (tensor cores)</td><td>0.19</td><td>702.4</td><td colspan="3">wgmma tensor-core path, same tiling logic</td></tr>
+            </tbody>
+          </table></div>
+          <p>
+            The naive kernel is instructive precisely because it is not as
+            slow as pure arithmetic-intensity accounting predicts: at
+            intensity \(1/4\), 3063.5 GB/s of HBM would cap it at 0.77
+            TFLOPS, yet it reaches 5.9 because adjacent threads read the
+            same row of \(A\) and consecutive elements of \(B\), and the
+            L1 and L2 caches convert that incidental locality into reuse.
+            Hardware caches are the reason lower bounds need care; they
+            are not a substitute for tiling, just a discount on its
+            absence. tiled32 makes the reuse explicit, 32 flops per global
+            byte pair loaded, but only improves \(1.4\times\): with one
+            output per thread, each thread issues two shared-memory reads
+            per FMA, and shared-memory bandwidth, not HBM, becomes the
+            binding resource. This is the step most tutorials stop at and
+            the reason their matmuls stall near 10 percent of peak.
+          </p>
+          <p>
+            blocked128 attacks the shared-memory bound the same way
+            tiled32 attacked the HBM bound, one level down the hierarchy:
+            each thread computes an \(8 \times 8\) <em>register tile</em>
+            of \(C\), so each value fetched from shared memory into a
+            register participates in 8 FMAs. Per iteration a thread reads
+            8+8 shared floats and performs 64 FMAs: 4 flops per
+            shared-memory byte instead of \(1/4\). The cost is registers,
+            112 per thread by ptxas count, which caps residency at 2
+            blocks (512 threads) per SM, 25 percent occupancy, and the
+            kernel is \(3.1\times\) faster than the full-occupancy tiled32
+            anyway: Volkov's argument made concrete. The remaining
+            \(2\times\) to cuBLAS SGEMM is double-buffering (prefetching
+            the next tile into registers while computing the current one,
+            hiding shared-memory latency), wider and asymmetric tiles, and
+            vectorized 128-bit loads; and the further \(13.7\times\) from
+            cuBLAS fp32 to fp16 is not software at all but the tensor-core
+            datapath, which exists precisely because matmul's buyable
+            intensity is high enough to justify dedicated silicon.
+          </p>
+          <pre class="flow">per-thread work at each level (one k-slice iteration)
+
+ tiled32:    smem As[ty][k], Bs[k][tx] ──► 1 FMA      (2 smem reads / 2 flops)
+ blocked128: regs a[0..7] ◄── smem As    8 reads
+             regs b[0..7] ◄── smem Bs    8 reads
+             acc[i][j] += a[i]*b[j]      64 FMAs      (16 smem reads / 128 flops)
+
+ HBM traffic        /32  (tile reuse)      ── tiled32 buys this
+ smem traffic       /8   (register reuse)  ── blocked128 buys this
+ issue slots        /2   (tensor core mma) ── hardware buys this</pre>
+
+          <h2>The roofline model, calibrated on this machine</h2>
+          <p>
+            The roofline (Williams, Waterman, and Patterson, 2009) reduces
+            a machine to two numbers and a kernel to one. For a kernel
+            with arithmetic intensity \(I\) flops per byte of memory
+            traffic, on a machine with peak compute \(P\) and memory
+            bandwidth \(B\):
+          </p>
+          $$ \text{attainable flops/s} \;=\; \min\big(P,\; I \times B\big). $$
+          <p>
+            The derivation is a one-line application of the bottleneck
+            principle: the kernel needs \(F\) flops and \(F/I\) bytes, and
+            with perfect overlap of compute and transfer, time is
+            \(\max(F/P,\; F/(IB))\); invert for throughput. The ridge
+            point \(I^* = P/B\) is the machine balance, the intensity at
+            which the roofs meet. Using this page's measured numbers
+            rather than datasheet values: \(B = 3063.5\) GB/s (streaming
+            add), and \(P\) depends on the datapath, which is the H100's
+            defining feature. For bf16 tensor cores, \(P = 744.6\)
+            measured TFLOPS, so \(I^* = 744.6 \times 10^{12} / 3063.5
+            \times 10^9 = 243\) flops per byte. For fp32 on the vector
+            units, cuBLAS's 51.2 TFLOPS gives \(I^* = 16.7\). One machine,
+            two ridges an order of magnitude apart: "is this kernel
+            compute-bound" has no answer until the precision and datapath
+            are named.
+          </p>
+          <pre class="flow">log-log roofline, this H100 (measured)
+
+ 744.6 TF ┤ bf16 tensor ─────────────────────────●━━━━━━━━━━
+          │                                  ridge I*=243
+  51.2 TF ┤ fp32 ────────────●━━━━━━━━━━━━ (I*=16.7)
+          │                ╱   ╲ sgemm fp32 n=4096: I=341, bound by P
+          │              ╱
+          │  slope = 3063.5 GB/s
+ 255 GF   ┤    ╱● vadd I=1/12          measured 232 GF ─ 91% of roof
+ 766 GF   ┤   ╱ ● reduce I=1/4         measured 758 GF ─ 99% of roof
+          └──┴────┴────┴────┴────┴────┴────┴──── I (flops/byte)
+            1/12  1/4   1    8   16.7  32   243</pre>
+          <p>
+            Reading kernels onto this chart is the daily use. The
+            elementwise and reduction kernels of this page live at
+            \(I \le 1/4\), three orders of magnitude left of the bf16
+            ridge; no code change short of fusion moves them, and their
+            only honest metric is fraction of \(B\). The measured fusion
+            experiment makes the point: a four-op elementwise chain
+            launched as separate PyTorch kernels takes 0.911 ms, and the
+            same chain compiled into one kernel takes 0.214 ms, a
+            \(4.26\times\) speedup that is purely the roofline's memory
+            term, four round trips of intermediates collapsed into one.
+            Matmul at \(n = 4096\) has intrinsic intensity \(I = 2n^3 /
+            (3n^2 \times 4) = n/6 = 683\) in fp32 accounting (341 if
+            counting 8 bytes per element in and out), far right of the
+            fp32 ridge: compute-bound, and indeed cuBLAS hits its fp32
+            peak. Attention, next section, is the interesting case: its
+            intensity is a <em>design choice</em>.
+          </p>
+
+          <h2>Attention: the kernel-design capstone</h2>
+          <h3>Why naive attention is memory-bound at any scale</h3>
+          <p>
+            Single-head attention computes, for \(Q, K, V \in
+            \R^{L \times d}\),
+          </p>
+          $$ O = \softmax\!\Big(\frac{QK^{\T}}{\sqrt{d}}\Big) V , $$
+          <p>
+            which is \(4L^2d\) flops (two \(L \times L \times d\) matmuls)
+            on \(O(Ld)\) input bytes: enormous intrinsic intensity. The
+            naive implementation throws that intensity away by
+            materializing the \(L \times L\) score matrix \(S\) and the
+            probability matrix \(P\) in HBM: write \(S\), read it for
+            softmax, write \(P\), read \(P\) for the second matmul. Those
+            four passes cost \(4 \times 2L^2\) bytes in half precision,
+            and since \(L \gg d\), realized intensity collapses to
+            \(O(d)\) divided by a constant, pinning the kernel to the
+            memory roof while the quadratic memory footprint grows until
+            it does not fit at all. The measured numbers below (batch
+            \(\times\) heads \(= 128\), \(d = 64\), half precision, H100
+            80GB) show naive attention stuck at 22 to 26 TFLOPS, 3 percent
+            of the machine's measured bf16 peak, at every length until it
+            runs out of memory, while the fused kernel <em>gains</em>
+            throughput with length as its inner loops grow:
+          </p>
+          <div class="tbl-wrap"><table class="data">
+            <thead><tr><th>L</th><th>naive ms</th><th>naive TFLOPS</th><th>naive peak mem</th><th>flash ms</th><th>flash TFLOPS</th><th>flash peak mem</th><th>speedup</th></tr></thead>
+            <tbody>
+              <tr><td>512</td><td>0.371</td><td>23.2</td><td>0.20 GB</td><td>0.050</td><td>170.2</td><td>0.07 GB</td><td>7.42x</td></tr>
+              <tr><td>1024</td><td>1.297</td><td>26.5</td><td>0.64 GB</td><td>0.110</td><td>313.1</td><td>0.10 GB</td><td>11.79x</td></tr>
+              <tr><td>2048</td><td>5.309</td><td>25.9</td><td>2.32 GB</td><td>0.299</td><td>460.0</td><td>0.17 GB</td><td>17.76x</td></tr>
+              <tr><td>4096</td><td>23.070</td><td>23.8</td><td>8.91 GB</td><td>0.976</td><td>563.0</td><td>0.30 GB</td><td>23.64x</td></tr>
+              <tr><td>8192</td><td>98.946</td><td>22.2</td><td>35.00 GB</td><td>3.575</td><td>615.1</td><td>0.57 GB</td><td>27.68x</td></tr>
+              <tr><td>16384</td><td colspan="3">OOM: 68.72 GB score matrix does not fit</td><td>13.742</td><td>640.1</td><td>1.12 GB</td><td>&mdash;</td></tr>
+            </tbody>
+          </table></div>
+          <h3>Online softmax: the enabling identity</h3>
+          <p>
+            Fusing attention requires computing softmax over a row of
+            scores <em>without having the whole row</em>. Softmax needs
+            the row max \(m\) for numerical stability and the normalizer
+            \(\ell = \sum_j e^{x_j - m}\). Milakov and Gimelshein (2018)
+            showed both can be maintained in one pass. Process the row in
+            chunks; after some chunks, hold the running pair \((m, \ell)\).
+            A new chunk \(c\) with local max \(\tilde m\) and local sum
+            \(\tilde\ell = \sum_{j \in c} e^{x_j - \tilde m}\) merges via
+            the new max \(m' = \max(m, \tilde m)\):
+          </p>
+          $$ \ell' \;=\; \ell\, e^{\,m - m'} \;+\; \tilde\ell\, e^{\,\tilde m - m'} , $$
+          <p>
+            which is exact, because multiplying by \(e^{m - m'}\) rebases
+            every previously accumulated exponential from the old max to
+            the new one: \(e^{x_j - m} \cdot e^{m - m'} = e^{x_j - m'}\).
+            FlashAttention (Dao, Fu, Ermon, Rudra, and R&eacute;, 2022)
+            extends the same rebase to the output accumulator: maintain
+            \(o = \sum_j e^{x_j - m}\, v_j\) unnormalized, scale the old
+            \(o\) by \(e^{m - m'}\) when the max moves, add the new
+            chunk's \(\tilde P V\) contribution, and divide by \(\ell\)
+            once at the end. Every intermediate lives in registers and
+            shared memory; \(S\) and \(P\) never touch HBM. The
+            measured fused softmax on this machine shows the standalone
+            win: an online-softmax CUDA kernel over an 8192x8192 matrix
+            runs one read and one write, 0.363 ms at 1480.3 GB/s, versus
+            0.863 ms for the unfused three-pass version, with
+            torch.softmax at 0.301 ms confirming the library does the
+            same fusion.
+          </p>
+          <p>
+            The IO accounting from the FlashAttention paper explains the
+            table's shape. With on-chip memory of size \(M\), tiles of
+            \(K\) and \(V\) of about \(M/(4d)\) rows stream through shared
+            memory once per row-block of \(Q\), giving total HBM traffic
+            \(\Theta(L^2 d^2 / M)\) instead of \(\Theta(L^2)\)
+            materialized twice; with \(M \approx 100\) KB and \(d = 64\),
+            that is a factor-of-tens reduction, and the measured peak
+            memory column (35.00 GB versus 0.57 GB at \(L = 8192\), a
+            \(61\times\) ratio) is that arithmetic made visible. The
+            backward pass follows by storing only \((m, \ell)\) per row
+            (2 floats) and recomputing \(S\) tiles from \(Q\) and \(K\)
+            during the gradient computation: recomputation is cheaper than
+            the memory traffic it replaces, the signature trade of the
+            whole post-2022 kernel era. FlashAttention-2 (Dao, 2023)
+            reorganized the loops so the outer loop over \(Q\) blocks is
+            the parallel grid dimension and warps split the head dimension
+            rather than the sequence, cutting non-matmul overhead and
+            inter-warp communication; FlashAttention-3 (Shah, Bikshandi,
+            Zhang, Thakkar, Ramani, and Dao, 2024) rebuilt it around Hopper's asynchronous
+            TMA copies and warpgroup matmuls with software pipelining
+            between the two matmuls and the softmax.
+          </p>
+          <p>
+            Two smaller measured points complete the picture. A minimal
+            fp32 CUDA flash-style kernel written for this page (one block
+            per query tile, 167 registers per thread, 32 KB shared memory
+            by ptxas) reaches 9.6 TFLOPS versus 16.4 for PyTorch's fp32
+            SDPA: correct and \(O(L)\) in memory, but far from the tensor
+            cores. The Triton version at fp16, 60 lines in the
+            implementation section below, reaches 340.2 TFLOPS on batch
+            \(\times\) heads \(= 64\), \(L = 4096\), \(d = 64\), beating
+            that configuration's SDPA baseline at 297.0: a tile-level
+            language with a good compiler is enough to be
+            production-competitive on this kernel, which is precisely the
+            argument Triton's designers made.
+          </p>
+
+          <h2>Worked problems</h2>
+          <div class="problem">
+            <span class="plabel">Problem 5</span>
+            <p>
+              The blocked128 matmul kernel compiles to 112 registers per
+              thread and 8192 bytes of shared memory per block, launched
+              with 256 threads per block. For an H100 SM (65,536
+              registers, 228 KB shared memory available to the kernel,
+              2048-thread and 32-block ceilings), compute the occupancy
+              and identify the limiting resource. Then verify the shared
+              memory figure from the tile shape: block tile \(128 \times
+              128\), \(k\)-slice depth 8, fp32.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> Registers: \(112 \times 32 =
+                3584\) per warp; \(\lfloor 65536 / 3584 \rfloor = 18\)
+                warps fit by registers. A block is \(256/32 = 8\) warps,
+                so \(\lfloor 18/8 \rfloor = 2\) blocks fit: 16 warps, 512
+                threads. Shared memory: \(\lfloor 228 \times 1024 / 8192
+                \rfloor = 28\) blocks, not binding. Thread ceiling:
+                \(2048/256 = 8\) blocks, not binding. Occupancy \(= 512 /
+                2048 = 25\) percent, limited by registers.
+              </p>
+              <p>
+                Shared memory check: per k-slice the block stages a
+                \(128 \times 8\) panel of \(A\) and an \(8 \times 128\)
+                panel of \(B\): \((128 \times 8 + 8 \times 128) \times 4
+                = 2048 \times 4 = 8192\) bytes, matching ptxas. Work
+                check: \(128 \times 128 = 16384\) outputs over 256
+                threads is 64 outputs per thread, the \(8 \times 8\)
+                register tile, which with two 8-wide operand vectors
+                requires on the order of \(64 + 16\) accumulator and
+                operand registers before addressing arithmetic, hence the
+                112-register count. This kernel at 25 percent occupancy
+                measures 25.1 TFLOPS against 8.1 for the
+                100-percent-occupancy tiled32: occupancy is a constraint,
+                not an objective.
+              </p>
+            </div>
+          </div>
+
+          <div class="problem">
+            <span class="plabel">Problem 6</span>
+            <p>
+              Derive the arithmetic intensity of a \(T \times T\)
+              shared-memory-tiled fp32 matmul as a function of \(T\)
+              (counting global memory traffic only), then use the roofline
+              with this machine's measured \(B = 3063.5\) GB/s to predict
+              the memory-roof ceiling for \(T = 32\) and explain why the
+              measured tiled32 kernel (8.1 TFLOPS) does not reach it.
+              Finally, compute the minimum time for the \(2^{28}\)-element
+              vector add and compare with the measured 1.157 ms.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> Each block computes a \(T \times
+                T\) tile of \(C\) by marching over \(n/T\) k-slices,
+                loading one \(T \times T\) tile of \(A\) and one of \(B\)
+                per slice. Global loads per block: \(2 T^2 \cdot (n/T) =
+                2nT\) floats. Blocks number \((n/T)^2\), so total traffic
+                is \((n/T)^2 \cdot 2nT \cdot 4 = 8n^3/T\) bytes, against
+                \(2n^3\) flops:
+                \(I(T) = 2n^3 / (8n^3/T) = T/4\) flops per byte.
+                Doubling the tile doubles intensity, which is the entire
+                logic of tiling in one formula. For \(T = 32\): \(I = 8\),
+                and the memory roof is \(8 \times 3063.5 = 24.5\) TFLOPS.
+              </p>
+              <p>
+                The measured 8.1 TFLOPS is a third of that ceiling, so HBM
+                is <em>not</em> the binding constraint; the kernel has
+                moved its bottleneck on-chip. At one output per thread it
+                issues two 4-byte shared-memory reads per FMA, demanding
+                8 bytes per 2 flops from a shared-memory system whose
+                bandwidth per SM is a small multiple of the FMA rate;
+                the register-tiled kernel exists to fix exactly this, and
+                its measured 25.1 TFLOPS sits above tiled32's shared-memory
+                bound but below the cuBLAS 51.2, which needs
+                double-buffering to cover latency. Rooflines nest: HBM,
+                L2, shared memory, and registers each have one.
+              </p>
+              <p>
+                Vector add: \(3 \times 4 \times 2^{28} = 3.221\) GB of
+                traffic (two reads, one write); at 3063.5 GB/s the floor
+                is \(3.221/3.0635 = 1.051\) ms. Measured: 1.157 ms, i.e.
+                2785.3 GB/s, 91 percent of the streaming ceiling; the gap
+                is write-allocate and DRAM page effects on the mixed
+                read/write stream. The measured Triton version of the same
+                kernel (1.078 ms, 2988.4 GB/s) and torch.add (3059.2 GB/s)
+                bracket the same floor, confirming the model: for
+                \(I = 1/12\), every correct implementation lands on the
+                memory roof and nothing else matters.
+              </p>
+            </div>
+          </div>
+
+          <div class="problem">
+            <span class="plabel">Problem 7</span>
+            <p>
+              For the naive attention configuration measured above (batch
+              \(\times\) heads \(= 128\), \(L = 8192\), \(d = 64\), 2-byte
+              elements): (a) compute the size of the materialized score
+              matrix and check it against the measured 35.00 GB peak
+              memory; (b) lower-bound the HBM traffic of the naive
+              implementation and convert it to a time floor at the
+              measured 3063.5 GB/s; (c) compare with the measured naive
+              (98.946 ms) and flash (3.575 ms) times and state the
+              conclusion.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> (a) One score matrix is \(128
+                \times 8192^2\) elements \(\times\) 2 bytes \(= 128 \times
+                67{,}108{,}864 \times 2 = 17.18\) GB. Naive attention
+                holds \(S\) and \(P\) simultaneously (softmax cannot
+                safely overwrite in place while both are live across
+                kernel boundaries): \(2 \times 17.18 = 34.36\) GB, plus
+                \(Q, K, V, O\) at \(4 \times 128 \times 8192 \times 64
+                \times 2\) bytes \(= 0.54\) GB, giving 34.90 GB, matching
+                the measured 35.00 GB peak within allocator rounding.
+              </p>
+              <p>
+                (b) The score tensors must be written once and read once
+                each: \(S\) written by the first matmul, read by softmax;
+                \(P\) written by softmax, read by the second matmul. That
+                is \(4 \times 17.18 = 68.7\) GB minimum, ignoring
+                \(Q,K,V\) entirely. Time floor: \(68.7 / 3063.5\) GB/s
+                \(= 22.4\) ms.
+              </p>
+              <p>
+                (c) The measured naive time, 98.946 ms, is \(4.4\times\)
+                the floor (softmax makes extra passes for max and sum, and
+                the matmuls' own tiling re-reads operands), while flash at
+                3.575 ms is \(6.3\times\) <em>below the naive floor</em>:
+                no schedule of the materializing algorithm, however
+                perfect, can come within a factor of six of the fused
+                kernel on this machine. The 2.199 Pflop of work is
+                identical in both; the entire \(27.68\times\) measured
+                speedup is memory traffic. This is the cleanest available
+                demonstration that on modern accelerators the algorithm's
+                IO complexity, not its flop count, is the object of
+                design.
+              </p>
+            </div>
+          </div>
+
+          <h2>Implementation</h2>
+          <p>
+            Every kernel in this section is a working program measured for
+            this page on the H100 80GB (PyTorch 2.7, CUDA 12.8, Triton
+            3.3); the quoted numbers are medians of 30 timed runs after
+            warmup, with correctness checked against the PyTorch
+            reference. The CUDA and Triton tabs implement the same
+            algorithm at two abstraction levels: CUDA states the thread's
+            view and manages shared memory by hand; Triton states the
+            tile's view and lets the compiler place data and schedule
+            lanes.
+          </p>
+
+          <h3>Vector add: the bandwidth baseline</h3>
+          <p>
+            The measured numbers: CUDA one-thread-per-element 1.157 ms
+            (2785.3 GB/s), CUDA grid-stride 1.179 ms (2733.3 GB/s),
+            Triton 1.078 ms (2988.4 GB/s), torch.add 3059.2 GB/s. Any
+            kernel this simple that does not land within about 10 percent
+            of memcpy has a launch-configuration or coalescing bug, which
+            is what makes it the right first benchmark on new hardware.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="cuda" class="active">CUDA</button>
+              <button data-lang="triton">Triton</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="cuda" class="shl lang active"><code class="language-cpp"><span class="c">// vadd.cu: c = a + b over n = 2^28 floats. Measured: 1.157 ms, 2785.3 GB/s.</span>
+<span class="c">// ptxas: 12 registers, 0 bytes smem. AI = 1 flop / 12 bytes: pure bandwidth.</span>
+<span class="k">#include</span> <span class="s">&lt;cuda_runtime.h&gt;</span>
+
+<span class="k">__global__</span> <span class="k">void</span> <span class="m1">vadd</span><span class="b0">(</span><span class="k">const</span> <span class="k">float</span>* <span class="k">__restrict__</span> <span class="v5">a</span>,
+                     <span class="k">const</span> <span class="k">float</span>* <span class="k">__restrict__</span> <span class="v6">b</span>,
+                     <span class="k">float</span>* <span class="k">__restrict__</span> <span class="v1">c</span>, <span class="k">int</span> <span class="v5">n</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">int</span> <span class="v3">i</span> = <span class="v5">blockIdx</span>.<span class="m2">x</span> * <span class="v6">blockDim</span>.<span class="m2">x</span> + <span class="v3">threadIdx</span>.<span class="m2">x</span>;<span class="c">   // global thread id</span>
+    <span class="k">if</span> <span class="b1">(</span><span class="v3">i</span> &lt; <span class="v5">n</span><span class="b1">)</span><span class="c">                                       // tail guard</span>
+        <span class="v1">c</span><span class="b1">[</span><span class="v3">i</span><span class="b1">]</span> = <span class="v5">a</span><span class="b1">[</span><span class="v3">i</span><span class="b1">]</span> + <span class="v6">b</span><span class="b1">[</span><span class="v3">i</span><span class="b1">]</span>;<span class="c">                          // warp reads 128 B of a,</span>
+<span class="b0">}</span><span class="c">                                                    // 128 B of b: coalesced</span>
+
+<span class="c">// Grid-stride variant: launch ~2 blocks/SM and loop. Same bandwidth here</span>
+<span class="c">// (measured 1.179 ms) but composes with any n and amortizes setup.</span>
+<span class="k">__global__</span> <span class="k">void</span> <span class="m1">vadd_gridstride</span><span class="b0">(</span><span class="k">const</span> <span class="k">float</span>* <span class="k">__restrict__</span> <span class="v5">a</span>,
+                                <span class="k">const</span> <span class="k">float</span>* <span class="k">__restrict__</span> <span class="v6">b</span>,
+                                <span class="k">float</span>* <span class="k">__restrict__</span> <span class="v1">c</span>, <span class="k">int</span> <span class="v5">n</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">int</span> <span class="v5">stride</span> = <span class="v2">gridDim</span>.<span class="m2">x</span> * <span class="v6">blockDim</span>.<span class="m2">x</span>;
+    <span class="k">for</span> <span class="b1">(</span><span class="k">int</span> <span class="v3">i</span> = <span class="v5">blockIdx</span>.<span class="m2">x</span> * <span class="v6">blockDim</span>.<span class="m2">x</span> + <span class="v3">threadIdx</span>.<span class="m2">x</span>; <span class="v3">i</span> &lt; <span class="v5">n</span>; <span class="v3">i</span> += <span class="v5">stride</span><span class="b1">)</span>
+        <span class="v1">c</span><span class="b1">[</span><span class="v3">i</span><span class="b1">]</span> = <span class="v5">a</span><span class="b1">[</span><span class="v3">i</span><span class="b1">]</span> + <span class="v6">b</span><span class="b1">[</span><span class="v3">i</span><span class="b1">]</span>;<span class="c">   // consecutive lanes -&gt; consecutive addresses</span>
+<span class="b0">}</span>
+
+<span class="k">int</span> <span class="m1">main</span><span class="b0">()</span> <span class="b0">{</span>
+    <span class="k">int</span> <span class="v5">n</span> = <span class="n">1</span> &lt;&lt; <span class="n">28</span>;
+    <span class="k">float</span> *<span class="v5">a</span>, *<span class="v6">b</span>, *<span class="v1">c</span>;
+    <span class="m1">cudaMalloc</span><span class="b1">(</span>&amp;<span class="v5">a</span>, <span class="v5">n</span> * <span class="k">sizeof</span><span class="b2">(</span><span class="k">float</span><span class="b2">)</span><span class="b1">)</span>;
+    <span class="m1">cudaMalloc</span><span class="b1">(</span>&amp;<span class="v6">b</span>, <span class="v5">n</span> * <span class="k">sizeof</span><span class="b2">(</span><span class="k">float</span><span class="b2">)</span><span class="b1">)</span>;
+    <span class="m1">cudaMalloc</span><span class="b1">(</span>&amp;<span class="v1">c</span>, <span class="v5">n</span> * <span class="k">sizeof</span><span class="b2">(</span><span class="k">float</span><span class="b2">)</span><span class="b1">)</span>;
+    <span class="k">int</span> <span class="v0">block</span> = <span class="n">256</span>;
+    <span class="m1">vadd</span>&lt;&lt;&lt;<span class="b1">(</span><span class="v5">n</span> + <span class="v0">block</span> - <span class="n">1</span><span class="b1">)</span> / <span class="v0">block</span>, <span class="v0">block</span>&gt;&gt;&gt;<span class="b1">(</span><span class="v5">a</span>, <span class="v6">b</span>, <span class="v1">c</span>, <span class="v5">n</span><span class="b1">)</span>;
+    <span class="m1">vadd_gridstride</span>&lt;&lt;&lt;<span class="n">132</span> * <span class="n">2</span>, <span class="v0">block</span>&gt;&gt;&gt;<span class="b1">(</span><span class="v5">a</span>, <span class="v6">b</span>, <span class="v1">c</span>, <span class="v5">n</span><span class="b1">)</span>;
+    <span class="k">return</span> <span class="m1">cudaDeviceSynchronize</span><span class="b1">()</span> != <span class="v3">cudaSuccess</span>;
+<span class="b0">}</span></code></pre>
+            <pre data-lang="triton" class="shl lang"><code class="language-python"><span class="c"># vadd in Triton. Measured on the H100: 1.078 ms, 2988.4 GB/s.</span>
+<span class="c"># One "program" owns a BLOCK-sized tile; the compiler maps it to warps.</span>
+<span class="k">import</span> <span class="m1">torch</span>
+<span class="k">import</span> <span class="m1">triton</span>
+<span class="k">import</span> <span class="m1">triton</span>.<span class="m2">language</span> <span class="k">as</span> <span class="m1">tl</span>
+
+<span class="m1">@triton.jit</span>
+<span class="k">def</span> <span class="m1">vadd_kernel</span><span class="b0">(</span><span class="v0">a_ptr</span>, <span class="v4">b_ptr</span>, <span class="v5">c_ptr</span>, <span class="v5">n</span>, <span class="v5">BLOCK</span>: <span class="m1">tl</span>.<span class="m2">constexpr</span><span class="b0">)</span>:
+    <span class="v5">pid</span> = <span class="m1">tl</span>.<span class="m2">program_id</span><span class="b0">(</span><span class="v4">axis</span>=<span class="n">0</span><span class="b0">)</span>
+    <span class="v4">offs</span> = <span class="v5">pid</span> * <span class="v5">BLOCK</span> + <span class="m1">tl</span>.<span class="m2">arange</span><span class="b0">(</span><span class="n">0</span>, <span class="v5">BLOCK</span><span class="b0">)</span>   <span class="c"># (BLOCK,) tile of indices</span>
+    <span class="v3">mask</span> = <span class="v4">offs</span> &lt; <span class="v5">n</span>                            <span class="c"># tail guard, vectorized</span>
+    <span class="v5">a</span> = <span class="m1">tl</span>.<span class="m2">load</span><span class="b0">(</span><span class="v0">a_ptr</span> + <span class="v4">offs</span>, <span class="v3">mask</span>=<span class="v3">mask</span><span class="b0">)</span>       <span class="c"># coalescing is the compiler's</span>
+    <span class="v6">b</span> = <span class="m1">tl</span>.<span class="m2">load</span><span class="b0">(</span><span class="v4">b_ptr</span> + <span class="v4">offs</span>, <span class="v3">mask</span>=<span class="v3">mask</span><span class="b0">)</span>       <span class="c"># job: contiguous tile -&gt;</span>
+    <span class="m1">tl</span>.<span class="m2">store</span><span class="b0">(</span><span class="v5">c_ptr</span> + <span class="v4">offs</span>, <span class="v5">a</span> + <span class="v6">b</span>, <span class="v3">mask</span>=<span class="v3">mask</span><span class="b0">)</span>   <span class="c"># contiguous sectors</span>
+
+<span class="k">def</span> <span class="m1">vadd</span><span class="b0">(</span><span class="v5">a</span>: <span class="m1">torch</span>.<span class="m2">Tensor</span>, <span class="v6">b</span>: <span class="m1">torch</span>.<span class="m2">Tensor</span><span class="b0">)</span> -&gt; <span class="m1">torch</span>.<span class="m2">Tensor</span>:
+    <span class="v1">c</span> = <span class="m1">torch</span>.<span class="m2">empty_like</span><span class="b0">(</span><span class="v5">a</span><span class="b0">)</span>                    <span class="c"># (n,)</span>
+    <span class="v5">n</span> = <span class="v5">a</span>.<span class="m2">numel</span><span class="b0">()</span>
+    <span class="v1">grid</span> = <span class="b0">(</span><span class="m1">triton</span>.<span class="m2">cdiv</span><span class="b1">(</span><span class="v5">n</span>, <span class="n">1024</span><span class="b1">)</span>,<span class="b0">)</span>
+    <span class="m1">vadd_kernel</span><span class="b0">[</span><span class="v1">grid</span><span class="b0">](</span><span class="v5">a</span>, <span class="v6">b</span>, <span class="v1">c</span>, <span class="v5">n</span>, <span class="v5">BLOCK</span>=<span class="n">1024</span><span class="b0">)</span>
+    <span class="k">return</span> <span class="v1">c</span>
+
+<span class="v4">x</span> = <span class="m1">torch</span>.<span class="m2">randn</span><span class="b0">(</span><span class="n">1</span> &lt;&lt; <span class="n">28</span>, <span class="v6">device</span>=<span class="s">"cuda"</span><span class="b0">)</span>        <span class="c"># (2^28,) = 1 GiB</span>
+<span class="v6">y</span> = <span class="m1">torch</span>.<span class="m2">randn</span><span class="b0">(</span><span class="n">1</span> &lt;&lt; <span class="n">28</span>, <span class="v6">device</span>=<span class="s">"cuda"</span><span class="b0">)</span>
+<span class="k">assert</span> <span class="m1">torch</span>.<span class="m2">equal</span><span class="b0">(</span><span class="m1">vadd</span><span class="b1">(</span><span class="v4">x</span>, <span class="v6">y</span><span class="b1">)</span>, <span class="v4">x</span> + <span class="v6">y</span><span class="b0">)</span></code></pre>
+          </div>
+
+          <h3>Reduction: grid-stride loads and warp shuffles</h3>
+          <p>
+            This is the reduce4 kernel from the measured progression,
+            0.357 ms and 3009.7 GB/s on \(2^{28}\) floats, 99 percent of
+            this machine's streaming ceiling and slightly ahead of
+            torch.sum (2974.4 GB/s). ptxas reports 28 registers and 128
+            bytes of shared memory: exactly the 32-float array of per-warp
+            partials. The Triton tab is the same two-level shape (2837.4
+            GB/s measured) with the tree implicit in tl.sum.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="cuda" class="active">CUDA</button>
+              <button data-lang="triton">Triton</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="cuda" class="shl lang active"><code class="language-cpp"><span class="c">// reduce4: grid-stride + warp shuffles. Measured: 0.357 ms, 3009.7 GB/s.</span>
+<span class="c">// Structure: long coalesced serial loop (bandwidth phase), then a</span>
+<span class="c">// log-depth tree entirely in registers (compute phase, ~0 cost).</span>
+<span class="k">#include</span> <span class="s">&lt;cuda_runtime.h&gt;</span>
+
+<span class="k">__global__</span> <span class="k">void</span> <span class="m1">reduce_gridstride</span><span class="b0">(</span><span class="k">const</span> <span class="k">float</span>* <span class="k">__restrict__</span> <span class="v4">x</span>,
+                                  <span class="k">float</span>* <span class="k">__restrict__</span> <span class="v2">out</span>, <span class="k">size_t</span> <span class="v5">n</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">float</span> <span class="v0">sum</span> = <span class="n">0.0</span><span class="k">f</span>;
+    <span class="k">size_t</span> <span class="v5">stride</span> = <span class="b1">(</span><span class="k">size_t</span><span class="b1">)</span><span class="v2">gridDim</span>.<span class="m2">x</span> * <span class="v6">blockDim</span>.<span class="m2">x</span>;
+    <span class="k">for</span> <span class="b1">(</span><span class="k">size_t</span> <span class="v3">i</span> = <span class="b2">(</span><span class="k">size_t</span><span class="b2">)</span><span class="v5">blockIdx</span>.<span class="m2">x</span> * <span class="v6">blockDim</span>.<span class="m2">x</span> + <span class="v3">threadIdx</span>.<span class="m2">x</span>;
+         <span class="v3">i</span> &lt; <span class="v5">n</span>; <span class="v3">i</span> += <span class="v5">stride</span><span class="b1">)</span>
+        <span class="v0">sum</span> += <span class="v4">x</span><span class="b1">[</span><span class="v3">i</span><span class="b1">]</span>;<span class="c">                         // each thread: ~n/(grid) adds,</span>
+<span class="c">                                             // consecutive lanes coalesce</span>
+<span class="c">    // warp tree: 5 shuffle-adds, register to register, no barrier needed</span>
+    <span class="k">for</span> <span class="b1">(</span><span class="k">int</span> <span class="v2">off</span> = <span class="n">16</span>; <span class="v2">off</span> &gt; <span class="n">0</span>; <span class="v2">off</span> &gt;&gt;= <span class="n">1</span><span class="b1">)</span>
+        <span class="v0">sum</span> += <span class="m1">__shfl_down_sync</span><span class="b1">(</span><span class="k">0x</span><span class="n">ffffffff</span><span class="k">u</span>, <span class="v0">sum</span>, <span class="v2">off</span><span class="b1">)</span>;
+
+    <span class="k">__shared__</span> <span class="k">float</span> <span class="v3">warp_partial</span><span class="b1">[</span><span class="n">32</span><span class="b1">]</span>;<span class="c">       // 128 B, matches ptxas</span>
+    <span class="k">int</span> <span class="v2">lane</span> = <span class="v3">threadIdx</span>.<span class="m2">x</span> &amp; <span class="n">31</span>, <span class="v3">warp</span> = <span class="v3">threadIdx</span>.<span class="m2">x</span> &gt;&gt; <span class="n">5</span>;
+    <span class="k">if</span> <span class="b1">(</span><span class="v2">lane</span> == <span class="n">0</span><span class="b1">)</span> <span class="v3">warp_partial</span><span class="b1">[</span><span class="v3">warp</span><span class="b1">]</span> = <span class="v0">sum</span>;<span class="c"> // one value per warp</span>
+    <span class="m1">__syncthreads</span><span class="b1">()</span>;
+
+    <span class="k">if</span> <span class="b1">(</span><span class="v3">warp</span> == <span class="n">0</span><span class="b1">)</span> <span class="b1">{</span><span class="c">                         // first warp reduces the partials</span>
+        <span class="k">int</span> <span class="v4">nwarps</span> = <span class="v6">blockDim</span>.<span class="m2">x</span> &gt;&gt; <span class="n">5</span>;
+        <span class="v0">sum</span> = <span class="b2">(</span><span class="v2">lane</span> &lt; <span class="v4">nwarps</span><span class="b2">)</span> ? <span class="v3">warp_partial</span><span class="b2">[</span><span class="v2">lane</span><span class="b2">]</span> : <span class="n">0.0</span><span class="k">f</span>;
+        <span class="k">for</span> <span class="b2">(</span><span class="k">int</span> <span class="v2">off</span> = <span class="n">16</span>; <span class="v2">off</span> &gt; <span class="n">0</span>; <span class="v2">off</span> &gt;&gt;= <span class="n">1</span><span class="b2">)</span>
+            <span class="v0">sum</span> += <span class="m1">__shfl_down_sync</span><span class="b2">(</span><span class="k">0x</span><span class="n">ffffffff</span><span class="k">u</span>, <span class="v0">sum</span>, <span class="v2">off</span><span class="b2">)</span>;
+        <span class="k">if</span> <span class="b2">(</span><span class="v2">lane</span> == <span class="n">0</span><span class="b2">)</span> <span class="m1">atomicAdd</span><span class="b2">(</span><span class="v2">out</span>, <span class="v0">sum</span><span class="b2">)</span>;<span class="c">  // few blocks -&gt; low contention</span>
+    <span class="b1">}</span>
+<span class="b0">}</span>
+<span class="c">// launch: reduce_gridstride&lt;&lt;&lt;132 * 4, 256&gt;&gt;&gt;(x, out, n);  out zeroed first</span></code></pre>
+            <pre data-lang="triton" class="shl lang"><code class="language-python"><span class="c"># Reduction in Triton. Measured: 0.378 ms, 2837.4 GB/s on 2^28 floats.</span>
+<span class="c"># tl.sum lowers to the same shuffle tree the CUDA tab writes by hand.</span>
+<span class="k">import</span> <span class="m1">torch</span>
+<span class="k">import</span> <span class="m1">triton</span>
+<span class="k">import</span> <span class="m1">triton</span>.<span class="m2">language</span> <span class="k">as</span> <span class="m1">tl</span>
+
+<span class="m1">@triton.jit</span>
+<span class="k">def</span> <span class="m1">reduce_kernel</span><span class="b0">(</span><span class="v5">x_ptr</span>, <span class="v3">out_ptr</span>, <span class="v5">n</span>, <span class="v5">BLOCK</span>: <span class="m1">tl</span>.<span class="m2">constexpr</span><span class="b0">)</span>:
+    <span class="v5">pid</span> = <span class="m1">tl</span>.<span class="m2">program_id</span><span class="b0">(</span><span class="n">0</span><span class="b0">)</span>
+    <span class="v4">offs</span> = <span class="v5">pid</span> * <span class="v5">BLOCK</span> + <span class="m1">tl</span>.<span class="m2">arange</span><span class="b0">(</span><span class="n">0</span>, <span class="v5">BLOCK</span><span class="b0">)</span>
+    <span class="v4">x</span> = <span class="m1">tl</span>.<span class="m2">load</span><span class="b0">(</span><span class="v5">x_ptr</span> + <span class="v4">offs</span>, <span class="v3">mask</span>=<span class="v4">offs</span> &lt; <span class="v5">n</span>, <span class="v6">other</span>=<span class="n">0.0</span><span class="b0">)</span>
+    <span class="v4">partial</span> = <span class="m1">tl</span>.<span class="m2">sum</span><span class="b0">(</span><span class="v4">x</span>, <span class="v4">axis</span>=<span class="n">0</span><span class="b0">)</span>              <span class="c"># block-level tree in registers</span>
+    <span class="m1">tl</span>.<span class="m2">atomic_add</span><span class="b0">(</span><span class="v3">out_ptr</span>, <span class="v4">partial</span><span class="b0">)</span>          <span class="c"># one atomic per program</span>
+
+<span class="k">def</span> <span class="m1">gpu_sum</span><span class="b0">(</span><span class="v4">x</span>: <span class="m1">torch</span>.<span class="m2">Tensor</span><span class="b0">)</span> -&gt; <span class="m1">torch</span>.<span class="m2">Tensor</span>:
+    <span class="v2">out</span> = <span class="m1">torch</span>.<span class="m2">zeros</span><span class="b0">(</span><span class="n">1</span>, <span class="v6">device</span>=<span class="v4">x</span>.<span class="m2">device</span>, <span class="v3">dtype</span>=<span class="m1">torch</span>.<span class="m2">float32</span><span class="b0">)</span>
+    <span class="v5">n</span> = <span class="v4">x</span>.<span class="m2">numel</span><span class="b0">()</span>
+    <span class="m1">reduce_kernel</span><span class="b0">[</span><span class="b1">(</span><span class="m1">triton</span>.<span class="m2">cdiv</span><span class="b2">(</span><span class="v5">n</span>, <span class="n">4096</span><span class="b2">)</span>,<span class="b1">)</span><span class="b0">](</span><span class="v4">x</span>, <span class="v2">out</span>, <span class="v5">n</span>, <span class="v5">BLOCK</span>=<span class="n">4096</span><span class="b0">)</span>
+    <span class="k">return</span> <span class="v2">out</span>
+
+<span class="v4">x</span> = <span class="m1">torch</span>.<span class="m2">randn</span><span class="b0">(</span><span class="n">1</span> &lt;&lt; <span class="n">28</span>, <span class="v6">device</span>=<span class="s">"cuda"</span><span class="b0">)</span>
+<span class="c"># atomics reorder float adds across runs: compare with a tolerance</span>
+<span class="k">assert</span> <span class="m1">torch</span>.<span class="m2">allclose</span><span class="b0">(</span><span class="m1">gpu_sum</span><span class="b1">(</span><span class="v4">x</span><span class="b1">)</span>, <span class="v4">x</span>.<span class="m2">sum</span><span class="b1">()</span>, <span class="v4">rtol</span>=<span class="n">1e-4</span><span class="b0">)</span></code></pre>
+          </div>
+
+          <h3>Scan: the three-phase decomposition in tensor code</h3>
+          <p>
+            Rather than reproduce a full CUDA scan (CUB's implementation
+            is the reference; see the open-source section), this block
+            shows the decomposition every GPU scan uses, expressed in
+            PyTorch, and the same computation through JAX's built-in
+            associative machinery, which applies the Blelloch construction
+            to <em>any</em> associative operator: the second JAX example
+            scans \(2\times 2\) matrix products to solve the recurrence
+            \(z_k = a_k z_{k-1} + b_k\) in \(O(\log n)\) depth, the trick
+            behind parallelized linear state-space layers.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="pytorch" class="shl lang active"><code class="language-python"><span class="k">import</span> <span class="m1">torch</span>
+
+<span class="v4">x</span> = <span class="m1">torch</span>.<span class="m2">randn</span><span class="b0">(</span><span class="n">1</span> &lt;&lt; <span class="n">20</span>, <span class="v6">device</span>=<span class="s">"cuda"</span><span class="b0">)</span>          <span class="c"># (n,), n = 2^20</span>
+<span class="v6">inc</span> = <span class="m1">torch</span>.<span class="m2">cumsum</span><span class="b0">(</span><span class="v4">x</span>, <span class="v5">dim</span>=<span class="n">0</span><span class="b0">)</span>                     <span class="c"># library scan</span>
+<span class="v2">exc</span> = <span class="v6">inc</span> - <span class="v4">x</span>                                    <span class="c"># exclusive from inclusive</span>
+
+<span class="c"># The three-phase structure of every device-wide GPU scan:</span>
+<span class="c">#   1) scan each block locally, 2) scan the block totals,</span>
+<span class="c">#   3) add each block's carry to its elements.</span>
+<span class="v0">B</span> = <span class="n">1024</span>
+<span class="v5">blocks</span> = <span class="v4">x</span>.<span class="m2">view</span><span class="b0">(</span>-<span class="n">1</span>, <span class="v0">B</span><span class="b0">)</span>                           <span class="c"># (n/B, B)</span>
+<span class="v3">local</span>  = <span class="m1">torch</span>.<span class="m2">cumsum</span><span class="b0">(</span><span class="v5">blocks</span>, <span class="v5">dim</span>=<span class="n">1</span><span class="b0">)</span>             <span class="c"># phase 1: (n/B, B)</span>
+<span class="v4">totals</span> = <span class="v3">local</span><span class="b0">[</span>:, -<span class="n">1</span><span class="b0">]</span>                            <span class="c"># (n/B,) block sums</span>
+<span class="v4">carry</span>  = <span class="m1">torch</span>.<span class="m2">cumsum</span><span class="b0">(</span><span class="v4">totals</span>, <span class="v5">dim</span>=<span class="n">0</span><span class="b0">)</span> - <span class="v4">totals</span>    <span class="c"># phase 2: exclusive scan</span>
+<span class="v2">out</span>    = <span class="b0">(</span><span class="v3">local</span> + <span class="v4">carry</span><span class="b1">[</span>:, <span class="k">None</span><span class="b1">]</span><span class="b0">)</span>.<span class="m2">reshape</span><span class="b0">(</span>-<span class="n">1</span><span class="b0">)</span>    <span class="c"># phase 3: apply carries</span>
+<span class="k">assert</span> <span class="m1">torch</span>.<span class="m2">allclose</span><span class="b0">(</span><span class="v2">out</span>, <span class="v6">inc</span>, <span class="v2">atol</span>=<span class="n">1e-2</span><span class="b0">)</span>
+
+<span class="c"># Scan as sort primitive: stable split by bit -&gt; radix sort pass</span>
+<span class="v4">keys</span>  = <span class="m1">torch</span>.<span class="m2">randint</span><span class="b0">(</span><span class="n">0</span>, <span class="n">2</span>, <span class="b1">(</span><span class="n">16</span>,<span class="b1">)</span>, <span class="v6">device</span>=<span class="s">"cuda"</span><span class="b0">)</span>
+<span class="v4">zeros</span> = <span class="b0">(</span><span class="v4">keys</span> == <span class="n">0</span><span class="b0">)</span>.<span class="m2">long</span><span class="b0">()</span>
+<span class="v0">dst0</span>  = <span class="m1">torch</span>.<span class="m2">cumsum</span><span class="b0">(</span><span class="v4">zeros</span>, <span class="n">0</span><span class="b0">)</span> - <span class="v4">zeros</span>           <span class="c"># exclusive scan of 0-flags</span>
+<span class="v5">dst1</span>  = <span class="v4">zeros</span>.<span class="m2">sum</span><span class="b0">()</span> + <span class="m1">torch</span>.<span class="m2">cumsum</span><span class="b0">(</span><span class="n">1</span> - <span class="v4">zeros</span>, <span class="n">0</span><span class="b0">)</span> - <span class="b0">(</span><span class="n">1</span> - <span class="v4">zeros</span><span class="b0">)</span>
+<span class="v1">dst</span>   = <span class="m1">torch</span>.<span class="m2">where</span><span class="b0">(</span><span class="v4">keys</span> == <span class="n">0</span>, <span class="v0">dst0</span>, <span class="v5">dst1</span><span class="b0">)</span>       <span class="c"># scatter destinations</span></code></pre>
+            <pre data-lang="jax" class="shl lang"><code class="language-python"><span class="k">import</span> <span class="m1">jax</span>
+<span class="k">import</span> <span class="m1">jax</span>.<span class="m2">numpy</span> <span class="k">as</span> <span class="m1">jnp</span>
+<span class="k">from</span> <span class="m1">jax</span> <span class="k">import</span> <span class="m1">lax</span>
+
+<span class="v4">x</span> = <span class="m1">jax</span>.<span class="m2">random</span>.<span class="m2">normal</span><span class="b0">(</span><span class="m1">jax</span>.<span class="m2">random</span>.<span class="m2">PRNGKey</span><span class="b1">(</span><span class="n">0</span><span class="b1">)</span>, <span class="b1">(</span><span class="n">1</span> &lt;&lt; <span class="n">20</span>,<span class="b1">)</span><span class="b0">)</span>  <span class="c"># (n,)</span>
+<span class="v6">inc</span> = <span class="m1">jnp</span>.<span class="m2">cumsum</span><span class="b0">(</span><span class="v4">x</span><span class="b0">)</span>
+<span class="c"># Blelloch-style construction for any associative op, O(n) work:</span>
+<span class="v3">inc2</span> = <span class="m1">lax</span>.<span class="m2">associative_scan</span><span class="b0">(</span><span class="m1">jnp</span>.<span class="m2">add</span>, <span class="v4">x</span><span class="b0">)</span>
+<span class="v2">run_max</span> = <span class="m1">lax</span>.<span class="m2">associative_scan</span><span class="b0">(</span><span class="m1">jnp</span>.<span class="m2">maximum</span>, <span class="v4">x</span><span class="b0">)</span>   <span class="c"># running maximum</span>
+
+<span class="c"># Linear recurrence z_k = a_k z_{k-1} + b_k as a scan over the</span>
+<span class="c"># associative composition of affine maps (a, b) ∘ (a', b'):</span>
+<span class="k">def</span> <span class="m1">affine_compose</span><span class="b0">(</span><span class="v0">f</span>, <span class="v2">g</span><span class="b0">)</span>:
+    <span class="v2">a1</span>, <span class="v0">b1</span> = <span class="v0">f</span>
+    <span class="v0">a2</span>, <span class="v1">b2</span> = <span class="v2">g</span>
+    <span class="k">return</span> <span class="b0">(</span><span class="v0">a2</span> * <span class="v2">a1</span>, <span class="v0">a2</span> * <span class="v0">b1</span> + <span class="v1">b2</span><span class="b0">)</span>               <span class="c"># apply f, then g</span>
+
+<span class="v0">key_a</span>, <span class="v1">key_b</span> = <span class="m1">jax</span>.<span class="m2">random</span>.<span class="m2">split</span><span class="b0">(</span><span class="m1">jax</span>.<span class="m2">random</span>.<span class="m2">PRNGKey</span><span class="b1">(</span><span class="n">1</span><span class="b1">)</span><span class="b0">)</span>
+<span class="v5">a</span> = <span class="m1">jax</span>.<span class="m2">random</span>.<span class="m2">uniform</span><span class="b0">(</span><span class="v0">key_a</span>, <span class="b1">(</span><span class="n">1</span> &lt;&lt; <span class="n">20</span>,<span class="b1">)</span><span class="b0">)</span> * <span class="n">0.9</span>  <span class="c"># (n,) decay terms</span>
+<span class="v6">b</span> = <span class="m1">jax</span>.<span class="m2">random</span>.<span class="m2">normal</span><span class="b0">(</span><span class="v1">key_b</span>, <span class="b1">(</span><span class="n">1</span> &lt;&lt; <span class="n">20</span>,<span class="b1">)</span><span class="b0">)</span>         <span class="c"># (n,) inputs</span>
+<span class="v4">_</span>, <span class="v0">z</span> = <span class="m1">lax</span>.<span class="m2">associative_scan</span><span class="b0">(</span><span class="m1">affine_compose</span>, <span class="b1">(</span><span class="v5">a</span>, <span class="v6">b</span><span class="b1">)</span><span class="b0">)</span>
+<span class="c"># z[k] == a[k] * z[k-1] + b[k], computed at depth O(log n):</span>
+<span class="v1">z_ref</span> = <span class="v6">b</span><span class="b0">[</span><span class="n">0</span><span class="b0">]</span>
+<span class="k">for</span> <span class="v6">k</span> <span class="k">in</span> <span class="m1">range</span><span class="b0">(</span><span class="n">1</span>, <span class="n">5</span><span class="b0">)</span>:
+    <span class="v1">z_ref</span> = <span class="v5">a</span><span class="b0">[</span><span class="v6">k</span><span class="b0">]</span> * <span class="v1">z_ref</span> + <span class="v6">b</span><span class="b0">[</span><span class="v6">k</span><span class="b0">]</span>
+<span class="k">assert</span> <span class="m1">jnp</span>.<span class="m2">allclose</span><span class="b0">(</span><span class="v0">z</span><span class="b1">[</span><span class="n">4</span><span class="b1">]</span>, <span class="v1">z_ref</span>, <span class="v4">rtol</span>=<span class="n">1e-4</span><span class="b0">)</span></code></pre>
+          </div>
+
+          <h3>Matmul: shared-memory tiles in CUDA, tl.dot in Triton</h3>
+          <p>
+            The CUDA tab is the measured tiled32 kernel (17.04 ms, 8.1
+            TFLOPS fp32 at \(n = 4096\)) with comments marking where
+            blocked128 (5.48 ms, 25.1 TFLOPS) departs from it. The Triton
+            tab is the measured fp16 kernel (0.269 ms, 511.6 TFLOPS
+            against cuBLAS at 702.4): tl.dot compiles to tensor-core
+            instructions, and the compiler handles shared-memory staging,
+            swizzling, and pipelining that CUDA leaves to the programmer.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="cuda" class="active">CUDA</button>
+              <button data-lang="triton">Triton</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="cuda" class="shl lang active"><code class="language-cpp"><span class="c">// tiled32: measured 17.04 ms / 8.1 TFLOPS fp32 at n = 4096.</span>
+<span class="c">// ptxas: 32 regs, 8192 B smem, full occupancy -- and still 6x off cuBLAS,</span>
+<span class="c">// because 1 output/thread leaves it bound on shared-memory bandwidth.</span>
+<span class="k">#define</span> <span class="m1">TILE</span> <span class="n">32</span>
+
+<span class="k">__global__</span> <span class="k">void</span> <span class="m1">sgemm_tiled</span><span class="b0">(</span><span class="k">const</span> <span class="k">float</span>* <span class="k">__restrict__</span> <span class="v6">A</span>,
+                            <span class="k">const</span> <span class="k">float</span>* <span class="k">__restrict__</span> <span class="v0">B</span>,
+                            <span class="k">float</span>* <span class="k">__restrict__</span> <span class="v2">C</span>, <span class="k">int</span> <span class="v5">n</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">__shared__</span> <span class="k">float</span> <span class="v5">As</span><span class="b1">[</span><span class="m1">TILE</span><span class="b1">][</span><span class="m1">TILE</span><span class="b1">]</span>;<span class="c">          // 4 KB</span>
+    <span class="k">__shared__</span> <span class="k">float</span> <span class="v2">Bs</span><span class="b1">[</span><span class="m1">TILE</span><span class="b1">][</span><span class="m1">TILE</span><span class="b1">]</span>;<span class="c">          // 4 KB</span>
+    <span class="k">int</span> <span class="v6">row</span> = <span class="v5">blockIdx</span>.<span class="m2">y</span> * <span class="m1">TILE</span> + <span class="v3">threadIdx</span>.<span class="m2">y</span>;
+    <span class="k">int</span> <span class="v1">col</span> = <span class="v5">blockIdx</span>.<span class="m2">x</span> * <span class="m1">TILE</span> + <span class="v3">threadIdx</span>.<span class="m2">x</span>;
+    <span class="k">float</span> <span class="v6">acc</span> = <span class="n">0.0</span><span class="k">f</span>;
+    <span class="k">for</span> <span class="b1">(</span><span class="k">int</span> <span class="v0">t</span> = <span class="n">0</span>; <span class="v0">t</span> &lt; <span class="v5">n</span> / <span class="m1">TILE</span>; ++<span class="v0">t</span><span class="b1">)</span> <span class="b1">{</span><span class="c">      // march over k in tile slices</span>
+        <span class="v5">As</span><span class="b2">[</span><span class="v3">threadIdx</span>.<span class="m2">y</span><span class="b2">][</span><span class="v3">threadIdx</span>.<span class="m2">x</span><span class="b2">]</span> = <span class="v6">A</span><span class="b2">[</span><span class="v6">row</span> * <span class="v5">n</span> + <span class="v0">t</span> * <span class="m1">TILE</span> + <span class="v3">threadIdx</span>.<span class="m2">x</span><span class="b2">]</span>;
+        <span class="v2">Bs</span><span class="b2">[</span><span class="v3">threadIdx</span>.<span class="m2">y</span><span class="b2">][</span><span class="v3">threadIdx</span>.<span class="m2">x</span><span class="b2">]</span> = <span class="v0">B</span><span class="b2">[</span><span class="b0">(</span><span class="v0">t</span> * <span class="m1">TILE</span> + <span class="v3">threadIdx</span>.<span class="m2">y</span><span class="b0">)</span> * <span class="v5">n</span> + <span class="v1">col</span><span class="b2">]</span>;
+        <span class="m1">__syncthreads</span><span class="b2">()</span>;<span class="c">                      // tile staged before use</span>
+        <span class="k">#pragma</span> <span class="m1">unroll</span>
+        <span class="k">for</span> <span class="b2">(</span><span class="k">int</span> <span class="v6">k</span> = <span class="n">0</span>; <span class="v6">k</span> &lt; <span class="m1">TILE</span>; ++<span class="v6">k</span><span class="b2">)</span><span class="c">        // 32 FMAs per global element:</span>
+            <span class="v6">acc</span> += <span class="v5">As</span><span class="b2">[</span><span class="v3">threadIdx</span>.<span class="m2">y</span><span class="b2">][</span><span class="v6">k</span><span class="b2">]</span> * <span class="v2">Bs</span><span class="b2">[</span><span class="v6">k</span><span class="b2">][</span><span class="v3">threadIdx</span>.<span class="m2">x</span><span class="b2">]</span>;<span class="c">   // AI = T/4 = 8</span>
+        <span class="m1">__syncthreads</span><span class="b2">()</span>;<span class="c">                      // done before overwrite</span>
+    <span class="b1">}</span>
+    <span class="v2">C</span><span class="b1">[</span><span class="v6">row</span> * <span class="v5">n</span> + <span class="v1">col</span><span class="b1">]</span> = <span class="v6">acc</span>;
+<span class="b0">}</span>
+<span class="c">// blocked128 (measured 25.1 TFLOPS) changes exactly one thing: each thread</span>
+<span class="c">// owns an 8x8 register tile of C. Inner iteration becomes</span>
+<span class="c">//   float a[8], b[8];             // read 16 floats from smem</span>
+<span class="c">//   acc[i][j] += a[i] * b[j];     // do 64 FMAs: 4 flops per smem byte</span>
+<span class="c">// cost: 112 regs/thread -&gt; 25% occupancy -&gt; 3.1x faster anyway.</span></code></pre>
+            <pre data-lang="triton" class="shl lang"><code class="language-python"><span class="c"># Triton matmul, fp16 in / fp32 accumulate. Measured at n = 4096:</span>
+<span class="c"># 0.269 ms, 511.6 TFLOPS (cuBLAS fp16: 702.4). Dims assumed multiples of BM/BN/BK.</span>
+<span class="k">import</span> <span class="m1">torch</span>
+<span class="k">import</span> <span class="m1">triton</span>
+<span class="k">import</span> <span class="m1">triton</span>.<span class="m2">language</span> <span class="k">as</span> <span class="m1">tl</span>
+
+<span class="m1">@triton.jit</span>
+<span class="k">def</span> <span class="m1">matmul_kernel</span><span class="b0">(</span><span class="v0">a_ptr</span>, <span class="v4">b_ptr</span>, <span class="v5">c_ptr</span>, <span class="v5">M</span>, <span class="v6">N</span>, <span class="v0">K</span>,
+                  <span class="v5">sam</span>, <span class="v2">sak</span>, <span class="v5">sbk</span>, <span class="v6">sbn</span>, <span class="v3">scm</span>, <span class="v5">scn</span>,
+                  <span class="v3">BM</span>: <span class="m1">tl</span>.<span class="m2">constexpr</span>, <span class="v4">BN</span>: <span class="m1">tl</span>.<span class="m2">constexpr</span>, <span class="v5">BK</span>: <span class="m1">tl</span>.<span class="m2">constexpr</span><span class="b0">)</span>:
+    <span class="v3">pid_m</span> = <span class="m1">tl</span>.<span class="m2">program_id</span><span class="b0">(</span><span class="n">0</span><span class="b0">)</span>
+    <span class="v5">pid_n</span> = <span class="m1">tl</span>.<span class="m2">program_id</span><span class="b0">(</span><span class="n">1</span><span class="b0">)</span>
+    <span class="v4">rm</span> = <span class="v3">pid_m</span> * <span class="v3">BM</span> + <span class="m1">tl</span>.<span class="m2">arange</span><span class="b0">(</span><span class="n">0</span>, <span class="v3">BM</span><span class="b0">)</span>          <span class="c"># (BM,) rows of C</span>
+    <span class="v5">rn</span> = <span class="v5">pid_n</span> * <span class="v4">BN</span> + <span class="m1">tl</span>.<span class="m2">arange</span><span class="b0">(</span><span class="n">0</span>, <span class="v4">BN</span><span class="b0">)</span>          <span class="c"># (BN,) cols of C</span>
+    <span class="v6">rk</span> = <span class="m1">tl</span>.<span class="m2">arange</span><span class="b0">(</span><span class="n">0</span>, <span class="v5">BK</span><span class="b0">)</span>                       <span class="c"># (BK,) k-slice</span>
+    <span class="v2">a_ptrs</span> = <span class="v0">a_ptr</span> + <span class="v4">rm</span><span class="b0">[</span>:, <span class="k">None</span><span class="b0">]</span> * <span class="v5">sam</span> + <span class="v6">rk</span><span class="b0">[</span><span class="k">None</span>, :<span class="b0">]</span> * <span class="v2">sak</span>   <span class="c"># (BM, BK)</span>
+    <span class="v4">b_ptrs</span> = <span class="v4">b_ptr</span> + <span class="v6">rk</span><span class="b0">[</span>:, <span class="k">None</span><span class="b0">]</span> * <span class="v5">sbk</span> + <span class="v5">rn</span><span class="b0">[</span><span class="k">None</span>, :<span class="b0">]</span> * <span class="v6">sbn</span>   <span class="c"># (BK, BN)</span>
+    <span class="v6">acc</span> = <span class="m1">tl</span>.<span class="m2">zeros</span><span class="b0">(</span><span class="b1">(</span><span class="v3">BM</span>, <span class="v4">BN</span><span class="b1">)</span>, <span class="v3">dtype</span>=<span class="m1">tl</span>.<span class="m2">float32</span><span class="b0">)</span>  <span class="c"># register tile of C</span>
+    <span class="k">for</span> <span class="v4">_</span> <span class="k">in</span> <span class="m1">range</span><span class="b0">(</span><span class="n">0</span>, <span class="v0">K</span>, <span class="v5">BK</span><span class="b0">)</span>:
+        <span class="v5">a</span> = <span class="m1">tl</span>.<span class="m2">load</span><span class="b0">(</span><span class="v2">a_ptrs</span><span class="b0">)</span>                     <span class="c"># compiler stages via smem,</span>
+        <span class="v6">b</span> = <span class="m1">tl</span>.<span class="m2">load</span><span class="b0">(</span><span class="v4">b_ptrs</span><span class="b0">)</span>                     <span class="c"># swizzles, pipelines</span>
+        <span class="v6">acc</span> = <span class="m1">tl</span>.<span class="m2">dot</span><span class="b0">(</span><span class="v5">a</span>, <span class="v6">b</span>, <span class="v6">acc</span><span class="b0">)</span>                 <span class="c"># tensor-core MMA</span>
+        <span class="v2">a_ptrs</span> += <span class="v5">BK</span> * <span class="v2">sak</span>
+        <span class="v4">b_ptrs</span> += <span class="v5">BK</span> * <span class="v5">sbk</span>
+    <span class="v3">c_ptrs</span> = <span class="v5">c_ptr</span> + <span class="v4">rm</span><span class="b0">[</span>:, <span class="k">None</span><span class="b0">]</span> * <span class="v3">scm</span> + <span class="v5">rn</span><span class="b0">[</span><span class="k">None</span>, :<span class="b0">]</span> * <span class="v5">scn</span>
+    <span class="m1">tl</span>.<span class="m2">store</span><span class="b0">(</span><span class="v3">c_ptrs</span>, <span class="v6">acc</span>.<span class="m2">to</span><span class="b1">(</span><span class="m1">tl</span>.<span class="m2">float16</span><span class="b1">)</span><span class="b0">)</span>
+
+<span class="k">def</span> <span class="m1">matmul</span><span class="b0">(</span><span class="v5">a</span>, <span class="v6">b</span><span class="b0">)</span>:
+    <span class="v5">M</span>, <span class="v0">K</span> = <span class="v5">a</span>.<span class="m2">shape</span>
+    <span class="v6">K2</span>, <span class="v6">N</span> = <span class="v6">b</span>.<span class="m2">shape</span>
+    <span class="v1">c</span> = <span class="m1">torch</span>.<span class="m2">empty</span><span class="b0">(</span><span class="v5">M</span>, <span class="v6">N</span>, <span class="v6">device</span>=<span class="v5">a</span>.<span class="m2">device</span>, <span class="v3">dtype</span>=<span class="m1">torch</span>.<span class="m2">float16</span><span class="b0">)</span>
+    <span class="v1">grid</span> = <span class="b0">(</span><span class="m1">triton</span>.<span class="m2">cdiv</span><span class="b1">(</span><span class="v5">M</span>, <span class="n">128</span><span class="b1">)</span>, <span class="m1">triton</span>.<span class="m2">cdiv</span><span class="b1">(</span><span class="v6">N</span>, <span class="n">128</span><span class="b1">)</span><span class="b0">)</span>
+    <span class="m1">matmul_kernel</span><span class="b0">[</span><span class="v1">grid</span><span class="b0">](</span><span class="v5">a</span>, <span class="v6">b</span>, <span class="v1">c</span>, <span class="v5">M</span>, <span class="v6">N</span>, <span class="v0">K</span>,
+                        <span class="v5">a</span>.<span class="m2">stride</span><span class="b1">(</span><span class="n">0</span><span class="b1">)</span>, <span class="v5">a</span>.<span class="m2">stride</span><span class="b1">(</span><span class="n">1</span><span class="b1">)</span>, <span class="v6">b</span>.<span class="m2">stride</span><span class="b1">(</span><span class="n">0</span><span class="b1">)</span>, <span class="v6">b</span>.<span class="m2">stride</span><span class="b1">(</span><span class="n">1</span><span class="b1">)</span>,
+                        <span class="v1">c</span>.<span class="m2">stride</span><span class="b1">(</span><span class="n">0</span><span class="b1">)</span>, <span class="v1">c</span>.<span class="m2">stride</span><span class="b1">(</span><span class="n">1</span><span class="b1">)</span>, <span class="v3">BM</span>=<span class="n">128</span>, <span class="v4">BN</span>=<span class="n">128</span>, <span class="v5">BK</span>=<span class="n">64</span><span class="b0">)</span>
+    <span class="k">return</span> <span class="v1">c</span>
+
+<span class="v5">a</span> = <span class="m1">torch</span>.<span class="m2">randn</span><span class="b0">(</span><span class="n">4096</span>, <span class="n">4096</span>, <span class="v6">device</span>=<span class="s">"cuda"</span>, <span class="v3">dtype</span>=<span class="m1">torch</span>.<span class="m2">float16</span><span class="b0">)</span>
+<span class="v6">b</span> = <span class="m1">torch</span>.<span class="m2">randn</span><span class="b0">(</span><span class="n">4096</span>, <span class="n">4096</span>, <span class="v6">device</span>=<span class="s">"cuda"</span>, <span class="v3">dtype</span>=<span class="m1">torch</span>.<span class="m2">float16</span><span class="b0">)</span>
+<span class="k">assert</span> <span class="m1">torch</span>.<span class="m2">allclose</span><span class="b0">(</span><span class="m1">matmul</span><span class="b1">(</span><span class="v5">a</span>, <span class="v6">b</span><span class="b1">)</span>, <span class="v5">a</span> @ <span class="v6">b</span>, <span class="v2">atol</span>=<span class="n">1e-1</span>, <span class="v4">rtol</span>=<span class="n">1e-2</span><span class="b0">)</span></code></pre>
+          </div>
+
+          <h3>Fused attention: the Triton kernel, and the library calls</h3>
+          <p>
+            The Triton tab is the measured flash-forward kernel (340.2
+            TFLOPS fp16 at batch \(\times\) heads \(= 64\), \(L = 4096\),
+            \(d = 64\), max abs error 1.2e-4 against SDPA), non-causal and
+            simplified to its load-bearing 40 lines: one program owns a
+            block of query rows, streams all key/value blocks through
+            on-chip memory, and carries the online-softmax state
+            \((m, \ell, o)\) in registers. The PyTorch and JAX tabs are
+            what production code should almost always call instead, with
+            the kernel choice pinned so a silent fallback to the
+            materializing path cannot reintroduce the \(O(L^2)\) memory.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="triton" class="active">Triton</button>
+              <button data-lang="pytorch">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="triton" class="shl lang active"><code class="language-python"><span class="c"># Minimal FlashAttention forward (non-causal). Measured: 0.808 ms,</span>
+<span class="c"># 340.2 TFLOPS at bh=64, L=4096, d=64 (SDPA on same shape: 0.926 ms).</span>
+<span class="k">import</span> <span class="m1">torch</span>
+<span class="k">import</span> <span class="m1">triton</span>
+<span class="k">import</span> <span class="m1">triton</span>.<span class="m2">language</span> <span class="k">as</span> <span class="m1">tl</span>
+
+<span class="m1">@triton.jit</span>
+<span class="k">def</span> <span class="m1">flash_fwd</span><span class="b0">(</span><span class="v2">q_ptr</span>, <span class="v3">k_ptr</span>, <span class="v3">v_ptr</span>, <span class="v2">o_ptr</span>, <span class="v3">L</span>, <span class="v6">scale</span>,
+              <span class="v3">BM</span>: <span class="m1">tl</span>.<span class="m2">constexpr</span>, <span class="v4">BN</span>: <span class="m1">tl</span>.<span class="m2">constexpr</span>, <span class="v5">D</span>: <span class="m1">tl</span>.<span class="m2">constexpr</span><span class="b0">)</span>:
+    <span class="v3">pid_m</span> = <span class="m1">tl</span>.<span class="m2">program_id</span><span class="b0">(</span><span class="n">0</span><span class="b0">)</span>               <span class="c"># which query block</span>
+    <span class="v1">pid_bh</span> = <span class="m1">tl</span>.<span class="m2">program_id</span><span class="b0">(</span><span class="n">1</span><span class="b0">)</span>              <span class="c"># which (batch, head)</span>
+    <span class="v3">offs_m</span> = <span class="v3">pid_m</span> * <span class="v3">BM</span> + <span class="m1">tl</span>.<span class="m2">arange</span><span class="b0">(</span><span class="n">0</span>, <span class="v3">BM</span><span class="b0">)</span> <span class="c"># (BM,) query rows</span>
+    <span class="v6">offs_d</span> = <span class="m1">tl</span>.<span class="m2">arange</span><span class="b0">(</span><span class="n">0</span>, <span class="v5">D</span><span class="b0">)</span>               <span class="c"># (D,) head dim</span>
+    <span class="v0">base</span> = <span class="v1">pid_bh</span> * <span class="v3">L</span> * <span class="v5">D</span>
+    <span class="v1">q</span> = <span class="m1">tl</span>.<span class="m2">load</span><span class="b0">(</span><span class="v2">q_ptr</span> + <span class="v0">base</span> + <span class="v3">offs_m</span><span class="b1">[</span>:, <span class="k">None</span><span class="b1">]</span> * <span class="v5">D</span> + <span class="v6">offs_d</span><span class="b1">[</span><span class="k">None</span>, :<span class="b1">]</span><span class="b0">)</span>  <span class="c"># (BM,D)</span>
+
+    <span class="v4">m_i</span> = <span class="m1">tl</span>.<span class="m2">full</span><span class="b0">(</span><span class="b1">(</span><span class="v3">BM</span>,<span class="b1">)</span>, <span class="m1">float</span><span class="b1">(</span><span class="s">"-inf"</span><span class="b1">)</span>, <span class="m1">tl</span>.<span class="m2">float32</span><span class="b0">)</span>   <span class="c"># running row max</span>
+    <span class="v6">l_i</span> = <span class="m1">tl</span>.<span class="m2">zeros</span><span class="b0">(</span><span class="b1">(</span><span class="v3">BM</span>,<span class="b1">)</span>, <span class="m1">tl</span>.<span class="m2">float32</span><span class="b0">)</span>                 <span class="c"># running normalizer</span>
+    <span class="v6">acc</span> = <span class="m1">tl</span>.<span class="m2">zeros</span><span class="b0">(</span><span class="b1">(</span><span class="v3">BM</span>, <span class="v5">D</span><span class="b1">)</span>, <span class="m1">tl</span>.<span class="m2">float32</span><span class="b0">)</span>               <span class="c"># unnormalized output</span>
+
+    <span class="k">for</span> <span class="v6">start</span> <span class="k">in</span> <span class="m1">range</span><span class="b0">(</span><span class="n">0</span>, <span class="v3">L</span>, <span class="v4">BN</span><span class="b0">)</span>:          <span class="c"># stream K/V blocks: S never in HBM</span>
+        <span class="v1">offs_n</span> = <span class="v6">start</span> + <span class="m1">tl</span>.<span class="m2">arange</span><span class="b0">(</span><span class="n">0</span>, <span class="v4">BN</span><span class="b0">)</span>
+        <span class="v6">k</span> = <span class="m1">tl</span>.<span class="m2">load</span><span class="b0">(</span><span class="v3">k_ptr</span> + <span class="v0">base</span> + <span class="v1">offs_n</span><span class="b1">[</span>:, <span class="k">None</span><span class="b1">]</span> * <span class="v5">D</span> + <span class="v6">offs_d</span><span class="b1">[</span><span class="k">None</span>, :<span class="b1">]</span><span class="b0">)</span>
+        <span class="v3">v</span> = <span class="m1">tl</span>.<span class="m2">load</span><span class="b0">(</span><span class="v3">v_ptr</span> + <span class="v0">base</span> + <span class="v1">offs_n</span><span class="b1">[</span>:, <span class="k">None</span><span class="b1">]</span> * <span class="v5">D</span> + <span class="v6">offs_d</span><span class="b1">[</span><span class="k">None</span>, :<span class="b1">]</span><span class="b0">)</span>
+        <span class="v4">s</span> = <span class="m1">tl</span>.<span class="m2">dot</span><span class="b0">(</span><span class="v1">q</span>, <span class="m1">tl</span>.<span class="m2">trans</span><span class="b1">(</span><span class="v6">k</span><span class="b1">)</span><span class="b0">)</span> * <span class="v6">scale</span>            <span class="c"># (BM, BN) score tile</span>
+        <span class="v3">m_new</span> = <span class="m1">tl</span>.<span class="m2">maximum</span><span class="b0">(</span><span class="v4">m_i</span>, <span class="m1">tl</span>.<span class="m2">max</span><span class="b1">(</span><span class="v4">s</span>, <span class="v4">axis</span>=<span class="n">1</span><span class="b1">)</span><span class="b0">)</span>    <span class="c"># merge maxima</span>
+        <span class="v6">p</span> = <span class="m1">tl</span>.<span class="m2">exp</span><span class="b0">(</span><span class="v4">s</span> - <span class="v3">m_new</span><span class="b1">[</span>:, <span class="k">None</span><span class="b1">]</span><span class="b0">)</span>                <span class="c"># local exponentials</span>
+        <span class="v5">alpha</span> = <span class="m1">tl</span>.<span class="m2">exp</span><span class="b0">(</span><span class="v4">m_i</span> - <span class="v3">m_new</span><span class="b0">)</span>                   <span class="c"># rebase factor</span>
+        <span class="v6">l_i</span> = <span class="v6">l_i</span> * <span class="v5">alpha</span> + <span class="m1">tl</span>.<span class="m2">sum</span><span class="b0">(</span><span class="v6">p</span>, <span class="v4">axis</span>=<span class="n">1</span><span class="b0">)</span>         <span class="c"># exact merge of sums</span>
+        <span class="v6">acc</span> = <span class="v6">acc</span> * <span class="v5">alpha</span><span class="b0">[</span>:, <span class="k">None</span><span class="b0">]</span> + <span class="m1">tl</span>.<span class="m2">dot</span><span class="b0">(</span><span class="v6">p</span>.<span class="m2">to</span><span class="b1">(</span><span class="v3">v</span>.<span class="m2">dtype</span><span class="b1">)</span>, <span class="v3">v</span><span class="b0">)</span>
+        <span class="v4">m_i</span> = <span class="v3">m_new</span>
+    <span class="v6">acc</span> = <span class="v6">acc</span> / <span class="v6">l_i</span><span class="b0">[</span>:, <span class="k">None</span><span class="b0">]</span>                          <span class="c"># normalize once</span>
+    <span class="m1">tl</span>.<span class="m2">store</span><span class="b0">(</span><span class="v2">o_ptr</span> + <span class="v0">base</span> + <span class="v3">offs_m</span><span class="b1">[</span>:, <span class="k">None</span><span class="b1">]</span> * <span class="v5">D</span> + <span class="v6">offs_d</span><span class="b1">[</span><span class="k">None</span>, :<span class="b1">]</span>,
+             <span class="v6">acc</span>.<span class="m2">to</span><span class="b1">(</span><span class="m1">tl</span>.<span class="m2">float16</span><span class="b1">)</span><span class="b0">)</span>
+
+<span class="k">def</span> <span class="m1">flash</span><span class="b0">(</span><span class="v1">q</span>, <span class="v6">k</span>, <span class="v3">v</span><span class="b0">)</span>:                        <span class="c"># q,k,v: (BH, L, D) fp16</span>
+    <span class="v0">BH</span>, <span class="v3">L</span>, <span class="v5">D</span> = <span class="v1">q</span>.<span class="m2">shape</span>
+    <span class="v0">o</span> = <span class="m1">torch</span>.<span class="m2">empty_like</span><span class="b0">(</span><span class="v1">q</span><span class="b0">)</span>
+    <span class="v1">grid</span> = <span class="b0">(</span><span class="m1">triton</span>.<span class="m2">cdiv</span><span class="b1">(</span><span class="v3">L</span>, <span class="n">128</span><span class="b1">)</span>, <span class="v0">BH</span><span class="b0">)</span>
+    <span class="m1">flash_fwd</span><span class="b0">[</span><span class="v1">grid</span><span class="b0">](</span><span class="v1">q</span>, <span class="v6">k</span>, <span class="v3">v</span>, <span class="v0">o</span>, <span class="v3">L</span>, <span class="v5">D</span> ** -<span class="n">0.5</span>, <span class="v3">BM</span>=<span class="n">128</span>, <span class="v4">BN</span>=<span class="n">64</span>, <span class="v5">D</span>=<span class="v5">D</span><span class="b0">)</span>
+    <span class="k">return</span> <span class="v0">o</span></code></pre>
+            <pre data-lang="pytorch" class="shl lang"><code class="language-python"><span class="k">import</span> <span class="m1">torch</span>
+<span class="k">import</span> <span class="m1">torch</span>.<span class="m2">nn</span>.<span class="m2">functional</span> <span class="k">as</span> <span class="m1">F</span>
+<span class="k">from</span> <span class="m1">torch</span>.<span class="m2">nn</span>.<span class="m2">attention</span> <span class="k">import</span> <span class="m1">SDPBackend</span>, <span class="m1">sdpa_kernel</span>
+
+<span class="c"># (batch, heads, L, d) -- measured on this H100 at bh=128, L=8192, d=64:</span>
+<span class="c"># flash path 3.575 ms / 615.1 TFLOPS vs naive 98.946 ms / 35.0 GB peak.</span>
+<span class="v1">q</span> = <span class="m1">torch</span>.<span class="m2">randn</span><span class="b0">(</span><span class="n">8</span>, <span class="n">16</span>, <span class="n">8192</span>, <span class="n">64</span>, <span class="v6">device</span>=<span class="s">"cuda"</span>, <span class="v3">dtype</span>=<span class="m1">torch</span>.<span class="m2">bfloat16</span><span class="b0">)</span>
+<span class="v6">k</span> = <span class="m1">torch</span>.<span class="m2">randn_like</span><span class="b0">(</span><span class="v1">q</span><span class="b0">)</span>
+<span class="v3">v</span> = <span class="m1">torch</span>.<span class="m2">randn_like</span><span class="b0">(</span><span class="v1">q</span><span class="b0">)</span>
+
+<span class="c"># Pin the fused kernel; a silent fallback to the math path would</span>
+<span class="c"># quietly reintroduce the O(L^2) score matrix.</span>
+<span class="k">with</span> <span class="m1">sdpa_kernel</span><span class="b0">(</span><span class="m1">SDPBackend</span>.<span class="m2">FLASH_ATTENTION</span><span class="b0">)</span>:
+    <span class="v0">o</span> = <span class="m1">F</span>.<span class="m2">scaled_dot_product_attention</span><span class="b0">(</span><span class="v1">q</span>, <span class="v6">k</span>, <span class="v3">v</span><span class="b0">)</span>       <span class="c"># (8, 16, 8192, 64)</span>
+
+<span class="c"># The naive reference the fused kernel is checked against:</span>
+<span class="k">def</span> <span class="m1">naive_attention</span><span class="b0">(</span><span class="v1">q</span>, <span class="v6">k</span>, <span class="v3">v</span><span class="b0">)</span>:
+    <span class="v4">s</span> = <span class="v1">q</span> @ <span class="v6">k</span>.<span class="m2">transpose</span><span class="b0">(</span>-<span class="n">2</span>, -<span class="n">1</span><span class="b0">)</span> / <span class="b0">(</span><span class="v1">q</span>.<span class="m2">shape</span><span class="b1">[</span>-<span class="n">1</span><span class="b1">]</span> ** <span class="n">0.5</span><span class="b0">)</span>  <span class="c"># (B,H,L,L) in HBM!</span>
+    <span class="k">return</span> <span class="m1">torch</span>.<span class="m2">softmax</span><span class="b0">(</span><span class="v4">s</span>, <span class="v5">dim</span>=-<span class="n">1</span><span class="b0">)</span> @ <span class="v3">v</span>
+
+<span class="v5">o_ref</span> = <span class="m1">naive_attention</span><span class="b0">(</span><span class="v1">q</span><span class="b1">[</span>:<span class="n">1</span>, :<span class="n">1</span><span class="b1">]</span>.<span class="m2">float</span><span class="b1">()</span>, <span class="v6">k</span><span class="b1">[</span>:<span class="n">1</span>, :<span class="n">1</span><span class="b1">]</span>.<span class="m2">float</span><span class="b1">()</span>,
+                        <span class="v3">v</span><span class="b1">[</span>:<span class="n">1</span>, :<span class="n">1</span><span class="b1">]</span>.<span class="m2">float</span><span class="b1">()</span><span class="b0">)</span>
+<span class="k">assert</span> <span class="m1">torch</span>.<span class="m2">allclose</span><span class="b0">(</span><span class="v0">o</span><span class="b1">[</span>:<span class="n">1</span>, :<span class="n">1</span><span class="b1">]</span>.<span class="m2">float</span><span class="b1">()</span>, <span class="v5">o_ref</span>, <span class="v2">atol</span>=<span class="n">2e-2</span><span class="b0">)</span></code></pre>
+            <pre data-lang="jax" class="shl lang"><code class="language-python"><span class="k">import</span> <span class="m1">jax</span>
+<span class="k">import</span> <span class="m1">jax</span>.<span class="m2">numpy</span> <span class="k">as</span> <span class="m1">jnp</span>
+
+<span class="c"># jax.nn.dot_product_attention takes (batch, L, heads, d) and dispatches</span>
+<span class="c"># to the cuDNN fused flash kernel on Hopper with implementation="cudnn".</span>
+<span class="v4">key</span> = <span class="m1">jax</span>.<span class="m2">random</span>.<span class="m2">PRNGKey</span><span class="b0">(</span><span class="n">0</span><span class="b0">)</span>
+<span class="v1">kq</span>, <span class="v4">kk</span>, <span class="v6">kv</span> = <span class="m1">jax</span>.<span class="m2">random</span>.<span class="m2">split</span><span class="b0">(</span><span class="v4">key</span>, <span class="n">3</span><span class="b0">)</span>
+<span class="v1">q</span> = <span class="m1">jax</span>.<span class="m2">random</span>.<span class="m2">normal</span><span class="b0">(</span><span class="v1">kq</span>, <span class="b1">(</span><span class="n">8</span>, <span class="n">8192</span>, <span class="n">16</span>, <span class="n">64</span><span class="b1">)</span>, <span class="v3">dtype</span>=<span class="m1">jnp</span>.<span class="m2">bfloat16</span><span class="b0">)</span>
+<span class="v6">k</span> = <span class="m1">jax</span>.<span class="m2">random</span>.<span class="m2">normal</span><span class="b0">(</span><span class="v4">kk</span>, <span class="b1">(</span><span class="n">8</span>, <span class="n">8192</span>, <span class="n">16</span>, <span class="n">64</span><span class="b1">)</span>, <span class="v3">dtype</span>=<span class="m1">jnp</span>.<span class="m2">bfloat16</span><span class="b0">)</span>
+<span class="v3">v</span> = <span class="m1">jax</span>.<span class="m2">random</span>.<span class="m2">normal</span><span class="b0">(</span><span class="v6">kv</span>, <span class="b1">(</span><span class="n">8</span>, <span class="n">8192</span>, <span class="n">16</span>, <span class="n">64</span><span class="b1">)</span>, <span class="v3">dtype</span>=<span class="m1">jnp</span>.<span class="m2">bfloat16</span><span class="b0">)</span>
+
+<span class="m1">@jax.jit</span>
+<span class="k">def</span> <span class="m1">attn</span><span class="b0">(</span><span class="v1">q</span>, <span class="v6">k</span>, <span class="v3">v</span><span class="b0">)</span>:
+    <span class="k">return</span> <span class="m1">jax</span>.<span class="m2">nn</span>.<span class="m2">dot_product_attention</span><span class="b0">(</span><span class="v1">q</span>, <span class="v6">k</span>, <span class="v3">v</span>, <span class="v6">implementation</span>=<span class="s">"cudnn"</span><span class="b0">)</span>
+
+<span class="v0">o</span> = <span class="m1">attn</span><span class="b0">(</span><span class="v1">q</span>, <span class="v6">k</span>, <span class="v3">v</span><span class="b0">)</span>                                  <span class="c"># (8, 8192, 16, 64)</span>
+
+<span class="c"># Same computation, materializing form (the one that OOMs at L=16384):</span>
+<span class="m1">@jax.jit</span>
+<span class="k">def</span> <span class="m1">naive</span><span class="b0">(</span><span class="v1">q</span>, <span class="v6">k</span>, <span class="v3">v</span><span class="b0">)</span>:
+    <span class="v4">s</span> = <span class="m1">jnp</span>.<span class="m2">einsum</span><span class="b0">(</span><span class="s">"bqhd,bkhd-&gt;bhqk"</span>, <span class="v1">q</span>, <span class="v6">k</span><span class="b0">)</span> / <span class="m1">jnp</span>.<span class="m2">sqrt</span><span class="b0">(</span><span class="n">64.0</span><span class="b0">)</span>
+    <span class="k">return</span> <span class="m1">jnp</span>.<span class="m2">einsum</span><span class="b0">(</span><span class="s">"bhqk,bkhd-&gt;bqhd"</span>, <span class="m1">jax</span>.<span class="m2">nn</span>.<span class="m2">softmax</span><span class="b1">(</span><span class="v4">s</span>, <span class="v4">axis</span>=-<span class="n">1</span><span class="b1">)</span>, <span class="v3">v</span><span class="b0">)</span></code></pre>
+          </div>
+
+          <h3>Fusion without writing kernels</h3>
+          <p>
+            The measured fusion numbers, 0.911 ms unfused to 0.214 ms
+            fused (\(4.26\times\)) for a four-op elementwise chain on
+            \(2^{26}\) elements, and a hand-written fused CUDA version of
+            the same chain at 0.205 ms (2616.6 GB/s), establish that the
+            compilers now reach hand-kernel bandwidth for elementwise
+            fusion. This is the roofline's memory term collapsed by a
+            decorator.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="pytorch" class="shl lang active"><code class="language-python"><span class="k">import</span> <span class="m1">torch</span>
+
+<span class="k">def</span> <span class="m1">chain</span><span class="b0">(</span><span class="v4">x</span><span class="b0">)</span>:                       <span class="c"># 4 elementwise ops: eager launches 4</span>
+    <span class="v6">y</span> = <span class="v4">x</span> * <span class="n">1.5</span> + <span class="n">0.5</span>               <span class="c"># kernels, 8 extra HBM round trips of</span>
+    <span class="v6">y</span> = <span class="m1">torch</span>.<span class="m2">nn</span>.<span class="m2">functional</span>.<span class="m2">gelu</span><span class="b0">(</span><span class="v6">y</span><span class="b0">)</span> <span class="c"># intermediates</span>
+    <span class="v6">y</span> = <span class="v6">y</span> * <span class="m1">torch</span>.<span class="m2">sigmoid</span><span class="b0">(</span><span class="v6">y</span><span class="b0">)</span>
+    <span class="k">return</span> <span class="v6">y</span> + <span class="v4">x</span>                    <span class="c"># residual</span>
+
+<span class="m1">fused</span> = <span class="m1">torch</span>.<span class="m2">compile</span><span class="b0">(</span><span class="m1">chain</span><span class="b0">)</span>        <span class="c"># Inductor emits ONE Triton kernel:</span>
+                                    <span class="c"># read x once, write result once</span>
+<span class="v4">x</span> = <span class="m1">torch</span>.<span class="m2">randn</span><span class="b0">(</span><span class="n">1</span> &lt;&lt; <span class="n">26</span>, <span class="v6">device</span>=<span class="s">"cuda"</span><span class="b0">)</span>
+<span class="c"># measured on this H100: eager 0.911 ms -&gt; compiled 0.214 ms (4.26x);</span>
+<span class="c"># hand-written fused CUDA kernel of the same chain: 0.205 ms, 2616.6 GB/s</span>
+<span class="c"># (tolerance: Inductor's gelu lowering differs by ~1e-6 in fp32)</span>
+<span class="k">assert</span> <span class="m1">torch</span>.<span class="m2">allclose</span><span class="b0">(</span><span class="m1">fused</span><span class="b1">(</span><span class="v4">x</span><span class="b1">)</span>, <span class="m1">chain</span><span class="b1">(</span><span class="v4">x</span><span class="b1">)</span>, <span class="v2">atol</span>=<span class="n">1e-5</span><span class="b0">)</span></code></pre>
+            <pre data-lang="jax" class="shl lang"><code class="language-python"><span class="k">import</span> <span class="m1">jax</span>
+<span class="k">import</span> <span class="m1">jax</span>.<span class="m2">numpy</span> <span class="k">as</span> <span class="m1">jnp</span>
+
+<span class="k">def</span> <span class="m1">chain</span><span class="b0">(</span><span class="v4">x</span><span class="b0">)</span>:
+    <span class="v6">y</span> = <span class="v4">x</span> * <span class="n">1.5</span> + <span class="n">0.5</span>
+    <span class="v6">y</span> = <span class="m1">jax</span>.<span class="m2">nn</span>.<span class="m2">gelu</span><span class="b0">(</span><span class="v6">y</span><span class="b0">)</span>
+    <span class="v6">y</span> = <span class="v6">y</span> * <span class="m1">jax</span>.<span class="m2">nn</span>.<span class="m2">sigmoid</span><span class="b0">(</span><span class="v6">y</span><span class="b0">)</span>
+    <span class="k">return</span> <span class="v6">y</span> + <span class="v4">x</span>
+
+<span class="m1">fused</span> = <span class="m1">jax</span>.<span class="m2">jit</span><span class="b0">(</span><span class="m1">chain</span><span class="b0">)</span>              <span class="c"># XLA fuses the whole chain into one</span>
+                                    <span class="c"># kernel; same 2-pass traffic as the</span>
+<span class="v4">x</span> = <span class="m1">jnp</span>.<span class="m2">ones</span><span class="b0">(</span><span class="b1">(</span><span class="n">1</span> &lt;&lt; <span class="n">26</span>,<span class="b1">)</span><span class="b0">)</span>            <span class="c"># hand-written CUDA version</span>
+<span class="m1">print</span><span class="b0">(</span><span class="m1">fused</span><span class="b1">(</span><span class="v4">x</span><span class="b1">)[</span><span class="n">0</span><span class="b1">]</span><span class="b0">)</span>                  <span class="c"># first call compiles, later calls run</span>
+<span class="c"># Inspect the fusion decision directly:</span>
+<span class="m1">print</span><span class="b0">(</span><span class="m1">jax</span>.<span class="m2">jit</span><span class="b1">(</span><span class="m1">chain</span><span class="b1">)</span>.<span class="m2">lower</span><span class="b1">(</span><span class="v4">x</span><span class="b1">)</span>.<span class="m2">compile</span><span class="b1">()</span>.<span class="m2">as_text</span><span class="b1">()[</span>:<span class="n">400</span><span class="b1">]</span><span class="b0">)</span></code></pre>
+          </div>
+
+          <h2>How it is done in practice</h2>
+          <h3>The division of labor in a production stack</h3>
+          <p>
+            No production system hand-writes most of its kernels. The
+            stable division of labor: matmuls go to cuBLAS or
+            CUTLASS-generated kernels (the measured gap on this page, 25.1
+            custom versus 51.2 cuBLAS fp32 and 702.4 fp16, is why);
+            attention goes to purpose-built fused kernels (FlashAttention,
+            cuDNN's fused path, or a Triton equivalent); collectives go to
+            NCCL; the long tail of elementwise, normalization, and
+            reshaping work goes to compilers (torch.compile's Inductor
+            emitting Triton, XLA for JAX), whose fusion decisions recover
+            the measured \(4.26\times\) automatically. Hand-written
+            kernels are reserved for the residue: new primitives the
+            libraries do not know (a new attention variant, a new
+            quantization scheme), and the highest-value inner loops where
+            the last 20 percent pays for the engineering. The skill that
+            stays scarce is not writing CUDA; it is the roofline
+            diagnosis that decides which bucket a slow operator belongs
+            in, using exactly the arithmetic this page practices.
+          </p>
+          <h3>Scaling out: the same laws, one level up</h3>
+          <p>
+            Multi-GPU training re-runs every idea on this page with the
+            network as the memory system. Data parallelism is a grid-stride
+            loop over devices with an all-reduce as the tree reduction;
+            its bucketing (tens of megabytes, per the measured
+            \(m_{1/2} \approx 10\) MB) and its overlap of gradient
+            communication with backward compute are the fusion and
+            latency-hiding arguments again. Tensor parallelism partitions
+            the matmul tiles across devices, and its all-gathers are
+            coalescing at rack scale; pipeline parallelism is the
+            five-stage pipeline with microbatches as instructions and
+            bubble fraction as the new Amdahl term: a pipeline of depth
+            \(p\) with \(m\) microbatches idles \((p-1)/(m+p-1)\) of its
+            stages, the same hyperbola as \(S(p)\). The measured NVLink
+            numbers set the intuition for why this matters: 328.3 GB/s
+            between two H100s is a tenth of on-package HBM bandwidth, and
+            cross-node InfiniBand is another order of magnitude down, so
+            the parallelism hierarchy (tensor parallel within a node, data
+            and pipeline parallel across) is the memory hierarchy argument
+            with new constants.
+          </p>
+          <h3>Determinism, testing, and the operational realities</h3>
+          <p>
+            Three practical habits separate working kernel engineering
+            from folklore. First, correctness harnesses compare against a
+            slow reference at fp64 or fp32 with explicit tolerances
+            (the measured kernels on this page carry max-abs-error
+            columns: 2.9e-6 for the fused layernorm, 8.9e-7 for the fp32
+            flash kernel), because a fast wrong kernel is worse than a
+            slow right one and tensor-core accumulation order makes
+            bitwise comparison meaningless. Second, timing discipline:
+            warmup runs to absorb JIT and clock ramp, medians over
+            many runs, cudaEvent or synchronized wall clocks, and
+            bandwidth or TFLOPS derived from first-principles byte and
+            flop counts, never from a profiler's guess. Third,
+            reproducibility has a price tag: atomics-based reductions
+            (including the histogram and reduction kernels above) are
+            nondeterministic in float, and frameworks expose deterministic
+            modes that swap in tree-ordered alternatives at measurable
+            cost; training-infrastructure teams choose per workload, and
+            debugging a loss-curve divergence starts by ruling this in or
+            out.
+          </p>
+
+          <h2>The current research frontier</h2>
+          <h3>Hardware-software co-design past the SIMT model</h3>
+          <p>
+            Hopper cracked the classical CUDA abstraction open, and the
+            frontier is the race to program what leaked out. The Tensor
+            Memory Accelerator (TMA) makes bulk shared-memory copies
+            asynchronous and address-generation-free; warpgroup matmul
+            instructions (WGMMA) issue from a quarter-SM at a time;
+            thread-block clusters let blocks on different SMs share
+            distributed shared memory. Exploiting all three requires
+            producer-consumer kernel structures (some warps feed tiles,
+            others compute) that look more like dataflow pipelines than
+            SPMD, and the systems that do it, FlashAttention-3 from
+            Colfax, Meta, NVIDIA, and Princeton collaborators, NVIDIA's
+            CUTLASS 3 with its CuTe layout algebra, and ThunderKittens
+            from Hazy Research at Stanford, define the current state of
+            the art. ThunderKittens's bet is that a small C++ embedded
+            library of register and shared-memory tile types recovers 90
+            percent of hand-tuned performance with a tenth of the code;
+            CUTLASS's bet is that a complete layout algebra composes to
+            100 percent; Triton's bet is that a compiler should own the
+            problem. Blackwell's fifth-generation tensor cores and fp4/fp6
+            microscaling formats raise the same questions again with a
+            wider gap between peak and portable.
+          </p>
+          <h3>Compilation and the end of the kernel boundary</h3>
+          <p>
+            A second line of work attacks kernel boundaries themselves.
+            Persistent "megakernel" designs keep one grid resident and
+            stream work through it, removing launch gaps that are pure
+            Amdahl serial fraction at small batch; Hazy Research's
+            megakernel prototypes for low-latency LLM inference and the
+            grouped/persistent GEMMs inside DeepSeek's DeepGEMM are the
+            visible examples, and DeepSeek's FlashMLA shows the attention
+            variant co-designed with the KV-cache compression it serves.
+            On the compiler side, Triton (now the backend of
+            torch.compile) is being met by JAX's Pallas, which exposes the
+            same tile-level model portably across GPU and TPU, and by
+            MLIR-based efforts industry-wide; the open contest is whether
+            scheduling decisions (pipelining depth, warp specialization)
+            stay human-written, become autotuned search as in the
+            long line of work descending from Halide and TVM, or are
+            learned outright, with AlphaTensor-style algorithm discovery
+            and LLM-driven kernel generation (NVIDIA and academic groups
+            have both reported Triton kernels written and verified by
+            models) as the aggressive end. Communication is being fused
+            too: overlapping tensor-parallel all-gathers with the matmuls
+            that consume them, in-network reduction in NVLink switches
+            (SHARP), and compiler-scheduled communication in DeepSeek's
+            DualPipe indicate that the roofline's two roofs are becoming
+            three, with the network as a first-class term.
+          </p>
+
+          <h2>Open source to read</h2>
+          <p>
+            Each entry names the file to open first; together they cover
+            every layer this page discussed.
+          </p>
+          <ul>
+            <li>
+              <a href="https://github.com/NVIDIA/cutlass" target="_blank" rel="noreferrer">NVIDIA/cutlass</a>:
+              GPU matmul at full performance, in the open. Read
+              media/docs/efficient_gemm.md first, the best short document
+              on hierarchical tiling anywhere, then the CuTe layout
+              tutorial under media/docs/cute/ to see the Hopper-era
+              abstraction.
+            </li>
+            <li>
+              <a href="https://github.com/NVIDIA/cccl" target="_blank" rel="noreferrer">NVIDIA/cccl</a>:
+              CUB and Thrust live here now. Open
+              cub/cub/block/block_reduce.cuh to see the reduction
+              progression of this page productionized, then
+              cub/cub/agent/agent_scan.cuh for decoupled look-back, the
+              single-pass scan.
+            </li>
+            <li>
+              <a href="https://github.com/triton-lang/triton" target="_blank" rel="noreferrer">triton-lang/triton</a>:
+              the tile-level kernel language. Open
+              python/tutorials/03-matrix-multiplication.py and
+              06-fused-attention.py; the tutorials are the canonical
+              readable implementations of this page's two capstone
+              kernels.
+            </li>
+            <li>
+              <a href="https://github.com/Dao-AILab/flash-attention" target="_blank" rel="noreferrer">Dao-AILab/flash-attention</a>:
+              the production fused attention kernel. Open
+              csrc/flash_attn/src/flash_fwd_kernel.h and find the online
+              softmax rebase from this page's derivation in the inner
+              loop, then the Hopper-specific code under hopper/ for the
+              FlashAttention-3 structures.
+            </li>
+            <li>
+              <a href="https://github.com/HazyResearch/ThunderKittens" target="_blank" rel="noreferrer">HazyResearch/ThunderKittens</a>:
+              tile-type kernel programming from the Hazy Research group at
+              Stanford. Open kernels/attn/h100/h100.cu for a fused
+              attention kernel in the tile idiom, shorter than seems
+              plausible.
+            </li>
+            <li>
+              <a href="https://github.com/NVIDIA/nccl" target="_blank" rel="noreferrer">NVIDIA/nccl</a>:
+              the collectives measured in the alpha-beta section. Open
+              src/device/all_reduce.h to see ring and tree all-reduce as
+              actual device code, then src/graph/search.cc for how
+              topology becomes rings.
+            </li>
+            <li>
+              <a href="https://github.com/rapidsai/cudf" target="_blank" rel="noreferrer">rapidsai/cudf</a>:
+              data-parallel primitives applied to dataframes: scans,
+              scatters, and hash joins at GPU bandwidth. Open
+              cpp/src/join/hash_join.cu to watch the histogram and scan
+              patterns of this page do database work.
+            </li>
+            <li>
+              <a href="https://github.com/ispc/ispc" target="_blank" rel="noreferrer">ispc/ispc</a>:
+              the SPMD-on-SIMD compiler for CPUs. Open
+              examples/cpu/mandelbrot/mandelbrot.ispc next to its serial
+              C++ twin: the diff is exactly the SPMD contract, and the
+              masking machinery the compiler generates is the CPU's
+              version of warp divergence.
+            </li>
+          </ul>
+
+          <h2>Common misconceptions</h2>
+          <p>
+            <strong>"Amdahl's law says parallel computing has a low
+            ceiling."</strong> Amdahl's law fixes the problem size, and
+            problems refuse to stay fixed. Gustafson's accounting shows
+            linear scaled speedup when the parallel work grows with the
+            machine, which is the regime of essentially all large-scale
+            training and simulation. The correct use of Amdahl is
+            diagnostic and local: profile the serial residue (launch gaps,
+            data loading, the optimizer step) and compute the ceiling it
+            imposes at your actual scale, as in Problem 1.
+          </p>
+          <p>
+            <strong>"Maximize occupancy."</strong> Occupancy is sufficient
+            warps to hide latency, and past that point it competes with
+            the resources that create per-thread performance. The measured
+            blocked128 kernel runs at 25 percent occupancy and beats the
+            100-percent-occupancy tiled32 by \(3.1\times\), because 112
+            registers per thread buy an \(8\times 8\) register tile worth
+            more than 48 extra resident warps. Volkov documented this in
+            2010 and it remains the most durable piece of GPU performance
+            lore.
+          </p>
+          <p>
+            <strong>"Coalescing means aligned access."</strong> Coalescing
+            is about which 32-byte sectors a warp's 32 addresses touch,
+            not about alignment per se. The measured strided reads degrade
+            smoothly (2380.5 to 1856.3 to 1218.3 GB/s at strides 1, 2, 4)
+            long before any alignment rule is violated, and the floor at
+            large stride (325.2 GB/s, \(1/7\) of contiguous) is set by the
+            4-useful-of-32-fetched-bytes ratio. The layout question to ask
+            is always: what sectors does one warp's instruction touch.
+          </p>
+          <p>
+            <strong>"Shared memory is a cache."</strong> Shared memory is
+            an explicitly managed scratchpad with a bank structure, and
+            treating it as a transparent cache forfeits both of its
+            advantages. It does nothing unless the kernel stages data into
+            it (the tiling transformations above), and it penalizes
+            layouts a cache would forgive: the measured transpose gains
+            \(1.58\times\) (1702.9 to 2694.0 GB/s) from one column of
+            padding whose only purpose is to spread accesses across
+            banks.
+          </p>
+          <p>
+            <strong>"Atomics are slow; avoid them."</strong> Atomics are
+            slow under contention and nearly free without it. The measured
+            histogram improved \(144.6\times\) not by removing atomics but
+            by privatizing them: per-block shared-memory histograms take
+            the contended traffic, and the global atomics that remain (256
+            per block) are rare. The reduction kernels end with a single
+            atomicAdd per block for the same reason. Count expected
+            conflicts, not atomic instructions.
+          </p>
+          <p>
+            <strong>"FlashAttention is an approximation, or saves
+            flops."</strong> It is exact to within rounding (measured max
+            abs error 1.2e-4 in fp16 against the materializing reference)
+            and performs the same \(4L^2d\) flops, slightly more with
+            recomputation in the backward pass. Everything it saves is
+            memory traffic: the measured \(27.68\times\) at \(L = 8192\)
+            comes from never writing the 17.18 GB score matrix. Confusing
+            IO savings with flop savings leads to wrong predictions
+            everywhere else too; recomputation strategies win
+            <em>because</em> flops are the cheap resource.
+          </p>
+          <p>
+            <strong>"Work-efficient algorithms are always the right
+            choice."</strong> Problem 4's arithmetic shows the crossover:
+            oversubscribed machines favor work-efficient algorithms
+            (Blelloch scan, \(6\times\) at \(n/p = 32\)), saturated ones
+            favor step-efficient algorithms (Hillis-Steele wins at
+            \(p = n\) despite \(9.5\times\) the work). Production scans
+            are hybrids for exactly this reason, and the same logic
+            governs choices like bitonic-in-block versus radix-across-device
+            sorting.
+          </p>
+          <p>
+            <strong>"Speedup numbers speak for themselves."</strong> A
+            speedup has three free parameters: the baseline, the scale,
+            and the denominator of the serial fraction. Against a parallel
+            code on one thread instead of the best serial code, against a
+            naive kernel instead of the library call (this page's flash
+            kernel is \(27.7\times\) over naive but \(1.15\times\) over
+            SDPA on the same shape), or with Gustafson's \(s\) quoted
+            where Amdahl's \(f\) is implied (Problem 2's factor of 120),
+            the same measurement supports opposite conclusions. Demand
+            all three parameters before believing any factor.
+          </p>
+
+          <h2>Self-check</h2>
+          <div class="quiz" data-quiz>
+            <script type="application/json" class="quiz-data">[
+              {"id": "q1", "qtype": "mcq",
+               "stem": "A program is 4% serial. Amdahl's ceiling is 25x, and the machine reaches half of that ceiling at approximately:",
+               "options": ["25 processors", "24 processors (p = (1-f)/f)", "50 processors", "625 processors"],
+               "correctIndex": 1,
+               "explanation": "Half the asymptote requires the parallel term (1-f)/p to equal f, so p = (1-f)/f = 0.96/0.04 = 24. Beyond that, added processors mostly idle against the serial fraction."},
+              {"id": "q2", "qtype": "truefalse",
+               "stem": "Gustafson's law contradicts Amdahl's law, so one of them must be wrong.",
+               "options": ["True", "False"],
+               "correctIndex": 1,
+               "explanation": "They answer different questions: Amdahl fixes the problem and shrinks time; Gustafson fixes time and grows the problem. The serial fractions are measured against different denominators, and both derivations are correct."},
+              {"id": "q3", "qtype": "mcq",
+               "stem": "An algorithm has work W = 10^9 and depth D = 10^3. Its useful parallelism is on the order of:",
+               "options": ["10^3 processors", "10^6 processors", "10^9 processors", "unbounded"],
+               "correctIndex": 1,
+               "explanation": "Brent's bound T_p <= W/p + D stops improving once W/p ~ D, i.e. p ~ W/D = 10^6. More processors than that leave the depth term dominant."},
+              {"id": "q4", "qtype": "mcq",
+               "stem": "Hillis-Steele scan does n log n work at depth log n; Blelloch does 2n work at depth 2 log n. On a warp of 32 lanes scanning 32 elements, the better choice is:",
+               "options": ["Blelloch, because work-efficiency always wins", "Hillis-Steele, because at full saturation the extra work rides in idle lanes and half the depth wins", "Neither; scan is serial within a warp", "They are identical in cost"],
+               "correctIndex": 1,
+               "explanation": "With p = n, runtime is just depth: 5 rounds versus 10. The extra work costs nothing because the lanes are otherwise idle, which is why CUB's warp scan is Hillis-Steele."},
+              {"id": "q5", "qtype": "mcq",
+               "stem": "A warp of 32 threads reads fp32 elements with stride 8. The best-case fraction of fetched bytes that are useful is:",
+               "options": ["100%", "50%", "25%", "12.5%"],
+               "correctIndex": 3,
+               "explanation": "At stride 8 floats (32 bytes), each lane's 4-byte load lands in its own 32-byte sector: 4 useful of 32 fetched. The measured H100 numbers approach this 1/8 floor at large strides (325.2 vs 2380.5 GB/s)."},
+              {"id": "q6", "qtype": "mcq",
+               "stem": "A kernel uses 112 registers/thread with 256-thread blocks on an SM with 65,536 registers. How many blocks are resident?",
+               "options": ["1", "2", "4", "8"],
+               "correctIndex": 1,
+               "explanation": "112 x 32 = 3584 registers per warp; 65536/3584 = 18 warps; 18/8 warps-per-block = 2 blocks. That is 25% occupancy, and the measured kernel with exactly these numbers is the fastest custom matmul on the page."},
+              {"id": "q7", "qtype": "mcq",
+               "stem": "Fusing a chain of elementwise ops sped it up 4.26x. The saving came from:",
+               "options": ["Fewer floating-point operations", "Better occupancy", "Eliminating HBM round trips for intermediate results", "Tensor cores"],
+               "correctIndex": 2,
+               "explanation": "Elementwise chains sit far left of the ridge point, where runtime is bytes moved divided by bandwidth. Fusion removes the intermediate reads and writes; the flop count is unchanged."},
+              {"id": "q8", "qtype": "mcq",
+               "stem": "Why does the online-softmax rebase l' = l*exp(m - m') + l_new*exp(m_new - m') give exactly the right normalizer?",
+               "options": ["It is a first-order approximation that converges", "Multiplying by exp(m - m') rewrites every accumulated exp(x - m) as exp(x - m'), so all terms end up referenced to the same max", "The max never changes in practice", "Softmax is invariant to the normalizer"],
+               "correctIndex": 1,
+               "explanation": "exp(x - m) * exp(m - m') = exp(x - m') identically, so the merge is exact algebra, not approximation. The same rebase applied to the output accumulator is what makes fused attention exact."},
+              {"id": "q9", "qtype": "mcq",
+               "stem": "Naive attention at L=8192 measured 22.2 TFLOPS while the fused kernel measured 615.1 TFLOPS on identical flops. The naive kernel is limited by:",
+               "options": ["Tensor-core availability", "Warp divergence in softmax", "Writing and reading the L x L score matrices in HBM", "Kernel launch overhead"],
+               "correctIndex": 2,
+               "explanation": "Materializing S and P costs at least 4 x 17.18 GB of traffic, a 22.4 ms floor at measured bandwidth; the fused kernel keeps score tiles on chip and turns the same computation compute-bound."},
+              {"id": "q10", "qtype": "mcq",
+               "stem": "Gradient buckets for all-reduce should be at least a few times alpha*beta (about 10 MB on the measured NVLink pair) because:",
+               "options": ["NCCL rejects smaller messages", "Below that size the transfer is latency-dominated and the link runs far under its bandwidth", "Larger buckets reduce the number of gradients", "The GPU cannot compute while communicating"],
+               "correctIndex": 1,
+               "explanation": "m_(1/2) = alpha*beta is where a link reaches half its asymptotic bandwidth; the measured 1 MB all-reduce achieved 28.8 GB/s against an asymptote of ~330. Batching messages is the direct remedy."},
+              {"id": "q11", "qtype": "ordering",
+               "stem": "Order one k-slice iteration of a shared-memory tiled matmul block.",
+               "options": ["Each thread loads its element(s) of the A and B tiles from global memory into shared memory", "__syncthreads: the tile must be fully staged", "Every thread runs the inner product over the tile's k range from shared memory", "__syncthreads again, so no thread overwrites a tile still being read"],
+               "correctIndex": -1,
+               "explanation": "The two barriers bracket the compute phase: the first publishes the staged tile, the second protects it until all readers finish. Removing either produces silently wrong results only under load."},
+              {"id": "q12", "qtype": "truefalse",
+               "stem": "A float reduction using atomicAdd gives bitwise-identical results across runs.",
+               "options": ["True", "False"],
+               "correctIndex": 1,
+               "explanation": "Atomic arrival order varies run to run and float addition is not associative under rounding, so the result varies in the last bits. Deterministic modes impose a fixed tree order at some performance cost."}
+            ]</script>
+          </div>
+
+          <h2>References</h2>
+          <ol class="refs">
+            <li>Hennessy, J. and Patterson, D. <em>Computer Architecture: A Quantitative Approach</em>, 6th ed., Morgan Kaufmann, 2017.</li>
+            <li>Hwu, W.-m., Kirk, D., and El Hajj, I. <em>Programming Massively Parallel Processors: A Hands-on Approach</em>, 4th ed., Morgan Kaufmann, 2022.</li>
+            <li>Herlihy, M., Shavit, N., Luchangco, V., and Spear, M. <em>The Art of Multiprocessor Programming</em>, 2nd ed., Morgan Kaufmann, 2020.</li>
+            <li>Amdahl, G. "Validity of the Single Processor Approach to Achieving Large Scale Computing Capabilities," <em>AFIPS Spring Joint Computer Conference</em>, 1967. <a href="https://doi.org/10.1145/1465482.1465560" target="_blank" rel="noreferrer">doi:10.1145/1465482.1465560</a></li>
+            <li>Gustafson, J. "Reevaluating Amdahl's Law," <em>CACM</em> 31(5), 1988. <a href="https://doi.org/10.1145/42411.42415" target="_blank" rel="noreferrer">doi:10.1145/42411.42415</a></li>
+            <li>Brent, R. "The Parallel Evaluation of General Arithmetic Expressions," <em>JACM</em> 21(2), 1974. <a href="https://doi.org/10.1145/321812.321815" target="_blank" rel="noreferrer">doi:10.1145/321812.321815</a></li>
+            <li>Hillis, W. D. and Steele, G. L. "Data Parallel Algorithms," <em>CACM</em> 29(12), 1986. <a href="https://doi.org/10.1145/7902.7903" target="_blank" rel="noreferrer">doi:10.1145/7902.7903</a></li>
+            <li>Blelloch, G. "Prefix Sums and Their Applications," Technical Report CMU-CS-90-190, Carnegie Mellon University, 1990. <a href="https://www.cs.cmu.edu/~guyb/papers/Ble93.pdf" target="_blank" rel="noreferrer">cs.cmu.edu/~guyb/papers/Ble93.pdf</a></li>
+            <li>Valiant, L. "A Bridging Model for Parallel Computation," <em>CACM</em> 33(8), 1990. <a href="https://doi.org/10.1145/79173.79181" target="_blank" rel="noreferrer">doi:10.1145/79173.79181</a></li>
+            <li>Culler, D., Karp, R., Patterson, D., Sahay, A., Schauser, K., Santos, E., Subramonian, R., and von Eicken, T. "LogP: Towards a Realistic Model of Parallel Computation," <em>PPoPP</em>, 1993. <a href="https://doi.org/10.1145/155332.155333" target="_blank" rel="noreferrer">doi:10.1145/155332.155333</a></li>
+            <li>Nickolls, J., Buck, I., Garland, M., and Skadron, K. "Scalable Parallel Programming with CUDA," <em>ACM Queue</em> 6(2), 2008. <a href="https://doi.org/10.1145/1365490.1365500" target="_blank" rel="noreferrer">doi:10.1145/1365490.1365500</a></li>
+            <li>Harris, M. "Optimizing Parallel Reduction in CUDA," NVIDIA Developer Technology, 2007. <a href="https://developer.download.nvidia.com/assets/cuda/files/reduction.pdf" target="_blank" rel="noreferrer">developer.download.nvidia.com/.../reduction.pdf</a></li>
+            <li>Volkov, V. "Better Performance at Lower Occupancy," GPU Technology Conference, 2010; and <em>Understanding Latency Hiding on GPUs</em>, PhD thesis, UC Berkeley, 2016.</li>
+            <li>Williams, S., Waterman, A., and Patterson, D. "Roofline: An Insightful Visual Performance Model for Multicore Architectures," <em>CACM</em> 52(4), 2009. <a href="https://doi.org/10.1145/1498765.1498785" target="_blank" rel="noreferrer">doi:10.1145/1498765.1498785</a></li>
+            <li>Pharr, M. and Mark, W. R. "ispc: A SPMD Compiler for High-Performance CPU Programming," <em>InPar</em>, 2012. <a href="https://doi.org/10.1109/InPar.2012.6339601" target="_blank" rel="noreferrer">doi:10.1109/InPar.2012.6339601</a></li>
+            <li>Merrill, D. and Garland, M. "Single-pass Parallel Prefix Scan with Decoupled Look-back," NVIDIA Technical Report NVR-2016-002, 2016.</li>
+            <li>Milakov, M. and Gimelshein, N. "Online Normalizer Calculation for Softmax," 2018. <a href="https://arxiv.org/abs/1805.02867" target="_blank" rel="noreferrer">arXiv:1805.02867</a></li>
+            <li>Rabe, M. and Staats, C. "Self-attention Does Not Need O(n^2) Memory," 2021. <a href="https://arxiv.org/abs/2112.05682" target="_blank" rel="noreferrer">arXiv:2112.05682</a></li>
+            <li>Dao, T., Fu, D., Ermon, S., Rudra, A., and R&eacute;, C. "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness," <em>NeurIPS</em>, 2022. <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noreferrer">arXiv:2205.14135</a></li>
+            <li>Dao, T. "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning," 2023. <a href="https://arxiv.org/abs/2307.08691" target="_blank" rel="noreferrer">arXiv:2307.08691</a></li>
+            <li>Shah, J., Bikshandi, G., Zhang, Y., Thakkar, V., Ramani, P., and Dao, T. "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision," 2024. <a href="https://arxiv.org/abs/2407.08608" target="_blank" rel="noreferrer">arXiv:2407.08608</a></li>
+            <li>Tillet, P., Kung, H. T., and Cox, D. "Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations," <em>MAPL</em>, 2019. <a href="https://doi.org/10.1145/3315508.3329973" target="_blank" rel="noreferrer">doi:10.1145/3315508.3329973</a></li>
+            <li>Spector, B., Arora, S., Singhal, A., Fu, D., and R&eacute;, C. "ThunderKittens: Simple, Fast, and Adorable AI Kernels," 2024. <a href="https://arxiv.org/abs/2410.20399" target="_blank" rel="noreferrer">arXiv:2410.20399</a></li>
+            <li>NVIDIA. <em>NVIDIA H100 Tensor Core GPU Architecture</em> (Hopper whitepaper), 2022.</li>
+          </ol>
+
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> parallel computing is two
+            ledgers kept honestly: the algorithm's ledger of work and
+            depth, and the machine's ledger of bytes moved and flops
+            available. Amdahl and Gustafson bound what parallelism can
+            buy; Brent's bound says a greedy schedule collects nearly all
+            of it if the parallelism exists; and everything after that is
+            memory. On this page's H100, one measured lesson repeated at
+            every level: the reduction gained \(8.5\times\) purely from
+            access patterns, the matmul gained \(3.1\times\) by moving
+            reuse from shared memory into registers at a quarter of the
+            occupancy, and attention gained \(27.7\times\) at \(L = 8192\)
+            by refusing to write a 17 GB matrix that was never the answer
+            to anything. The roofline, calibrated here at 3063.5 GB/s and
+            744.6 bf16 TFLOPS with a ridge at 243 flops per byte, is the
+            one-line summary of all of it: know a kernel's intensity, know
+            which roof it lives under, and spend effort only on
+            transformations that move bytes, because on modern machines
+            the flops were never the problem.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>&copy; <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;&middot;&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/classes/math.js"></script>
+    <script defer src="/code-tabs.js"></script>
+    <script defer src="/quiz.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/code-copy.js"></script>
+  </body>
+</html>

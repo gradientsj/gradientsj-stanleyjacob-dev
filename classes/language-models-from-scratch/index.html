@@ -1,0 +1,1957 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Language models from scratch &middot; Stanley Jacob</title>
+    <meta name="description" content="The full modern decoder-only pipeline, derived: BPE tokenization with a worked merge trace, RoPE, RMSNorm, SwiGLU, grouped-query attention, FlashAttention and the online softmax, 6ND FLOPs accounting, ZeRO and 3D parallelism, Chinchilla scaling, MoE routing, and paged-KV inference with speculative decoding." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes" class="active">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/classes">Classes</a></div>
+        <h1>Building a language model from scratch: tokenizer to trained checkpoint</h1>
+        <p class="lead">
+          Every frontier language model since roughly 2020 is the same object:
+          a byte-pair-encoded token stream fed through a stack of pre-norm
+          decoder blocks, trained with next-token cross-entropy on a few
+          trillion deduplicated tokens, sharded across a few thousand
+          accelerators, then served through a paged KV cache. This page walks
+          that pipeline end to end and derives each piece rather than naming
+          it: the BPE merge rule with a real counted trace, the rotation
+          algebra that makes RoPE encode relative position, the online-softmax
+          recurrence that makes FlashAttention exact, the 6ND FLOPs
+          approximation component by component, the communication arithmetic
+          of ZeRO, tensor, and pipeline parallelism, the Chinchilla allocation
+          as a constrained optimization, and the rejection-sampling argument
+          that makes speculative decoding lossless. Measured numbers come from
+          an H100 80GB in this repository. A reader who finishes it should be
+          able to budget, build, train, and serve a small model without
+          consulting anything else.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Why this subject matters now</h2>
+          <p>
+            Ten years ago, "training a language model" meant fitting an LSTM
+            on a single GPU and the hard parts were optimization tricks. Today
+            the model itself is almost boringly standardized: nearly every
+            serious system, from Llama to Qwen to DeepSeek to the closed
+            frontier models, is a decoder-only transformer with rotary
+            positions, RMS normalization, a gated MLP, and some form of
+            grouped or latent attention for the KV cache. What changed is
+            where the difficulty lives. The open problems a practitioner
+            actually faces are quantitative and systemic: how many parameters
+            and how many tokens a fixed compute budget should buy, whether a
+            kernel is bound by arithmetic or by memory bandwidth, how much
+            each parallelism strategy communicates per step, how much HBM a
+            KV cache eats at a given batch and context, and what an inference
+            token costs at serving time. None of these questions are answered
+            by knowing what attention is; all of them are answered by
+            arithmetic that fits on one page once the right approximations
+            are derived.
+          </p>
+          <p>
+            The economics force the issue. A single H100 80GB in this
+            repository measures 744.6 TFLOPS on a 4096-square bf16 matmul and
+            2992.4 GB/s of memory bandwidth; a pretraining run at the scale of
+            a 70B model consumes on the order of \(10^{24}\) FLOPs, months of
+            thousands of such devices. At that price, a 10% error in FLOPs
+            accounting or a mis-sized KV cache is not a rounding error, it is
+            a seven-figure line item. The material below is the set of
+            derivations that let those numbers be computed rather than
+            guessed. A sibling page covers the pre-transformer lineage,
+            embeddings, recurrent models, and the encoder side of pretraining;
+            this page owns the modern decoder-only pipeline from raw bytes to
+            a served checkpoint.
+          </p>
+
+          <h2>The tokenizer: byte-pair encoding, derived</h2>
+          <h3>Why subwords, and why bytes underneath</h3>
+          <p>
+            A language model needs a finite vocabulary over which its softmax
+            is defined. Word-level vocabularies fail on unseen words, code,
+            URLs, and morphology-rich languages; character-level vocabularies
+            make sequences several times longer, and since attention cost
+            grows with sequence length and information per position drops,
+            both compute and modeling suffer. Subword tokenization is the
+            compromise the field settled on: frequent strings become single
+            tokens, rare strings decompose into pieces, and nothing is ever
+            out of vocabulary. Byte-pair encoding, adapted from a 1994
+            compression algorithm to translation by Sennrich, Haddow, and
+            Birch (2016), builds this vocabulary greedily from data. Modern
+            systems following GPT-2 run BPE over raw bytes rather than
+            Unicode characters, so the base alphabet is exactly 256 symbols
+            and any string, in any script, with any mojibake, is encodable by
+            construction.
+          </p>
+          <p>
+            The training procedure is a greedy frequency count. Start from a
+            corpus split by a pretokenizer (a regex that keeps words,
+            numbers, and punctuation apart, so merges never cross a space),
+            represent each pretoken as a sequence of base symbols, and
+            repeat: count every adjacent symbol pair, weighted by pretoken
+            frequency; merge the most frequent pair into a new symbol; add
+            that symbol to the vocabulary and record the merge rule. After
+            \(k\) merges the vocabulary has \(256 + k\) entries plus special
+            tokens. Encoding a new string replays the recorded merges in
+            training order, earliest first, which is why the merge list, not
+            just the vocabulary, is the tokenizer. Each merge strictly
+            shortens the token sequence wherever it applies, so the greedy
+            objective is compression: pick the merge that removes the most
+            symbols from the corpus in this round.
+          </p>
+
+          <div class="problem">
+            <span class="plabel">Problem 1</span>
+            <p>
+              A corpus pretokenizes to five distinct words with frequencies:
+              <em>seed</em> 7, <em>see</em> 5, <em>bee</em> 4, <em>bed</em> 3,
+              <em>deed</em> 2. The base alphabet is {s, e, d, b}. Run three
+              BPE merges by hand, showing the full pair-count table at each
+              step, and then tokenize the unseen word <em>bees</em> with the
+              learned merges.
+            </p>
+            <div class="solution">
+              <p><strong>Solution.</strong> Round 1. The symbol sequences are
+              s&nbsp;e&nbsp;e&nbsp;d (7), s&nbsp;e&nbsp;e (5),
+              b&nbsp;e&nbsp;e (4), b&nbsp;e&nbsp;d (3),
+              d&nbsp;e&nbsp;e&nbsp;d (2). Adjacent-pair counts, weighted by
+              word frequency: (e,e) appears once in each of <em>seed</em>,
+              <em>see</em>, <em>bee</em>, <em>deed</em>, so
+              7+5+4+2 = 18; (s,e) appears in <em>seed</em> and <em>see</em>,
+              7+5 = 12; (e,d) appears in <em>seed</em>, <em>bed</em>,
+              <em>deed</em>, 7+3+2 = 12; (b,e) in <em>bee</em> and
+              <em>bed</em>, 4+3 = 7; (d,e) only in <em>deed</em>, 2. The
+              winner is (e,e) with 18. Merge it into the symbol "ee". Note
+              that <em>seed</em> contributes only one (e,e) pair, not two:
+              after the first "ee" is formed greedily left to right there is
+              no second adjacent e pair.</p>
+              <p>Round 2. Sequences are now s&nbsp;ee&nbsp;d (7),
+              s&nbsp;ee (5), b&nbsp;ee (4), b&nbsp;e&nbsp;d (3),
+              d&nbsp;ee&nbsp;d (2). Counts: (s,ee) 7+5 = 12; (ee,d) 7+2 = 9;
+              (b,ee) 4; (b,e) 3; (e,d) 3; (d,ee) 2. Winner: (s,ee) with 12,
+              forming "see".</p>
+              <p>Round 3. Sequences: see&nbsp;d (7), see (5), b&nbsp;ee (4),
+              b&nbsp;e&nbsp;d (3), d&nbsp;ee&nbsp;d (2). Counts: (see,d) 7;
+              (b,ee) 4; (b,e) 3; (e,d) 3; (d,ee) 2; (ee,d) 2. Winner:
+              (see,d) with 7, forming "seed". The learned merge list is
+              [(e,e), (s,ee), (see,d)] and the vocabulary is
+              {s, e, d, b, ee, see, seed}.</p>
+              <p>Encoding <em>bees</em>: start from b&nbsp;e&nbsp;e&nbsp;s.
+              Merge 1 applies: b&nbsp;ee&nbsp;s. Merge 2 looks for the pair
+              (s, ee), but the sequence contains (ee, s), which is a
+              different ordered pair, so it does not apply; merge 3 does not
+              apply either. The output is [b, ee, s], three tokens. The
+              word was never seen in training, yet it is encoded using
+              learned structure, which is the whole point.</p>
+            </div>
+          </div>
+
+          <h3>Engineering the vocabulary</h3>
+          <p>
+            Vocabulary size trades parameters against sequence length. With
+            embedding dimension \(d\) and untied input and output matrices, a
+            vocabulary of size \(V\) costs \(2Vd\) parameters: at
+            \(V = 128{,}000\) and \(d = 4096\) that is roughly a billion
+            parameters before the first block. Against that, a bigger
+            vocabulary compresses text into fewer tokens, and fewer tokens
+            means less attention compute and effectively more text per unit
+            of training budget. The empirical fertility of modern tokenizers
+            on English is in the neighborhood of 3.5 to 4.5 characters per
+            token, and multilingual coverage is the main pressure pushing
+            vocabularies from GPT-2's 50,257 toward the 128K-256K range used
+            by Llama 3 and Gemma. Two implementation details matter more
+            than they look. First, the pretokenizer regex is load-bearing:
+            GPT-2's regex splits off contractions and keeps a leading space
+            attached to words, and inconsistencies here are a classic source
+            of subtle train/serve mismatch. Second, digits are usually split
+            to single characters or small groups, because letting BPE form
+            tokens like "2016" wholesale gives the model an arbitrary,
+            frequency-skewed numeral vocabulary that quietly damages
+            arithmetic.
+          </p>
+          <p>
+            The reference implementation below trains on the toy corpus from
+            Problem 1 and reproduces its trace exactly. It is quadratic per
+            merge for clarity; production trainers (SentencePiece,
+            HuggingFace tokenizers) maintain a heap of pair counts with
+            incremental updates and run in near-linear time.
+          </p>
+
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="python" class="active">Python</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="python" class="shl lang active"><code class="language-python"><span class="k">import</span> <span class="m1">collections</span>
+
+<span class="k">def</span> <span class="m1">train_bpe</span><span class="b0">(</span><span class="v0">word_counts</span>, <span class="v6">num_merges</span><span class="b0">)</span>:
+    <span class="s">"""word_counts: pretoken -&gt; corpus frequency, from the pretokenizer."""</span>
+    <span class="v2">seqs</span> = <span class="b0">{</span><span class="v5">w</span>: <span class="m1">list</span><span class="b1">(</span><span class="v5">w</span><span class="b1">)</span> <span class="k">for</span> <span class="v5">w</span> <span class="k">in</span> <span class="v0">word_counts</span><span class="b0">}</span>           <span class="c"># symbol sequences</span>
+    <span class="v5">merges</span> = <span class="b0">[]</span>
+    <span class="k">for</span> <span class="v4">_</span> <span class="k">in</span> <span class="m1">range</span><span class="b0">(</span><span class="v6">num_merges</span><span class="b0">)</span>:
+        <span class="v6">pairs</span> = <span class="m1">collections</span>.<span class="m2">Counter</span><span class="b0">()</span>
+        <span class="k">for</span> <span class="v5">w</span>, <span class="v5">sym</span> <span class="k">in</span> <span class="v2">seqs</span>.<span class="m2">items</span><span class="b0">()</span>:
+            <span class="k">for</span> <span class="v5">a</span>, <span class="v6">b</span> <span class="k">in</span> <span class="m1">zip</span><span class="b0">(</span><span class="v5">sym</span>, <span class="v5">sym</span><span class="b1">[</span><span class="n">1</span>:<span class="b1">]</span><span class="b0">)</span>:
+                <span class="v6">pairs</span><span class="b0">[</span><span class="b1">(</span><span class="v5">a</span>, <span class="v6">b</span><span class="b1">)</span><span class="b0">]</span> += <span class="v0">word_counts</span><span class="b0">[</span><span class="v5">w</span><span class="b0">]</span>        <span class="c"># weight by frequency</span>
+        <span class="k">if</span> <span class="k">not</span> <span class="v6">pairs</span>:
+            <span class="k">break</span>
+        <span class="v3">best</span> = <span class="m1">max</span><span class="b0">(</span><span class="v6">pairs</span>, <span class="v4">key</span>=<span class="v6">pairs</span>.<span class="m2">get</span><span class="b0">)</span>               <span class="c"># most frequent pair</span>
+        <span class="v5">merges</span>.<span class="m2">append</span><span class="b0">(</span><span class="v3">best</span><span class="b0">)</span>
+        <span class="k">for</span> <span class="v5">w</span>, <span class="v5">sym</span> <span class="k">in</span> <span class="v2">seqs</span>.<span class="m2">items</span><span class="b0">()</span>:                    <span class="c"># apply the merge</span>
+            <span class="v2">out</span>, <span class="v3">i</span> = <span class="b0">[]</span>, <span class="n">0</span>
+            <span class="k">while</span> <span class="v3">i</span> &lt; <span class="m1">len</span><span class="b0">(</span><span class="v5">sym</span><span class="b0">)</span>:
+                <span class="k">if</span> <span class="v3">i</span> + <span class="n">1</span> &lt; <span class="m1">len</span><span class="b0">(</span><span class="v5">sym</span><span class="b0">)</span> <span class="k">and</span> <span class="b0">(</span><span class="v5">sym</span><span class="b1">[</span><span class="v3">i</span><span class="b1">]</span>, <span class="v5">sym</span><span class="b1">[</span><span class="v3">i</span> + <span class="n">1</span><span class="b1">]</span><span class="b0">)</span> == <span class="v3">best</span>:
+                    <span class="v2">out</span>.<span class="m2">append</span><span class="b0">(</span><span class="v5">sym</span><span class="b1">[</span><span class="v3">i</span><span class="b1">]</span> + <span class="v5">sym</span><span class="b1">[</span><span class="v3">i</span> + <span class="n">1</span><span class="b1">]</span><span class="b0">)</span>; <span class="v3">i</span> += <span class="n">2</span>
+                <span class="k">else</span>:
+                    <span class="v2">out</span>.<span class="m2">append</span><span class="b0">(</span><span class="v5">sym</span><span class="b1">[</span><span class="v3">i</span><span class="b1">]</span><span class="b0">)</span>; <span class="v3">i</span> += <span class="n">1</span>
+            <span class="v2">seqs</span><span class="b0">[</span><span class="v5">w</span><span class="b0">]</span> = <span class="v2">out</span>
+    <span class="k">return</span> <span class="v5">merges</span>
+
+<span class="k">def</span> <span class="m1">encode</span><span class="b0">(</span><span class="v6">word</span>, <span class="v5">merges</span><span class="b0">)</span>:
+    <span class="s">"""Replay merges in training order: earlier merges take priority."""</span>
+    <span class="v5">sym</span> = <span class="m1">list</span><span class="b0">(</span><span class="v6">word</span><span class="b0">)</span>
+    <span class="k">for</span> <span class="v5">a</span>, <span class="v6">b</span> <span class="k">in</span> <span class="v5">merges</span>:
+        <span class="v2">out</span>, <span class="v3">i</span> = <span class="b0">[]</span>, <span class="n">0</span>
+        <span class="k">while</span> <span class="v3">i</span> &lt; <span class="m1">len</span><span class="b0">(</span><span class="v5">sym</span><span class="b0">)</span>:
+            <span class="k">if</span> <span class="v3">i</span> + <span class="n">1</span> &lt; <span class="m1">len</span><span class="b0">(</span><span class="v5">sym</span><span class="b0">)</span> <span class="k">and</span> <span class="v5">sym</span><span class="b0">[</span><span class="v3">i</span><span class="b0">]</span> == <span class="v5">a</span> <span class="k">and</span> <span class="v5">sym</span><span class="b0">[</span><span class="v3">i</span> + <span class="n">1</span><span class="b0">]</span> == <span class="v6">b</span>:
+                <span class="v2">out</span>.<span class="m2">append</span><span class="b0">(</span><span class="v5">a</span> + <span class="v6">b</span><span class="b0">)</span>; <span class="v3">i</span> += <span class="n">2</span>
+            <span class="k">else</span>:
+                <span class="v2">out</span>.<span class="m2">append</span><span class="b0">(</span><span class="v5">sym</span><span class="b1">[</span><span class="v3">i</span><span class="b1">]</span><span class="b0">)</span>; <span class="v3">i</span> += <span class="n">1</span>
+        <span class="v5">sym</span> = <span class="v2">out</span>
+    <span class="k">return</span> <span class="v5">sym</span>
+
+<span class="v3">counts</span> = <span class="b0">{</span><span class="s">"seed"</span>: <span class="n">7</span>, <span class="s">"see"</span>: <span class="n">5</span>, <span class="s">"bee"</span>: <span class="n">4</span>, <span class="s">"bed"</span>: <span class="n">3</span>, <span class="s">"deed"</span>: <span class="n">2</span><span class="b0">}</span>
+<span class="v5">merges</span> = <span class="m1">train_bpe</span><span class="b0">(</span><span class="v3">counts</span>, <span class="n">3</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="v5">merges</span><span class="b0">)</span>                    <span class="c"># [('e','e'), ('s','ee'), ('see','d')]</span>
+<span class="m1">print</span><span class="b0">(</span><span class="m1">encode</span><span class="b1">(</span><span class="s">"bees"</span>, <span class="v5">merges</span><span class="b1">)</span><span class="b0">)</span>    <span class="c"># ['b', 'ee', 's']  -- matches Problem 1</span></code></pre>
+          </div>
+          <h2>The decoder block, component by component</h2>
+          <p>
+            The model is an embedding table, \(L\) identical blocks, a final
+            normalization, and an unembedding projection to vocabulary
+            logits. Each block is two residual sub-layers in the pre-norm
+            arrangement: the input is normalized, transformed, and added back
+            to the untouched residual stream,
+            \(x \leftarrow x + \mathrm{Attn}(\mathrm{Norm}(x))\) then
+            \(x \leftarrow x + \mathrm{MLP}(\mathrm{Norm}(x))\). Pre-norm
+            won over the original post-norm placement for a concrete reason:
+            with normalization inside the branch, the residual path is an
+            identity from any layer to the output, so gradients reach early
+            layers with unit scale regardless of depth, and hundred-layer
+            models train without the careful warmup that post-norm requires.
+            The price is a residual stream whose norm grows with depth, which
+            is why a final norm before the unembedding is mandatory. What
+            follows derives the four places where the modern block departs
+            from the 2017 original: RMSNorm instead of LayerNorm, rotary
+            instead of additive positions, a gated SwiGLU instead of the
+            two-matrix ReLU MLP, and grouped-query instead of full
+            multi-head attention.
+          </p>
+
+          <pre class="flow">
+tokens ──▶ embed (V×d) ──▶ ┌────────────────────────────────────┐
+                           │  block × L                         │
+                           │   x ─ RMSNorm ─ GQA+RoPE ─(+)─┐    │
+                           │   │____________________________│   │
+                           │   x ─ RMSNorm ─ SwiGLU MLP ─(+)─┐  │
+                           │   │_____________________________│  │
+                           └────────────────────────────────────┘
+                     ──▶ RMSNorm ──▶ unembed (d×V) ──▶ logits ──▶ softmax / loss</pre>
+
+          <h3>RMSNorm: what LayerNorm was actually doing</h3>
+          <p>
+            LayerNorm computes
+            \( y = g \odot \frac{x - \mu}{\sigma} + b \) with
+            \( \mu = \frac{1}{d}\sum_i x_i \) and
+            \( \sigma^2 = \frac{1}{d}\sum_i (x_i-\mu)^2 \): two reductions
+            over the feature dimension, a subtraction, a division, and two
+            learned vectors. Zhang and Sennrich (2019) asked which parts earn
+            their keep and found that re-centering is dispensable. RMSNorm
+            keeps only the rescaling:
+          </p>
+          $$ \mathrm{RMSNorm}(x) = \frac{x}{\mathrm{RMS}(x)} \odot g,
+             \qquad \mathrm{RMS}(x) = \sqrt{\tfrac{1}{d}\textstyle\sum_{i=1}^{d} x_i^2 + \epsilon}. $$
+          <p>
+            The property that matters is scale invariance: for any
+            \(\alpha &gt; 0\),
+            \(\mathrm{RMSNorm}(\alpha x) = \mathrm{RMSNorm}(x)\), because the
+            RMS in the denominator scales by the same \(\alpha\). So the
+            block's input magnitude is decoupled from the growing residual
+            stream, exactly the stabilization LayerNorm provided, without
+            the mean statistic. The gradient shows the same regularization.
+            Writing \(\hat{x} = x/\mathrm{RMS}(x)\) and differentiating,
+          </p>
+          $$ \frac{\partial \hat{x}_i}{\partial x_j}
+             = \frac{\delta_{ij}}{\mathrm{RMS}(x)}
+             - \frac{x_i x_j}{d\,\mathrm{RMS}(x)^3}
+             = \frac{1}{\mathrm{RMS}(x)}\Big(\delta_{ij} - \frac{\hat{x}_i \hat{x}_j}{d}\Big), $$
+          <p>
+            a projection that removes the component of the gradient along
+            \(x\) itself and shrinks everything by the input's RMS: large
+            activations receive proportionally damped gradients. Practically,
+            RMSNorm replaces two reductions with one and drops the bias, a
+            measurable win at scale since normalization is bandwidth-bound,
+            and every prominent open model since Llama uses it. One
+            precision note that recurs in real codebases: the sum of squares
+            is computed in fp32 even when the surrounding block runs in
+            bf16, because a long reduction in a format with 8 mantissa bits
+            accumulates error linearly in \(d\).
+          </p>
+
+          <h3>Rotary position embeddings, derived from the requirement</h3>
+          <p>
+            Attention is permutation-equivariant; position must be injected.
+            The original design added a position vector to each embedding,
+            which entangles content with absolute location: the score between
+            positions \(m\) and \(n\) becomes a sum of four terms, and
+            nothing constrains it to depend on the offset \(n - m\), which is
+            the quantity language actually cares about. Su et al. (2021)
+            posed the requirement directly. Find transformations
+            \(f(q, m)\) applied to queries and \(f(k, n)\) applied to keys
+            such that the score is a function of the contents and the
+            relative offset only:
+          </p>
+          $$ \langle f(q, m),\, f(k, n) \rangle = g(q, k, n - m) \quad \text{for all } m, n. $$
+          <p>
+            Work in two dimensions first and identify \(\R^2\) with the
+            complex plane. Try \(f(q, m) = q\, e^{i m \theta}\), a rotation of
+            \(q\) by angle \(m\theta\). The real inner product of complex
+            numbers is \(\langle u, v\rangle = \mathrm{Re}(\bar{u} v)\), so
+          </p>
+          $$ \langle q e^{i m\theta},\, k e^{i n\theta} \rangle
+             = \mathrm{Re}\big(\bar{q} k\, e^{i (n-m)\theta}\big), $$
+          <p>
+            which depends on \(m\) and \(n\) only through \(n - m\): the
+            requirement is met exactly, not approximately. In matrix form the
+            same statement is that rotation matrices commute and compose by
+            angle addition, \(R_m^{\!\T} R_n = R_{n-m}\), so
+            \((R_m q)^{\!\T}(R_n k) = q^{\!\T} R_{n-m}\, k\). This is also
+            the reason the transformation must be a rotation and not a
+            general linear map: orthogonality is what turns two absolute
+            positions into one relative one inside a dot product.
+          </p>
+          <p>
+            To lift this to head dimension \(d_h\), split the vector into
+            \(d_h/2\) two-dimensional pairs and rotate pair \(i\) by angle
+            \(m\theta_i\) with a geometric frequency ladder
+            \(\theta_i = b^{-2i/d_h}\), base \(b = 10{,}000\) classically.
+            The block-diagonal rotation applied to a query at position
+            \(m\) is
+          </p>
+          $$ f(q, m)_{2i:2i+2} = \begin{pmatrix} \cos m\theta_i &amp; -\sin m\theta_i \\ \sin m\theta_i &amp; \cos m\theta_i \end{pmatrix} \begin{pmatrix} q_{2i} \\ q_{2i+1} \end{pmatrix}, $$
+          <p>
+            implemented as two fused multiplies against precomputed cosine
+            and sine tables rather than a matmul, since the matrix is
+            2×2-block-diagonal. The fast pairs (\(\theta_0 = 1\), a full
+            radian per position) resolve local order; the slow pairs
+            (\(\theta_{d_h/2-1} \approx 1/b\), a period of tens of thousands
+            of positions) carry coarse long-range structure, the same
+            multi-scale trick as the original sinusoidal table but applied
+            multiplicatively where it can cancel inside the score. Three
+            consequences follow directly from the derivation. Values are
+            never rotated, because the output should carry content, not
+            position. The KV cache stores rotated keys, so cached entries
+            never need updating as the sequence grows, which absolute-affine
+            relative schemes cannot offer. And the norm of every vector is
+            preserved, so RoPE composes safely with the softmax temperature
+            analysis. The frequency base has become a tuning knob: because
+            pairs with \(m\theta_i\) beyond the trained range are
+            out-of-distribution, context extension methods (positional
+            interpolation, NTK-aware scaling, YaRN) all amount to remapping
+            the ladder \(\theta_i\) after training, and models aimed at long
+            context now train with bases of 500,000 (Llama 3) or more from
+            the start.
+          </p>
+
+          <h3>SwiGLU: gating the MLP</h3>
+          <p>
+            The original position-wise MLP is
+            \(\mathrm{FFN}(x) = \max(0, xW_1)W_2\) with hidden width
+            \(4d\). Shazeer (2020) revisited the family of gated linear
+            units, where one linear projection is passed through a
+            nonlinearity and multiplies a second, linear projection
+            elementwise:
+          </p>
+          $$ \mathrm{SwiGLU}(x) = \big(\mathrm{swish}(x W_{\text{gate}}) \odot x W_{\text{up}}\big)\, W_{\text{down}}, \qquad \mathrm{swish}(z) = z\,\sigma(z). $$
+          <p>
+            The gate makes the layer a data-dependent selector: the
+            \(W_{\text{up}}\) path carries candidate features and the
+            swish-activated gate decides, per coordinate and per token, how
+            much of each passes. Because there are now three matrices
+            instead of two, holding the parameter count fixed requires
+            shrinking the hidden width by a factor of \(2/3\): the classic
+            \(2 \times d \times 4d = 8d^2\) budget becomes
+            \(3 \times d \times d_{ff}\), so
+            \(d_{ff} = \tfrac{8}{3}d \approx 2.67d\), then rounded up to a
+            hardware-friendly multiple. For \(d = 2048\):
+            \(\tfrac{2}{3} \cdot 8192 = 5461.3\), and Llama-style configs
+            round to \(d_{ff} = 5632 = 22 \times 256\). The paper is frank
+            that it offers no theoretical account of why the gated variants
+            win; they simply do, consistently, by a fraction of a point of
+            perplexity at equal parameters, and at frontier training budgets
+            a reliable fraction of a point is enormous. Every major open
+            model since 2022 (Llama, Mistral, Qwen, DeepSeek) ships SwiGLU
+            or the closely related GeGLU.
+          </p>
+
+          <h3>Grouped-query attention and the KV-cache arithmetic</h3>
+          <p>
+            At inference, autoregressive decoding caches each layer's keys
+            and values so that generating token \(t+1\) costs one new
+            column of KV rather than a recomputation of the prefix. The
+            cache is the dominant memory consumer at serving time, and its
+            size follows from counting. With \(L\) layers, \(n_{kv}\)
+            key-value heads of dimension \(d_h\), and \(p\) bytes per
+            element, each token stores keys and values in every layer:
+          </p>
+          $$ \text{bytes per token} = 2 \cdot L \cdot n_{kv} \cdot d_h \cdot p, $$
+          <p>
+            and a batch of \(B\) sequences at context length \(S\)
+            multiplies this by \(BS\). Multi-head attention sets
+            \(n_{kv} = n_h\) and pays full price. Multi-query attention
+            (MQA), the opposite extreme, shares a single K and V head across
+            all query heads, dividing cache and KV-projection bandwidth by
+            \(n_h\) but measurably hurting quality and destabilizing
+            training at scale. Ainslie et al. (2023) interpolated: grouped-query
+            attention gives each group of \(n_h / n_{kv}\) query heads one
+            shared KV head. The cache shrinks by \(n_h / n_{kv}\), typically
+            4-8x, while quality stays within noise of full MHA, and an
+            existing MHA checkpoint can be converted by mean-pooling each
+            group's KV projections followed by a short uptraining run (about
+            5% of the original pretraining compute in the paper). The
+            asymmetry that makes this nearly free is that queries exist only
+            for the token being generated while keys and values exist for
+            the whole history: cutting KV heads attacks the term that scales
+            with context, and the query side, which does not scale, keeps
+            its full capacity.
+          </p>
+
+          <div class="problem">
+            <span class="plabel">Problem 2</span>
+            <p>
+              A 7B-class model has 32 layers, 32 query heads of dimension
+              128, and stores its cache in bf16. (a) Compute the KV-cache
+              size per token and for a batch of 16 sequences at 8192-token
+              context under full multi-head attention. (b) Repeat with
+              grouped-query attention using 8 KV heads. (c) The weights
+              occupy 13.5 GB in bf16 on an 80 GB device; how many concurrent
+              8192-token sequences fit in the remaining memory under each
+              scheme? Verify against the formula before trusting any
+              serving-cost estimate built on it.
+            </p>
+            <div class="solution">
+              <p><strong>Solution.</strong> (a) Per token:
+              \(2 \times 32 \times 32 \times 128 \times 2\) bytes
+              = 524,288 bytes = 512 KiB. The batch holds
+              \(16 \times 8192 = 131{,}072\) token slots, so the cache is
+              \(131{,}072 \times 512\,\text{KiB} = 64\) GiB (68.7 GB). That
+              is five times the size of the weights, for one batch.</p>
+              <p>(b) With \(n_{kv} = 8\): per token
+              \(2 \times 32 \times 8 \times 128 \times 2 = 131{,}072\) bytes
+              = 128 KiB, a 4x reduction as predicted by
+              \(n_h/n_{kv} = 32/8\). The batch cache is 16 GiB.</p>
+              <p>(c) Free memory is roughly \(80 - 13.5 = 66.5\) GB. One
+              full-context sequence costs \(8192 \times 512\,\text{KiB}
+              = 4.29\) GB under MHA, so \(66.5 / 4.29 \approx 15\)
+              sequences fit. Under GQA each costs 1.07 GB and
+              \(66.5 / 1.07 \approx 62\) fit. Decode throughput at fixed
+              latency scales roughly with the batch size the cache allows,
+              so this one architectural choice quadruples serving capacity
+              per GPU. That is why GQA is a pretraining-time decision with
+              an inference-side payoff, and why every major model since
+              Llama 2 70B has shipped with it.</p>
+            </div>
+          </div>
+          <h2>FlashAttention and the online softmax</h2>
+          <h3>The problem is bandwidth, not FLOPs</h3>
+          <p>
+            Naive attention materializes the \(S \times S\) score matrix in
+            HBM: one kernel writes \(QK^{\!\T}\), another reads it to compute
+            softmax, a third reads the probabilities to multiply by \(V\).
+            The arithmetic is cheap relative to the traffic. On the H100
+            80GB in this repository, a bf16 4096-square matmul sustains
+            744.6 TFLOPS while HBM copy bandwidth measures 2992.4 GB/s, so
+            the crossover arithmetic intensity is
+            \(744.6 \times 10^{12} / 2992.4 \times 10^9 \approx 249\) FLOPs
+            per byte: any kernel doing less arithmetic per byte moved is
+            bandwidth-bound and leaves the tensor cores idle. Measured on
+            this machine at head dimension 64, sequence length 8192: the
+            naive three-kernel implementation runs at 22.2 TFLOPS and takes
+            98.9 ms with a 35.0 GB peak footprint (the fp32 score matrix
+            alone is 17.18 GB), while the fused FlashAttention kernel runs
+            the same math at 615.1 TFLOPS in 3.58 ms with 0.57 GB peak, a
+            27.7x speedup and 61x memory reduction. At 16K context the naive
+            kernel cannot run at all: its 68.7 GB score matrix does not fit
+            in 80 GB, while the fused kernel needs 1.12 GB. The fix is not a
+            different formula, it is refusing to write the score matrix to
+            HBM, and the enabling piece of mathematics is a streaming form
+            of softmax.
+          </p>
+
+          <h3>The online softmax recurrence</h3>
+          <p>
+            Numerically safe softmax over scores \(x_1, \dots, x_S\)
+            subtracts the maximum before exponentiating:
+            \(p_i = e^{x_i - m} / \ell\) with \(m = \max_i x_i\) and
+            \(\ell = \sum_i e^{x_i - m}\). Computed directly this needs
+            three passes over the data: one for \(m\), one for \(\ell\), one
+            to normalize, and pass structure is exactly what tiling cannot
+            afford. Milakov and Gimelshein (2018) showed the max and the sum
+            can be maintained jointly in one pass. Keep a running maximum
+            \(m^{(j)}\) and a running sum \(\ell^{(j)}\) that is always
+            expressed relative to the current maximum, and on seeing a new
+            score \(x_j\) update
+          </p>
+          $$ m^{(j)} = \max\big(m^{(j-1)},\, x_j\big), \qquad
+             \ell^{(j)} = \ell^{(j-1)}\, e^{\,m^{(j-1)} - m^{(j)}} + e^{\,x_j - m^{(j)}}. $$
+          <p>
+            The correction factor \(e^{\,m^{(j-1)} - m^{(j)}}\) is the whole
+            trick: when a new, larger maximum arrives, every term already
+            accumulated was exponentiated against the stale reference, and
+            multiplying the running sum by the ratio of references rescales
+            them all at once. The invariant
+            \(\ell^{(j)} = \sum_{i \le j} e^{\,x_i - m^{(j)}}\) holds by
+            induction: it is true at \(j = 1\), and if it holds at
+            \(j-1\) then
+            \(\ell^{(j-1)} e^{m^{(j-1)} - m^{(j)}} = \sum_{i \le j-1} e^{x_i - m^{(j)}}\),
+            to which the update adds the \(j\)-th term. Since
+            \(m^{(j-1)} \le m^{(j)}\), the correction factor never exceeds 1
+            and nothing overflows. A quick numeric check with scores
+            \((2, 5, 3)\): after \(x_1 = 2\), \(m = 2\), \(\ell = 1\). After
+            \(x_2 = 5\): \(m = 5\),
+            \(\ell = 1 \cdot e^{2-5} + 1 = 1.0498\). After \(x_3 = 3\):
+            \(m\) stays 5, \(\ell = 1.0498 + e^{-2} = 1.1851\), which equals
+            \(e^{-3} + e^{0} + e^{-2}\) exactly as the invariant demands.
+          </p>
+
+          <h3>Tiling attention around the recurrence</h3>
+          <p>
+            Dao et al. (2022) extended the same rescaling from scalar sums
+            to the attention output, which is a sum of value vectors
+            weighted by the not-yet-normalized exponentials. Split \(K\) and
+            \(V\) into blocks of rows that fit in on-chip SRAM (a few
+            hundred KB per SM versus tens of GB of HBM). For one query
+            block, hold an output accumulator \(O\), a running max \(m\),
+            and a running sum \(\ell\) in SRAM, and for each KV block \(j\)
+            compute the block of scores \(s = qK_j^{\!\T}/\sqrt{d_h}\)
+            entirely on chip, then update
+          </p>
+          $$ m' = \max(m, \operatorname{rowmax}(s)), \qquad
+             \tilde{P} = e^{\,s - m'}, \qquad
+             \ell' = \ell\, e^{\,m - m'} + \operatorname{rowsum}(\tilde{P}), $$
+          $$ O' = O \cdot e^{\,m - m'} + \tilde{P}\, V_j, $$
+          <p>
+            and after the last block divide once: \(O \leftarrow O / \ell\).
+            The output correction mirrors the sum correction because every
+            row of the accumulated \(O\) is a combination
+            \(\sum_i e^{x_i - m} v_i\) referenced to the stale max, so one
+            scalar multiply per row re-references it. No \(S \times S\)
+            object ever touches HBM; the kernel reads \(Q, K, V\) once per
+            tile pass and writes \(O\) once. Dao et al. prove the HBM
+            traffic is \(\Theta(S^2 d_h^2 / M)\) for SRAM size \(M\),
+            versus \(\Theta(S d_h + S^2)\) for the naive path, and that no
+            exact algorithm can do asymptotically better over a range of
+            SRAM sizes; the proof lives in the paper. For the backward pass
+            the kernel stores only the per-row logsumexp
+            \(m + \log \ell\) (size \(S\), not \(S^2\)) and recomputes score
+            tiles on the fly, spending about 30% more FLOPs to avoid the
+            quadratic write, a trade that wins precisely because the FLOPs
+            were free and the bytes were not. FlashAttention-2 (Dao, 2023)
+            reorganized the loops so each thread block owns a query tile and
+            sweeps KV, moving the non-matmul rescaling work out of the inner
+            loop and roughly doubling throughput; FlashAttention-3
+            overlapped the softmax with asynchronous tensor-core matmuls on
+            Hopper. The measured 4.26x speedup from fusing a small
+            elementwise chain on this machine (0.911 ms unfused, 0.214 ms
+            fused) is the same lesson in miniature: on modern accelerators,
+            the unit of optimization is memory traffic, and exact
+            mathematical restructuring that eliminates round trips beats
+            approximation almost every time.
+          </p>
+
+          <h2>Counting parameters and FLOPs</h2>
+          <h3>Where the parameters live</h3>
+          <p>
+            For a config with vocabulary \(V\), width \(d\), \(L\) layers,
+            \(n_h\) query heads, \(n_{kv}\) KV heads, head dimension
+            \(d_h = d/n_h\), and SwiGLU width \(d_{ff}\), the exact count
+            is a short table. Attention:
+            \(W_Q \in \R^{d \times d}\), \(W_K, W_V \in \R^{d \times n_{kv} d_h}\),
+            \(W_O \in \R^{d \times d}\), totaling
+            \(2d^2 + 2d\,n_{kv}d_h\) per layer. MLP: three matrices,
+            \(3 d\, d_{ff}\). Norms: \(2d\) per layer plus \(d\) at the end,
+            negligible. Embedding and unembedding: \(Vd\) each if untied.
+            Nothing else. The habit worth building is computing this per
+            component, because the ratios drive design: at Llama-like
+            shapes (\(d_{ff} \approx 2.67d\), GQA at
+            \(n_{kv} = n_h/4\)) the MLP holds roughly 65% of block
+            parameters and attention 25-30%, which is why MoE targets the
+            MLP and why GQA's parameter savings are minor even though its
+            cache savings are decisive.
+          </p>
+
+          <h3>Deriving the 6ND rule</h3>
+          <p>
+            Every parameter that participates in a matmul touches each token
+            three matrix products' worth of work. Forward: computing
+            \(y = xW\) with \(W \in \R^{a \times b}\) costs \(ab\)
+            multiply-accumulates per token, conventionally \(2ab\) FLOPs.
+            Backward: two matmuls of the same shape, the input gradient
+            \(\partial x = \partial y\, W^{\!\T}\) (another \(2ab\)) and the
+            weight gradient \(\partial W = x^{\!\T} \partial y\) (another
+            \(2ab\)). So training costs \(6\) FLOPs per matmul parameter per
+            token, and for a model with \(N\) such parameters trained on
+            \(D\) tokens,
+          </p>
+          $$ C \approx 6\,N D \quad \text{FLOPs}, \qquad
+             \text{forward alone} \approx 2ND. $$
+          <p>
+            Two corrections keep the estimate honest. The embedding lookup
+            is a copy, not a matmul, so the embedding table is excluded from
+            \(N\) (the unembedding projection is a real matmul and stays).
+            And attention's score and value products,
+            \(QK^{\!\T}\) and \(PV\), involve no parameters at all, so 6ND
+            misses them entirely; per token per layer they cost
+            \(2 \cdot 2 \cdot S d_h \cdot n_h = 4Sd\) forward (each of the
+            \(S\) cached positions participates in one MAC per head
+            dimension, for both products), hence \(12\,S d L\) in training.
+            The ratio of the attention term to 6N is roughly
+            \(S / (d \cdot \text{const})\), so at short context the rule is
+            excellent and at long context it degrades: for the 1.27B model
+            worked in Problem 5 below, at 4096 context the score/value
+            FLOPs are already 25% of the total, and a 6ND-based MFU figure
+            would overstate efficiency by the same fraction.
+          </p>
+          <p>
+            Model FLOPs utilization (MFU), defined in the PaLM report
+            (Chowdhery et al., 2022), is observed useful FLOPs per second
+            divided by the accelerator's peak: tokens/s times FLOPs per
+            token, over the datasheet number (989 TFLOPS dense bf16 for an
+            H100 SXM). It deliberately excludes recomputation, which is why
+            it is the honest cross-system metric: activation checkpointing
+            raises hardware utilization while lowering MFU. Two calibration
+            points from this repository's H100: the best measured bf16
+            matmul sustains 744.6 TFLOPS, 75% of datasheet peak, so even a
+            model that were pure large matmuls could not reach MFU 1.0; and
+            small matmuls are far worse (108.9 TFLOPS at 1024-square, 11% of
+            peak), which is why wide models with fat matmuls report better
+            MFU than narrow deep ones. Well-engineered dense-model
+            pretraining lands between 35% and 45%; the Llama 3 report states
+            38-43% across its parallelism configurations.
+          </p>
+
+          <h3>Mixed precision and loss scaling</h3>
+          <p>
+            The H100 measurements make the case for reduced precision
+            bluntly: at 4096-square, fp32 matmul sustains 51.3 TFLOPS, tf32
+            384.0, bf16 744.6, a 14.5x gap between naive fp32 and bf16.
+            Nobody can afford to leave that on the table, so training runs
+            matmuls in 16-bit while keeping an fp32 master copy of the
+            weights, fp32 optimizer moments, and fp32 for the numerically
+            delicate reductions (norm statistics, softmax, the final loss).
+            The choice between the two 16-bit formats is a choice about
+            which failure to buy. fp16 spends its 16 bits as 1 sign, 5
+            exponent, 10 mantissa: fine relative precision
+            (\(2^{-11} \approx 5 \times 10^{-4}\)) but a floor of
+            \(6.1 \times 10^{-5}\) for normal values, and activation
+            gradients late in training routinely fall below it, silently
+            flushing to zero. bf16 spends 8 exponent and 7 mantissa bits:
+            the full fp32 range (\(\sim 10^{38}\)) but only
+            \(2^{-8} \approx 0.4\%\) relative precision.
+          </p>
+          <p>
+            Loss scaling (Micikevicius et al., 2018) rescues fp16 by
+            exploiting linearity of the gradient: multiply the loss by
+            \(S\), and every gradient in the chain is multiplied by \(S\),
+            shifting the whole gradient distribution up into representable
+            range; divide by \(S\) in fp32 before the optimizer step, and
+            the update is mathematically unchanged wherever nothing
+            over- or underflowed. Dynamic schedules pick \(S\) empirically:
+            double it every few thousand clean steps, and on any overflow
+            (an inf/nan in the gradients) skip the step and halve \(S\).
+            bf16 needs none of this, its exponent range already covers the
+            gradient distribution, and its coarse mantissa turns out to be
+            tolerable because the fp32 master weights integrate small
+            updates across steps and tensor-core matmuls accumulate their
+            inner products in fp32 regardless. This is why essentially all
+            large-scale training moved to bf16 once Ampere-class hardware
+            made it fast, and why the frontier of precision research is now
+            one level down, at fp8 with per-tile scaling, discussed in the
+            frontier section.
+          </p>
+
+          <h2>Data: the pipeline and deduplication</h2>
+          <p>
+            A trillion-token corpus is manufactured, not found. The standard
+            pipeline, visible end to end in public efforts like RefinedWeb,
+            Dolma, and FineWeb, runs: HTML extraction from web crawls (the
+            extractor matters; boilerplate-heavy extraction measurably hurts
+            downstream models), language identification, heuristic quality
+            filters (document length, symbol-to-word ratios, repetition
+            statistics), often a model-based quality score, deduplication,
+            and finally tokenization into shuffled fixed-length shards.
+            Documents are packed into contiguous training sequences and the
+            notion of an epoch essentially disappears; at frontier scale the
+            corpus is engineered so that little of it repeats even once.
+          </p>
+          <p>
+            Deduplication earns its own machinery because web crawls are
+            drenched in near-copies and the damage is quantified: Lee et
+            al. (2021) showed a single-epoch model emits memorized text an
+            order of magnitude more often when its training set contains
+            near-duplicates, and that deduplicated training reaches equal or
+            better perplexity in fewer steps. Exact duplicates fall to
+            hashing; the interesting case is near-duplicates, handled by
+            MinHash. Shingle each document into overlapping n-grams, apply a
+            random permutation \(\pi\) to the shingle universe, and record
+            the minimum. The probability two documents agree on that minimum
+            equals their Jaccard similarity: the minimum over the union
+            \(A \cup B\) lands in \(A \cap B\) with probability exactly
+            \(|A \cap B| / |A \cup B| = J(A,B)\), since \(\pi\) makes every
+            element of the union equally likely to be the overall minimum,
+            and the two documents agree precisely when that element belongs
+            to both. Repeating with \(b \cdot r\) independent permutations
+            and banding the signature into \(b\) bands of \(r\) rows, two
+            documents collide in at least one band with probability
+          </p>
+          $$ P(\text{candidate}) = 1 - \big(1 - J^{\,r}\big)^{b}, $$
+          <p>
+            an S-curve whose threshold sits near \((1/b)^{1/r}\). A common
+            production setting, \(b = 14\) bands of \(r = 9\) rows (126
+            hashes), catches documents at \(J = 0.8\) with probability
+            \(1 - (1 - 0.8^9)^{14} = 0.867\) while flagging \(J = 0.5\)
+            pairs only \(1 - (1 - 0.5^9)^{14} = 2.7\%\) of the time: a
+            tunable knob trading recall against the quadratic cost of
+            verifying candidates. The countervailing finding, from the
+            FineWeb ablations, is that dedup can be overdone: aggressive
+            global deduplication preferentially deletes high-quality
+            frequently-copied text, and the best recipes dedup within
+            crawl snapshots rather than across all of them. Data work is
+            unglamorous and decides more benchmark variance than most
+            architecture choices; every serious lab treats the pipeline as
+            a first-class engineering artifact with its own evaluations.
+          </p>
+          <h2>Distributed training</h2>
+          <h3>The memory anatomy of a training step</h3>
+          <p>
+            Mixed-precision Adam training carries, per parameter: a 2-byte
+            bf16 working copy, a 2-byte bf16 gradient, and 12 bytes of fp32
+            optimizer state (4-byte master weight, 4-byte first moment,
+            4-byte second moment), 16 bytes in all before a single
+            activation is stored. A 7B model therefore needs 112 GB of
+            state, more than an 80 GB H100 holds; even at 7B, training on
+            one device is impossible without sharding something. This
+            single piece of arithmetic explains the entire distributed
+            training stack: the three parallelism families differ in what
+            they shard (state, weights per layer, or layers) and in what
+            they must communicate to compensate.
+          </p>
+
+          <pre class="flow">
+data parallel      tensor parallel        pipeline parallel
+ GPU0  GPU1         GPU0     GPU1          GPU0   GPU1
+ ┌───┐ ┌───┐        ┌───────┬───────┐      ┌────┐ ┌────┐
+ │all│ │all│        │ W[:h/2]│W[h/2:]│      │L1-8│▶│L9-16│
+ │lyr│ │lyr│        │  cols  │ cols  │      └────┘ └────┘
+ └───┘ └───┘        └───────┴───────┘      activations flow
+ batch split        every layer split      layers split
+ sync: grads        sync: activations      sync: boundary acts
+ (all-reduce)       (all-reduce ×2/layer)  (p2p send/recv)</pre>
+
+          <h3>Data parallelism and the ZeRO ladder</h3>
+          <p>
+            Plain data parallelism replicates everything and splits the
+            batch; after backward, gradients are averaged with an
+            all-reduce. Ring all-reduce on \(n\) workers moves
+            \(2(n-1)/n \approx 2\) times the buffer size per worker, so a
+            7B model's 14 GB of bf16 gradients cost about 28 GB of traffic
+            per step per GPU, roughly 70 ms at an achievable 400 GB/s of
+            NVLink bandwidth, overlappable with backward compute because
+            gradients for late layers are ready while early layers are
+            still computing. The waste is that all 16 bytes per parameter
+            sit replicated on every worker. Rajbhandari et al. (2020)
+            observed that an all-reduce is algebraically a reduce-scatter
+            followed by an all-gather, and between those two halves each
+            worker holds a complete, exact shard of the summed gradients,
+            which is all it needs to update a shard of the optimizer state.
+            ZeRO's three stages shard progressively more: stage 1 shards
+            the 12 bytes of optimizer state (memory
+            \(4\psi + 12\psi/n\) for \(\psi\) parameters), stage 2 also
+            shards gradients (\(2\psi + 14\psi/n\)), and stage 3 shards the
+            parameters themselves (\(16\psi/n\)), gathering each layer's
+            weights on the fly just before its forward and backward use.
+            Stages 1 and 2 cost no extra communication volume versus plain
+            DP; stage 3 adds an extra all-gather of the parameters per
+            step, making total volume roughly 1.5x plain DP, the price of
+            fitting arbitrarily large models. PyTorch's FSDP is a native
+            implementation of the stage-3 idea with per-module gathering
+            and prefetch.
+          </p>
+
+          <div class="problem">
+            <span class="plabel">Problem 3</span>
+            <p>
+              A 7B-parameter dense model trains with bf16 compute, fp32
+              Adam state, on a single node of 8 GPUs. Compute the
+              per-GPU memory for model state (ignore activations) under
+              plain data parallelism and under ZeRO stages 1, 2, and 3, and
+              state which configurations fit an 80 GB device with room for
+              activations.
+            </p>
+            <div class="solution">
+              <p><strong>Solution.</strong> Total state is
+              \(16 \times 7 \times 10^9 = 112\) GB: 14 GB bf16 parameters,
+              14 GB bf16 gradients, 84 GB fp32 optimizer state (28 GB master
+              weights, 28 GB each for the two moments). Plain DP replicates
+              all 112 GB per GPU: does not fit. Stage 1 keeps parameters
+              and gradients replicated and shards the 84 GB of optimizer
+              state eight ways: \(14 + 14 + 84/8 = 38.5\) GB per GPU. Stage
+              2 also shards gradients: \(14 + (14 + 84)/8 = 26.25\) GB.
+              Stage 3 shards everything: \(112/8 = 14\) GB. Stages 1-3 all
+              fit; stage 1 already leaves about 41 GB for activations and
+              is the cheapest in communication and complexity, which is why
+              the practical rule is to take the lowest ZeRO stage that
+              fits. The same arithmetic scaled up says a 70B model (1.12 TB
+              of state) needs at least stage 3 across two 8-GPU nodes, or
+              tensor and pipeline parallelism, before it trains at all.</p>
+            </div>
+          </div>
+
+          <h3>Tensor parallelism: sharding inside the layer</h3>
+          <p>
+            Megatron-LM (Shoeybi et al., 2019) splits individual weight
+            matrices across \(g\) GPUs in a pattern chosen so that
+            synchronization happens only twice per layer. In the MLP, the
+            up and gate projections are split by columns, so each GPU
+            computes a disjoint slice of the hidden activations and applies
+            the nonlinearity locally, legal because SwiGLU acts
+            elementwise; the down projection is split by rows, so each GPU
+            produces a partial sum of the output, and one all-reduce adds
+            the partials. Attention splits by heads, which are independent
+            until the output projection, again row-split, again one
+            all-reduce. The communication is therefore two all-reduces of
+            the activation tensor \(B \times S \times d\) per layer in
+            forward and two more in backward. The volume is substantial:
+            at \(d = 8192\) with 32,768 tokens per microbatch in bf16, the
+            activation tensor is 512 MiB, a ring all-reduce over 8 GPUs
+            moves \(2 \times 7/8 \times 512 = 896\) MiB per GPU, and with
+            two all-reduces each way a single layer's forward-plus-backward
+            moves about 3.5 GiB per GPU per microbatch. This traffic sits
+            on the critical path between matmuls and cannot be fully
+            hidden, which yields the standard placement rule: tensor
+            parallelism stays inside a node where NVLink provides hundreds
+            of GB/s, and its degree rarely exceeds 8. Sequence parallelism
+            (Korthikanti et al., 2022) extends the same idea to the norms
+            and dropout by splitting along the sequence dimension in the
+            regions between attention and MLP, converting the all-reduces
+            into all-gather plus reduce-scatter pairs of the same total
+            volume but removing redundant activation memory.
+          </p>
+
+          <h3>Pipeline parallelism and the bubble</h3>
+          <p>
+            Pipeline parallelism assigns contiguous groups of layers to
+            stages and passes activations point to point, so communication
+            is tiny (one boundary tensor per microbatch per stage pair),
+            which is why it is the parallelism of choice across nodes on
+            slower interconnect. Its tax is idleness. With one batch, stage
+            \(p\) waits for everything upstream: utilization is \(1/p\).
+            GPipe (Huang et al., 2019) splits the batch into \(m\)
+            microbatches pushed through in a wave. The wall-clock in
+            microbatch-units is \(m + p - 1\) (the first microbatch takes
+            \(p\) steps to emerge, the rest follow one per step), of which
+            useful work is \(m\), so the idle fraction, the bubble, is
+          </p>
+          $$ \text{bubble} = \frac{p - 1}{m + p - 1}. $$
+          <p>
+            Eight stages with 32 microbatches idle
+            \(7/39 = 17.9\%\) of the time; doubling to 64 microbatches
+            drops it to \(7/70 = 10\%\). Bigger \(m\) fights the bubble but
+            raises activation memory under GPipe's schedule, which holds
+            all \(m\) microbatches' activations until backward; the 1F1B
+            schedule (one-forward-one-backward, from PipeDream and refined
+            in Narayanan et al., 2021) interleaves so that at most \(p\)
+            microbatches are live, and interleaved virtual stages shrink
+            the bubble further by a factor of the interleave degree at the
+            cost of proportionally more communication. Production systems
+            compose all three axes: tensor parallel within a node, pipeline
+            across nodes, data parallel (with ZeRO-1) as the outer loop,
+            with the batch size, microbatch count, and parallel degrees
+            solved jointly so that no single term, bubble, TP traffic, or
+            DP all-reduce, dominates the step time.
+          </p>
+
+          <h2>Scaling laws: Kaplan versus Chinchilla</h2>
+          <h3>The empirical form and the correction</h3>
+          <p>
+            Across many orders of magnitude, held-out loss follows a
+            power law in each resource when the others are unconstrained.
+            Kaplan et al. (2020) fit
+            \(L(N) \propto N^{-0.076}\) and \(L(D) \propto D^{-0.095}\) and,
+            allocating a fixed compute budget \(C \approx 6ND\), concluded
+            \(N_{\text{opt}} \propto C^{0.73}\): compute should be spent
+            overwhelmingly on parameters, models should be huge and
+            undertrained. GPT-3 (175B parameters, 300B tokens, 1.7 tokens
+            per parameter) is that prescription made flesh. Hoffmann et
+            al. (2022) reran the experiment with a fixed protocol flaw
+            repaired: Kaplan's runs used a learning-rate decay schedule
+            whose length did not match each run's token budget, which
+            systematically overstates the loss of well-trained small models
+            (a cosine schedule truncated early leaves the model at too high
+            a learning rate). With schedules matched to budgets, three
+            independent analyses (fixed model sizes across budgets,
+            isoFLOP valleys, and a parametric fit) agree that
+            \(N_{\text{opt}} \propto C^{a}\) with \(a \approx 0.5\):
+            parameters and tokens should scale together, roughly 20 tokens
+            per parameter. The 70B Chinchilla model trained on 1.4T tokens
+            beat the 280B Gopher trained on 300B tokens using the same
+            compute, the single most consequential empirical correction in
+            the scaling literature.
+          </p>
+          <h3>Deriving the optimal allocation</h3>
+          <p>
+            The parametric route makes the optimization explicit and is
+            worth doing once by hand. Hoffmann et al. fit the loss surface
+          </p>
+          $$ L(N, D) = E + \frac{A}{N^{\alpha}} + \frac{B}{D^{\beta}}, \qquad
+             E = 1.69,\; A = 406.4,\; B = 410.7,\; \alpha = 0.34,\; \beta = 0.28, $$
+          <p>
+            where \(E\) is the irreducible entropy of the data, and the two
+            power terms are the penalties for finite capacity and finite
+            data. Minimize subject to \(6ND = C\): substitute
+            \(D = C/6N\), so
+            \(L(N) = E + A N^{-\alpha} + B (6/C)^{\beta} N^{\beta}\), and
+            set the derivative to zero:
+          </p>
+          $$ -\alpha A N^{-\alpha - 1} + \beta B (6/C)^{\beta} N^{\beta - 1} = 0
+             \;\;\Longrightarrow\;\;
+             N_{\text{opt}} = \left(\frac{\alpha A}{\beta B}\right)^{\frac{1}{\alpha+\beta}} \left(\frac{C}{6}\right)^{\frac{\beta}{\alpha+\beta}}. $$
+          <p>
+            The capacity penalty falls and the data penalty rises as \(N\)
+            grows at fixed compute; the optimum balances their marginal
+            rates. With the fitted constants the exponent is
+            \(\beta/(\alpha+\beta) = 0.28/0.62 = 0.452\) and the prefactor
+            \((\alpha A / \beta B)^{1/0.62} = 1.345\). Note the exponent is
+            not exactly the 0.5 of the other two analyses; the parametric
+            fit tilts toward more data at large budgets, a discrepancy that
+            is real and documented (Besiroglu et al., 2024, re-derived the
+            fit from the paper's own data and found the approaches
+            reconcile better with corrected fitting). The honest summary: the
+            optimum is a broad, flat valley, 20 tokens per parameter is a
+            serviceable center estimate, and the loss cost of being 2x off
+            in either direction is small, worked out numerically in
+            Problem 6.
+          </p>
+          <p>
+            One more force now overrides all of this: inference. A
+            Chinchilla-optimal model minimizes training loss per training
+            FLOP, but every serving token thereafter costs
+            \(\approx 2N\) FLOPs and \(2N\) bytes of weight reads, forever.
+            When lifetime inference volume is large, the rational choice is
+            a smaller model trained far past its Chinchilla point: Llama 3
+            8B was trained on 15T tokens, nearly 1,900 tokens per
+            parameter, roughly two orders of magnitude "overtrained" by the
+            20:1 rule, because the loss still improves (just at a poor
+            marginal rate per training FLOP) and every point of quality in
+            an 8B serves 10x cheaper than in an 80B. Compute-optimal and
+            product-optimal are different objectives, and the field now
+            budgets against the second.
+          </p>
+
+          <h2>Mixture of experts: paying for parameters only when used</h2>
+          <p>
+            MoE replaces each MLP with \(N_e\) expert MLPs and a learned
+            router: for each token, a linear gate produces scores, a
+            softmax converts them to probabilities, and the token is
+            dispatched to the top-\(k\) experts, its output the
+            probability-weighted sum of theirs. Parameters scale with
+            \(N_e\), per-token FLOPs with \(k\): DeepSeek-V3 holds 671B
+            total parameters while activating 37B per token, an 18x
+            capacity-to-compute ratio. The catch is that the routing
+            decision is discrete and self-reinforcing: a slightly favored
+            expert receives more tokens, trains faster, and gets favored
+            more, collapsing the network onto a few experts while the rest
+            idle, and simultaneously ruining the load balance that
+            expert-parallel hardware sharding assumes. Shazeer et al.
+            introduced, and the Switch Transformer (Fedus et al., 2021)
+            simplified, an auxiliary loss that penalizes imbalance. With
+            \(f_i\) the fraction of tokens actually routed to expert
+            \(i\) (a hard count, not differentiable) and \(P_i\) the mean
+            router probability for expert \(i\) (soft, differentiable),
+          </p>
+          $$ \L_{\text{aux}} = \alpha_{\text{aux}} \, N_e \sum_{i=1}^{N_e} f_i \, P_i. $$
+          <p>
+            Why this form balances: if routing concentrates, both \(f\) and
+            \(P\) concentrate on the same coordinates, and for
+            \(f \approx P\) the loss is \(N_e \sum_i f_i^2\), which by
+            Cauchy-Schwarz satisfies
+            \(\sum_i f_i^2 \ge (\sum_i f_i)^2 / N_e = 1/N_e\) with equality
+            exactly at the uniform distribution, so the minimum of the
+            auxiliary loss is 1, achieved when every expert receives an
+            equal share. The gradient flows through the differentiable
+            factor \(P_i\), pushing router probability away from
+            overloaded experts (those with large \(f_i\)); the hard counts
+            \(f_i\) act as the weights on that pressure. The coefficient
+            \(\alpha_{\text{aux}}\) is a genuine tension: too small and the
+            system collapses, too large and balancing overrides quality.
+            DeepSeek-V3 sidestepped the tension with auxiliary-loss-free
+            balancing: a per-expert bias added to the routing scores before
+            top-\(k\) selection (but not to the mixture weights), nudged up
+            for underloaded experts and down for overloaded ones by a fixed
+            step after each batch, a control loop rather than a loss term,
+            which their ablations show trains better than the auxiliary
+            loss at equal balance. Fine-grained experts (many small experts,
+            several active) and a shared always-on expert, both DeepSeek
+            refinements, are now standard in open MoE recipes including
+            Qwen3 and Mixtral-descended designs.
+          </p>
+          <h2>Inference: the memory-bound endgame</h2>
+          <h3>Prefill and decode are different regimes</h3>
+          <p>
+            Serving splits into two phases with opposite characters.
+            Prefill processes the whole prompt in parallel, large matmuls,
+            compute-bound, high MFU. Decode generates one token at a time:
+            every weight matrix is read from HBM to produce a single
+            token's activations, so arithmetic intensity per sequence is
+            about 1 FLOP-pair per byte, hopelessly below the ~249
+            FLOPs/byte an H100 needs to be compute-bound. Decode speed at
+            batch 1 is therefore a bandwidth division: a 7B model in bf16
+            is 14 GB of weights, and at this machine's measured 2992.4
+            GB/s the floor is 4.7 ms per token, at most 214 tokens/s, no
+            matter how fast the tensor cores are. The only lever is
+            batching, amortizing each weight read across \(B\) sequences,
+            and the only obstacle to batching is KV-cache memory, which is
+            why the KV arithmetic of Problem 2, GQA, and the two systems
+            ideas below jointly determine the cost of a served token.
+          </p>
+          <h3>Paged KV cache and continuous batching</h3>
+          <p>
+            Early serving stacks allocated each request a contiguous KV
+            buffer sized for its maximum possible length. Kwon et al.
+            (2023) measured the consequence: with generation lengths
+            unknown in advance, real systems wasted 60-80% of KV memory on
+            reservation and fragmentation. vLLM's PagedAttention is the
+            operating-systems fix transplanted whole: carve KV memory into
+            fixed-size blocks (16 tokens each), give each sequence a block
+            table mapping logical to physical blocks, allocate on demand,
+            and let the attention kernel gather through the indirection.
+            Fragmentation drops to under 4%, the freed memory becomes
+            batch size, and throughput rises 2-4x at equal latency, with
+            copy-on-write block sharing handling beam search and shared
+            prompt prefixes for free. Continuous batching (Yu et al.,
+            2022, the Orca system) fixes the scheduling half: instead of
+            batching whole requests and waiting for the longest to finish,
+            admit and retire sequences at every iteration, so a finishing
+            sequence's slot is refilled immediately and prefill of new
+            requests interleaves with decode of old ones. Every serious
+            serving engine (vLLM, TensorRT-LLM, SGLang) is built on these
+            two ideas.
+          </p>
+          <h3>Speculative decoding, derived to be lossless</h3>
+          <p>
+            Decode is bandwidth-bound, so the accelerator has idle FLOPs;
+            speculative decoding (Leviathan et al., 2023; concurrently
+            Chen et al., 2023 at DeepMind) spends them checking many
+            tokens at once. A cheap draft model proposes \(\gamma\) tokens
+            autoregressively; the target model then scores all of them in
+            one parallel forward pass, exactly the shape of work it is
+            good at. The subtlety is accepting draft tokens without
+            changing the target distribution, and the mechanism is a
+            token-level rejection sampler. At a given position, the draft
+            proposed \(x \sim q\) and the target assigns \(p\). Accept
+            \(x\) with probability \(\min(1, p(x)/q(x))\); on rejection,
+            resample from the residual distribution
+            \(p'(x) = \max(0, p(x) - q(x)) / \sum_z \max(0, p(z) - q(z))\).
+            The output distribution is exactly \(p\): the probability of
+            emitting a particular token \(x\) via acceptance is
+          </p>
+          $$ q(x)\, \min\!\Big(1, \frac{p(x)}{q(x)}\Big) = \min\big(q(x),\, p(x)\big), $$
+          <p>
+            the total rejection probability is
+            \(1 - \sum_z \min(p(z), q(z))\), which equals the residual
+            normalizer \(\sum_z \max(0, p(z) - q(z))\) because both equal
+            \(\sum_z (p(z) - \min(p(z), q(z)))\), and so the probability of
+            emitting \(x\) via the resampling branch is exactly
+            \(\max(0, p(x) - q(x))\). Summing the two branches gives
+            \(\min(p, q) + (p - \min(p, q)) = p(x)\) for every token:
+            lossless by construction, for any draft model whatsoever. The
+            per-token acceptance probability is
+            \(\alpha = \sum_z \min(p(z), q(z)) = 1 - \mathrm{TV}(p, q)\),
+            one minus the total variation distance, which is the clean
+            statement of the obvious intuition: better-aligned drafts get
+            accepted more.
+          </p>
+          <p>
+            The throughput math follows from treating acceptances as
+            independent with rate \(\alpha\). A verification round emits
+            the accepted prefix of the \(\gamma\) drafts plus exactly one
+            token from the target itself (the residual sample on the first
+            rejection, or a bonus token if all \(\gamma\) survive). The
+            number of accepted drafts is \(\min(G, \gamma)\) where
+            \(G\) is geometric, so
+          </p>
+          $$ \E[\text{tokens per round}]
+             = 1 + \sum_{k=1}^{\gamma} \alpha^{k}
+             = \frac{1 - \alpha^{\gamma + 1}}{1 - \alpha}, $$
+          <p>
+            using \(\E[\min(G,\gamma)] = \sum_{k=1}^{\gamma} P(G \ge k) =
+            \sum_k \alpha^k\) and then summing the finite geometric
+            series. Since a round costs one target forward pass plus
+            \(\gamma\) draft passes, the speedup over plain decoding with
+            relative draft cost \(c\) is that expectation divided by
+            \(1 + \gamma c\), worked numerically in Problem 4. Everything
+            after the original papers is engineering the drafter:
+            Medusa-style extra heads, EAGLE's feature-level drafting, and
+            n-gram lookahead all trade draft quality \(\alpha\) against
+            draft cost \(c\) in this same formula.
+          </p>
+
+          <div class="problem">
+            <span class="plabel">Problem 4</span>
+            <p>
+              A target model is served with a draft model that costs
+              \(c = 0.05\) of a target forward pass and achieves per-token
+              acceptance rate \(\alpha = 0.8\), with draft length
+              \(\gamma = 4\). (a) Compute the expected tokens per
+              verification round. (b) Compute the wall-clock speedup over
+              plain autoregressive decoding, assuming decode is fully
+              serialized and verification of \(\gamma+1\) positions costs
+              the same as one decode step. (c) Would raising \(\gamma\) to
+              8 help? Support the answer with the arithmetic.
+            </p>
+            <div class="solution">
+              <p><strong>Solution.</strong> (a)
+              \(\E[\text{tokens}] = (1 - 0.8^5)/(1 - 0.8)
+              = (1 - 0.32768)/0.2 = 0.67232/0.2 = 3.362\) tokens per round
+              (a 200,000-trial simulation on this machine gives 3.358,
+              confirming the formula).</p>
+              <p>(b) Each round costs \(1 + \gamma c = 1 + 4 \times 0.05
+              = 1.2\) target-step equivalents and yields 3.362 tokens,
+              versus 1 token per 1.0 steps for plain decoding: speedup
+              \(= 3.362 / 1.2 = 2.80\)x.</p>
+              <p>(c) At \(\gamma = 8\):
+              \(\E = (1 - 0.8^9)/0.2 = (1 - 0.13422)/0.2 = 4.329\) tokens,
+              cost \(1 + 8 \times 0.05 = 1.4\), speedup
+              \(4.329/1.4 = 3.09\)x. The gain from four extra drafts is
+              only 0.29x because the marginal draft survives with
+              probability \(\alpha^k\), which has fallen to
+              \(0.8^5 \approx 0.33\) by position five, while its cost is
+              constant. The expected-tokens curve saturates at
+              \(1/(1-\alpha) = 5\) as \(\gamma \to \infty\) while cost
+              grows linearly, so an interior optimum exists;
+              scanning \(\gamma = 4, 5, 6, 7, 8\) gives speedups 2.80,
+              2.95, 3.04, 3.08, 3.09: nearly flat past \(\gamma
+              \approx 6\), and in a real system the verification pass
+              also grows with \(\gamma\), pushing the optimum lower.
+              Draft length is a tuning parameter with steeply diminishing
+              returns, and \(\alpha\), not \(\gamma\), is where the
+              leverage lives.</p>
+            </div>
+          </div>
+
+          <h2>Worked problems</h2>
+          <p>
+            Two capstone computations, the kind that should be doable on a
+            whiteboard before any budget is approved. Both are verified
+            with a calculator-level Python session in this repository.
+          </p>
+
+          <div class="problem">
+            <span class="plabel">Problem 5</span>
+            <p>
+              A model has vocabulary 32,768 (untied embeddings), width
+              \(d = 2048\), 24 layers, 16 query heads and 8 KV heads of
+              dimension 128, SwiGLU width 5632, and trains at sequence
+              length 4096. (a) Compute the exact parameter count.
+              (b) Compute training FLOPs per token, including the
+              attention score/value terms. (c) The run sustains 45,000
+              tokens/s on one H100 (datasheet peak 989 TFLOPS dense bf16).
+              Compute MFU, and compare against the 744.6 TFLOPS this
+              repository actually measures for large bf16 matmuls on the
+              same device.
+            </p>
+            <div class="solution">
+              <p><strong>Solution.</strong> (a) Embedding and unembedding:
+              \(2 \times 32{,}768 \times 2048 = 134{,}217{,}728\). Per
+              layer, attention: \(W_Q\) and \(W_O\) are
+              \(2048 \times 2048 = 4{,}194{,}304\) each; \(W_K\) and
+              \(W_V\) map 2048 to \(8 \times 128 = 1024\), so
+              \(2{,}097{,}152\) each; subtotal 12,582,912. MLP:
+              \(3 \times 2048 \times 5632 = 34{,}603{,}008\). Two norms add
+              4096. Layer total 47,190,016; times 24 layers is
+              1,132,560,384; plus embeddings and the final norm (2048):
+              <strong>1,266,780,160 parameters</strong>, a 1.27B model.
+              Note the MLP is 73% of each block.</p>
+              <p>(b) Matmul-participating parameters exclude the embedding
+              lookup: \(N' = 1{,}266{,}780{,}160 - 67{,}108{,}864 =
+              1{,}199{,}671{,}296\). The 6ND term:
+              \(6N' = 7.198 \times 10^9\) FLOPs/token. Attention
+              score/value terms: \(12\,S d L = 12 \times 4096 \times 2048
+              \times 24 = 2.416 \times 10^9\). Total
+              \(9.614 \times 10^9\) FLOPs per token; the parameter-free
+              attention arithmetic is 25% of the budget at this context
+              length, so ignoring it here would be a real error, not a
+              rounding one.</p>
+              <p>(c) Achieved throughput:
+              \(9.614 \times 10^9 \times 45{,}000 = 4.326 \times 10^{14}\)
+              FLOPS = 432.6 TFLOPS. MFU \(= 432.6 / 989 = 43.7\%\), squarely
+              in the healthy 35-45% band for dense pretraining. Against the
+              measured matmul ceiling of 744.6 TFLOPS the run achieves
+              58.1%: the residual gap is attention's lower efficiency,
+              small-matmul layers, the optimizer step, and communication,
+              not "wasted" compute. Quoting MFU against the datasheet while
+              knowing the realizable ceiling is 75% of it is exactly the
+              kind of context that separates a real capacity plan from a
+              slide.</p>
+            </div>
+          </div>
+
+          <div class="problem">
+            <span class="plabel">Problem 6</span>
+            <p>
+              A lab has \(C = 10^{23}\) FLOPs for a pretraining run.
+              (a) Allocate it with the 20-tokens-per-parameter rule.
+              (b) Allocate it by exact minimization of the Hoffmann et al.
+              parametric loss (constants in the text), and compare the two
+              allocations' predicted losses. (c) Estimate wall-clock on
+              1024 H100s at 40% MFU. (d) GPT-3 spent \(3.15 \times 10^{23}\)
+              FLOPs as \(N = 175\)B, \(D = 300\)B. Using the parametric
+              loss, compare it to the compute-optimal model at its own
+              budget.
+            </p>
+            <div class="solution">
+              <p><strong>Solution.</strong> (a) With \(D = 20N\) and
+              \(C = 6ND = 120N^2\):
+              \(N = \sqrt{10^{23}/120} = 2.89 \times 10^{10}\), so a 29B
+              model on \(D = 577\)B tokens.</p>
+              <p>(b) The derived optimum is
+              \(N_{\text{opt}} = 1.345\,(C/6)^{0.452}\). With
+              \(C/6 = 1.667 \times 10^{22}\):
+              \(N_{\text{opt}} = 1.46 \times 10^{10}\), \(D_{\text{opt}} =
+              C/6N = 1.14 \times 10^{12}\): a 14.6B model on 1.14T tokens,
+              78 tokens per parameter. Predicted losses:
+              \(L(29\text{B}, 577\text{B}) = 1.69 + 406.4/(2.89 \times
+              10^{10})^{0.34} + 410.7/(5.77\times 10^{11})^{0.28} = 2.012\),
+              versus \(L(14.6\text{B}, 1.14\text{T}) = 2.005\). The two
+              allocations differ 2x in model size and by 0.007 nats: the
+              valley really is that flat, which is why the crude rule
+              survives, and why secondary considerations (inference cost,
+              data availability) legitimately dominate the choice within
+              the valley.</p>
+              <p>(c) \(10^{23} / (0.40 \times 989 \times 10^{12}) =
+              2.53 \times 10^{8}\) GPU-seconds \(= 2{,}925\) GPU-days,
+              which is 2.9 days on 1024 GPUs, before restarts, failures,
+              and evaluation pauses.</p>
+              <p>(d) GPT-3's predicted loss:
+              \(1.69 + 406.4/(1.75\times 10^{11})^{0.34} +
+              410.7/(3\times 10^{11})^{0.28} = 2.002\). The compute-optimal
+              allocation of the same \(3.15 \times 10^{23}\) budget is
+              \(N = 2.45 \times 10^{10}\), \(D = 2.14 \times 10^{12}\)
+              (24.5B on 2.1T tokens), with predicted loss 1.954. Under this
+              loss surface, a model one-seventh the size, correctly fed,
+              beats it by 0.05 nats, comparable to the 0.057-nat
+              Gopher-to-Chinchilla gap on the same surface, while being 7x
+              cheaper per inference token. This is the
+              arithmetic that reorganized the industry's budgets after
+              2022.</p>
+            </div>
+          </div>
+          <h2>Implementation</h2>
+          <p>
+            The blocks below are the derivations made executable, and each
+            was run and checked on the H100 in this repository before being
+            included. The first implements the full modern decoder block:
+            RoPE as two fused multiplies against precomputed tables (with a
+            check that shifting all positions by a constant leaves attention
+            scores bit-for-bit unchanged, the relative-position property
+            derived above), RMSNorm with its fp32 internal reduction, GQA
+            with explicit KV-head broadcasting, and the SwiGLU MLP. Shapes
+            are annotated at every step. The PyTorch version delegates the
+            attention contraction to scaled_dot_product_attention so it
+            dispatches to a fused FlashAttention kernel; the JAX version
+            writes the masked softmax explicitly so the tiling target is
+            visible (in production JAX code that line becomes a call to a
+            fused kernel such as the Pallas/cuDNN attention).
+          </p>
+
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="pytorch" class="shl lang active"><code class="language-python"><span class="k">import</span> <span class="m1">torch</span>
+<span class="k">import</span> <span class="m1">torch</span>.<span class="m2">nn</span> <span class="k">as</span> <span class="m1">nn</span>
+<span class="k">import</span> <span class="m1">torch</span>.<span class="m2">nn</span>.<span class="m2">functional</span> <span class="k">as</span> <span class="m1">F</span>
+
+<span class="k">def</span> <span class="m1">rope_tables</span><span class="b0">(</span><span class="v6">head_dim</span>: <span class="m1">int</span>, <span class="v6">max_seq</span>: <span class="m1">int</span>, <span class="v0">base</span>: <span class="m1">float</span> = <span class="n">10000.0</span><span class="b0">)</span>:
+    <span class="c"># theta_i = base^(-2i/d_h) for pair i = 0 .. d_h/2 - 1</span>
+    <span class="v1">inv_freq</span> = <span class="v0">base</span> ** <span class="b0">(</span>-<span class="m1">torch</span>.<span class="m2">arange</span><span class="b1">(</span><span class="n">0</span>, <span class="v6">head_dim</span>, <span class="n">2</span><span class="b1">)</span>.<span class="m2">float</span><span class="b1">()</span> / <span class="v6">head_dim</span><span class="b0">)</span>
+    <span class="v2">pos</span> = <span class="m1">torch</span>.<span class="m2">arange</span><span class="b0">(</span><span class="v6">max_seq</span><span class="b0">)</span>.<span class="m2">float</span><span class="b0">()</span>                <span class="c"># (S,)</span>
+    <span class="v5">ang</span> = <span class="m1">torch</span>.<span class="m2">outer</span><span class="b0">(</span><span class="v2">pos</span>, <span class="v1">inv_freq</span><span class="b0">)</span>                   <span class="c"># (S, hd/2)</span>
+    <span class="k">return</span> <span class="m1">torch</span>.<span class="m2">cos</span><span class="b0">(</span><span class="v5">ang</span><span class="b0">)</span>, <span class="m1">torch</span>.<span class="m2">sin</span><span class="b0">(</span><span class="v5">ang</span><span class="b0">)</span>
+
+<span class="k">def</span> <span class="m1">apply_rope</span><span class="b0">(</span><span class="v4">x</span>, <span class="v4">cos</span>, <span class="v5">sin</span><span class="b0">)</span>:
+    <span class="c"># x: (B, H, S, hd); rotate each (even, odd) pair by the position angle</span>
+    <span class="v0">x_even</span>, <span class="v3">x_odd</span> = <span class="v4">x</span><span class="b0">[</span>..., <span class="n">0</span>::<span class="n">2</span><span class="b0">]</span>, <span class="v4">x</span><span class="b0">[</span>..., <span class="n">1</span>::<span class="n">2</span><span class="b0">]</span>         <span class="c"># (B, H, S, hd/2)</span>
+    <span class="v1">c</span>, <span class="v4">s</span> = <span class="v4">cos</span><span class="b0">[</span><span class="k">None</span>, <span class="k">None</span><span class="b0">]</span>, <span class="v5">sin</span><span class="b0">[</span><span class="k">None</span>, <span class="k">None</span><span class="b0">]</span>            <span class="c"># (1, 1, S, hd/2)</span>
+    <span class="v2">out</span> = <span class="m1">torch</span>.<span class="m2">empty_like</span><span class="b0">(</span><span class="v4">x</span><span class="b0">)</span>
+    <span class="v2">out</span><span class="b0">[</span>..., <span class="n">0</span>::<span class="n">2</span><span class="b0">]</span> = <span class="v0">x_even</span> * <span class="v1">c</span> - <span class="v3">x_odd</span> * <span class="v4">s</span>
+    <span class="v2">out</span><span class="b0">[</span>..., <span class="n">1</span>::<span class="n">2</span><span class="b0">]</span> = <span class="v0">x_even</span> * <span class="v4">s</span> + <span class="v3">x_odd</span> * <span class="v1">c</span>
+    <span class="k">return</span> <span class="v2">out</span>
+
+<span class="k">class</span> <span class="m1">RMSNorm</span><span class="b0">(</span><span class="m1">nn</span>.<span class="m1">Module</span><span class="b0">)</span>:
+    <span class="k">def</span> <span class="m1">__init__</span><span class="b0">(</span><span class="k">self</span>, <span class="v5">dim</span>: <span class="m1">int</span>, <span class="v3">eps</span>: <span class="m1">float</span> = <span class="n">1e-6</span><span class="b0">)</span>:
+        <span class="m1">super</span><span class="b0">()</span>.<span class="m1">__init__</span><span class="b0">()</span>
+        <span class="k">self</span>.<span class="m2">weight</span> = <span class="m1">nn</span>.<span class="m2">Parameter</span><span class="b0">(</span><span class="m1">torch</span>.<span class="m2">ones</span><span class="b1">(</span><span class="v5">dim</span><span class="b1">)</span><span class="b0">)</span>
+        <span class="k">self</span>.<span class="m2">eps</span> = <span class="v3">eps</span>
+    <span class="k">def</span> <span class="m1">forward</span><span class="b0">(</span><span class="k">self</span>, <span class="v4">x</span><span class="b0">)</span>:                              <span class="c"># (B, S, d)</span>
+        <span class="c"># sum of squares in fp32 even under bf16 autocast: long reductions</span>
+        <span class="c"># are exactly where 8 mantissa bits lose accuracy</span>
+        <span class="v3">var</span> = <span class="v4">x</span>.<span class="m2">float</span><span class="b0">()</span>.<span class="m2">pow</span><span class="b0">(</span><span class="n">2</span><span class="b0">)</span>.<span class="m2">mean</span><span class="b0">(</span><span class="v5">dim</span>=-<span class="n">1</span>, <span class="v5">keepdim</span>=<span class="k">True</span><span class="b0">)</span>
+        <span class="v4">x</span> = <span class="b0">(</span><span class="v4">x</span>.<span class="m2">float</span><span class="b1">()</span> * <span class="m1">torch</span>.<span class="m2">rsqrt</span><span class="b1">(</span><span class="v3">var</span> + <span class="k">self</span>.<span class="m2">eps</span><span class="b1">)</span><span class="b0">)</span>.<span class="m2">type_as</span><span class="b0">(</span><span class="v4">x</span><span class="b0">)</span>
+        <span class="k">return</span> <span class="v4">x</span> * <span class="k">self</span>.<span class="m2">weight</span>
+
+<span class="k">class</span> <span class="m1">GQABlock</span><span class="b0">(</span><span class="m1">nn</span>.<span class="m1">Module</span><span class="b0">)</span>:
+    <span class="s">"""Pre-norm decoder block: RMSNorm - GQA(RoPE) - RMSNorm - SwiGLU."""</span>
+    <span class="k">def</span> <span class="m1">__init__</span><span class="b0">(</span><span class="k">self</span>, <span class="v4">d</span>: <span class="m1">int</span>, <span class="v5">n_heads</span>: <span class="m1">int</span>, <span class="v6">n_kv</span>: <span class="m1">int</span>, <span class="v5">d_ff</span>: <span class="m1">int</span><span class="b0">)</span>:
+        <span class="m1">super</span><span class="b0">()</span>.<span class="m1">__init__</span><span class="b0">()</span>
+        <span class="k">assert</span> <span class="v5">n_heads</span> % <span class="v6">n_kv</span> == <span class="n">0</span>
+        <span class="k">self</span>.<span class="m2">nh</span>, <span class="k">self</span>.<span class="m2">nkv</span>, <span class="k">self</span>.<span class="m2">hd</span> = <span class="v5">n_heads</span>, <span class="v6">n_kv</span>, <span class="v4">d</span> // <span class="v5">n_heads</span>
+        <span class="k">self</span>.<span class="m2">wq</span> = <span class="m1">nn</span>.<span class="m2">Linear</span><span class="b0">(</span><span class="v4">d</span>, <span class="v5">n_heads</span> * <span class="k">self</span>.<span class="m2">hd</span>, <span class="v4">bias</span>=<span class="k">False</span><span class="b0">)</span>
+        <span class="k">self</span>.<span class="m2">wk</span> = <span class="m1">nn</span>.<span class="m2">Linear</span><span class="b0">(</span><span class="v4">d</span>, <span class="v6">n_kv</span>    * <span class="k">self</span>.<span class="m2">hd</span>, <span class="v4">bias</span>=<span class="k">False</span><span class="b0">)</span>  <span class="c"># small!</span>
+        <span class="k">self</span>.<span class="m2">wv</span> = <span class="m1">nn</span>.<span class="m2">Linear</span><span class="b0">(</span><span class="v4">d</span>, <span class="v6">n_kv</span>    * <span class="k">self</span>.<span class="m2">hd</span>, <span class="v4">bias</span>=<span class="k">False</span><span class="b0">)</span>
+        <span class="k">self</span>.<span class="m2">wo</span> = <span class="m1">nn</span>.<span class="m2">Linear</span><span class="b0">(</span><span class="v5">n_heads</span> * <span class="k">self</span>.<span class="m2">hd</span>, <span class="v4">d</span>, <span class="v4">bias</span>=<span class="k">False</span><span class="b0">)</span>
+        <span class="k">self</span>.<span class="m2">w_gate</span> = <span class="m1">nn</span>.<span class="m2">Linear</span><span class="b0">(</span><span class="v4">d</span>, <span class="v5">d_ff</span>, <span class="v4">bias</span>=<span class="k">False</span><span class="b0">)</span>   <span class="c"># SwiGLU: 3 matrices,</span>
+        <span class="k">self</span>.<span class="m2">w_up</span>   = <span class="m1">nn</span>.<span class="m2">Linear</span><span class="b0">(</span><span class="v4">d</span>, <span class="v5">d_ff</span>, <span class="v4">bias</span>=<span class="k">False</span><span class="b0">)</span>   <span class="c"># d_ff ~ (8/3) d</span>
+        <span class="k">self</span>.<span class="m2">w_down</span> = <span class="m1">nn</span>.<span class="m2">Linear</span><span class="b0">(</span><span class="v5">d_ff</span>, <span class="v4">d</span>, <span class="v4">bias</span>=<span class="k">False</span><span class="b0">)</span>
+        <span class="k">self</span>.<span class="m2">norm1</span>, <span class="k">self</span>.<span class="m2">norm2</span> = <span class="m1">RMSNorm</span><span class="b0">(</span><span class="v4">d</span><span class="b0">)</span>, <span class="m1">RMSNorm</span><span class="b0">(</span><span class="v4">d</span><span class="b0">)</span>
+
+    <span class="k">def</span> <span class="m1">forward</span><span class="b0">(</span><span class="k">self</span>, <span class="v4">x</span>, <span class="v4">cos</span>, <span class="v5">sin</span><span class="b0">)</span>:                    <span class="c"># x: (B, S, d)</span>
+        <span class="v0">B</span>, <span class="v5">S</span>, <span class="v4">_</span> = <span class="v4">x</span>.<span class="m2">shape</span>
+        <span class="v1">h</span> = <span class="k">self</span>.<span class="m2">norm1</span><span class="b0">(</span><span class="v4">x</span><span class="b0">)</span>
+        <span class="v1">q</span> = <span class="k">self</span>.<span class="m2">wq</span><span class="b0">(</span><span class="v1">h</span><span class="b0">)</span>.<span class="m2">view</span><span class="b0">(</span><span class="v0">B</span>, <span class="v5">S</span>, <span class="k">self</span>.<span class="m2">nh</span>,  <span class="k">self</span>.<span class="m2">hd</span><span class="b0">)</span>.<span class="m2">transpose</span><span class="b0">(</span><span class="n">1</span>, <span class="n">2</span><span class="b0">)</span>
+        <span class="v6">k</span> = <span class="k">self</span>.<span class="m2">wk</span><span class="b0">(</span><span class="v1">h</span><span class="b0">)</span>.<span class="m2">view</span><span class="b0">(</span><span class="v0">B</span>, <span class="v5">S</span>, <span class="k">self</span>.<span class="m2">nkv</span>, <span class="k">self</span>.<span class="m2">hd</span><span class="b0">)</span>.<span class="m2">transpose</span><span class="b0">(</span><span class="n">1</span>, <span class="n">2</span><span class="b0">)</span>
+        <span class="v3">v</span> = <span class="k">self</span>.<span class="m2">wv</span><span class="b0">(</span><span class="v1">h</span><span class="b0">)</span>.<span class="m2">view</span><span class="b0">(</span><span class="v0">B</span>, <span class="v5">S</span>, <span class="k">self</span>.<span class="m2">nkv</span>, <span class="k">self</span>.<span class="m2">hd</span><span class="b0">)</span>.<span class="m2">transpose</span><span class="b0">(</span><span class="n">1</span>, <span class="n">2</span><span class="b0">)</span>
+        <span class="v1">q</span> = <span class="m1">apply_rope</span><span class="b0">(</span><span class="v1">q</span>, <span class="v4">cos</span><span class="b1">[</span>:<span class="v5">S</span><span class="b1">]</span>, <span class="v5">sin</span><span class="b1">[</span>:<span class="v5">S</span><span class="b1">]</span><span class="b0">)</span>            <span class="c"># (B, nh,  S, hd)</span>
+        <span class="v6">k</span> = <span class="m1">apply_rope</span><span class="b0">(</span><span class="v6">k</span>, <span class="v4">cos</span><span class="b1">[</span>:<span class="v5">S</span><span class="b1">]</span>, <span class="v5">sin</span><span class="b1">[</span>:<span class="v5">S</span><span class="b1">]</span><span class="b0">)</span>            <span class="c"># values NOT rotated</span>
+        <span class="v6">k</span> = <span class="v6">k</span>.<span class="m2">repeat_interleave</span><span class="b0">(</span><span class="k">self</span>.<span class="m2">nh</span> // <span class="k">self</span>.<span class="m2">nkv</span>, <span class="v5">dim</span>=<span class="n">1</span><span class="b0">)</span>   <span class="c"># share KV</span>
+        <span class="v3">v</span> = <span class="v3">v</span>.<span class="m2">repeat_interleave</span><span class="b0">(</span><span class="k">self</span>.<span class="m2">nh</span> // <span class="k">self</span>.<span class="m2">nkv</span>, <span class="v5">dim</span>=<span class="n">1</span><span class="b0">)</span>   <span class="c"># across group</span>
+        <span class="v0">o</span> = <span class="m1">F</span>.<span class="m2">scaled_dot_product_attention</span><span class="b0">(</span><span class="v1">q</span>, <span class="v6">k</span>, <span class="v3">v</span>, <span class="v4">is_causal</span>=<span class="k">True</span><span class="b0">)</span>  <span class="c"># fused</span>
+        <span class="v0">o</span> = <span class="v0">o</span>.<span class="m2">transpose</span><span class="b0">(</span><span class="n">1</span>, <span class="n">2</span><span class="b0">)</span>.<span class="m2">reshape</span><span class="b0">(</span><span class="v0">B</span>, <span class="v5">S</span>, <span class="k">self</span>.<span class="m2">nh</span> * <span class="k">self</span>.<span class="m2">hd</span><span class="b0">)</span>
+        <span class="v4">x</span> = <span class="v4">x</span> + <span class="k">self</span>.<span class="m2">wo</span><span class="b0">(</span><span class="v0">o</span><span class="b0">)</span>                             <span class="c"># residual 1</span>
+        <span class="v1">h</span> = <span class="k">self</span>.<span class="m2">norm2</span><span class="b0">(</span><span class="v4">x</span><span class="b0">)</span>
+        <span class="v4">x</span> = <span class="v4">x</span> + <span class="k">self</span>.<span class="m2">w_down</span><span class="b0">(</span><span class="m1">F</span>.<span class="m2">silu</span><span class="b1">(</span><span class="k">self</span>.<span class="m2">w_gate</span><span class="b2">(</span><span class="v1">h</span><span class="b2">)</span><span class="b1">)</span> * <span class="k">self</span>.<span class="m2">w_up</span><span class="b1">(</span><span class="v1">h</span><span class="b1">)</span><span class="b0">)</span>
+        <span class="k">return</span> <span class="v4">x</span>                                       <span class="c"># residual 2</span>
+
+<span class="c"># Relative-position check: shift every position by 1; scores must not move.</span>
+<span class="v4">cos</span>, <span class="v5">sin</span> = <span class="m1">rope_tables</span><span class="b0">(</span><span class="n">32</span>, <span class="n">128</span><span class="b0">)</span>
+<span class="v1">q</span>, <span class="v6">k</span> = <span class="m1">torch</span>.<span class="m2">randn</span><span class="b0">(</span><span class="n">1</span>, <span class="n">1</span>, <span class="n">10</span>, <span class="n">32</span><span class="b0">)</span>, <span class="m1">torch</span>.<span class="m2">randn</span><span class="b0">(</span><span class="n">1</span>, <span class="n">1</span>, <span class="n">10</span>, <span class="n">32</span><span class="b0">)</span>
+<span class="v3">s0</span> = <span class="b0">(</span><span class="m1">apply_rope</span><span class="b1">(</span><span class="v1">q</span>, <span class="v4">cos</span><span class="b2">[</span><span class="n">0</span>:<span class="n">10</span><span class="b2">]</span>, <span class="v5">sin</span><span class="b2">[</span><span class="n">0</span>:<span class="n">10</span><span class="b2">]</span><span class="b1">)[</span><span class="n">0</span>, <span class="n">0</span>, <span class="n">3</span><span class="b1">]</span>
+      * <span class="m1">apply_rope</span><span class="b1">(</span><span class="v6">k</span>, <span class="v4">cos</span><span class="b2">[</span><span class="n">0</span>:<span class="n">10</span><span class="b2">]</span>, <span class="v5">sin</span><span class="b2">[</span><span class="n">0</span>:<span class="n">10</span><span class="b2">]</span><span class="b1">)[</span><span class="n">0</span>, <span class="n">0</span>, <span class="n">7</span><span class="b1">]</span><span class="b0">)</span>.<span class="m2">sum</span><span class="b0">()</span>
+<span class="v1">s1</span> = <span class="b0">(</span><span class="m1">apply_rope</span><span class="b1">(</span><span class="v1">q</span>, <span class="v4">cos</span><span class="b2">[</span><span class="n">1</span>:<span class="n">11</span><span class="b2">]</span>, <span class="v5">sin</span><span class="b2">[</span><span class="n">1</span>:<span class="n">11</span><span class="b2">]</span><span class="b1">)[</span><span class="n">0</span>, <span class="n">0</span>, <span class="n">3</span><span class="b1">]</span>
+      * <span class="m1">apply_rope</span><span class="b1">(</span><span class="v6">k</span>, <span class="v4">cos</span><span class="b2">[</span><span class="n">1</span>:<span class="n">11</span><span class="b2">]</span>, <span class="v5">sin</span><span class="b2">[</span><span class="n">1</span>:<span class="n">11</span><span class="b2">]</span><span class="b1">)[</span><span class="n">0</span>, <span class="n">0</span>, <span class="n">7</span><span class="b1">]</span><span class="b0">)</span>.<span class="m2">sum</span><span class="b0">()</span>
+<span class="k">assert</span> <span class="m1">torch</span>.<span class="m2">allclose</span><span class="b0">(</span><span class="v3">s0</span>, <span class="v1">s1</span>, <span class="v2">atol</span>=<span class="n">1e-4</span><span class="b0">)</span>               <span class="c"># passes on this H100</span></code></pre>
+            <pre data-lang="jax" class="shl lang"><code class="language-python"><span class="k">import</span> <span class="m1">jax</span>
+<span class="k">import</span> <span class="m1">jax</span>.<span class="m2">numpy</span> <span class="k">as</span> <span class="m1">jnp</span>
+
+<span class="k">def</span> <span class="m1">rope_tables</span><span class="b0">(</span><span class="v6">head_dim</span>, <span class="v6">max_seq</span>, <span class="v0">base</span>=<span class="n">10000.0</span><span class="b0">)</span>:
+    <span class="v1">inv_freq</span> = <span class="v0">base</span> ** <span class="b0">(</span>-<span class="m1">jnp</span>.<span class="m2">arange</span><span class="b1">(</span><span class="n">0</span>, <span class="v6">head_dim</span>, <span class="n">2</span><span class="b1">)</span> / <span class="v6">head_dim</span><span class="b0">)</span>  <span class="c"># (hd/2,)</span>
+    <span class="v5">ang</span> = <span class="m1">jnp</span>.<span class="m2">arange</span><span class="b0">(</span><span class="v6">max_seq</span><span class="b0">)[</span>:, <span class="k">None</span><span class="b0">]</span> * <span class="v1">inv_freq</span><span class="b0">[</span><span class="k">None</span>, :<span class="b0">]</span>       <span class="c"># (S, hd/2)</span>
+    <span class="k">return</span> <span class="m1">jnp</span>.<span class="m2">cos</span><span class="b0">(</span><span class="v5">ang</span><span class="b0">)</span>, <span class="m1">jnp</span>.<span class="m2">sin</span><span class="b0">(</span><span class="v5">ang</span><span class="b0">)</span>
+
+<span class="k">def</span> <span class="m1">apply_rope</span><span class="b0">(</span><span class="v4">x</span>, <span class="v4">cos</span>, <span class="v5">sin</span><span class="b0">)</span>:
+    <span class="c"># x: (B, H, S, hd); rotate each (even, odd) pair by the position angle</span>
+    <span class="v0">x_even</span>, <span class="v3">x_odd</span> = <span class="v4">x</span><span class="b0">[</span>..., <span class="n">0</span>::<span class="n">2</span><span class="b0">]</span>, <span class="v4">x</span><span class="b0">[</span>..., <span class="n">1</span>::<span class="n">2</span><span class="b0">]</span>         <span class="c"># (B, H, S, hd/2)</span>
+    <span class="v1">c</span>, <span class="v4">s</span> = <span class="v4">cos</span><span class="b0">[</span><span class="k">None</span>, <span class="k">None</span><span class="b0">]</span>, <span class="v5">sin</span><span class="b0">[</span><span class="k">None</span>, <span class="k">None</span><span class="b0">]</span>
+    <span class="v3">rot_even</span> = <span class="v0">x_even</span> * <span class="v1">c</span> - <span class="v3">x_odd</span> * <span class="v4">s</span>
+    <span class="v1">rot_odd</span>  = <span class="v0">x_even</span> * <span class="v4">s</span> + <span class="v3">x_odd</span> * <span class="v1">c</span>
+    <span class="c"># re-interleave to (..., hd): [e0, o0, e1, o1, ...]</span>
+    <span class="k">return</span> <span class="m1">jnp</span>.<span class="m2">stack</span><span class="b0">(</span><span class="b1">[</span><span class="v3">rot_even</span>, <span class="v1">rot_odd</span><span class="b1">]</span>, <span class="v4">axis</span>=-<span class="n">1</span><span class="b0">)</span>.<span class="m2">reshape</span><span class="b0">(</span><span class="v4">x</span>.<span class="m2">shape</span><span class="b0">)</span>
+
+<span class="k">def</span> <span class="m1">rms_norm</span><span class="b0">(</span><span class="v4">x</span>, <span class="v6">weight</span>, <span class="v3">eps</span>=<span class="n">1e-6</span><span class="b0">)</span>:
+    <span class="v3">var</span> = <span class="m1">jnp</span>.<span class="m2">mean</span><span class="b0">(</span><span class="m1">jnp</span>.<span class="m2">square</span><span class="b1">(</span><span class="v4">x</span>.<span class="m2">astype</span><span class="b2">(</span><span class="m1">jnp</span>.<span class="m2">float32</span><span class="b2">)</span><span class="b1">)</span>, <span class="v4">axis</span>=-<span class="n">1</span>, <span class="v3">keepdims</span>=<span class="k">True</span><span class="b0">)</span>
+    <span class="k">return</span> <span class="b0">(</span><span class="v4">x</span> * <span class="m1">jax</span>.<span class="m2">lax</span>.<span class="m2">rsqrt</span><span class="b1">(</span><span class="v3">var</span> + <span class="v3">eps</span><span class="b1">)</span><span class="b0">)</span>.<span class="m2">astype</span><span class="b0">(</span><span class="v4">x</span>.<span class="m2">dtype</span><span class="b0">)</span> * <span class="v6">weight</span>
+
+<span class="k">def</span> <span class="m1">gqa_block</span><span class="b0">(</span><span class="v1">params</span>, <span class="v4">x</span>, <span class="v4">cos</span>, <span class="v5">sin</span>, <span class="v5">n_heads</span>, <span class="v6">n_kv</span><span class="b0">)</span>:
+    <span class="v0">B</span>, <span class="v5">S</span>, <span class="v4">d</span> = <span class="v4">x</span>.<span class="m2">shape</span>
+    <span class="v1">hd</span> = <span class="v4">d</span> // <span class="v5">n_heads</span>
+    <span class="v1">h</span> = <span class="m1">rms_norm</span><span class="b0">(</span><span class="v4">x</span>, <span class="v1">params</span><span class="b1">[</span><span class="s">"norm1"</span><span class="b1">]</span><span class="b0">)</span>
+    <span class="v1">q</span> = <span class="b0">(</span><span class="v1">h</span> @ <span class="v1">params</span><span class="b1">[</span><span class="s">"wq"</span><span class="b1">]</span><span class="b0">)</span>.<span class="m2">reshape</span><span class="b0">(</span><span class="v0">B</span>, <span class="v5">S</span>, <span class="v5">n_heads</span>, <span class="v1">hd</span><span class="b0">)</span>.<span class="m2">transpose</span><span class="b0">(</span><span class="n">0</span>, <span class="n">2</span>, <span class="n">1</span>, <span class="n">3</span><span class="b0">)</span>
+    <span class="v6">k</span> = <span class="b0">(</span><span class="v1">h</span> @ <span class="v1">params</span><span class="b1">[</span><span class="s">"wk"</span><span class="b1">]</span><span class="b0">)</span>.<span class="m2">reshape</span><span class="b0">(</span><span class="v0">B</span>, <span class="v5">S</span>, <span class="v6">n_kv</span>,    <span class="v1">hd</span><span class="b0">)</span>.<span class="m2">transpose</span><span class="b0">(</span><span class="n">0</span>, <span class="n">2</span>, <span class="n">1</span>, <span class="n">3</span><span class="b0">)</span>
+    <span class="v3">v</span> = <span class="b0">(</span><span class="v1">h</span> @ <span class="v1">params</span><span class="b1">[</span><span class="s">"wv"</span><span class="b1">]</span><span class="b0">)</span>.<span class="m2">reshape</span><span class="b0">(</span><span class="v0">B</span>, <span class="v5">S</span>, <span class="v6">n_kv</span>,    <span class="v1">hd</span><span class="b0">)</span>.<span class="m2">transpose</span><span class="b0">(</span><span class="n">0</span>, <span class="n">2</span>, <span class="n">1</span>, <span class="n">3</span><span class="b0">)</span>
+    <span class="v1">q</span> = <span class="m1">apply_rope</span><span class="b0">(</span><span class="v1">q</span>, <span class="v4">cos</span><span class="b1">[</span>:<span class="v5">S</span><span class="b1">]</span>, <span class="v5">sin</span><span class="b1">[</span>:<span class="v5">S</span><span class="b1">]</span><span class="b0">)</span>                <span class="c"># (B, nh,  S, hd)</span>
+    <span class="v6">k</span> = <span class="m1">apply_rope</span><span class="b0">(</span><span class="v6">k</span>, <span class="v4">cos</span><span class="b1">[</span>:<span class="v5">S</span><span class="b1">]</span>, <span class="v5">sin</span><span class="b1">[</span>:<span class="v5">S</span><span class="b1">]</span><span class="b0">)</span>                <span class="c"># values NOT rotated</span>
+    <span class="v6">k</span> = <span class="m1">jnp</span>.<span class="m2">repeat</span><span class="b0">(</span><span class="v6">k</span>, <span class="v5">n_heads</span> // <span class="v6">n_kv</span>, <span class="v4">axis</span>=<span class="n">1</span><span class="b0">)</span>         <span class="c"># broadcast KV heads</span>
+    <span class="v3">v</span> = <span class="m1">jnp</span>.<span class="m2">repeat</span><span class="b0">(</span><span class="v3">v</span>, <span class="v5">n_heads</span> // <span class="v6">n_kv</span>, <span class="v4">axis</span>=<span class="n">1</span><span class="b0">)</span>
+    <span class="c"># explicit masked softmax; production code calls a fused kernel here</span>
+    <span class="v0">scores</span> = <span class="v1">q</span> @ <span class="v6">k</span>.<span class="m2">transpose</span><span class="b0">(</span><span class="n">0</span>, <span class="n">1</span>, <span class="n">3</span>, <span class="n">2</span><span class="b0">)</span> / <span class="m1">jnp</span>.<span class="m2">sqrt</span><span class="b0">(</span><span class="v1">hd</span><span class="b0">)</span>   <span class="c"># (B, nh, S, S)</span>
+    <span class="v3">mask</span> = <span class="m1">jnp</span>.<span class="m2">tril</span><span class="b0">(</span><span class="m1">jnp</span>.<span class="m2">ones</span><span class="b1">(</span><span class="b2">(</span><span class="v5">S</span>, <span class="v5">S</span><span class="b2">)</span>, <span class="v3">dtype</span>=<span class="m1">bool</span><span class="b1">)</span><span class="b0">)</span>
+    <span class="v0">scores</span> = <span class="m1">jnp</span>.<span class="m2">where</span><span class="b0">(</span><span class="v3">mask</span>, <span class="v0">scores</span>, -<span class="m1">jnp</span>.<span class="m2">inf</span><span class="b0">)</span>         <span class="c"># -inf, not -1e9</span>
+    <span class="v0">o</span> = <span class="m1">jax</span>.<span class="m2">nn</span>.<span class="m2">softmax</span><span class="b0">(</span><span class="v0">scores</span>, <span class="v4">axis</span>=-<span class="n">1</span><span class="b0">)</span> @ <span class="v3">v</span>            <span class="c"># (B, nh, S, hd)</span>
+    <span class="v0">o</span> = <span class="v0">o</span>.<span class="m2">transpose</span><span class="b0">(</span><span class="n">0</span>, <span class="n">2</span>, <span class="n">1</span>, <span class="n">3</span><span class="b0">)</span>.<span class="m2">reshape</span><span class="b0">(</span><span class="v0">B</span>, <span class="v5">S</span>, <span class="v5">n_heads</span> * <span class="v1">hd</span><span class="b0">)</span>
+    <span class="v4">x</span> = <span class="v4">x</span> + <span class="v0">o</span> @ <span class="v1">params</span><span class="b0">[</span><span class="s">"wo"</span><span class="b0">]</span>                           <span class="c"># residual 1</span>
+    <span class="v1">h</span> = <span class="m1">rms_norm</span><span class="b0">(</span><span class="v4">x</span>, <span class="v1">params</span><span class="b1">[</span><span class="s">"norm2"</span><span class="b1">]</span><span class="b0">)</span>
+    <span class="v1">ff</span> = <span class="b0">(</span><span class="m1">jax</span>.<span class="m2">nn</span>.<span class="m2">silu</span><span class="b1">(</span><span class="v1">h</span> @ <span class="v1">params</span><span class="b2">[</span><span class="s">"w_gate"</span><span class="b2">]</span><span class="b1">)</span> * <span class="b1">(</span><span class="v1">h</span> @ <span class="v1">params</span><span class="b2">[</span><span class="s">"w_up"</span><span class="b2">]</span><span class="b1">)</span><span class="b0">)</span>
+    <span class="k">return</span> <span class="v4">x</span> + <span class="v1">ff</span> @ <span class="v1">params</span><span class="b0">[</span><span class="s">"w_down"</span><span class="b0">]</span>                   <span class="c"># residual 2</span>
+
+<span class="c"># init and one jitted call, d=256, 8 query heads sharing 2 KV heads</span>
+<span class="v4">d</span>, <span class="v0">nh</span>, <span class="v4">nkv</span>, <span class="v6">dff</span> = <span class="n">256</span>, <span class="n">8</span>, <span class="n">2</span>, <span class="n">704</span>                       <span class="c"># 704 = round(8/3 d)</span>
+<span class="v5">ks</span> = <span class="m1">jax</span>.<span class="m2">random</span>.<span class="m2">split</span><span class="b0">(</span><span class="m1">jax</span>.<span class="m2">random</span>.<span class="m2">PRNGKey</span><span class="b1">(</span><span class="n">0</span><span class="b1">)</span>, <span class="n">8</span><span class="b0">)</span>
+<span class="m1">init</span> = <span class="k">lambda</span> <span class="v6">k</span>, <span class="v2">shp</span>: <span class="m1">jax</span>.<span class="m2">random</span>.<span class="m2">normal</span><span class="b0">(</span><span class="v6">k</span>, <span class="v2">shp</span><span class="b0">)</span> * <span class="n">0.02</span>
+<span class="v1">params</span> = <span class="b0">{</span>
+    <span class="s">"wq"</span>: <span class="m1">init</span><span class="b1">(</span><span class="v5">ks</span><span class="b2">[</span><span class="n">0</span><span class="b2">]</span>, <span class="b2">(</span><span class="v4">d</span>, <span class="v4">d</span><span class="b2">)</span><span class="b1">)</span>,
+    <span class="s">"wk"</span>: <span class="m1">init</span><span class="b1">(</span><span class="v5">ks</span><span class="b2">[</span><span class="n">1</span><span class="b2">]</span>, <span class="b2">(</span><span class="v4">d</span>, <span class="v4">nkv</span> * <span class="b0">(</span><span class="v4">d</span> // <span class="v0">nh</span><span class="b0">)</span><span class="b2">)</span><span class="b1">)</span>,           <span class="c"># (256, 64): small</span>
+    <span class="s">"wv"</span>: <span class="m1">init</span><span class="b1">(</span><span class="v5">ks</span><span class="b2">[</span><span class="n">2</span><span class="b2">]</span>, <span class="b2">(</span><span class="v4">d</span>, <span class="v4">nkv</span> * <span class="b0">(</span><span class="v4">d</span> // <span class="v0">nh</span><span class="b0">)</span><span class="b2">)</span><span class="b1">)</span>,
+    <span class="s">"wo"</span>: <span class="m1">init</span><span class="b1">(</span><span class="v5">ks</span><span class="b2">[</span><span class="n">3</span><span class="b2">]</span>, <span class="b2">(</span><span class="v4">d</span>, <span class="v4">d</span><span class="b2">)</span><span class="b1">)</span>,
+    <span class="s">"w_gate"</span>: <span class="m1">init</span><span class="b1">(</span><span class="v5">ks</span><span class="b2">[</span><span class="n">4</span><span class="b2">]</span>, <span class="b2">(</span><span class="v4">d</span>, <span class="v6">dff</span><span class="b2">)</span><span class="b1">)</span>, <span class="s">"w_up"</span>: <span class="m1">init</span><span class="b1">(</span><span class="v5">ks</span><span class="b2">[</span><span class="n">5</span><span class="b2">]</span>, <span class="b2">(</span><span class="v4">d</span>, <span class="v6">dff</span><span class="b2">)</span><span class="b1">)</span>,
+    <span class="s">"w_down"</span>: <span class="m1">init</span><span class="b1">(</span><span class="v5">ks</span><span class="b2">[</span><span class="n">6</span><span class="b2">]</span>, <span class="b2">(</span><span class="v6">dff</span>, <span class="v4">d</span><span class="b2">)</span><span class="b1">)</span>,
+    <span class="s">"norm1"</span>: <span class="m1">jnp</span>.<span class="m2">ones</span><span class="b1">(</span><span class="v4">d</span><span class="b1">)</span>, <span class="s">"norm2"</span>: <span class="m1">jnp</span>.<span class="m2">ones</span><span class="b1">(</span><span class="v4">d</span><span class="b1">)</span>,
+<span class="b0">}</span>
+<span class="v4">cos</span>, <span class="v5">sin</span> = <span class="m1">rope_tables</span><span class="b0">(</span><span class="v4">d</span> // <span class="v0">nh</span>, <span class="n">128</span><span class="b0">)</span>
+<span class="v4">x</span> = <span class="m1">jax</span>.<span class="m2">random</span>.<span class="m2">normal</span><span class="b0">(</span><span class="v5">ks</span><span class="b1">[</span><span class="n">7</span><span class="b1">]</span>, <span class="b1">(</span><span class="n">2</span>, <span class="n">64</span>, <span class="v4">d</span><span class="b1">)</span><span class="b0">)</span>               <span class="c"># (B=2, S=64, d)</span>
+<span class="v6">y</span> = <span class="m1">jax</span>.<span class="m2">jit</span><span class="b0">(</span><span class="m1">gqa_block</span>, <span class="v4">static_argnames</span>=<span class="b1">(</span><span class="s">"n_heads"</span>, <span class="s">"n_kv"</span><span class="b1">)</span><span class="b0">)(</span>
+    <span class="v1">params</span>, <span class="v4">x</span>, <span class="v4">cos</span>, <span class="v5">sin</span>, <span class="v0">nh</span>, <span class="v4">nkv</span><span class="b0">)</span>                      <span class="c"># (2, 64, 256)</span></code></pre>
+          </div>
+
+          <p>
+            The training step is where the mixed-precision policy lives.
+            In PyTorch, autocast runs matmuls in bf16 while master weights,
+            gradients, and the optimizer remain fp32; the cross-entropy is
+            computed on fp32 logits; gradients are clipped by global norm
+            (the standard defense against loss spikes) with AdamW betas
+            (0.9, 0.95) and a warmup schedule, the settings that have been
+            near-universal since GPT-3. The JAX version expresses the same
+            policy functionally: parameters stay fp32, a bf16-cast copy
+            feeds the forward pass, and optax composes clipping, warmup
+            cosine decay, and decoupled weight decay into one gradient
+            transformation. Neither uses a loss scaler because neither uses
+            fp16; a comment marks where one would go.
+          </p>
+
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="pytorch" class="active">PyTorch</button>
+              <button data-lang="jax">JAX</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="pytorch" class="shl lang active"><code class="language-python"><span class="k">import</span> <span class="m1">torch</span>
+<span class="k">import</span> <span class="m1">torch</span>.<span class="m2">nn</span>.<span class="m2">functional</span> <span class="k">as</span> <span class="m1">F</span>
+
+<span class="c"># model: any nn.Module mapping (B, S) int64 tokens -&gt; (B, S, V) logits.</span>
+<span class="c"># Parameters and optimizer state stay fp32; autocast runs matmuls in bf16.</span>
+<span class="v1">opt</span> = <span class="m1">torch</span>.<span class="m2">optim</span>.<span class="m2">AdamW</span><span class="b0">(</span><span class="m1">model</span>.<span class="m2">parameters</span><span class="b1">()</span>, <span class="v4">lr</span>=<span class="n">3e-4</span>,
+                        <span class="v3">betas</span>=<span class="b1">(</span><span class="n">0.9</span>, <span class="n">0.95</span><span class="b1">)</span>, <span class="v4">weight_decay</span>=<span class="n">0.1</span><span class="b0">)</span>
+<span class="v0">warmup</span> = <span class="n">2000</span>
+<span class="v1">sched</span> = <span class="m1">torch</span>.<span class="m2">optim</span>.<span class="m2">lr_scheduler</span>.<span class="m2">LambdaLR</span><span class="b0">(</span>
+    <span class="v1">opt</span>, <span class="k">lambda</span> <span class="v6">step</span>: <span class="m1">min</span><span class="b1">(</span><span class="n">1.0</span>, <span class="b2">(</span><span class="v6">step</span> + <span class="n">1</span><span class="b2">)</span> / <span class="v0">warmup</span><span class="b1">)</span><span class="b0">)</span>   <span class="c"># then cosine, elided</span>
+
+<span class="k">def</span> <span class="m1">train_step</span><span class="b0">(</span><span class="v0">tokens</span><span class="b0">)</span>:
+    <span class="c"># tokens: (B, S+1); inputs tokens[:, :-1], targets tokens[:, 1:]</span>
+    <span class="v0">inputs</span>, <span class="v1">targets</span> = <span class="v0">tokens</span><span class="b0">[</span>:, :-<span class="n">1</span><span class="b0">]</span>, <span class="v0">tokens</span><span class="b0">[</span>:, <span class="n">1</span>:<span class="b0">]</span>
+    <span class="k">with</span> <span class="m1">torch</span>.<span class="m2">autocast</span><span class="b0">(</span><span class="s">"cuda"</span>, <span class="v3">dtype</span>=<span class="m1">torch</span>.<span class="m2">bfloat16</span><span class="b0">)</span>:
+        <span class="v6">logits</span> = <span class="m1">model</span><span class="b0">(</span><span class="v0">inputs</span><span class="b0">)</span>                         <span class="c"># (B, S, V) in bf16</span>
+        <span class="v6">loss</span> = <span class="m1">F</span>.<span class="m2">cross_entropy</span><span class="b0">(</span>                        <span class="c"># loss math in fp32</span>
+            <span class="v6">logits</span>.<span class="m2">reshape</span><span class="b1">(</span>-<span class="n">1</span>, <span class="v6">logits</span>.<span class="m2">size</span><span class="b2">(</span>-<span class="n">1</span><span class="b2">)</span><span class="b1">)</span>.<span class="m2">float</span><span class="b1">()</span>,
+            <span class="v1">targets</span>.<span class="m2">reshape</span><span class="b1">(</span>-<span class="n">1</span><span class="b1">)</span><span class="b0">)</span>
+    <span class="c"># bf16 needs no GradScaler; with fp16 this would be</span>
+    <span class="c"># scaler.scale(loss).backward(); scaler.unscale_(opt); ...</span>
+    <span class="v6">loss</span>.<span class="m2">backward</span><span class="b0">()</span>                                    <span class="c"># grads land in fp32</span>
+    <span class="v2">grad_norm</span> = <span class="m1">torch</span>.<span class="m2">nn</span>.<span class="m2">utils</span>.<span class="m2">clip_grad_norm_</span><span class="b0">(</span><span class="m1">model</span>.<span class="m2">parameters</span><span class="b1">()</span>, <span class="n">1.0</span><span class="b0">)</span>
+    <span class="v1">opt</span>.<span class="m2">step</span><span class="b0">()</span>
+    <span class="v1">opt</span>.<span class="m2">zero_grad</span><span class="b0">(</span><span class="v6">set_to_none</span>=<span class="k">True</span><span class="b0">)</span>
+    <span class="v1">sched</span>.<span class="m2">step</span><span class="b0">()</span>
+    <span class="k">return</span> <span class="v6">loss</span>.<span class="m2">detach</span><span class="b0">()</span>, <span class="v2">grad_norm</span>                    <span class="c"># log both every step</span></code></pre>
+            <pre data-lang="jax" class="shl lang"><code class="language-python"><span class="k">import</span> <span class="m1">jax</span>
+<span class="k">import</span> <span class="m1">jax</span>.<span class="m2">numpy</span> <span class="k">as</span> <span class="m1">jnp</span>
+<span class="k">import</span> <span class="m1">optax</span>
+
+<span class="c"># model_apply: params, (B, S) int32 tokens -&gt; (B, S, V) logits (pure fn)</span>
+
+<span class="k">def</span> <span class="m1">loss_fn</span><span class="b0">(</span><span class="v1">params</span>, <span class="v0">tokens</span><span class="b0">)</span>:
+    <span class="v0">inputs</span>, <span class="v1">targets</span> = <span class="v0">tokens</span><span class="b0">[</span>:, :-<span class="n">1</span><span class="b0">]</span>, <span class="v0">tokens</span><span class="b0">[</span>:, <span class="n">1</span>:<span class="b0">]</span>
+    <span class="c"># mixed precision, functionally: params stay fp32 (the master copy);</span>
+    <span class="c"># a bf16-cast view feeds the forward pass, loss math runs in fp32</span>
+    <span class="v0">p16</span> = <span class="m1">jax</span>.<span class="m2">tree</span>.<span class="m2">map</span><span class="b0">(</span><span class="k">lambda</span> <span class="v5">w</span>: <span class="v5">w</span>.<span class="m2">astype</span><span class="b1">(</span><span class="m1">jnp</span>.<span class="m2">bfloat16</span><span class="b1">)</span>, <span class="v1">params</span><span class="b0">)</span>
+    <span class="v6">logits</span> = <span class="m1">model_apply</span><span class="b0">(</span><span class="v0">p16</span>, <span class="v0">inputs</span><span class="b0">)</span>.<span class="m2">astype</span><span class="b0">(</span><span class="m1">jnp</span>.<span class="m2">float32</span><span class="b0">)</span>  <span class="c"># (B, S, V)</span>
+    <span class="v5">logp</span> = <span class="m1">jax</span>.<span class="m2">nn</span>.<span class="m2">log_softmax</span><span class="b0">(</span><span class="v6">logits</span>, <span class="v4">axis</span>=-<span class="n">1</span><span class="b0">)</span>
+    <span class="v0">nll</span> = -<span class="m1">jnp</span>.<span class="m2">take_along_axis</span><span class="b0">(</span><span class="v5">logp</span>, <span class="v1">targets</span><span class="b1">[</span>..., <span class="k">None</span><span class="b1">]</span>, <span class="v4">axis</span>=-<span class="n">1</span><span class="b0">)</span>
+    <span class="k">return</span> <span class="v0">nll</span>.<span class="m2">mean</span><span class="b0">()</span>                                  <span class="c"># no loss scale: bf16</span>
+
+<span class="v1">tx</span> = <span class="m1">optax</span>.<span class="m2">chain</span><span class="b0">(</span>
+    <span class="m1">optax</span>.<span class="m2">clip_by_global_norm</span><span class="b1">(</span><span class="n">1.0</span><span class="b1">)</span>,                    <span class="c"># spike defense</span>
+    <span class="m1">optax</span>.<span class="m2">adamw</span><span class="b1">(</span><span class="m1">optax</span>.<span class="m2">warmup_cosine_decay_schedule</span><span class="b2">(</span>
+        <span class="n">0.0</span>, <span class="v1">peak_value</span>=<span class="n">3e-4</span>, <span class="v5">warmup_steps</span>=<span class="n">2000</span>, <span class="v3">decay_steps</span>=<span class="n">100_000</span><span class="b2">)</span>,
+        <span class="v0">b1</span>=<span class="n">0.9</span>, <span class="v1">b2</span>=<span class="n">0.95</span>, <span class="v4">weight_decay</span>=<span class="n">0.1</span><span class="b1">)</span>,
+<span class="b0">)</span>
+
+<span class="m1">@jax.jit</span>
+<span class="k">def</span> <span class="m1">train_step</span><span class="b0">(</span><span class="v1">params</span>, <span class="v4">opt_state</span>, <span class="v0">tokens</span><span class="b0">)</span>:
+    <span class="v6">loss</span>, <span class="v2">grads</span> = <span class="m1">jax</span>.<span class="m2">value_and_grad</span><span class="b0">(</span><span class="m1">loss_fn</span><span class="b0">)(</span><span class="v1">params</span>, <span class="v0">tokens</span><span class="b0">)</span>
+    <span class="v2">updates</span>, <span class="v4">opt_state</span> = <span class="v1">tx</span>.<span class="m2">update</span><span class="b0">(</span><span class="v2">grads</span>, <span class="v4">opt_state</span>, <span class="v1">params</span><span class="b0">)</span>
+    <span class="v1">params</span> = <span class="m1">optax</span>.<span class="m2">apply_updates</span><span class="b0">(</span><span class="v1">params</span>, <span class="v2">updates</span><span class="b0">)</span>      <span class="c"># fp32 master update</span>
+    <span class="k">return</span> <span class="v1">params</span>, <span class="v4">opt_state</span>, <span class="v6">loss</span>
+
+<span class="c"># opt_state = tx.init(params); then loop:</span>
+<span class="c"># params, opt_state, loss = train_step(params, opt_state, batch)</span>
+<span class="c"># Sharding: wrap train_step in jax.jit with in_shardings over a mesh and</span>
+<span class="c"># the same code runs data-, tensor-, or fully-sharded (ZeRO-3) parallel.</span></code></pre>
+          </div>
+
+          <p>
+            Finally, the kernel view. RMSNorm is the simplest realistic
+            example of the fusion argument made throughout this page: as
+            three separate operations (square-and-reduce, rsqrt-scale,
+            gain multiply) it would round-trip the activation tensor
+            through HBM three times; as one Triton kernel each row is
+            loaded once into registers, reduced, scaled, and stored once.
+            One program instance handles one row, the row must fit in a
+            power-of-two block, and the reduction is done in fp32
+            regardless of the tensor dtype, mirroring the precision note in
+            the RMSNorm section. Verified against the PyTorch reference to
+            within bf16 rounding on this machine.
+          </p>
+
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="triton" class="active">Triton</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="triton" class="shl lang active"><code class="language-python"><span class="k">import</span> <span class="m1">torch</span>
+<span class="k">import</span> <span class="m1">triton</span>
+<span class="k">import</span> <span class="m1">triton</span>.<span class="m2">language</span> <span class="k">as</span> <span class="m1">tl</span>
+
+<span class="m1">@triton.jit</span>
+<span class="k">def</span> <span class="m1">rmsnorm_fwd</span><span class="b0">(</span><span class="v5">X</span>, <span class="v6">W</span>, <span class="v0">Y</span>, <span class="v5">stride</span>, <span class="v5">D</span>, <span class="v3">eps</span>, <span class="v5">BLOCK</span>: <span class="m1">tl</span>.<span class="m2">constexpr</span><span class="b0">)</span>:
+    <span class="s">"""One program per row: load once, reduce in fp32, store once.</span>
+<span class="s">    Unfused, this is 3 HBM round trips; fused, it is 1 read + 1 write."""</span>
+    <span class="v6">row</span> = <span class="m1">tl</span>.<span class="m2">program_id</span><span class="b0">(</span><span class="n">0</span><span class="b0">)</span>
+    <span class="v5">cols</span> = <span class="m1">tl</span>.<span class="m2">arange</span><span class="b0">(</span><span class="n">0</span>, <span class="v5">BLOCK</span><span class="b0">)</span>                 <span class="c"># BLOCK = next pow2 &gt;= D</span>
+    <span class="v3">mask</span> = <span class="v5">cols</span> &lt; <span class="v5">D</span>
+    <span class="v4">x</span> = <span class="m1">tl</span>.<span class="m2">load</span><span class="b0">(</span><span class="v5">X</span> + <span class="v6">row</span> * <span class="v5">stride</span> + <span class="v5">cols</span>, <span class="v3">mask</span>=<span class="v3">mask</span>, <span class="v6">other</span>=<span class="n">0.0</span><span class="b0">)</span>.<span class="m2">to</span><span class="b0">(</span><span class="m1">tl</span>.<span class="m2">float32</span><span class="b0">)</span>
+    <span class="v0">ms</span> = <span class="m1">tl</span>.<span class="m2">sum</span><span class="b0">(</span><span class="v4">x</span> * <span class="v4">x</span>, <span class="v4">axis</span>=<span class="n">0</span><span class="b0">)</span> / <span class="v5">D</span>             <span class="c"># mean of squares, fp32</span>
+    <span class="v0">rstd</span> = <span class="n">1.0</span> / <span class="m1">tl</span>.<span class="m2">sqrt</span><span class="b0">(</span><span class="v0">ms</span> + <span class="v3">eps</span><span class="b0">)</span>
+    <span class="v5">w</span> = <span class="m1">tl</span>.<span class="m2">load</span><span class="b0">(</span><span class="v6">W</span> + <span class="v5">cols</span>, <span class="v3">mask</span>=<span class="v3">mask</span>, <span class="v6">other</span>=<span class="n">0.0</span><span class="b0">)</span>.<span class="m2">to</span><span class="b0">(</span><span class="m1">tl</span>.<span class="m2">float32</span><span class="b0">)</span>
+    <span class="v6">y</span> = <span class="v4">x</span> * <span class="v0">rstd</span> * <span class="v5">w</span>
+    <span class="m1">tl</span>.<span class="m2">store</span><span class="b0">(</span><span class="v0">Y</span> + <span class="v6">row</span> * <span class="v5">stride</span> + <span class="v5">cols</span>, <span class="v6">y</span>.<span class="m2">to</span><span class="b1">(</span><span class="v0">Y</span>.<span class="m2">dtype</span>.<span class="m2">element_ty</span><span class="b1">)</span>, <span class="v3">mask</span>=<span class="v3">mask</span><span class="b0">)</span>
+
+<span class="k">def</span> <span class="m1">rmsnorm</span><span class="b0">(</span><span class="v4">x</span>: <span class="m1">torch</span>.<span class="m2">Tensor</span>, <span class="v6">weight</span>: <span class="m1">torch</span>.<span class="m2">Tensor</span>, <span class="v3">eps</span>: <span class="m1">float</span> = <span class="n">1e-6</span><span class="b0">)</span>:
+    <span class="v4">shape</span> = <span class="v4">x</span>.<span class="m2">shape</span>
+    <span class="v3">x2</span> = <span class="v4">x</span>.<span class="m2">reshape</span><span class="b0">(</span>-<span class="n">1</span>, <span class="v4">shape</span><span class="b1">[</span>-<span class="n">1</span><span class="b1">]</span><span class="b0">)</span>.<span class="m2">contiguous</span><span class="b0">()</span> <span class="c"># (rows, D)</span>
+    <span class="v5">M</span>, <span class="v5">D</span> = <span class="v3">x2</span>.<span class="m2">shape</span>
+    <span class="v6">y</span> = <span class="m1">torch</span>.<span class="m2">empty_like</span><span class="b0">(</span><span class="v3">x2</span><span class="b0">)</span>
+    <span class="v5">BLOCK</span> = <span class="m1">triton</span>.<span class="m2">next_power_of_2</span><span class="b0">(</span><span class="v5">D</span><span class="b0">)</span>          <span class="c"># row must fit one block</span>
+    <span class="m1">rmsnorm_fwd</span><span class="b0">[</span><span class="b1">(</span><span class="v5">M</span>,<span class="b1">)</span><span class="b0">](</span><span class="v3">x2</span>, <span class="v6">weight</span>, <span class="v6">y</span>, <span class="v3">x2</span>.<span class="m2">stride</span><span class="b1">(</span><span class="n">0</span><span class="b1">)</span>, <span class="v5">D</span>, <span class="v3">eps</span>, <span class="v5">BLOCK</span>=<span class="v5">BLOCK</span><span class="b0">)</span>
+    <span class="k">return</span> <span class="v6">y</span>.<span class="m2">reshape</span><span class="b0">(</span><span class="v4">shape</span><span class="b0">)</span>
+
+<span class="c"># checked on the H100 in this repo against the eager PyTorch reference:</span>
+<span class="c"># max abs error 0.0625 on bf16 (8, 1024, 2048), i.e. one bf16 ulp at |y|~8</span>
+<span class="v4">x</span> = <span class="m1">torch</span>.<span class="m2">randn</span><span class="b0">(</span><span class="n">8</span>, <span class="n">1024</span>, <span class="n">2048</span>, <span class="v6">device</span>=<span class="s">"cuda"</span>, <span class="v3">dtype</span>=<span class="m1">torch</span>.<span class="m2">bfloat16</span><span class="b0">)</span>
+<span class="v5">w</span> = <span class="m1">torch</span>.<span class="m2">ones</span><span class="b0">(</span><span class="n">2048</span>, <span class="v6">device</span>=<span class="s">"cuda"</span>, <span class="v3">dtype</span>=<span class="m1">torch</span>.<span class="m2">bfloat16</span><span class="b0">)</span>
+<span class="v2">out</span> = <span class="m1">rmsnorm</span><span class="b0">(</span><span class="v4">x</span>, <span class="v5">w</span><span class="b0">)</span>                            <span class="c"># (8, 1024, 2048)</span></code></pre>
+          </div>
+
+          <h2>How it is done in practice</h2>
+          <p>
+            The distance between these derivations and a production run is
+            mostly operational. A real pretraining job is a long-running
+            distributed system with a failure model: at thousands of GPUs,
+            hardware faults arrive daily (the Llama 3 report counts 466
+            interruptions across its 54-day 405B run, 78% from hardware),
+            so asynchronous distributed checkpointing, fast job restart,
+            and straggler detection are not conveniences but throughput
+            terms in expectation. Loss spikes are handled with a playbook
+            rather than a theory: global-norm clipping absorbs small ones;
+            large ones are handled by rewinding to a checkpoint and
+            skipping the offending data window; persistent instability
+            argues for lower learning rate or tighter numerics (fp32
+            attention logits, z-loss on the softmax normalizer). Monitoring
+            centers on the gradient norm, the loss, and per-layer
+            activation statistics, because divergence announces itself in
+            the gradient norm before the loss moves.
+          </p>
+          <p>
+            The hyperparameters of record have converged hard: AdamW with
+            betas (0.9, 0.95), weight decay 0.1, gradient clip 1.0, a few
+            thousand steps of linear warmup into cosine decay to about 10%
+            of peak learning rate, batch sizes in the millions of tokens,
+            often ramped during early training. Newer runs increasingly use
+            warmup-stable-decay schedules so that training length need not
+            be fixed in advance, plus a final anneal on a high-quality data
+            mix, both visible in open recipes like DeepSeek's and MiniCPM's
+            reports. Every scaling decision is de-risked at small scale
+            first: data mixtures, architecture tweaks, and hyperparameters
+            are screened on models 100-1000x smaller, using scaling-law
+            fits (and increasingly muP-style width-invariant
+            parameterizations) to extrapolate, because a single full-scale
+            experiment is unrepeatable by construction. And the serving
+            fleet is engineered against the arithmetic of the inference
+            section: GQA or MLA to shrink the cache, paged allocation to
+            stop wasting it, continuous batching to keep it full,
+            speculative decoding to spend idle FLOPs, and quantization
+            (weights first, KV cache second) to move the bandwidth floor
+            itself. The measured numbers on this page's H100, 27.7x from
+            attention fusion at 8K context, 14.5x from bf16 over fp32
+            matmuls, 4.26x from fusing one small elementwise chain, are the
+            reason systems engineers, not just modelers, set the pace of
+            this field.
+          </p>
+
+          <h2>The current research frontier</h2>
+          <p>
+            The clearest active front is precision. DeepSeek-V3
+            demonstrated fp8 matmuls for most of a 671B-parameter
+            pretraining run, with per-tile (128x128) scaling factors and
+            periodic promotion of accumulations to fp32 to contain the
+            error of Hopper's fp8 tensor-core accumulate; NVIDIA's
+            Transformer Engine productizes the same per-tensor and
+            per-block scaling machinery, and Blackwell-generation
+            microscaling formats (MXFP8, NVFP4) push block scaling into
+            hardware. On attention, the KV cache remains the target:
+            DeepSeek's multi-head latent attention (MLA) compresses keys
+            and values into a shared low-rank latent that is cached in
+            place of K and V, cutting cache size well below GQA at equal
+            quality, while trainable sparse attention (DeepSeek's NSA,
+            Moonshot's MoBA, both 2025) and hybrid state-space designs
+            (Mamba-2-based hybrids such as Jamba from AI21, and
+            NVIDIA's Nemotron-H) attack the quadratic term directly.
+            Context extension consolidated around RoPE remapping: position
+            interpolation (Chen et al., Meta, 2023), NTK-aware scaling from
+            the open-source community, and YaRN (Peng et al., 2023) are
+            the standard ladder, with ring/context parallelism handling
+            the training-time memory. On the objective side, multi-token
+            prediction (Gloeckle et al., Meta, 2024) adds auxiliary heads
+            predicting several future tokens, improving sample efficiency
+            and doubling as a built-in speculative drafter, adopted in
+            DeepSeek-V3. Scaling-law research moved past Chinchilla to
+            inference-aware and distillation-aware allocations, data-
+            constrained regimes (Muennighoff et al., 2023, on repeating
+            data), and learning-rate-schedule-aware fits; and the largest
+            budget shift of all is toward test-time compute, where
+            reasoning-trained models spend orders of magnitude more decode
+            FLOPs per query, which in turn re-prices every inference
+            optimization on this page. These lines are advancing from many
+            directions at once: DeepSeek, Moonshot, and Qwen on
+            architecture and fp8; Meta, Google DeepMind, Anthropic, and
+            OpenAI on scaling and post-training; NVIDIA on formats and
+            kernels; with academic groups (Tri Dao's lab at Princeton on
+            state-space models and kernels, Berkeley's Sky lab on serving)
+            supplying much of the systems substrate.
+          </p>
+
+          <h2>Open source to read</h2>
+          <p>
+            The fastest way to internalize this material is to read
+            working code in ascending order of complexity.
+          </p>
+          <ul>
+            <li><a href="https://github.com/karpathy/nanoGPT" target="_blank" rel="noreferrer">karpathy/nanoGPT</a>:
+              the whole pretraining loop in two files; read model.py, then
+              train.py for the AdamW/warmup/clipping recipe in its minimal
+              form.</li>
+            <li><a href="https://github.com/meta-llama/llama" target="_blank" rel="noreferrer">meta-llama/llama</a>:
+              the canonical reference for the modern block; llama/model.py
+              contains RoPE, RMSNorm, GQA, and SwiGLU in barely 300 lines,
+              directly comparable to the code above.</li>
+            <li><a href="https://github.com/Dao-AILab/flash-attention" target="_blank" rel="noreferrer">Dao-AILab/flash-attention</a>:
+              the kernels behind the attention measurements here; start
+              with the Triton implementation in
+              flash_attn/flash_attn_triton.py before the CUDA in csrc.</li>
+            <li><a href="https://github.com/NVIDIA/Megatron-LM" target="_blank" rel="noreferrer">NVIDIA/Megatron-LM</a>:
+              production tensor/pipeline/sequence parallelism; read
+              megatron/core/tensor_parallel/layers.py to see the
+              column/row split pair as actual classes.</li>
+            <li><a href="https://github.com/pytorch/torchtitan" target="_blank" rel="noreferrer">pytorch/torchtitan</a>:
+              clean-room Llama pretraining showing FSDP2, tensor parallel,
+              and pipeline composition with modern PyTorch; the
+              parallelize_llama.py files are the 3D-parallelism section in
+              code.</li>
+            <li><a href="https://github.com/EleutherAI/gpt-neox" target="_blank" rel="noreferrer">EleutherAI/gpt-neox</a>:
+              a battle-tested Megatron/DeepSpeed derivative; its config
+              directory is a museum of real training configurations with
+              every hyperparameter exposed.</li>
+            <li><a href="https://github.com/google/maxtext" target="_blank" rel="noreferrer">google/maxtext</a>:
+              pure-JAX LLM pretraining at high MFU on TPU and GPU; read
+              how sharding is expressed declaratively with jit and mesh
+              annotations rather than explicit communication calls.</li>
+            <li><a href="https://github.com/vllm-project/vllm" target="_blank" rel="noreferrer">vllm-project/vllm</a>:
+              PagedAttention and continuous batching in production; read
+              the scheduler and block-manager sources under vllm/core to
+              see the OS analogy carried through.</li>
+            <li><a href="https://github.com/huggingface/transformers" target="_blank" rel="noreferrer">huggingface/transformers</a>:
+              models/llama/modeling_llama.py is the most-read
+              implementation on earth and a good place to see KV-cache
+              plumbing and RoPE scaling variants side by side.</li>
+          </ul>
+
+          <h2>Common misconceptions</h2>
+          <p>
+            <strong>"FlashAttention approximates attention to go
+            faster."</strong> It computes bit-for-bit exact attention
+            (up to floating-point reassociation); the speedup comes from
+            eliminating HBM round trips, not arithmetic. The online-softmax
+            invariant proved above is an equality, and the measured 27.7x
+            at 8K context on this machine involved no approximation. Sparse
+            and linear attention are approximations; FlashAttention is a
+            schedule.
+          </p>
+          <p>
+            <strong>"bf16 training needs loss scaling."</strong> Loss
+            scaling exists to lift fp16's gradient distribution above its
+            \(6 \times 10^{-5}\) normal floor. bf16 shares fp32's exponent
+            range, so underflow of that kind is not the failure mode; its
+            cost is mantissa precision, which is paid for with fp32 master
+            weights and fp32 accumulation instead. Carrying a GradScaler
+            into a bf16 run is cargo cult.
+          </p>
+          <p>
+            <strong>"6ND is the FLOPs cost of training a
+            transformer."</strong> It is the matmul-parameter term only.
+            The parameter-free attention products add \(12SdL\) per token,
+            25% of the total for the 1.27B/4K-context model worked above
+            and growing linearly with context; and the embedding table
+            contributes parameters but no matmul FLOPs. MFU claims that
+            ignore both can be off by a third in either direction.
+          </p>
+          <p>
+            <strong>"Chinchilla proved 20 tokens per parameter is
+            optimal."</strong> It estimated a compute-optimal ratio for
+            training loss under one data distribution, with the paper's own
+            three analyses disagreeing about the exponent, and the optimum
+            it found is a shallow valley (0.007 nats across a 2x
+            misallocation in the worked problem above). Inference-aware
+            budgets rationally overtrain by one to two orders of magnitude,
+            as Llama 3 8B's 1,900 tokens per parameter shows. The paper's
+            durable lesson is the direction of the correction and the
+            method, not the constant.
+          </p>
+          <p>
+            <strong>"An MoE with 8x parameters costs 8x to run."</strong>
+            Per-token compute scales with the active experts \(k\), not the
+            expert count: DeepSeek-V3 activates 37B of 671B parameters. The
+            costs that do scale with total parameters are memory, checkpoint
+            size, and expert-parallel communication, which is why MoE is a
+            memory-for-FLOPs trade, profitable exactly when serving batch
+            sizes are large enough to keep every expert's weights busy.
+          </p>
+          <p>
+            <strong>"Speculative decoding trades quality for speed."</strong>
+            The rejection-sampling construction derived above emits tokens
+            from exactly the target distribution for any draft model; a bad
+            draft costs speed (low \(\alpha\)), never correctness. Methods
+            that do change the distribution (accepting by top-k membership,
+            lenient thresholds) exist, but they are a different, lossy
+            contract and should be benchmarked as such.
+          </p>
+          <p>
+            <strong>"Decode throughput is limited by compute, so a faster
+            GPU generates proportionally faster."</strong> Batch-1 decode
+            is a weight-streaming problem: 14 GB of bf16 weights over
+            2992.4 GB/s of measured bandwidth bounds a 7B model at 214
+            tokens/s on this H100 regardless of tensor-core throughput.
+            Only batching, cache shrinking (GQA/MLA), quantization, or
+            speculative parallelism move that number materially; more
+            TFLOPS alone do not.
+          </p>
+          <p>
+            <strong>"The KV cache grows with the number of query
+            heads."</strong> It grows with KV heads only:
+            \(2 L\, n_{kv} d_h\, p\) bytes per token. That asymmetry is the
+            entire design space between MHA, GQA, and MQA, and it is why
+            GQA cuts cache 4-8x while leaving query-side capacity, and
+            parameter count, nearly untouched.
+          </p>
+          <h2>Self-check</h2>
+          <div class="quiz" data-quiz>
+            <script type="application/json" class="quiz-data">[
+              {"id": "q1", "qtype": "mcq",
+               "stem": "A BPE tokenizer's behavior on unseen text is determined by",
+               "options": ["the vocabulary alone, applied longest-match-first",
+                            "the ordered merge list, replayed in training order",
+                            "the pair frequencies of the new text itself",
+                            "a Viterbi search over all segmentations"],
+               "correctIndex": 1,
+               "explanation": "Encoding replays recorded merges earliest-first; the same vocabulary with a different merge order tokenizes differently. Longest-match is WordPiece-style, and Viterbi segmentation is the unigram LM tokenizer, not BPE."},
+              {"id": "q2", "qtype": "mcq",
+               "stem": "RoPE encodes relative position because",
+               "options": ["rotation angles are learned per head during training",
+                            "the rotation of q at position m and k at position n composes to a rotation by (n-m) inside the dot product",
+                            "it adds a decaying bias to attention scores by distance",
+                            "it concatenates a position one-hot to each key"],
+               "correctIndex": 1,
+               "explanation": "Orthogonality gives R_m^T R_n = R_(n-m), so the score depends on positions only through their difference. The decaying-bias description is ALiBi, a different mechanism."},
+              {"id": "q3", "qtype": "truefalse",
+               "stem": "In grouped-query attention, halving the number of KV heads roughly halves the KV cache but leaves the model's parameter count almost unchanged.",
+               "options": ["True", "False"],
+               "correctIndex": 0,
+               "explanation": "Cache scales with n_kv exactly; parameters barely move because W_K and W_V are a small minority of block parameters next to W_Q, W_O, and the MLP."},
+              {"id": "q4", "qtype": "mcq",
+               "stem": "The correction factor exp(m_old - m_new) in the online softmax exists because",
+               "options": ["it prevents division by zero in the final normalization",
+                            "previously accumulated exponentials were computed against a stale maximum and must be re-referenced when a larger one arrives",
+                            "it implements the causal mask incrementally",
+                            "it compensates for bf16 rounding in the reduction"],
+               "correctIndex": 1,
+               "explanation": "Every accumulated term e^(x_i - m_old) becomes e^(x_i - m_new) after one multiply by e^(m_old - m_new); this is what makes a single streaming pass exact."},
+              {"id": "q5", "qtype": "mcq",
+               "stem": "For a model with N matmul parameters trained at long context, the true training FLOPs per token are",
+               "options": ["exactly 6N",
+                            "6N plus a parameter-free attention term that grows linearly with sequence length",
+                            "2N, since backward can reuse forward activations",
+                            "6N minus the embedding matmuls"],
+               "correctIndex": 1,
+               "explanation": "The QK^T and PV products involve no parameters and cost 12*S*d*L per token in training; at 4K context on the worked 1.27B config they are already 25% of the budget."},
+              {"id": "q6", "qtype": "mcq",
+               "stem": "Why does bf16 avoid the loss-scaling machinery fp16 requires?",
+               "options": ["bf16 has more mantissa bits than fp16",
+                            "bf16 shares fp32's exponent range, so small gradients do not underflow to zero",
+                            "bf16 gradients are always accumulated in int32",
+                            "bf16 is only used at inference time"],
+               "correctIndex": 1,
+               "explanation": "fp16's normal floor near 6e-5 flushes small activation gradients to zero, which loss scaling works around; bf16 trades mantissa (7 bits, fewer than fp16's 10) for fp32-range exponent, removing the underflow failure mode."},
+              {"id": "q7", "qtype": "mcq",
+               "stem": "ZeRO stage 1 reduces per-GPU memory by sharding",
+               "options": ["the layers across pipeline stages",
+                            "the fp32 optimizer state across data-parallel workers",
+                            "the attention heads across tensor-parallel workers",
+                            "the activations along the sequence dimension"],
+               "correctIndex": 1,
+               "explanation": "Stage 1 shards the 12 bytes/parameter of Adam state while keeping parameters and gradients replicated, adding no communication volume over plain data parallelism."},
+              {"id": "q8", "qtype": "truefalse",
+               "stem": "With 8 pipeline stages and 32 microbatches under a GPipe-style schedule, the pipeline is idle roughly 18% of the time.",
+               "options": ["True", "False"],
+               "correctIndex": 0,
+               "explanation": "Bubble fraction is (p-1)/(m+p-1) = 7/39 = 17.9%. More microbatches shrink it; 1F1B changes memory, not this bubble fraction."},
+              {"id": "q9", "qtype": "mcq",
+               "stem": "The Chinchilla correction to Kaplan et al. traces primarily to",
+               "options": ["training on higher-quality data",
+                            "matching the learning-rate decay schedule length to each run's token budget",
+                            "using MoE models in the sweep",
+                            "measuring downstream accuracy instead of loss"],
+               "correctIndex": 1,
+               "explanation": "Truncated cosine schedules overstate the loss of well-trained smaller models; with matched schedules, optimal N and D scale together (roughly C^0.5 each) instead of N getting nearly all of the budget."},
+              {"id": "q10", "qtype": "mcq",
+               "stem": "Batch-1 decoding of a 7B bf16 model on hardware with about 3 TB/s of memory bandwidth is bounded near",
+               "options": ["2,000 tokens/s, by tensor-core throughput",
+                            "214 tokens/s, by streaming 14 GB of weights per generated token",
+                            "50 tokens/s, by kernel launch overhead",
+                            "no bound; it depends only on sequence length"],
+               "correctIndex": 1,
+               "explanation": "Each decode step reads every weight once for one token of output: 14 GB / 2992.4 GB/s is 4.7 ms per token. This is why batching, cache compression, quantization, and speculative decoding are the levers that matter."},
+              {"id": "q11", "qtype": "mcq",
+               "stem": "In speculative decoding with per-token acceptance rate alpha = 0.8 and draft length 4, the expected tokens per target forward pass is",
+               "options": ["4.0", "3.36", "5.0", "1.8"],
+               "correctIndex": 1,
+               "explanation": "(1 - alpha^(gamma+1)) / (1 - alpha) = (1 - 0.32768)/0.2 = 3.36, counting the guaranteed target-sampled token. The limit as gamma grows is 1/(1-alpha) = 5, which is why long drafts saturate."},
+              {"id": "q12", "qtype": "ordering",
+               "stem": "Order these steps of one FlashAttention inner iteration over a KV tile.",
+               "options": ["load the KV tile into SRAM and compute the score block against the resident query tile",
+                            "update the running row-max and compute the tile's exponentials against it",
+                            "rescale the existing output accumulator and running sum by exp(m_old - m_new)",
+                            "accumulate the tile's weighted values into the output and move to the next tile"],
+               "correctIndex": -1,
+               "explanation": "Scores are computed on-chip, the max is updated, prior accumulations are re-referenced to the new max, and only then is the new tile's contribution added; the single division by the final sum happens after the last tile."}
+            ]</script>
+          </div>
+
+          <h2>References</h2>
+          <ol class="refs">
+            <li>Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A. N., Kaiser, L., and Polosukhin, I. (2017). Attention Is All You Need. NeurIPS. <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noreferrer">arXiv:1706.03762</a></li>
+            <li>Sennrich, R., Haddow, B., and Birch, A. (2016). Neural Machine Translation of Rare Words with Subword Units. ACL. <a href="https://arxiv.org/abs/1508.07909" target="_blank" rel="noreferrer">arXiv:1508.07909</a></li>
+            <li>Su, J., Lu, Y., Pan, S., Murtadha, A., Wen, B., and Liu, Y. (2021). RoFormer: Enhanced Transformer with Rotary Position Embedding. <a href="https://arxiv.org/abs/2104.09864" target="_blank" rel="noreferrer">arXiv:2104.09864</a></li>
+            <li>Zhang, B., and Sennrich, R. (2019). Root Mean Square Layer Normalization. NeurIPS. <a href="https://arxiv.org/abs/1910.07467" target="_blank" rel="noreferrer">arXiv:1910.07467</a></li>
+            <li>Shazeer, N. (2020). GLU Variants Improve Transformer. <a href="https://arxiv.org/abs/2002.05202" target="_blank" rel="noreferrer">arXiv:2002.05202</a></li>
+            <li>Ainslie, J., Lee-Thorp, J., de Jong, M., Zemlyanskiy, Y., Lebron, F., and Sanghai, S. (2023). GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints. EMNLP. <a href="https://arxiv.org/abs/2305.13245" target="_blank" rel="noreferrer">arXiv:2305.13245</a></li>
+            <li>Milakov, M., and Gimelshein, N. (2018). Online Normalizer Calculation for Softmax. <a href="https://arxiv.org/abs/1805.02867" target="_blank" rel="noreferrer">arXiv:1805.02867</a></li>
+            <li>Dao, T., Fu, D. Y., Ermon, S., Rudra, A., and Re, C. (2022). FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness. NeurIPS. <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noreferrer">arXiv:2205.14135</a></li>
+            <li>Dao, T. (2023). FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning. <a href="https://arxiv.org/abs/2307.08691" target="_blank" rel="noreferrer">arXiv:2307.08691</a></li>
+            <li>Kaplan, J., McCandlish, S., Henighan, T., Brown, T. B., et al. (2020). Scaling Laws for Neural Language Models. <a href="https://arxiv.org/abs/2001.08361" target="_blank" rel="noreferrer">arXiv:2001.08361</a></li>
+            <li>Hoffmann, J., Borgeaud, S., Mensch, A., Buchatskaya, E., et al. (2022). Training Compute-Optimal Large Language Models. NeurIPS. <a href="https://arxiv.org/abs/2203.15556" target="_blank" rel="noreferrer">arXiv:2203.15556</a></li>
+            <li>Besiroglu, T., Erdil, E., Barnett, M., and You, J. (2024). Chinchilla Scaling: A Replication Attempt. <a href="https://arxiv.org/abs/2404.10102" target="_blank" rel="noreferrer">arXiv:2404.10102</a></li>
+            <li>Micikevicius, P., Narang, S., Alben, J., Diamos, G., et al. (2018). Mixed Precision Training. ICLR. <a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noreferrer">arXiv:1710.03740</a></li>
+            <li>Rajbhandari, S., Rasley, J., Ruwase, O., and He, Y. (2020). ZeRO: Memory Optimizations Toward Training Trillion Parameter Models. SC20. <a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noreferrer">arXiv:1910.02054</a></li>
+            <li>Shoeybi, M., Patwary, M., Puri, R., LeGresley, P., Casper, J., and Catanzaro, B. (2019). Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism. <a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noreferrer">arXiv:1909.08053</a></li>
+            <li>Huang, Y., Cheng, Y., Bapna, A., Firat, O., et al. (2019). GPipe: Efficient Training of Giant Neural Networks Using Pipeline Parallelism. NeurIPS. <a href="https://arxiv.org/abs/1811.06965" target="_blank" rel="noreferrer">arXiv:1811.06965</a></li>
+            <li>Narayanan, D., Shoeybi, M., Casper, J., LeGresley, P., et al. (2021). Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM. SC21. <a href="https://arxiv.org/abs/2104.04473" target="_blank" rel="noreferrer">arXiv:2104.04473</a></li>
+            <li>Korthikanti, V., Casper, J., Lym, S., McAfee, L., et al. (2022). Reducing Activation Recomputation in Large Transformer Models. <a href="https://arxiv.org/abs/2205.05198" target="_blank" rel="noreferrer">arXiv:2205.05198</a></li>
+            <li>Fedus, W., Zoph, B., and Shazeer, N. (2021). Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity. JMLR. <a href="https://arxiv.org/abs/2101.03961" target="_blank" rel="noreferrer">arXiv:2101.03961</a></li>
+            <li>Lee, K., Ippolito, D., Nystrom, A., Zhang, C., Eck, D., Callison-Burch, C., and Carlini, N. (2021). Deduplicating Training Data Makes Language Models Better. ACL. <a href="https://arxiv.org/abs/2107.06499" target="_blank" rel="noreferrer">arXiv:2107.06499</a></li>
+            <li>Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu, C. H., Gonzalez, J. E., Zhang, H., and Stoica, I. (2023). Efficient Memory Management for Large Language Model Serving with PagedAttention. SOSP. <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noreferrer">arXiv:2309.06180</a></li>
+            <li>Yu, G.-I., Jeong, J. S., Kim, G.-W., Kim, S., and Chun, B.-G. (2022). Orca: A Distributed Serving System for Transformer-Based Generative Models. OSDI. <a href="https://www.usenix.org/conference/osdi22/presentation/yu" target="_blank" rel="noreferrer">USENIX OSDI 2022</a></li>
+            <li>Leviathan, Y., Kalman, M., and Matias, Y. (2023). Fast Inference from Transformers via Speculative Decoding. ICML. <a href="https://arxiv.org/abs/2211.17192" target="_blank" rel="noreferrer">arXiv:2211.17192</a></li>
+            <li>Chen, C., Borgeaud, S., Irving, G., Lespiau, J.-B., Sifre, L., and Jumper, J. (2023). Accelerating Large Language Model Decoding with Speculative Sampling. <a href="https://arxiv.org/abs/2302.01318" target="_blank" rel="noreferrer">arXiv:2302.01318</a></li>
+            <li>Touvron, H., Martin, L., Stone, K., et al. (2023). Llama 2: Open Foundation and Fine-Tuned Chat Models. <a href="https://arxiv.org/abs/2307.09288" target="_blank" rel="noreferrer">arXiv:2307.09288</a></li>
+            <li>Grattafiori, A., Dubey, A., et al. (2024). The Llama 3 Herd of Models. <a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noreferrer">arXiv:2407.21783</a></li>
+            <li>DeepSeek-AI (2024). DeepSeek-V3 Technical Report. <a href="https://arxiv.org/abs/2412.19437" target="_blank" rel="noreferrer">arXiv:2412.19437</a></li>
+            <li>Chowdhery, A., Narang, S., Devlin, J., et al. (2022). PaLM: Scaling Language Modeling with Pathways. JMLR. <a href="https://arxiv.org/abs/2204.02311" target="_blank" rel="noreferrer">arXiv:2204.02311</a></li>
+          </ol>
+
+          <div class="takeaway">
+            <p>
+              A modern language model is one long chain of counted
+              quantities, and fluency in this subject means being able to
+              walk the chain without hand-waving at any link. Bytes become
+              tokens through a greedy merge rule whose entire state is an
+              ordered list of pair counts. Tokens flow through a block whose
+              every deviation from the 2017 design, RMSNorm, RoPE, SwiGLU,
+              GQA, exists for a derivable reason: one fewer reduction, an
+              exactly relative position code, a data-dependent gate at fixed
+              parameters, a KV cache cut by the ratio of head counts.
+              Training cost is 6ND plus an attention term someone in the
+              room should always remember, memory is 16 bytes per parameter
+              until ZeRO divides it, parallelism is three sharding choices
+              with three communication bills, and the budget split between
+              N and D is a one-line Lagrangian whose valley is flat enough
+              that inference economics decide. Serving is a bandwidth
+              division softened by paging, batching, and a rejection
+              sampler that gets free tokens without changing the
+              distribution. None of these pieces is individually deep; the
+              craft is that they compose, and that every one of them can,
+              and should, be checked with arithmetic before a single GPU is
+              rented.
+            </p>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>&copy; <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;&middot;&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/classes/math.js"></script>
+    <script defer src="/code-tabs.js"></script>
+    <script defer src="/quiz.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/code-copy.js"></script>
+  </body>
+</html>
