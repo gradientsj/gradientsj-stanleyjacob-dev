@@ -100,8 +100,12 @@
     var pos = document.createElement("span");
     pos.className = "reader-pos"; pos.hidden = true;
 
+    var speed = document.createElement("button");
+    speed.type = "button"; speed.className = "reader-stop reader-speed";
+    speed.setAttribute("aria-label", "Playback speed");
+
     bar.appendChild(btn); bar.appendChild(stop);
-    bar.appendChild(range); bar.appendChild(pos);
+    bar.appendChild(range); bar.appendChild(pos); bar.appendChild(speed);
     root.appendChild(bar); root.appendChild(note);
 
     // floating controls that follow the reader down the page
@@ -119,17 +123,41 @@
     fRange.type = "range"; fRange.className = "reader-range reader-float-range";
     fRange.min = "0"; fRange.value = "0"; fRange.step = "1";
     fRange.setAttribute("aria-label", "Reading position");
+    var fSpeed = document.createElement("button");
+    fSpeed.type = "button"; fSpeed.className = "reader-stop reader-speed";
+    fSpeed.setAttribute("aria-label", "Playback speed");
     var fRow = document.createElement("div");
     fRow.className = "reader-float-row";
-    fRow.appendChild(fBtn); fRow.appendChild(fStop); fRow.appendChild(fJump); fRow.appendChild(fPos);
+    fRow.appendChild(fBtn); fRow.appendChild(fStop); fRow.appendChild(fJump); fRow.appendChild(fSpeed); fRow.appendChild(fPos);
     float_.appendChild(fRange); float_.appendChild(fRow);
     document.body.appendChild(float_);
 
     var supportsSpeech = "speechSynthesis" in window;
+    // playback rate is a single absolute value, only ever assigned from
+    // RATES, never multiplied, so speeds cannot compound across jumps
+    var RATES = [1, 1.5, 2];
+    var rate = 1;
+    try {
+      var saved = parseFloat(localStorage.getItem("reader-rate"));
+      if (RATES.indexOf(saved) >= 0) rate = saved;
+    } catch (e) {}
     var mode = null, audio = null;
     var chunks = [], units = [], idx = 0, speaking = false, paused = false;
     var barVisible = true, userAway = false;
 
+    function rateLabel() {
+      var t = (rate % 1 === 0 ? rate : rate.toFixed(1)) + "x";
+      speed.textContent = t; fSpeed.textContent = t;
+    }
+    function cycleRate() {
+      rate = RATES[(RATES.indexOf(rate) + 1) % RATES.length];
+      try { localStorage.setItem("reader-rate", String(rate)); } catch (e) {}
+      rateLabel();
+      if (mode === "audio" && audio) audio.playbackRate = rate;
+      // a fresh utterance is the only way a new rate applies to speech, so
+      // respeak the current sentence at the new speed
+      if (mode === "speech" && speaking && !paused) jumpTo(idx);
+    }
     function label(playing) {
       [btn, fBtn].forEach(function (b) {
         b.textContent = "";
@@ -256,6 +284,7 @@
       range.value = String(i); setPos((i + 1) + " / " + units.length);
       var myGen = gen;
       var utt = new SpeechSynthesisUtterance(u.text);
+      utt.rate = rate;
       var v = pickVoice(); if (v) utt.voice = v;
       utt.onboundary = function (e) {
         if (myGen !== gen) return;
@@ -291,6 +320,7 @@
     }
     function startAudio() {
       mode = "audio"; audio = new Audio(audioUrl);
+      audio.playbackRate = rate;
       note.textContent = "natural narration";
       audio.addEventListener("ended", finish);
       audio.addEventListener("loadedmetadata", function () {
@@ -340,6 +370,9 @@
       finish();
     }
 
+    speed.addEventListener("click", cycleRate);
+    fSpeed.addEventListener("click", cycleRate);
+    rateLabel();
     btn.addEventListener("click", togglePlay);
     fBtn.addEventListener("click", togglePlay);
     stop.addEventListener("click", stopAll);
