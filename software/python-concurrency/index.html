@@ -1,0 +1,580 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Python Concurrency in Practice · Stanley Jacob</title>
+    <meta name="description" content="A practitioner's walkthrough of Python threading, multiprocessing, and asyncio with runnable code and real measured numbers from a 52-core Xeon, covering locks, queues, pools, shared memory, chunksize, fork versus spawn, pickling costs, and a closing decision table." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+      <script>(function(){try{var t=localStorage.getItem("theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+  </head>
+  <body>
+
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software" class="active">Software</a>
+          <a href="/classes">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/software">← Software</a></div>
+        <h1>Python Concurrency in Practice</h1>
+        <p class="meta">Software &amp; architecture · concurrency · Jul 2026</p>
+      </div>
+    </header>
+    <section style="padding-top: 0">
+      <div class="wrap">
+        <article class="prose article">
+          <div class="reader" data-reader data-audio="listen.mp3"></div>
+          <p>This is a working guide to threads, processes, and the event loop in Python, written to be lifted straight into a project. Every code block on this page actually ran, and every number came from running it here, on a virtualized slice of a Xeon Platinum 8480+ with 52 logical cores visible to the guest, under the system CPython 3.10.12 with numpy 1.21.5. The host is shared with other tenants, so absolute times wobble a little from run to run and the ratios are the story. The theory behind these numbers, the GIL as a single interpreter-wide mutex, memory models, and how the same experiments look in C, C++, and Rust, lives on the <a href="/classes/concurrent-systems-programming">concurrent systems programming page</a>. This page is the practitioner's half of that pair.</p>
+
+          <h2>The one decision that matters</h2>
+          <p>Before any API choice there is one question, and almost everything follows from the answer. Is your program slow because the CPU is busy, or because it is waiting? A scraper, an API client, a service that talks to a database, all of these spend nearly all of their wall time blocked on sockets and disks, and that is I/O-bound work. A parser, an image resizer, a pure-Python numeric loop, these keep a core pinned, and that is CPU-bound work.</p>
+          <p>The honest map has three regions. For I/O-bound work, use threads or asyncio, because a Python thread that is blocked in a system call has released the GIL and costs you nothing. For CPU-bound pure-Python work, use processes, because only one thread can execute Python bytecode at a time and adding threads adds nothing. And for CPU-bound array math, first check whether numpy or another compiled library already solves it in one process, a case section four measures in detail. Here is the whole argument as a script.</p>
+          <pre><code class="language-python">import time
+import threading
+import multiprocessing as mp
+
+N = 5_000_000
+TASKS = 8
+
+def burn(n=N):
+    total = 0
+    for i in range(n):
+        total += i * i
+    return total
+
+def timed(label, fn):
+    t0 = time.perf_counter()
+    fn()
+    print(f"{label:12s} {time.perf_counter() - t0:.3f}s")
+
+def sequential():
+    for _ in range(TASKS):
+        burn()
+
+def with_threads():
+    threads = [threading.Thread(target=burn) for _ in range(TASKS)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+def with_processes():
+    with mp.Pool(TASKS) as pool:
+        pool.map(burn, [N] * TASKS)
+
+if __name__ == "__main__":
+    timed("sequential", sequential)
+    timed("8 threads", with_threads)
+    timed("8 processes", with_processes)</code></pre>
+          <p>On this machine a run printed the following.</p>
+          <pre><code class="language-text">sequential   1.913s
+8 threads    1.848s
+8 processes  0.249s</code></pre>
+          <p>Eight threads bought nothing at all, the 1.848 s against 1.913 s is within the noise of a shared host, because all eight took turns holding one interpreter lock. Eight processes finished the same work 7.7 times faster, because each process carries its own interpreter and its own GIL, and this box has cores to spare. If the loop body had been <code>time.sleep</code> instead of arithmetic, the threads would have won just as decisively, which is the whole asymmetry in one sentence. The <a href="/classes/concurrent-systems-programming">classes page</a> explains why the GIL exists, measures the same asymmetry with a different workload, and shows the 5 ms switch interval in CPython's eval loop, so I will not repeat that here.</p>
+          <div class="takeaway">Decide I/O-bound versus CPU-bound first. Threads and asyncio for waiting, processes for computing, and a vectorized library before either when the work is array math.</div>
+
+          <h2>threading done right</h2>
+          <p>The first thing to internalize is that the GIL does not make your code thread-safe. It makes individual bytecode operations atomic, but any read-modify-write that spans more than one operation can be interleaved. On this interpreter a bare <code>counter += 1</code> loop happened to come out exact in every run I tried, because CPython 3.10 checks for a thread switch at loop back edges and the load and store inside one iteration have no switch point between them, but that is an accident of the current eval loop and not a promise. Put any real work between the read and the write, a fee computation, a log line, a metrics call, and the race appears immediately.</p>
+          <pre><code class="language-python">import threading
+
+balance = 0
+lock = threading.Lock()
+
+def audit(v):
+    # stands in for real work between read and write, a fee
+    # computation, a log line, a metrics call
+    return v + 1
+
+def deposit(n, use_lock):
+    global balance
+    for _ in range(n):
+        if use_lock:
+            with lock:
+                balance = audit(balance)
+        else:
+            balance = audit(balance)
+
+def run(use_lock):
+    global balance
+    balance = 0
+    threads = [threading.Thread(target=deposit, args=(100_000, use_lock))
+               for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    print(f"use_lock={use_lock}: expected 400000, got {balance}")
+
+if __name__ == "__main__":
+    run(use_lock=False)
+    run(use_lock=True)</code></pre>
+          <pre><code class="language-text">use_lock=False: expected 400000, got 364900
+use_lock=True: expected 400000, got 400000</code></pre>
+          <p>Roughly nine percent of the deposits vanished without the lock, and repeated runs lost 363489 and then 334493 the same way. The fix is the <code>with lock:</code> idiom you see above. Never call <code>acquire</code> and <code>release</code> by hand, because the context manager releases the lock even when the body raises, and a lock that leaks on an exception is a deadlock you will find at 3 a.m. Hold locks for the shortest span that covers the invariant, and if you ever need two locks, acquire them in one global order everywhere.</p>
+          <p>Most threaded programs should not be passing bare locks around, though. The tool that structures them is <code>queue.Queue</code>, a thread-safe channel with built-in blocking, and the shape it enables is the producer-consumer pipeline. This example is complete and runnable. The bounded <code>maxsize</code> gives backpressure, so a fast producer blocks rather than filling memory, and one sentinel per consumer shuts the whole thing down cleanly.</p>
+          <pre><code class="language-python">import queue
+import random
+import threading
+import time
+
+SENTINEL = object()
+jobs = queue.Queue(maxsize=100)
+results = queue.Queue()
+
+def producer(n_items):
+    for i in range(n_items):
+        jobs.put(("resize", f"image_{i:04d}.jpg"))
+    # one sentinel per consumer tells everyone to go home
+    for _ in range(N_CONSUMERS):
+        jobs.put(SENTINEL)
+
+def consumer(worker_id):
+    while True:
+        item = jobs.get()
+        if item is SENTINEL:
+            jobs.task_done()
+            break
+        op, name = item
+        time.sleep(random.uniform(0.001, 0.005))  # the actual work
+        results.put((worker_id, name))
+        jobs.task_done()
+
+N_CONSUMERS = 4
+
+if __name__ == "__main__":
+    t0 = time.perf_counter()
+    threads = [threading.Thread(target=producer, args=(200,))]
+    threads += [threading.Thread(target=consumer, args=(i,)) for i in range(N_CONSUMERS)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    print(f"processed {results.qsize()} items in {time.perf_counter() - t0:.3f}s")</code></pre>
+          <p>This processed all 200 items in 0.161 s here, and the arithmetic checks out, 200 jobs at about 3 ms average spread over 4 workers is 0.15 s of ideal time. Notice that no user code takes a lock. The queue is the synchronization, which is why this shape survives contact with production better than anything built from bare <code>Lock</code> objects.</p>
+          <p>For the extremely common shape of running one function over many inputs, skip hand-rolled threads entirely and use <code>ThreadPoolExecutor</code>. The pattern below is the concurrent-downloads shape, submit everything, then consume results in completion order with <code>as_completed</code>, so a slow straggler never blocks you from handling the fast ones. The sleep stands in for network latency so the demo runs anywhere.</p>
+          <pre><code class="language-python">import random
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+URLS = [f"https://example.com/report_{i}.pdf" for i in range(40)]
+
+def download(url):
+    # a real download would be requests.get(url, timeout=10); the sleep
+    # models 100 to 400 ms of network latency
+    time.sleep(random.uniform(0.1, 0.4))
+    return url, random.randrange(10_000, 90_000)
+
+if __name__ == "__main__":
+    t0 = time.perf_counter()
+    for u in URLS[:8]:
+        download(u)
+    print(f"sequential, first 8 only: {time.perf_counter() - t0:.2f}s")
+
+    t0 = time.perf_counter()
+    done = 0
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        futures = {pool.submit(download, url): url for url in URLS}
+        for fut in as_completed(futures):
+            url, size = fut.result()
+            done += 1
+    print(f"all {done} with 16 threads:  {time.perf_counter() - t0:.2f}s")</code></pre>
+          <p>Downloading just the first 8 sequentially took 1.83 s here, while all 40 through 16 threads took 0.80 s, which is about a twelvefold throughput improvement over what the full sequential run would have cost. The <code>futures</code> dict mapping future to input is the standard trick for knowing which task a result belongs to. If you leave <code>max_workers</code> unset, the default on 3.10 is <code>min(32, cores + 4)</code>, which on this 52-core box is 32, a reasonable number for I/O and a meaningless one for CPU work, one more reminder of what this pool is for.</p>
+          <p>The last threading tool worth owning is clean shutdown. A thread marked <code>daemon=True</code> will not keep the process alive, which prevents the classic hung-on-exit bug, but daemon threads are killed abruptly at interpreter shutdown with no chance to flush or close anything. The polite pattern is a <code>threading.Event</code> the worker polls with <code>stop.wait(timeout)</code>, which doubles as its sleep, so shutdown is immediate rather than waiting out a <code>time.sleep</code>.</p>
+          <pre><code class="language-python">import threading
+import time
+
+stop = threading.Event()
+
+def heartbeat(interval):
+    while not stop.wait(timeout=interval):
+        print("  heartbeat: still alive")
+    print("  heartbeat: stop requested, cleaning up")
+
+if __name__ == "__main__":
+    t = threading.Thread(target=heartbeat, args=(0.5,), daemon=True)
+    t.start()
+    time.sleep(1.8)          # the main program does its real work here
+    stop.set()               # ask the worker to finish
+    t.join(timeout=2)        # and wait for it, bounded
+    print("main: clean exit,", "worker done" if not t.is_alive() else "worker hung")</code></pre>
+          <p>Run here, this printed three heartbeats, then the cleanup line, then a clean exit with the worker confirmed done. The <code>daemon=True</code> is the safety net and the <code>Event</code> is the protocol, and you want both.</p>
+          <div class="takeaway">The GIL is not a thread-safety guarantee. Guard shared state with the with-lock idiom, structure pipelines with queue.Queue, run map-shaped I/O through ThreadPoolExecutor with as_completed, and shut down with an Event plus a bounded join.</div>
+
+          <h2>multiprocessing done right</h2>
+          <p>Processes sidestep the GIL by the blunt method of running several interpreters, and the price is that nothing is shared by default. Every argument and every result crosses a pipe as a pickle, and that framing cost is the key to using the module well.</p>
+          <p>The workhorse is <code>Pool.map</code>, and its most consequential knob is <code>chunksize</code>, how many items travel in each task message. Each message pays pickling, a pipe write, a scheduling wakeup, and a pickled reply, so for cheap functions the message overhead dwarfs the work. I measured squaring 200,000 integers across 8 workers at several chunk sizes.</p>
+          <pre><code class="language-python">import time
+import multiprocessing as mp
+
+def square(x):
+    return x * x
+
+ITEMS = list(range(200_000))
+
+def run_map(chunksize=None):
+    with mp.Pool(8) as pool:
+        t0 = time.perf_counter()
+        if chunksize is None:
+            pool.map(square, ITEMS)
+        else:
+            pool.map(square, ITEMS, chunksize=chunksize)
+        return time.perf_counter() - t0
+
+def run_imap_unordered(chunksize):
+    with mp.Pool(8) as pool:
+        t0 = time.perf_counter()
+        for _ in pool.imap_unordered(square, ITEMS, chunksize=chunksize):
+            pass
+        return time.perf_counter() - t0
+
+if __name__ == "__main__":
+    for cs in (1, 16, 256, 4096):
+        print(f"map        chunksize={cs:5d}: {run_map(cs):7.3f}s")
+    print(f"map        default (6250):  {run_map():7.3f}s")
+    for cs in (1, 256):
+        print(f"imap_unord chunksize={cs:5d}: {run_imap_unordered(cs):7.3f}s")</code></pre>
+          <pre><code class="language-text">map        chunksize=    1:   8.947s
+map        chunksize=   16:   0.584s
+map        chunksize=  256:   0.055s
+map        chunksize= 4096:   0.021s
+map        default (6250):    0.020s
+imap_unord chunksize=    1:   9.524s
+imap_unord chunksize=  256:   0.086s</code></pre>
+          <p>That is a 450-fold spread from one parameter. <code>map</code> is forgiving because its default chunksize is computed as roughly the item count divided by four times the worker count, 6250 here, which is why the default row matches the best row. The trap is <code>imap_unordered</code>, which is otherwise the better tool for large or streaming inputs since it yields results as they finish instead of building one giant list, because its default chunksize is 1. At that default it spent 9.5 s on work the same pool finishes in 0.086 s with <code>chunksize=256</code>. Always pass a chunksize to the imap variants.</p>
+          <p>When workers must share mutable state rather than just exchange arguments, the small tools are <code>Value</code> and <code>Array</code>, real shared memory holding C types, with an optional lock built in.</p>
+          <pre><code class="language-python">from multiprocessing import Process, Value, Array
+
+def work(counter, samples, worker_id):
+    for i in range(worker_id * 4, worker_id * 4 + 4):
+        samples[i] = i * 1.5
+        with counter.get_lock():       # Value carries its own lock
+            counter.value += 1
+
+if __name__ == "__main__":
+    done = Value("i", 0)               # one shared int
+    out = Array("d", 8)                # eight shared doubles
+    procs = [Process(target=work, args=(done, out, w)) for w in range(2)]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join()
+    print(f"done={done.value}, out={list(out)}")</code></pre>
+          <p>This printed <code>done=8</code> with all eight slots filled, and the <code>get_lock()</code> line matters for the same reason the threading lock did, since <code>counter.value += 1</code> is a read and a write with a window between them, now across processes.</p>
+          <p>The big tool is <code>multiprocessing.shared_memory</code>, which since 3.8 lets a numpy array live in a named block that any process can map, so only the name crosses the pipe instead of the bytes. The difference is dramatic even for a modest 64 MiB array.</p>
+          <pre><code class="language-python">import time
+import numpy as np
+import multiprocessing as mp
+from multiprocessing import shared_memory
+
+N = 16 * 1024 * 1024          # 16M float32 = 64 MiB
+
+def sum_pickled(arr):
+    return float(arr.sum())
+
+def sum_shared(name, shape, dtype):
+    shm = shared_memory.SharedMemory(name=name)
+    try:
+        arr = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+        return float(arr.sum())
+    finally:
+        shm.close()
+
+if __name__ == "__main__":
+    data = np.random.rand(N).astype(np.float32)
+
+    with mp.Pool(1) as pool:
+        pool.apply(sum_pickled, (data[:1],))       # warm the worker
+        t0 = time.perf_counter()
+        s1 = pool.apply(sum_pickled, (data,))
+        t_pickle = time.perf_counter() - t0
+
+    shm = shared_memory.SharedMemory(create=True, size=data.nbytes)
+    try:
+        view = np.ndarray(data.shape, dtype=data.dtype, buffer=shm.buf)
+        t0 = time.perf_counter()
+        view[:] = data                              # one copy in
+        t_copy_in = time.perf_counter() - t0
+        with mp.Pool(1) as pool:
+            pool.apply(sum_shared, (shm.name, (1,), data.dtype))  # warm
+            t0 = time.perf_counter()
+            s2 = pool.apply(sum_shared, (shm.name, data.shape, data.dtype))
+            t_shared = time.perf_counter() - t0
+    finally:
+        shm.close()
+        shm.unlink()
+
+    print(f"pickled 64 MiB through the pipe: {t_pickle * 1000:7.1f} ms")
+    print(f"copy into shared memory (once):  {t_copy_in * 1000:7.1f} ms")
+    print(f"pass only the name, attach:      {t_shared * 1000:7.1f} ms")
+    print(f"same answer: {abs(s1 - s2) &lt; 1e-3}")</code></pre>
+          <pre><code class="language-text">pickled 64 MiB through the pipe:   196.7 ms
+copy into shared memory (once):     41.5 ms
+pass only the name, attach:         10.2 ms
+same answer: True</code></pre>
+          <p>Passing the name is 19 times faster than pickling the array, the one-time 41.5 ms copy into the block amortizes over every subsequent call, and for workers that only read, the array could have been built in shared memory from the start and never copied at all. The lifecycle discipline in the <code>finally</code> blocks is not optional, every process calls <code>close()</code> on its handle and exactly one calls <code>unlink()</code>, or you leak named blocks in <code>/dev/shm</code> and Python's resource tracker will scold you at exit.</p>
+          <p>Underneath all of this sits the choice of start method, and it is the source of most multiprocessing bugs that look supernatural. With <code>fork</code>, the child is a copy-on-write clone of the parent, instantly, with every module already imported. It is also a clone of everything else, including locks that some other thread held at the moment of the fork, and that thread does not exist in the child, so the lock will never be released. A parent that mixes threads and fork, and modern parents often carry hidden threads from logging handlers, gRPC, or numpy's BLAS, can deadlock in ways that reproduce once a week. With <code>spawn</code>, the child is a fresh interpreter that imports your module and receives pickled arguments, slower but with no inherited haunted state. Windows only has spawn, macOS made spawn its default in Python 3.8 because Apple's system libraries are not fork-safe, Linux on 3.10 still defaults to fork, 3.12 began warning when a multithreaded process forks, and 3.14 moved the Linux default to forkserver, a middle path that forks children from a clean single-threaded server process. The portable, safe choice is to set it explicitly and write code that survives spawn.</p>
+          <pre><code class="language-python">import multiprocessing as mp
+
+def worker(x):
+    return x * 2
+
+if __name__ == "__main__":
+    ctx = mp.get_context("spawn")      # explicit, portable, boring
+    with ctx.Pool(4) as pool:
+        print(pool.map(worker, range(8)))</code></pre>
+          <p>Surviving spawn is also the real reason the <code>if __name__ == "__main__":</code> guard is mandatory in every script on this page. A spawned child re-imports your module to reconstruct the worker function, and without the guard that import re-runs the pool creation, which spawns children that re-import the module, and the recursion only stops when the OS runs out of patience. On Linux under fork the unguarded script happens to work, which is exactly why the bug ships and then detonates on a colleague's Mac.</p>
+          <p>Finally, prefer <code>ProcessPoolExecutor</code> from <code>concurrent.futures</code> over raw <code>Pool</code> for new code. It is the same worker pool underneath with a smaller, better API, futures instead of a dozen map variants, real exception propagation, and a thread twin with the identical interface, which section six turns into a pattern.</p>
+          <div class="takeaway">Everything that crosses a process boundary is pickled, so batch small tasks with chunksize, share big arrays through shared_memory, set the start method to spawn explicitly, and keep the __main__ guard sacred.</div>
+
+          <h2>The costs nobody mentions</h2>
+          <p>Multiprocessing tutorials show the speedup and skip the bill. The bill has three lines, and each is measurable.</p>
+          <p>The first line is serialization, already measured above, 196.7 ms to hand a worker a 64 MiB array against 10.2 ms to hand it a name. Every argument and result pays pickle plus copy plus unpickle, twice per call, and for data-heavy workloads this tax alone can eat the entire parallel gain.</p>
+          <p>The second line is worker startup, which depends on the start method and, less obviously, on your imports. I timed a do-nothing <code>Process</code> from start to join, averaged over 15 runs, first with a bare module and then with nothing changed except <code>import numpy</code> at the top.</p>
+          <pre><code class="language-python">import os
+import time
+import multiprocessing as mp
+
+if os.environ.get("HEAVY_IMPORTS"):
+    import numpy  # noqa: F401  simulate a module with heavy top-level imports
+
+def noop():
+    pass
+
+def measure(method, n=15):
+    ctx = mp.get_context(method)
+    p = ctx.Process(target=noop)
+    p.start()
+    p.join()                       # warm (forkserver boots its server here)
+    t0 = time.perf_counter()
+    for _ in range(n):
+        p = ctx.Process(target=noop)
+        p.start()
+        p.join()
+    return (time.perf_counter() - t0) / n
+
+if __name__ == "__main__":
+    tag = " (with numpy import)" if os.environ.get("HEAVY_IMPORTS") else ""
+    for method in ("fork", "forkserver", "spawn"):
+        print(f"{method:10s}{tag}: {measure(method) * 1000:7.1f} ms per Process")</code></pre>
+          <pre><code class="language-text">fork      :     1.3 ms per Process
+forkserver:     4.8 ms per Process
+spawn     :    27.3 ms per Process
+
+fork       (with numpy import):     2.2 ms per Process
+forkserver (with numpy import):   100.3 ms per Process
+spawn      (with numpy import):   174.4 ms per Process</code></pre>
+          <p>Fork is 20 times cheaper than spawn even for an empty module, and the second block is the part nobody mentions. One <code>import numpy</code> at the top of the module took spawn from 27 ms to 174 ms per worker, because every spawned child re-imports your module and re-pays every top-level import, while fork inherits the already-imported modules for free through copy-on-write. Forkserver pays it too here, since its children still import the main module to find the target function, unless you configure <code>set_forkserver_preload</code>. The practical rules follow directly. Create pools once and reuse them so startup amortizes, keep worker modules lean, and never spawn a fresh process per small task.</p>
+          <p>The third line on the bill is the one that decides whether to use multiprocessing at all. When the work is array math, a single process running vectorized numpy usually beats a pool of processes, because the pool pays pickling and startup to distribute work that C was already doing at memory-bandwidth speed. Here is the sum of squares of 20 million float64 values, three ways.</p>
+          <pre><code class="language-python">import time
+import numpy as np
+import multiprocessing as mp
+
+N = 20_000_000                     # 160 MB of float64
+
+def chunk_sum_sq(chunk):
+    return float(np.dot(chunk, chunk))
+
+if __name__ == "__main__":
+    data = np.random.rand(N)
+
+    t0 = time.perf_counter()
+    total_py = 0.0
+    for x in data.tolist():        # pure Python, one core
+        total_py += x * x
+    t_python = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    with mp.Pool(8) as pool:       # 8 processes, numpy per chunk
+        total_mp = sum(pool.map(chunk_sum_sq, np.array_split(data, 8)))
+    t_pool = time.perf_counter() - t0
+
+    for _ in range(2):             # warm, then measure
+        t0 = time.perf_counter()
+        total_np = float(np.dot(data, data))   # one process, vectorized
+        t_numpy = time.perf_counter() - t0
+
+    print(f"pure Python loop, 1 core:   {t_python:8.3f} s")
+    print(f"8 processes + numpy:        {t_pool:8.3f} s (incl. pool + pickling)")
+    print(f"1 process, numpy dot:       {t_numpy:8.3f} s")</code></pre>
+          <pre><code class="language-text">pure Python loop, 1 core:      1.781 s
+8 processes + numpy:           0.314 s (incl. pool + pickling)
+1 process, numpy dot:          0.012 s</code></pre>
+          <p>The pool beat pure Python by 5.7 times and then lost to a single vectorized call by 26 times, because shipping 160 MB to eight workers costs far more than the 12 ms the arithmetic actually takes. The ranking generalizes into a habit. Before reaching for processes, ask whether a library already does the loop in C, and note that numpy releases the GIL inside most of its heavy operations, so even plain threads can scale a numpy-heavy workload where they cannot scale pure Python. Multiprocessing earns its complexity when the per-task work is substantial pure-Python computation, seconds rather than microseconds, and the data crossing the boundary is small relative to it, or shared through <code>shared_memory</code>.</p>
+          <div class="takeaway">The pool's bill is pickling, startup, and the import tax under spawn. Pay it only when a vectorized single process cannot do the job, and check for that first, because here the vectorized loser-on-paper won by 26 times.</div>
+
+          <h2>asyncio in one honest section</h2>
+          <p>asyncio runs many tasks on one thread by having each task volunteer to pause. A coroutine runs until it reaches an <code>await</code> on something not ready, the event loop parks it and resumes another, and no locks are needed for state touched only between awaits because nothing preempts you. The model earns its keep when one process must hold very many slow connections at once, the shape of chat servers, scrapers with thousands of requests in flight, and websocket fanout. A coroutine costs about a kilobyte, while every thread carries a full stack and a scheduler presence.</p>
+          <pre><code class="language-python">import asyncio
+import time
+import threading
+
+CONCURRENCY = 500
+DELAY = 0.1
+
+async def fetch(i):
+    await asyncio.sleep(DELAY)     # a real client would await an HTTP response
+    return i
+
+async def main():
+    t0 = time.perf_counter()
+    results = await asyncio.gather(*(fetch(i) for i in range(CONCURRENCY)))
+    print(f"asyncio, {len(results)} tasks:  {time.perf_counter() - t0:.3f}s")
+
+def sleeper():
+    time.sleep(DELAY)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+    t0 = time.perf_counter()
+    threads = [threading.Thread(target=sleeper) for _ in range(CONCURRENCY)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    print(f"{CONCURRENCY} threads:           {time.perf_counter() - t0:.3f}s")
+    print(f"sequential would be:    {CONCURRENCY * DELAY:.0f}s")</code></pre>
+          <pre><code class="language-text">asyncio, 500 tasks:  0.106s
+500 threads:           0.152s
+sequential would be:    50s</code></pre>
+          <p>Both approaches turned 50 seconds of waiting into a tenth of a second, and at 500 tasks they are nearly tied, with asyncio slightly ahead because creating 500 threads is itself work. The gap widens with scale, since 50,000 coroutines is a normal Tuesday for an event loop and 50,000 threads is not something you should ask of a kernel. The <code>gather</code> call is the workhorse shape, launch everything, await one aggregate, and with <code>return_exceptions=True</code> it will hand back errors as values instead of cancelling the batch.</p>
+          <p>The event loop's weakness is that its cooperation is mandatory. One CPU-bound call, or one innocent synchronous <code>requests.get</code>, freezes every task in the process because nothing can run until the offender returns. The bridge out is <code>run_in_executor</code>, which ships blocking or heavy work to a thread pool or process pool and gives you an awaitable for it, so the loop stays live.</p>
+          <pre><code class="language-python">import asyncio
+import time
+from concurrent.futures import ProcessPoolExecutor
+
+def heavy(n):                       # CPU-bound, would freeze the event loop
+    total = 0
+    for i in range(n):
+        total += i * i
+    return total
+
+async def status_ticker():
+    for _ in range(4):
+        print("  event loop is still responsive")
+        await asyncio.sleep(0.1)
+
+async def main():
+    loop = asyncio.get_running_loop()
+    with ProcessPoolExecutor() as pool:
+        t0 = time.perf_counter()
+        result, _ = await asyncio.gather(
+            loop.run_in_executor(pool, heavy, 20_000_000),
+            status_ticker(),
+        )
+        print(f"heavy result {result} in {time.perf_counter() - t0:.2f}s")
+
+if __name__ == "__main__":
+    asyncio.run(main())</code></pre>
+          <p>Run here, the ticker printed all four responsiveness lines on schedule while the 0.95 s computation ran in a worker process, which is the whole point in one screenful. As for when asyncio is the wrong tool, the list is short and firm. CPU-bound work gains nothing and blocks everything. A script making a handful of requests is simpler with a thread pool, since async is viral and every caller up the stack must become a coroutine. And a codebase built on synchronous libraries, database drivers, SDKs, ORMs, fights the loop at every call site, because one forgotten blocking call is a site-wide stall. asyncio is an architecture, not a sprinkle.</p>
+          <div class="takeaway">The event loop wins when connections vastly outnumber cores, loses the moment anything blocks, and run_in_executor is the pressure valve that keeps it honest.</div>
+
+          <h2>concurrent.futures as the unifying API</h2>
+          <p>The quiet gift of <code>concurrent.futures</code> is that its two executors share one interface, so the thread-versus-process decision becomes an argument instead of a rewrite. One function can serve both worlds, and this is the version I actually reuse, completion-order results, per-item error capture, and the input attached to each outcome.</p>
+          <pre><code class="language-python">import time
+from concurrent.futures import (
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    as_completed,
+)
+
+def run_all(fn, inputs, executor_cls, max_workers=8):
+    """Run fn over inputs concurrently, yield (input, result or exception)."""
+    with executor_cls(max_workers=max_workers) as pool:
+        futures = {pool.submit(fn, item): item for item in inputs}
+        for fut in as_completed(futures):
+            item = futures[fut]
+            try:
+                yield item, fut.result()
+            except Exception as exc:
+                yield item, exc
+
+def io_task(i):
+    time.sleep(0.2)                  # network-shaped work
+    return f"fetched {i}"
+
+def cpu_task(n):
+    total = 0
+    for i in range(n):
+        total += i * i
+    return total
+
+if __name__ == "__main__":
+    t0 = time.perf_counter()
+    list(run_all(io_task, range(16), ThreadPoolExecutor))
+    print(f"16 I/O tasks, threads:    {time.perf_counter() - t0:.2f}s")
+
+    t0 = time.perf_counter()
+    list(run_all(cpu_task, [2_000_000] * 16, ProcessPoolExecutor))
+    print(f"16 CPU tasks, processes:  {time.perf_counter() - t0:.2f}s")
+
+    t0 = time.perf_counter()
+    list(run_all(cpu_task, [2_000_000] * 16, ThreadPoolExecutor))
+    print(f"16 CPU tasks, threads:    {time.perf_counter() - t0:.2f}s")</code></pre>
+          <pre><code class="language-text">16 I/O tasks, threads:    0.40s
+16 CPU tasks, processes:  0.20s
+16 CPU tasks, threads:    1.47s</code></pre>
+          <p>The same eleven-line helper served all three runs, and the numbers retell the whole article. Sixteen 200 ms sleeps through 8 threads finished in two waves, the CPU batch scaled across processes, and the deliberately wrong pairing of CPU work on threads ran 7.4 times slower than the right one. The differences between the executors hide in the constraints, not the interface. <code>ProcessPoolExecutor</code> needs <code>fn</code> to be importable at module top level and every input and output to be picklable, so lambdas, closures, and open sockets do not travel, while <code>ThreadPoolExecutor</code> will happily run anything but shares one GIL. Exceptions raised in a worker surface exactly where you want them, out of <code>fut.result()</code>, which is why the try sits inside the loop and one poisoned input cannot kill the batch. That uniformity is also what <code>run_in_executor</code> leaned on in the previous section, and it means a codebase can settle on this one shape and move workloads between pools as profiling dictates.</p>
+          <div class="takeaway">Write against the executor interface, not a specific pool. The thread or process choice then lives in one argument, where a profiler can veto it cheaply.</div>
+
+          <h2>The near future</h2>
+          <p>The free-threaded build of CPython, specified by PEP 703, removes the GIL rather than working around it, shipping as an experimental separate binary in 3.13 and a supported build option in 3.14. On that interpreter, CPU-bound threads genuinely scale, which dissolves the central asymmetry this page is organized around, though the ecosystem of C extensions is still catching up and single-thread performance pays a small overhead. The engineering that makes it possible, biased reference counting, immortal objects, and per-object locks, is walked through on the <a href="/classes/concurrent-systems-programming">concurrent systems programming page</a> alongside its GIL measurements. This machine runs 3.10, so nothing here changes yet, and even in a free-threaded world every non-GIL lesson on this page survives intact, since races, queues, backpressure, and clean shutdown are properties of shared-memory concurrency, not of one lock in one interpreter.</p>
+          <p>Subinterpreters are the other path. PEP 684 gave each interpreter within one process its own GIL in 3.12, and PEP 734 exposes them to Python code in 3.14 through a stdlib module with an executor that slots into the <code>concurrent.futures</code> shape above. The pitch is process-like isolation at thread-like cost, parallel bytecode streams in one address space with no forced pickling of the world, though objects still cross between interpreters by copying or through explicitly shareable types. For worker-pool workloads over mostly independent tasks they are a plausible future default, and the fact that both futures arrive wearing the executor interface is a quiet endorsement of building on it today.</p>
+
+          <h2>The decision table</h2>
+          <p>Everything measured above compresses into a table I actually use.</p>
+          <div style="overflow-x: auto">
+            <table>
+              <thead>
+                <tr><th>Your situation</th><th>Reach for</th><th>Because</th></tr>
+              </thead>
+              <tbody>
+                <tr><td>A handful to a few hundred network or disk calls</td><td>ThreadPoolExecutor with as_completed</td><td>Blocked threads release the GIL, and 40 downloads ran 12 times faster here with 16 threads</td></tr>
+                <tr><td>Thousands of concurrent connections</td><td>asyncio</td><td>500 waits finished in 0.106 s on one thread, and coroutines cost kilobytes where threads cost stacks</td></tr>
+                <tr><td>CPU-bound pure-Python work</td><td>ProcessPoolExecutor</td><td>8 processes ran 7.7 times faster where 8 threads gained nothing</td></tr>
+                <tr><td>CPU-bound array or numeric work</td><td>numpy or another compiled library first</td><td>One vectorized call beat the 8-process pool by 26 times</td></tr>
+                <tr><td>Streams of small items between threads</td><td>queue.Queue with sentinels and maxsize</td><td>The queue is the synchronization, and backpressure comes free</td></tr>
+                <tr><td>Big arrays shared with worker processes</td><td>multiprocessing.shared_memory</td><td>Passing a name was 19 times faster than pickling 64 MiB</td></tr>
+                <tr><td>Many tiny tasks through a pool</td><td>A large chunksize, always set on imap</td><td>chunksize alone swung the same job by 450 times</td></tr>
+                <tr><td>Async code that must call blocking or heavy functions</td><td>run_in_executor</td><td>The loop stayed responsive while a 0.95 s computation ran in a worker</td></tr>
+                <tr><td>Code that must run on macOS or Windows</td><td>spawn, set explicitly, with the __main__ guard</td><td>Fork inherits haunted locks, and spawn is the only portable truth</td></tr>
+                <tr><td>Unsure, or likely to change your mind</td><td>concurrent.futures behind one helper</td><td>The pool choice becomes an argument a profiler can veto</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>Every number quoted on this page came from a single representative run of the scripts shown, executed with the system CPython 3.10.12 and numpy 1.21.5 on this shared virtualized 52-core Xeon 8480+ host. Rerun them and your absolute times will differ, especially on a quiet dedicated machine, but I have yet to see the ratios change their minds. For the deeper story underneath these numbers, the GIL's mechanics, memory models, and the same measurements taken in C, C++, and Rust, the companion is the <a href="/classes/concurrent-systems-programming">concurrent systems programming page</a>.</p>
+        </article>
+      </div>
+    </section>
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/reader.js"></script>
+    <script defer src="/code-copy.js"></script>
+      <script defer src="/theme.js"></script>
+  </body>
+</html>
