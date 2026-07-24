@@ -19,12 +19,14 @@ import { fileURLToPath } from 'node:url'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 
-const SHIKI_LANGS = ['python', 'cpp', 'rust', 'go', 'typescript', 'swift', 'sql', 'http', 'bash', 'javascript', 'json', 'yaml', 'nginx', 'java', 'xml']
+const SHIKI_LANGS = ['python', 'cpp', 'rust', 'go', 'typescript', 'swift', 'sql', 'http', 'bash', 'javascript', 'json', 'yaml', 'nginx', 'java', 'xml', 'system-verilog', 'verilog', 'tcl']
 const CODE_CLASS_MAP = {
   python: 'python', cpp: 'cpp', c: 'cpp', rust: 'rust', go: 'go', typescript: 'typescript',
   ts: 'typescript', swift: 'swift', sql: 'sql', http: 'http', bash: 'bash', shell: 'bash',
   sh: 'bash', javascript: 'javascript', js: 'javascript', json: 'json', yaml: 'yaml',
   nginx: 'nginx', java: 'java', xml: 'xml',
+  systemverilog: 'system-verilog', 'system-verilog': 'system-verilog', sv: 'system-verilog',
+  verilog: 'verilog', v: 'verilog', tcl: 'tcl', xdc: 'tcl', sdc: 'tcl',
 }
 const DATA_LANG_MAP = {
   python: 'python', cpp: 'cpp', rust: 'rust', go: 'go', typescript: 'typescript', swift: 'swift',
