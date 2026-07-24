@@ -89,17 +89,41 @@ history.
 
 | Group | Pages | Done |
 | --- | --- | --- |
-| Machine learning foundations | 5 | 0 |
-| Language, generative, multimodal | 11 | 0 |
-| Reinforcement learning and decisions | 7 | 0 |
-| Systems, architecture, data at scale | 10 | 0 |
+| Machine learning foundations | 5 | 2 |
+| Language, generative, multimodal | 11 | 4 |
+| Reinforcement learning and decisions | 7 | 3 |
+| Systems, architecture, data at scale | 10 | 2 |
 | Algorithms, theory, optimization, security | 7 | 0 |
 | Graphics, rendering, 3D | 5 | 0 |
 | Robotics and embodied intelligence | 5 | 0 |
 | Applied domains, product, interfaces | 6 | 0 |
-| **Total** | **56** | **0** |
+| **Total** | **56** | **11** |
+
+Complete and validated: computer-architecture, deep-generative-models,
+deep-learning-engineering, deep-reinforcement-learning,
+diffusion-and-large-vision-models, graph-machine-learning,
+meta-learning-and-multitask, mining-massive-datasets, nlp-deep-learning,
+probabilistic-graphical-models, reinforcement-learning-fundamentals.
+
+Partial stubs on disk from agents killed mid-write (resume these first, do not
+trust their current contents as finished): algorithm-design-and-analysis,
+concurrent-systems-programming, statistical-learning. The index generator
+treats a page as live only when it contains both a reference list and a
+closing takeaway, so partial pages are not linked from the index.
 
 ## Log
+
+### Session 2 (2026-07-24)
+
+- Resumed after a usage-limit cutoff. Committed the in-flight checkpoint
+  (graph ML rewrite, RL foundations expansion, `algorithms.json`,
+  `parallel.json`, `networks.json`) as fc929db.
+- Corrected the stale status table above: 11 pages were done as of the
+  cutoff, not 0.
+- Launched parallel authoring agents for the six pages listed as in flight
+  above. Coordinator loop per batch: validate with `tools/check_classes.py`,
+  bake highlighting with `node scripts/highlight.mjs`, regenerate the index,
+  update this file, commit, push.
 
 ### Session 1 (2026-07-23)
 

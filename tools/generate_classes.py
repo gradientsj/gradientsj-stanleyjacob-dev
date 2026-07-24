@@ -59,6 +59,20 @@ def e(s):
     return html.escape(s, quote=False)
 
 
+def is_complete(slug):
+    """A page counts as live only once it is finished.
+
+    Authoring can be interrupted, leaving a partial file on disk. Those must not
+    be linked from the index, so completeness is judged by the markers that only
+    appear in a finished page: the reference list and the closing takeaway.
+    """
+    p = ROOT / "classes" / slug / "index.html"
+    if not p.exists():
+        return False
+    src = p.read_text(encoding="utf-8")
+    return '<ol class="refs">' in src and '<div class="takeaway">' in src
+
+
 def row(article, exists):
     tags = " &middot; ".join(e(t) for t in article.get("tags", []))
     title = e(article["title"])
@@ -83,7 +97,7 @@ def main():
         rows = []
         for a in g["articles"]:
             total += 1
-            exists = (ROOT / "classes" / a["slug"] / "index.html").exists()
+            exists = is_complete(a["slug"])
             written += exists
             rows.append(row(a, exists))
         parts.append(
@@ -110,7 +124,7 @@ def main():
         None,
     )
     card = ""
-    if featured and (ROOT / "classes" / featured["slug"] / "index.html").exists():
+    if featured and is_complete(featured["slug"]):
         card = f"""        <a class="article-card" href="/classes/{featured['slug']}">
           <span class="k">Featured write-up</span>
           <h3>{e(featured['title'])}</h3>

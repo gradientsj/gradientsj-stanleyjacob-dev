@@ -1,0 +1,818 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Concurrency Across Four Languages &middot; Stanley Jacob</title>
+    <meta name="description" content="One concurrency curriculum written four times: fork and pipes in C, pthreads and std::thread in C++, Send/Sync and compile-time race freedom in Rust, the GIL and free threading in Python, plus the acquire/release memory model, a measured store-buffering litmus test, lock-free queues, and work stealing, with benchmarks from a 52-core Xeon." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes" class="active">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/classes">Classes</a></div>
+        <h1>Concurrency across four languages: threads, processes, and memory models in Rust, C++, C, and Python</h1>
+        <p class="lead">
+          Every language that runs on a multicore machine has to answer the
+          same four questions: what is the unit of execution, what state do
+          two units share, what does one unit observe of another's writes,
+          and who is responsible when the answer is "garbage". C answers
+          with processes, pipes, and pthreads and makes the programmer
+          responsible for everything. C++ adds RAII locks and a formal
+          memory model. Rust moves the data-race check into the type system,
+          so the racy program from the C chapter does not compile. Python
+          serializes the interpreter behind a global lock and is now, three
+          decades in, removing it. This page writes one curriculum four
+          times, side by side, and calibrates every claim against
+          measurements taken on the 52-core Xeon 8480+ that builds this
+          site: what a fork costs, what a contended mutex costs, how often
+          the x86 store buffer reorders a litmus test, and what the GIL does
+          to eight CPU-bound threads.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Why this subject matters now</h2>
+          <p>
+            Single-thread performance stopped improving on schedule around
+            2005, when Dennard scaling ended and the industry converted
+            transistor budget into cores instead of clock. Herb Sutter's
+            "The Free Lunch Is Over" named the consequence at the time:
+            software that wants the machine's throughput must be concurrent,
+            and concurrency is not a library detail but a change in the
+            semantics of the language. Twenty years later the machine in
+            question is a 52-way server part or a 10-core phone, and the
+            expectation on a working engineer has hardened accordingly. It
+            is no longer enough to know one language's idioms. Services are
+            polyglot: a Python control plane spawning processes, a Rust or
+            C++ data plane holding locks for nanoseconds, an async runtime
+            multiplexing a hundred thousand connections onto a dozen
+            threads. The engineer who understands why these designs differ,
+            rather than only how to imitate them, is the one who can debug
+            the 2 a.m. incident where the answer crosses a language
+            boundary.
+          </p>
+          <p>
+            The deeper reason to study concurrency comparatively is that the
+            four languages here occupy four distinct points in a single
+            design space, and seeing all four at once makes the space
+            visible. C exposes the operating system's primitives raw:
+            fork, exec, wait, pipes, pthreads, futexes. C++ keeps C's cost
+            model but adds a precisely specified memory model (Boehm and
+            Adve, 2008) so that compilers and programmers finally agree on
+            what a racy program means, namely nothing at all. Rust keeps
+            C++'s memory model and moves the race check to compile time:
+            the type system, through the <code>Send</code> and
+            <code>Sync</code> traits and the ownership rules, rejects
+            programs that would race, a guarantee given formal footing by
+            the RustBelt project (Jung, Jourdan, Krebbers, and Dreyer).
+            Python historically declined the whole problem by serializing
+            bytecode execution behind the global interpreter lock, and the
+            free-threaded build specified by PEP 703, shipping as a
+            supported option since CPython 3.13, is the most consequential
+            change to the runtime in decades. Each design is a coherent
+            answer to the same question; the differences are the curriculum.
+          </p>
+          <p>
+            Everything below is measured where a measurement is possible.
+            The numbers quoted come from benchmark runs on this repository's
+            build machine, an Intel Xeon Platinum 8480+ (Sapphire Rapids, 52
+            logical CPUs visible, Ubuntu 22.04, gcc 11.4 at -O2, rustc
+            1.97 at -O, CPython 3.10), recorded in
+            <code>classes/data/concurrency.json</code>. The host is shared
+            and virtualized, so the numbers are honest order-of-magnitude
+            engineering data, not microarchitectural truth; medians of
+            repeated runs are quoted throughout.
+          </p>
+
+          <h2>Processes: isolation first</h2>
+          <h3>fork, exec, wait</h3>
+          <p>
+            The oldest concurrency primitive on Unix is also the strongest:
+            a process owns a private virtual address space, so two processes
+            share nothing unless they arrange to. <code>fork()</code>
+            duplicates the calling process; the child receives a
+            copy-on-write image of the parent's memory, open file
+            descriptors that refer to the same underlying descriptions, and
+            a return value of 0 where the parent receives the child's pid.
+            <code>exec*()</code> replaces the current image with a new
+            program, preserving descriptors, which is the entire mechanism
+            by which shells wire up redirection: adjust descriptors between
+            fork and exec, then exec the target. <code>wait()</code> and
+            <code>waitpid()</code> collect the child's exit status and
+            release the kernel's bookkeeping for it; a dead child that no
+            one has waited for is a zombie, kept around solely so its status
+            can still be delivered.
+          </p>
+          <pre class="flow">parent                                child
+──────                                ─────
+fork() ──────────────────────────────► (copy-on-write clone begins here)
+  │                                     │ dup2(pipe_wr, STDOUT_FILENO)
+  │                                     │ close unused ends
+  │                                     │ execvp("sort", ...)   image replaced
+  │ read(pipe_rd, ...)  ◄── pipe ────── │ writes flow into the pipe
+  │ waitpid(child, &amp;status, 0) ◄─────── │ _exit(0)  status delivered to parent</pre>
+          <p>
+            The cost of this isolation is measurable but smaller than its
+            reputation. On this machine, a fork immediately followed by
+            child exit and parent wait costs a median of 118.9 &micro;s;
+            adding an exec of <code>/bin/true</code> raises it to
+            499.7 &micro;s, and <code>posix_spawn</code> of the same binary
+            costs 432.6 &micro;s. For comparison, creating and joining a
+            pthread costs 33.9 &micro;s. A process is roughly 3.5 times the
+            price of a thread here, not the orders of magnitude folklore
+            suggests, because copy-on-write means fork copies page tables
+            and metadata, not memory. What stays expensive is what happens
+            after: every write to a shared-with-parent page takes a fault
+            and a page copy, and communication requires a kernel-mediated
+            channel.
+          </p>
+          <h3>Pipes and the cost of a context switch</h3>
+          <p>
+            A pipe is a bounded in-kernel byte queue with a read end and a
+            write end. Writes of up to <code>PIPE_BUF</code> bytes (4096 on
+            Linux) are atomic with respect to other writers; a read on an
+            empty pipe blocks; a write on a full pipe blocks; a read on a
+            pipe whose write ends are all closed returns 0, which is how
+            end-of-file propagates down a shell pipeline. Because blocking
+            reads and writes deschedule the caller, a pipe doubles as a
+            crude scheduling instrument: bouncing one byte between two
+            processes pinned to the same core forces two context switches
+            per round trip, and timing it bounds the switch cost. Measured
+            here: 3,730 ns per round trip, or roughly 1.9 &micro;s per
+            context switch including the pipe read/write system calls
+            themselves. That number is the floor under every design that
+            blocks per message, and it is about 350 times the 5.5 ns cost
+            of an uncontended mutex acquire measured below; the ratio is
+            the quantitative content of the advice "do not take a kernel
+            round trip when a user-space handoff will do".
+          </p>
+          <p>
+            The same pattern, three ways. The C version is the canonical
+            one; the Rust version shows the higher-level
+            <code>std::process</code> API over the same syscalls; Python's
+            <code>subprocess</code> is a direct wrapper over
+            fork/exec/wait (via <code>posix_spawn</code> or
+            <code>vfork</code> where it can).
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="c" class="active">C</button>
+              <button data-lang="rust">Rust</button>
+              <button data-lang="python">Python</button>
+            </div>
+            <pre data-lang="c" class="lang active"><code class="language-cpp">/* run "sort" as a child, feed it words through a pipe, read nothing back:
+ * the child inherits stdout. gcc -O2 pipeline.c */
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;sys/wait.h&gt;
+#include &lt;unistd.h&gt;
+
+int main(void) {
+    int fds[2];                       /* fds[0] = read end, fds[1] = write end */
+    if (pipe(fds) != 0) { perror("pipe"); exit(1); }
+
+    pid_t pid = fork();
+    if (pid == 0) {                   /* child */
+        dup2(fds[0], STDIN_FILENO);   /* stdin now reads from the pipe */
+        close(fds[0]);                /* close originals; dup2 kept a copy */
+        close(fds[1]);                /* CRUCIAL: or sort never sees EOF   */
+        execlp("sort", "sort", (char *)NULL);
+        perror("execlp");             /* only reached if exec failed */
+        _exit(127);
+    }
+    /* parent */
+    close(fds[0]);
+    const char *words = "pear\napple\nquince\n";
+    write(fds[1], words, strlen(words));
+    close(fds[1]);                    /* child's read() now returns 0: EOF */
+
+    int status;
+    waitpid(pid, &amp;status, 0);
+    printf("sort exited with %d\n", WEXITSTATUS(status));
+    return 0;
+}
+</code></pre>
+            <pre data-lang="rust" class="lang"><code class="language-rust">// std::process wraps the same fork/exec/wait; Stdio::piped() makes the pipe.
+use std::io::Write;
+use std::process::{Command, Stdio};
+
+fn main() -&gt; std::io::Result&lt;()&gt; {
+    let mut child = Command::new("sort")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .spawn()?;                       // fork + exec happen here
+
+    // Scope the handle so the write end drops (closes) before we wait:
+    // without the close, sort waits forever for EOF, we wait for sort.
+    {
+        let stdin = child.stdin.as_mut().expect("piped stdin");
+        stdin.write_all(b"pear\napple\nquince\n")?;
+    }
+    drop(child.stdin.take());            // explicit close of the pipe
+
+    let status = child.wait()?;          // waitpid
+    println!("sort exited with {:?}", status.code());
+    Ok(())
+}
+</code></pre>
+            <pre data-lang="python" class="lang"><code class="language-python"># subprocess wraps fork/exec/wait (using posix_spawn when it can).
+import subprocess
+
+# communicate() writes, closes the pipe so the child sees EOF, and waits:
+# the same three steps the C version performs by hand.
+result = subprocess.run(
+    ["sort"],
+    input="pear\napple\nquince\n",
+    capture_output=True,
+    text=True,
+)
+print(result.stdout, end="")
+print("sort exited with", result.returncode)
+
+# The raw primitives still exist when needed:
+# os.fork(), os.execvp(), os.waitpid(), os.pipe()
+</code></pre>
+          </div>
+          <p>
+            The single most common bug in hand-rolled pipelines appears in
+            the comments above: an unclosed write end. The kernel delivers
+            end-of-file on a pipe only when every descriptor referring to
+            the write end is closed, and fork duplicates descriptors, so
+            the child holds a copy of the write end it never uses. If the
+            child does not close it, the child's own read never returns 0
+            and the pipeline deadlocks with both processes blocked. The
+            Rust version makes the same mistake harder by tying the close
+            to a drop; the Python version buries it inside
+            <code>communicate()</code>.
+          </p>
+          <p>
+            Processes remain the right tool more often than a
+            threads-first curriculum suggests. Isolation means a crash,
+            a leak, or a corrupted heap in the child cannot take down the
+            parent; address-space separation is the only memory-safety
+            boundary C offers at all. Chrome runs a process per site,
+            not a thread per site, for exactly this reason, and Python's
+            <code>multiprocessing</code> module (measured below) turns
+            the same isolation into its escape hatch from the GIL.
+          </p>
+
+          <h2>Threads and locks: the shared-memory contract</h2>
+          <h3>What a thread is, and what it costs</h3>
+          <p>
+            A thread is an execution context, program counter, registers,
+            and stack, scheduled by the kernel but sharing its process's
+            address space, descriptors, and heap with every sibling. On
+            Linux both threads and processes are created by
+            <code>clone()</code>; the difference is which resources the
+            flags say to share. Sharing is the point and the poison: any
+            thread can read what any other thread wrote, at the price that
+            any thread can read what another thread is halfway through
+            writing. The measured creation costs on this machine, medians
+            over thousands of create-join pairs: 33.9 &micro;s for a
+            pthread, 45.4 &micro;s for a Rust <code>std::thread</code>
+            (the same pthread plus ownership bookkeeping), 74.5 &micro;s
+            for a Python <code>threading.Thread</code> (a pthread plus
+            interpreter-state setup), against 118.9 &micro;s for a fork.
+            Each thread also reserves stack address space, 8 MB of virtual
+            memory by default on Linux, committed lazily a page at a time;
+            ten thousand threads is feasible in address-space terms and
+            fatal in scheduler terms, which is the observation that
+            motivates the thread pools and event loops later on this page.
+          </p>
+          <h3>Mutual exclusion</h3>
+          <p>
+            The mutex is the oldest correctness tool, going back to
+            Dijkstra's 1965 formulation of the mutual-exclusion problem: at
+            most one thread executes the critical section at a time, so any
+            invariant that holds when the lock is released holds when it is
+            next acquired. A modern Linux mutex costs almost nothing when
+            uncontended, a single atomic compare-and-swap in user space,
+            5.53 ns per lock-increment-unlock measured here, and enters the
+            kernel through a futex (Franke, Russell, and Kirkwood, 2002)
+            only when a thread must sleep. The four implementations below
+            are semantically identical; the differences worth noticing are
+            who unlocks (C: the programmer, everyone else: a destructor or
+            context manager) and where the lock lives relative to the data
+            it guards (only Rust ties them together in the type;
+            <code>Mutex&lt;i64&gt;</code> owns its data, and the compiler
+            refuses access without the lock).
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="c" class="active">C</button>
+              <button data-lang="cpp">C++</button>
+              <button data-lang="rust">Rust</button>
+              <button data-lang="python">Python</button>
+            </div>
+            <pre data-lang="c" class="lang active"><code class="language-cpp">/* pthreads: the lock and the data are associated only by convention. */
+#include &lt;pthread.h&gt;
+#include &lt;stdio.h&gt;
+
+long counter = 0;
+pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+
+void *worker(void *arg) {
+    for (long i = 0; i &lt; 1000000; i++) {
+        pthread_mutex_lock(&amp;lock);
+        counter++;                      /* critical section */
+        pthread_mutex_unlock(&amp;lock);    /* forget this and deadlock later */
+    }
+    return NULL;
+}
+
+int main(void) {
+    pthread_t t[4];
+    for (int i = 0; i &lt; 4; i++) pthread_create(&amp;t[i], NULL, worker, NULL);
+    for (int i = 0; i &lt; 4; i++) pthread_join(t[i], NULL);
+    printf("%ld\n", counter);           /* always 4000000 */
+    return 0;
+}
+</code></pre>
+            <pre data-lang="cpp" class="lang"><code class="language-cpp">// C++: RAII. The guard's destructor unlocks on every exit path,
+// including exceptions. g++ -O2 -std=c++20 counter.cpp -lpthread
+#include &lt;iostream&gt;
+#include &lt;mutex&gt;
+#include &lt;thread&gt;
+#include &lt;vector&gt;
+
+int main() {
+    long counter = 0;
+    std::mutex m;
+    std::vector&lt;std::thread&gt; threads;
+    for (int i = 0; i &lt; 4; i++)
+        threads.emplace_back([&amp;] {
+            for (long j = 0; j &lt; 1'000'000; j++) {
+                std::lock_guard&lt;std::mutex&gt; guard(m);
+                counter++;
+            }                            // guard unlocks here
+        });
+    for (auto &amp;t : threads) t.join();
+    std::cout &lt;&lt; counter &lt;&lt; "\n";        // always 4000000
+}
+</code></pre>
+            <pre data-lang="rust" class="lang"><code class="language-rust">// Rust: Mutex&lt;i64&gt; owns the data. There is no way to reach the i64
+// without lock(), so "forgot to take the lock" is a compile error.
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+fn main() {
+    let counter = Arc::new(Mutex::new(0i64));
+    let handles: Vec&lt;_&gt; = (0..4)
+        .map(|_| {
+            let c = Arc::clone(&amp;counter);
+            thread::spawn(move || {
+                for _ in 0..1_000_000 {
+                    *c.lock().unwrap() += 1; // guard drops (unlocks) here
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    println!("{}", *counter.lock().unwrap()); // always 4000000
+}
+</code></pre>
+            <pre data-lang="python" class="lang"><code class="language-python">import threading
+
+counter = 0
+lock = threading.Lock()
+
+def worker():
+    global counter
+    for _ in range(1_000_000):
+        with lock:          # context manager releases on any exit
+            counter += 1
+
+threads = [threading.Thread(target=worker) for _ in range(4)]
+for t in threads: t.start()
+for t in threads: t.join()
+print(counter)  # always 4000000
+
+# The lock is NOT redundant under the GIL: counter += 1 compiles to
+# LOAD / ADD / STORE bytecodes, and the interpreter may switch threads
+# between them. Without the lock this prints less than 4000000.
+</code></pre>
+          </div>
+          <h3>Condition variables and the bounded buffer</h3>
+          <p>
+            A mutex answers "not at the same time"; a condition variable
+            answers "not until". The pattern comes from Hoare's 1974
+            monitors: a thread that finds the state unsuitable atomically
+            releases the mutex and sleeps; a thread that makes the state
+            suitable signals; the sleeper wakes holding the mutex again and
+            rechecks. The recheck is mandatory, always
+            <code>while</code>, never <code>if</code>, for two reasons that
+            hold in all four languages. First, spurious wakeups are
+            permitted by every one of these APIs (POSIX permits them so
+            implementations need not suppress them at cost). Second, and
+            more fundamentally, between the signal and the wakeup another
+            thread may acquire the mutex and consume the state; the
+            condition variable promises that the predicate was true at
+            signal time, not that it is true at wake time. The canonical
+            exercise is the bounded buffer: producers wait while full,
+            consumers wait while empty, two conditions so that producers
+            wake consumers and vice versa.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="c" class="active">C</button>
+              <button data-lang="cpp">C++</button>
+              <button data-lang="rust">Rust</button>
+              <button data-lang="python">Python</button>
+            </div>
+            <pre data-lang="c" class="lang active"><code class="language-cpp">#include &lt;pthread.h&gt;
+
+#define CAP 8
+long buf[CAP];
+int head = 0, tail = 0, count = 0;      /* count disambiguates full/empty */
+pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t not_full  = PTHREAD_COND_INITIALIZER;
+pthread_cond_t not_empty = PTHREAD_COND_INITIALIZER;
+
+void put(long v) {
+    pthread_mutex_lock(&amp;m);
+    while (count == CAP)                 /* while, never if */
+        pthread_cond_wait(&amp;not_full, &amp;m);  /* unlocks m, sleeps, relocks */
+    buf[tail] = v;
+    tail = (tail + 1) % CAP;
+    count++;
+    pthread_cond_signal(&amp;not_empty);
+    pthread_mutex_unlock(&amp;m);
+}
+
+long get(void) {
+    pthread_mutex_lock(&amp;m);
+    while (count == 0)
+        pthread_cond_wait(&amp;not_empty, &amp;m);
+    long v = buf[head];
+    head = (head + 1) % CAP;
+    count--;
+    pthread_cond_signal(&amp;not_full);
+    pthread_mutex_unlock(&amp;m);
+    return v;
+}
+</code></pre>
+            <pre data-lang="cpp" class="lang"><code class="language-cpp">#include &lt;condition_variable&gt;
+#include &lt;deque&gt;
+#include &lt;mutex&gt;
+
+class BoundedBuffer {
+    std::deque&lt;long&gt; q;
+    const size_t cap = 8;
+    std::mutex m;
+    std::condition_variable not_full, not_empty;
+
+public:
+    void put(long v) {
+        std::unique_lock&lt;std::mutex&gt; lk(m);
+        not_full.wait(lk, [&amp;] { return q.size() &lt; cap; });
+        // wait(lk, pred) is exactly: while (!pred()) wait(lk);
+        q.push_back(v);
+        not_empty.notify_one();
+    }
+    long get() {
+        std::unique_lock&lt;std::mutex&gt; lk(m);
+        not_empty.wait(lk, [&amp;] { return !q.empty(); });
+        long v = q.front();
+        q.pop_front();
+        not_full.notify_one();
+        return v;
+    }
+};
+</code></pre>
+            <pre data-lang="rust" class="lang"><code class="language-rust">use std::collections::VecDeque;
+use std::sync::{Condvar, Mutex};
+
+pub struct BoundedBuffer {
+    q: Mutex&lt;VecDeque&lt;i64&gt;&gt;,
+    cap: usize,
+    not_full: Condvar,
+    not_empty: Condvar,
+}
+
+impl BoundedBuffer {
+    pub fn put(&amp;self, v: i64) {
+        let mut q = self.q.lock().unwrap();
+        while q.len() == self.cap {
+            q = self.not_full.wait(q).unwrap(); // gives back the guard
+        }
+        q.push_back(v);
+        self.not_empty.notify_one();
+    }
+    pub fn get(&amp;self) -&gt; i64 {
+        let mut q = self.q.lock().unwrap();
+        while q.is_empty() {
+            q = self.not_empty.wait(q).unwrap();
+        }
+        let v = q.pop_front().unwrap();
+        self.not_full.notify_one();
+        v
+    }
+}
+// In production Rust this whole type is a channel:
+// std::sync::mpsc::sync_channel(8) or crossbeam_channel::bounded(8).
+</code></pre>
+            <pre data-lang="python" class="lang"><code class="language-python">import threading
+from collections import deque
+
+class BoundedBuffer:
+    def __init__(self, cap=8):
+        self.q = deque()
+        self.cap = cap
+        self.m = threading.Lock()
+        self.not_full = threading.Condition(self.m)
+        self.not_empty = threading.Condition(self.m)
+
+    def put(self, v):
+        with self.not_full:
+            while len(self.q) == self.cap:
+                self.not_full.wait()
+            self.q.append(v)
+            self.not_empty.notify()
+
+    def get(self):
+        with self.not_empty:
+            while not self.q:
+                self.not_empty.wait()
+            v = self.q.popleft()
+            self.not_full.notify()
+            return v
+
+# queue.Queue(maxsize=8) is this class, hardened, in the stdlib.
+</code></pre>
+          </div>
+          <p>
+            Measured on this machine, the mutex-and-two-condvars queue
+            moves a median of 5.1 million items per second between one
+            producer and one consumer; the lock-free ring buffer derived
+            later on this page moves 19.4 million under the same protocol,
+            and the gap is the cost of the futex sleep/wake cycles and of
+            bouncing the lock's cache line. Both numbers matter: 5 million
+            handoffs per second is far more than most applications need,
+            which is why the advice to start with locks is not
+            condescension but arithmetic.
+          </p>
+          <h2>Data races: what actually goes wrong</h2>
+          <h3>A definition worth being precise about</h3>
+          <p>
+            A <em>data race</em> is two accesses to the same memory
+            location from different threads, at least one a write, neither
+            an atomic operation, and neither ordered before the other by
+            synchronization. The C++11 standard, following Boehm and Adve,
+            declares the behavior of any program containing a data race
+            undefined; C11 adopted the same model, and Rust adopts it for
+            <code>unsafe</code> code while making safe code race-free by
+            construction. A data race is not the same thing as a
+            <em>race condition</em>, which is any timing-dependent
+            correctness bug; withdraw-then-withdraw on a bank balance can
+            be a race condition built entirely out of perfectly
+            synchronized operations. Data races are the narrower, sharper
+            notion: they are the thing the memory model needs to outlaw so
+            that compilers can optimize single-threaded code as if it were
+            single-threaded.
+          </p>
+          <p>
+            The textbook demonstration is four threads incrementing a
+            shared counter five million times each with no lock. The
+            increment is a load, an add, and a store; two threads that
+            load the same value store the same value, and one increment is
+            lost. Measured on this machine, gcc -O2, the counter declared
+            <code>volatile</code> so the compiler actually performs each
+            memory round trip: expected 20,000,000, observed (five runs)
+            5,135,947, 5,125,041, 5,034,240, 5,045,762, 5,116,295. The
+            median run lost 74.4 percent of all updates. It is worth
+            pausing on how bad that is: not a few percent lost at unlucky
+            interleavings, but three quarters of all work discarded,
+            because under contention the load-add-store windows of four
+            cores overlap almost constantly. And this is the
+            <em>friendly</em> failure mode, visible because the counter is
+            a single word. Without <code>volatile</code>, gcc hoists the
+            counter into a register and stores once per thread at the end,
+            which is a perfectly legal compilation of the racy program and
+            loses updates in a completely different pattern; that
+            sensitivity to optimization level is what undefined behavior
+            means in practice.
+          </p>
+          <pre class="flow">thread A                 thread B                 counter
+────────                 ────────                 ───────
+load counter → 41                                    41
+                         load counter → 41           41
+add 1        → 42                                    41
+                         add 1        → 42           41
+store 42                                             42
+                         store 42                    42   ← one increment lost</pre>
+          <h3>Why volatile is not a fix</h3>
+          <p>
+            <code>volatile</code> in C and C++ orders and preserves
+            accesses <em>with respect to the compiler</em> for a single
+            thread; it says nothing about atomicity or about what other
+            cores observe, and it does not prevent the interleaving above.
+            It exists for memory-mapped I/O. The measured 74 percent loss
+            happened <em>with</em> volatile. The correct tools are the
+            mutex (semantic simplicity, 11.5 M contended ops/s measured
+            below) or the atomic (44.6 M ops/s), and which to choose is a
+            later section's subject. Java's <code>volatile</code> is a
+            different and stronger construct (it gives ordering and
+            visibility, though still not read-modify-write atomicity),
+            a terminological collision that has caused real bugs in
+            programmers moving between the languages.
+          </p>
+
+          <h2>Rust: data races as type errors</h2>
+          <h3>Ownership, then Send and Sync</h3>
+          <p>
+            Rust's claim, "fearless concurrency" in Klabnik and Nichols's
+            phrase, is precise: safe Rust programs contain no data races,
+            checked at compile time, with no runtime cost. The mechanism
+            is not a race detector; it is the composition of three rules
+            that exist independently of concurrency. First, every value
+            has one owner, and aliasing is governed by borrowing: at any
+            point there may be either many shared references
+            <code>&amp;T</code> or exactly one mutable reference
+            <code>&amp;mut T</code>, never both. Second, the
+            <code>Send</code> marker trait declares that ownership of a
+            type may move to another thread, and <code>Sync</code>
+            declares that a shared reference to it may be used from
+            another thread (formally, <code>T: Sync</code> iff
+            <code>&amp;T: Send</code>). Third, APIs that cross thread
+            boundaries demand these traits in their signatures:
+            <code>thread::spawn</code> requires its closure to be
+            <code>Send + 'static</code>. Both traits are auto-derived
+            structurally, so a type is Send unless it contains something
+            that is not, and the "not" list is exactly the types whose
+            invariants a second thread could break:
+            <code>Rc&lt;T&gt;</code> (non-atomic reference counts),
+            <code>Cell</code>/<code>RefCell</code> shared across threads
+            (unsynchronized interior mutability, so they are Send but not
+            Sync), raw pointers (no invariants at all).
+          </p>
+          <p>
+            The consequence is that the racy counter from the previous
+            section is not a bug you find in Rust; it is a program you
+            cannot write. Here it is, attempted honestly, with the actual
+            compiler output from rustc 1.97 on this machine.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="rust" class="active">Rust (rejected)</button>
+              <button data-lang="bash">rustc output</button>
+            </div>
+            <pre data-lang="rust" class="lang active"><code class="language-rust">// This is the C data-race program, transliterated. It does not compile.
+use std::thread;
+
+fn main() {
+    let mut counter = 0i64;
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        handles.push(thread::spawn(|| {
+            for _ in 0..5_000_000 {
+                counter += 1;          // 4 threads, one &amp;mut: rejected
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    println!("{counter}");
+}
+</code></pre>
+            <pre data-lang="bash" class="lang"><code class="language-bash">error[E0373]: closure may outlive the current function, but it borrows
+              `counter`, which is owned by the current function
+ --&gt; compile_fail.rs:7:36
+  |
+7 |         handles.push(thread::spawn(|| {
+  |                                    ^^ may outlive borrowed value `counter`
+9 |                 counter += 1;
+  |                 ------- `counter` is borrowed here
+  |
+note: function requires argument type to outlive `'static`
+
+error[E0499]: cannot borrow `counter` as mutable more than once at a time
+ --&gt; compile_fail.rs:7:36
+  |
+7 |         handles.push(thread::spawn(|| {
+  |                      -             ^^ `counter` was mutably borrowed here
+  |                                       in the previous iteration of the loop
+</code></pre>
+          </div>
+          <p>
+            Two independent rules each reject the program. E0373 is a
+            lifetime error: the spawned thread may outlive
+            <code>main</code>'s stack frame, so borrowing a stack variable
+            into it is unsound (the same dangling-pointer bug C permits
+            silently). E0499 is the aliasing error, and it is the one that
+            encodes race freedom: four closures each need
+            <code>&amp;mut counter</code>, and the borrow checker permits
+            only one mutable borrow at a time. Note what the error is not:
+            it is not a special concurrency diagnostic. It is the ordinary
+            aliasing rule, applied across a spawn boundary.
+          </p>
+          <p>
+            The second rejection is the one that names the traits. Wrap
+            the counter in <code>Rc&lt;RefCell&lt;i64&gt;&gt;</code>, the
+            single-threaded shared-mutability idiom, and move a clone into
+            the thread:
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="rust" class="active">Rust (rejected)</button>
+              <button data-lang="bash">rustc output</button>
+            </div>
+            <pre data-lang="rust" class="lang active"><code class="language-rust">use std::cell::RefCell;
+use std::rc::Rc;
+use std::thread;
+
+fn main() {
+    let counter = Rc::new(RefCell::new(0i64));
+    let c2 = Rc::clone(&amp;counter);
+    let h = thread::spawn(move || {
+        *c2.borrow_mut() += 1;   // Rc's refcount is a plain integer:
+    });                          // two threads cloning/dropping would race it
+    h.join().unwrap();
+    println!("{}", counter.borrow());
+}
+</code></pre>
+            <pre data-lang="bash" class="lang"><code class="language-bash">error[E0277]: `Rc&lt;RefCell&lt;i64&gt;&gt;` cannot be sent between threads safely
+  --&gt; compile_fail2.rs:8:27
+   |
+ 8 |     let h = thread::spawn(move || {
+   |             ------------- ^------ within this closure
+   |             required by a bound introduced by this call
+   |
+   = help: the trait `Send` is not implemented for `Rc&lt;RefCell&lt;i64&gt;&gt;`
+note: required by a bound in `spawn`
+</code></pre>
+          </div>
+          <p>
+            <code>Rc</code> bumps its reference count with ordinary
+            arithmetic, exactly the load-add-store that lost 74 percent of
+            updates above, so <code>Rc</code> opts out of
+            <code>Send</code> and the bound on <code>spawn</code> refuses
+            the closure. The fix is to buy back each capability with a
+            type that pays for it: <code>Arc</code> replaces the plain
+            refcount with an atomic one (restoring Send/Sync), and
+            <code>Mutex</code> replaces <code>RefCell</code>'s
+            single-threaded borrow flag with real mutual exclusion. That
+            is why the working Rust counter earlier reads
+            <code>Arc&lt;Mutex&lt;i64&gt;&gt;</code>: each wrapper is the
+            minimal payment for one trait bound, and the compiler will
+            name the missing trait if either is omitted. The RustBelt
+            project (Jung, Jourdan, Krebbers, Dreyer, POPL 2018) proved in
+            Coq that this discipline is sound: the ownership rules,
+            including the unsafe implementations inside
+            <code>Arc</code>, <code>Mutex</code>, and friends, compose
+            into a machine-checked absence-of-races theorem for the safe
+            fragment. The guarantee has limits worth stating exactly: safe
+            Rust rules out data races, not race conditions, not
+            deadlocks (two <code>Mutex</code>es acquired in opposite
+            orders deadlock in Rust as anywhere), and not races through
+            <code>unsafe</code> code that violates its obligations.
+          </p>
+<!-- CONT -->
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>&copy; <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;&middot;&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/classes/math.js"></script>
+    <script defer src="/code-tabs.js"></script>
+    <script defer src="/quiz.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/code-copy.js"></script>
+  </body>
+</html>
