@@ -115,7 +115,14 @@
     fJump.type = "button"; fJump.className = "reader-stop reader-jump"; fJump.textContent = "Go to text";
     var fPos = document.createElement("span");
     fPos.className = "reader-pos";
-    float_.appendChild(fBtn); float_.appendChild(fStop); float_.appendChild(fJump); float_.appendChild(fPos);
+    var fRange = document.createElement("input");
+    fRange.type = "range"; fRange.className = "reader-range reader-float-range";
+    fRange.min = "0"; fRange.value = "0"; fRange.step = "1";
+    fRange.setAttribute("aria-label", "Reading position");
+    var fRow = document.createElement("div");
+    fRow.className = "reader-float-row";
+    fRow.appendChild(fBtn); fRow.appendChild(fStop); fRow.appendChild(fJump); fRow.appendChild(fPos);
+    float_.appendChild(fRange); float_.appendChild(fRow);
     document.body.appendChild(float_);
 
     var supportsSpeech = "speechSynthesis" in window;
@@ -151,7 +158,10 @@
       }
     }
     function showScrub(show) { range.hidden = !show; pos.hidden = !show; }
-    function setPos(text) { pos.textContent = text; fPos.textContent = text; }
+    function setPos(text) {
+      pos.textContent = text; fPos.textContent = text;
+      fRange.max = range.max; fRange.value = range.value;
+    }
     function fmt(t) {
       t = Math.max(0, Math.floor(t || 0));
       return Math.floor(t / 60) + ":" + ("0" + (t % 60)).slice(-2);
@@ -294,15 +304,16 @@
       });
       label(true); audio.play();
     }
-    range.addEventListener("input", function () {
-      var v = parseInt(range.value, 10) || 0;
+    function onScrub(v) {
       userAway = false;
       if (mode === "speech") jumpTo(v);
       else if (mode === "audio" && audio && audio.duration) {
         audio.currentTime = (v / 1000) * audio.duration;
         if (audio.paused) { audio.play(); label(true); }
       }
-    });
+    }
+    range.addEventListener("input", function () { onScrub(parseInt(range.value, 10) || 0); });
+    fRange.addEventListener("input", function () { onScrub(parseInt(fRange.value, 10) || 0); });
     function haveAudio() {
       if (!audioUrl) return Promise.resolve(false);
       return fetch(audioUrl, { method: "HEAD" }).then(function (r) { return r.ok; }).catch(function () { return false; });
