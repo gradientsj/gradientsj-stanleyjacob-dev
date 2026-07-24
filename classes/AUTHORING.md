@@ -236,6 +236,17 @@ test understanding, not recall of a number. Explanations are one to three
 sentences. Note that the quiz JSON is not processed by KaTeX, so write math in
 plain text there.
 
+**Numerical environment hazard (read before measuring anything).** The system
+Python's NumPy 1.21 was linked against a broken reference LAPACK on this host:
+`linalg.solve`, `svd`, `qr`, and `cholesky` silently returned garbage for
+matrices of size 50 and above, while plain matrix multiply stayed correct. That
+is the worst kind of failure, because the wrong answers look plausible. It was
+fixed on 2026-07-24 by installing NumPy 2.2.6 and SciPy 1.15.3, whose wheels
+bundle their own OpenBLAS. Before publishing any number that came from a CPU
+factorization, sanity-check it: solve a system and confirm the residual, or
+reconstruct a matrix from its SVD and confirm the error is near machine epsilon.
+Torch on the GPU goes through cuBLAS/cuSOLVER and was never affected.
+
 **Measured numbers.** `classes/data/h100.json` holds real benchmark output from
 an NVIDIA H100 80GB HBM3 (132 SMs, PyTorch 2.7, CUDA 12.8) in this repository.
 Quote from it directly when a page discusses memory bandwidth, matmul

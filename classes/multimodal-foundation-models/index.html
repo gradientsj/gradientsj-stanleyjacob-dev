@@ -1,0 +1,726 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Multimodal foundation models &middot; Stanley Jacob</title>
+    <meta name="description" content="Multimodal models derived end to end: the InfoNCE objective and its temperature gradient, SigLIP's sigmoid loss, ViT patch arithmetic, connectors from linear projections to perceiver resamplers with the KV math, AnyRes tiling, factorized video attention, VQ tokenization with the straight-through estimator, and the hallucination and evaluation problems of any-to-any systems." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes" class="active">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/classes">Classes</a></div>
+        <h1>Multimodal models: contrastive pretraining, fusion, and any-to-any generation</h1>
+        <p class="lead">
+          Every production assistant that reads an image, and increasingly
+          every one that hears audio or emits pictures, is built from three
+          separable ideas: a contrastive or captioning objective that puts
+          images and text in one representation space, a connector that
+          converts continuous perceptual features into something a language
+          model can attend over, and, for generation, a quantizer that turns
+          pixels into discrete tokens the same autoregressive machinery can
+          predict. This page derives all three. The InfoNCE loss is taken
+          apart gradient by gradient, including what the temperature does and
+          why its learnable version must be clamped; SigLIP's sigmoid
+          alternative is derived and its batch-size decoupling made precise;
+          ViT, connector, and video-attention arithmetic is worked with real
+          numbers; VQ-VAE's straight-through estimator is derived rather than
+          waved at; and the failure modes, the modality gap, object
+          hallucination, benchmark contamination, are treated as first-class
+          material. Zero-shot numbers from real checkpoints were measured on
+          the H100 in this repository.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Why this subject matters now</h2>
+          <p>
+            Until roughly 2021, computer vision and natural language
+            processing were separate fields with separate pretraining
+            recipes: ImageNet-style supervised classification on one side,
+            masked or causal language modeling on the other. Two results
+            collapsed the boundary. CLIP (Radford et al., 2021, OpenAI) and
+            ALIGN (Jia et al., 2021, Google) showed that a pair of encoders
+            trained contrastively on hundreds of millions of noisy web
+            image-text pairs learns a representation that classifies images
+            zero-shot, retrieves across modalities, and transfers better
+            than supervised pretraining at comparable scale. Flamingo
+            (Alayrac et al., 2022, DeepMind) then showed that a frozen
+            language model can be taught to consume those visual features
+            through a thin cross-attention interface, and LLaVA (Liu et
+            al., 2023, Wisconsin-Madison and Microsoft Research) showed the
+            interface can be as small as one linear layer if the instruction
+            data is right. From there the field split into two engineering
+            philosophies that this page compares throughout: bolt a vision
+            encoder onto a pretrained language model through an adapter, or
+            tokenize everything, images, audio, text, into one discrete
+            stream and train a single model natively, the route publicly
+            described for Gemini (Google DeepMind, 2023) and taken openly by
+            Chameleon (Meta, 2024).
+          </p>
+          <p>
+            The practitioner's questions are now quantitative. How many
+            tokens does an image cost at a given resolution, and what does
+            that do to the context budget and the KV cache? Why does a
+            contrastive model need a batch of 32k and a temperature of 0.01,
+            and what breaks if the temperature is left unclamped? Why does a
+            vision-language model confidently describe objects that are not
+            in the image, and why do benchmark scores move several points
+            when answer options are reordered? Each of these has a concrete
+            arithmetic or gradient-level answer, and the answers are what
+            this page derives. The sibling pages own the neighboring
+            territory: the
+            <a href="/classes/language-models-from-scratch/">language-model page</a>
+            owns the decoder pipeline, FLOPs accounting, and KV-cache
+            arithmetic that this page reuses, and the
+            <a href="/classes/diffusion-and-large-vision-models/">diffusion page</a>
+            owns continuous image generation; here the generation story is
+            told through discrete tokens, which is the route autoregressive
+            multimodal models actually take.
+          </p>
+
+          <h2>Core theory</h2>
+
+          <h3>Contrastive pretraining: the InfoNCE objective</h3>
+          <p>
+            The data is a stream of pairs \( (x_i, y_i) \): an image and the
+            alt-text that accompanied it on some web page. An image encoder
+            \( f \) and a text encoder \( g \) map each side to
+            \( \R^d \), and both outputs are L2-normalized, so
+            \( u_i = f(x_i)/\lVert f(x_i)\rVert \) and
+            \( v_i = g(y_i)/\lVert g(y_i)\rVert \) live on the unit sphere
+            and their inner product \( s_{ij} = u_i\T v_j \in [-1, 1] \) is
+            a cosine similarity. The training signal is co-occurrence:
+            \( (u_i, v_i) \) came from the same web page, every other
+            pairing in the batch presumably did not. The InfoNCE loss,
+            introduced for contrastive predictive coding by van den Oord et
+            al. (2018) and applied symmetrically by CLIP, treats each row of
+            the batch similarity matrix as a classification problem: given
+            image \( i \), pick its caption out of the \( N \) candidates in
+            the batch,
+          </p>
+          $$ \L_{\text{i}\to\text{t}}
+             = -\frac{1}{N}\sum_{i=1}^{N}
+               \log \frac{\exp(s_{ii}/\tau)}{\sum_{j=1}^{N} \exp(s_{ij}/\tau)} , $$
+          <p>
+            and each column as the mirror problem, given a caption, pick its
+            image,
+          </p>
+          $$ \L_{\text{t}\to\text{i}}
+             = -\frac{1}{N}\sum_{i=1}^{N}
+               \log \frac{\exp(s_{ii}/\tau)}{\sum_{j=1}^{N} \exp(s_{ji}/\tau)} ,
+             \qquad
+             \L = \tfrac{1}{2}\big(\L_{\text{i}\to\text{t}} + \L_{\text{t}\to\text{i}}\big). $$
+          <p>
+            The two directions are not redundant. The row softmax normalizes
+            over captions and never compares two images with each other; the
+            column softmax normalizes over images and never compares two
+            captions. Using both makes each embedding serve simultaneously
+            as a query and as a key, which is what a retrieval system needs,
+            and empirically the symmetric loss trains better-conditioned
+            spaces than either direction alone. Note also what the loss does
+            not require: no labels, no bounding boxes, no human annotation
+            beyond what the web already produced. That is why the recipe
+            scales to the 400M pairs of CLIP's WIT dataset and the 1.8B
+            noisy pairs of ALIGN, and why data curation, not architecture,
+            became the competitive axis (the DataComp benchmark of Gadre et
+            al., 2023, exists to study exactly this).
+          </p>
+          <p>
+            Why "InfoNCE"? For a batch of \( N \) pairs the row loss is a
+            lower-bound estimator of the mutual information between the two
+            views: van den Oord et al. show
+            \( I(u; v) \ge \log N - \L_{\text{i}\to\text{t}} \). The proof
+            is short. The optimal critic in the softmax is the density ratio
+            \( p(v\mid u)/p(v) \); substituting it and taking expectations,
+            the loss becomes an expectation of
+            \( \log\!\big(1 + (N{-}1)\,\E\,[p(v)/p(v\mid u)]\big) \)-type
+            terms bounded below by \( \log N - I(u;v) \). Two practical
+            consequences follow directly from the bound. First, the bound
+            saturates at \( \log N \): a batch of 32,768 can certify at most
+            \( \log_2 32768 = 15 \) bits of mutual information per pair,
+            which is one reason large batches help. Second, the loss only
+            ever compares similarities within a batch, a fact that matters
+            for the modality gap below.
+          </p>
+
+          <h3>The temperature, derived from the gradient</h3>
+          <p>
+            Everything interesting about \( \tau \) falls out of one
+            differentiation. Fix a row \( i \), write
+            \( p_{ij} = \exp(s_{ij}/\tau)\big/\sum_k \exp(s_{ik}/\tau) \)
+            for the row softmax, and let
+            \( \ell_i = -s_{ii}/\tau + \log\sum_j \exp(s_{ij}/\tau) \) be
+            the per-row loss. Differentiating with respect to a similarity,
+            using \( \partial \log\sum_j e^{s_{ij}/\tau} / \partial s_{ik}
+            = p_{ik}/\tau \),
+          </p>
+          $$ \frac{\partial \ell_i}{\partial s_{ii}} = \frac{p_{ii} - 1}{\tau} \le 0,
+             \qquad
+             \frac{\partial \ell_i}{\partial s_{ij}} = \frac{p_{ij}}{\tau} \ge 0
+             \quad (j \ne i). $$
+          <p>
+            Three facts are visible at once. First, every gradient carries a
+            factor \( 1/\tau \): halving the temperature doubles the
+            effective learning rate on the similarities, so \( \tau \) and
+            the learning rate are entangled. Second, the push on a negative
+            pair is proportional to \( p_{ij} \), the softmax weight that
+            negative currently receives. With small \( \tau \) the softmax
+            is sharp and nearly all of the repulsive gradient concentrates
+            on the few hardest negatives, the confusable ones; with large
+            \( \tau \) the repulsion spreads uniformly over the batch.
+            Temperature is therefore a hard-negative-weighting dial, not a
+            cosmetic rescaling. Third, the attractive and repulsive terms
+            balance: \( \sum_j \partial \ell_i / \partial s_{ij} = 0 \), so
+            the loss only shapes relative geometry within the row, never
+            absolute positions.
+          </p>
+          <p>
+            CLIP makes \( \tau \) learnable, and the gradient explains what
+            the optimizer does with it. Differentiating \( \ell_i \) with
+            respect to \( \tau \) directly,
+          </p>
+          $$ \frac{\partial \ell_i}{\partial \tau}
+             = \frac{s_{ii}}{\tau^2}
+               - \sum_j p_{ij}\,\frac{s_{ij}}{\tau^2}
+             = \frac{1}{\tau^2}\Big( s_{ii} - \E_{j\sim p_i}[\,s_{ij}\,] \Big). $$
+          <p>
+            Once training has made the positive similarity \( s_{ii} \)
+            larger than the softmax-average similarity of the row, which
+            happens almost immediately, this derivative is positive, so
+            gradient descent drives \( \tau \) down, monotonically
+            sharpening the softmax. Nothing in the loss stops it: as
+            \( \tau \to 0 \) the loss approaches a margin objective on the
+            single hardest negative and keeps decreasing. Left alone,
+            \( 1/\tau \) grows without bound, the logits
+            \( s_{ij}/\tau \) blow past the fp16 range inside the
+            \( \exp \), and the \( 1/\tau \) factor in every gradient
+            destabilizes the encoders. CLIP therefore parameterizes the
+            scale as a learnable log-temperature, optimizing
+            \( t' = \log(1/\tau) \) so that the scale \( e^{t'} \) is
+            positive by construction, initializes it at
+            \( \log(1/0.07) \approx 2.659 \), and clamps the scale at 100,
+            equivalently \( \tau \ge 0.01 \). The clamp is not decorative.
+            In the measured demo later on this page, the released OpenAI
+            checkpoint's logit scale sits at \( e^{4.6055} = 100.03 \),
+            within fp16 rounding of the clamp boundary exactly as this
+            derivation predicts: training pushed the temperature to the
+            floor and the clamp held it there.
+          </p>
+
+          <div class="problem">
+            <span class="plabel">Problem 1</span>
+            <p>
+              A batch of \( N = 3 \) image-text pairs has the cosine
+              similarity matrix (rows are images, columns are texts)
+            </p>
+            $$ S = \begin{pmatrix} 0.9 &amp; 0.1 &amp; 0.3 \\ 0.2 &amp; 0.8 &amp; 0.0 \\ 0.4 &amp; 0.3 &amp; 0.7 \end{pmatrix},
+               \qquad \tau = 0.5 . $$
+            <p>
+              Compute the CLIP loss: both directional losses per example,
+              their means, and the symmetric loss. Then compute the gradient
+              of the first row's loss with respect to the positive
+              similarity \( s_{11} \) and with respect to \( \tau \), and
+              interpret the sign of the latter. All numbers verified in
+              python.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> The logits are \( S/\tau = 2S \).
+                Exponentials for the image-to-text direction, row by row:
+                row 1 is \( (e^{1.8}, e^{0.2}, e^{0.6}) = (6.0496,\
+                1.2214,\ 1.8221) \), sum \( 9.0932 \); row 2 is
+                \( (1.4918,\ 4.9530,\ 1.0000) \), sum \( 7.4449 \); row 3 is
+                \( (2.2255,\ 1.8221,\ 4.0552) \), sum \( 8.1029 \). The
+                per-example losses are \( \ell_i = \log(\text{row sum} /
+                \text{diagonal term}) \):
+                \( \ell_1 = \log(9.0932/6.0496) = 0.4075 \),
+                \( \ell_2 = \log(7.4449/4.9530) = 0.4075 \),
+                \( \ell_3 = \log(8.1029/4.0552) = 0.6922 \), mean
+                \( \L_{\text{i}\to\text{t}} = 0.5024 \). The tie between
+                rows 1 and 2 is not a coincidence: row 1's logits
+                \( (1.8, 0.2, 0.6) \) sit 1.6 and 1.2 below the positive,
+                row 2's logits \( (0.4, 1.6, 0.0) \) sit 1.2 and 1.6 below
+                its positive, and a softmax loss depends only on that
+                multiset of gaps to the positive, never on absolute logit
+                values, so the two rows cost exactly the same.
+              </p>
+              <p>
+                Text-to-image normalizes down the columns. Column sums of
+                the same exponential matrix: \( 9.7670, 7.9966, 6.8773 \),
+                giving \( \log(9.7670/6.0496) = 0.4790 \),
+                \( \log(7.9966/4.9530) = 0.4790 \),
+                \( \log(6.8773/4.0552) = 0.5282 \), mean
+                \( \L_{\text{t}\to\text{i}} = 0.4954 \). The symmetric loss
+                is \( \tfrac12(0.5024 + 0.4954) = 0.4989 \). The two
+                directions differ (0.5024 vs 0.4954) because the matrix is
+                not symmetric: image 3 is moderately similar to text 1
+                (0.4), which hurts row 3's classification more than any
+                column is hurt.
+              </p>
+              <p>
+                Gradients for row 1: the row softmax is
+                \( p_{1\cdot} = (0.6653, 0.1343, 0.2004) \), so
+                \( \partial \ell_1/\partial s_{11} = (0.6653 - 1)/0.5 =
+                -0.6694 \): increasing the positive similarity by
+                \( \varepsilon \) lowers the loss by about
+                \( 0.67\,\varepsilon \). For the temperature,
+                \( \E_{p}[s_{1\cdot}] = 0.6653 \times 0.9 + 0.1343 \times
+                0.1 + 0.2004 \times 0.3 = 0.6723 \), so
+                \( \partial \ell_1/\partial \tau = (0.9 - 0.6723)/0.25 =
+                0.9107 &gt; 0 \). Gradient descent on \( \tau \) moves it
+                down, exactly the runaway sharpening the clamp exists to
+                stop.
+              </p>
+            </div>
+          </div>
+
+          <h3>The modality gap</h3>
+          <p>
+            A natural expectation is that contrastive training fuses the two
+            modalities into one cloud: matched image and text embeddings
+            nearly coincident on the sphere. Measurement says otherwise.
+            Liang et al. (2022, Stanford) showed that in trained CLIP-family
+            models all image embeddings occupy one narrow cone and all text
+            embeddings another, with a roughly constant offset vector
+            between the cone centers, the modality gap. The mean image-text
+            cosine of matched pairs in CLIP sits far below 1, while the loss
+            is nonetheless near its floor. Two mechanisms produce this.
+            First, the cone effect: at random initialization a deep
+            encoder's outputs already concentrate in a narrow cone (each
+            layer's nonlinearities and normalizations contract angular
+            spread), and two differently-initialized encoders start in two
+            different cones. Second, and this is the part the derivation
+            above makes precise, InfoNCE has no force that closes the gap:
+            the loss depends only on the similarities \( s_{ij} \) compared
+            within a row or column, and the softmax is shift-invariant, so
+            adding a constant to every logit in a row changes nothing. A
+            uniform cross-modal offset that raises or lowers all
+            \( s_{ij} \) by nearly the same amount is thus invisible to the
+            objective; only the contrast between matched and mismatched
+            pairs is trained. Liang et al. further showed the equilibrium
+            gap size depends on the temperature, with low \( \tau \)
+            preserving a larger gap, and that artificially shrinking or
+            enlarging the gap by translating one modality's embeddings can
+            shift downstream zero-shot accuracy and fairness metrics in
+            either direction: the gap is a property of the objective's
+            invariances, not a bug with a one-line fix. Practical
+            consequence: pipelines that mix modalities in one vector index,
+            or that threshold absolute cosine values, must calibrate per
+            modality pair; a matched image-text cosine of 0.3 can be a
+            strong match while a text-text cosine of 0.3 is a weak one.
+          </p>
+
+          <h3>SigLIP: the sigmoid loss, and why batch size decouples</h3>
+          <p>
+            The softmax in InfoNCE creates a systems problem: every device
+            needs the full \( N \times N \) similarity matrix's row and
+            column sums, so the standard implementation all-gathers all
+            \( N \) embeddings to every device. At CLIP's batch of 32,768
+            that is manageable; the desire to push batch size further, and
+            to remove the two all-gathers, motivated Zhai, Mustafa,
+            Kolesnikov, and Beyer (2023, Google) to replace the softmax with
+            independent binary classifications. SigLIP scores every pair in
+            the batch as pair-or-not-pair with a logistic model,
+          </p>
+          $$ \L_{\text{sig}} = -\frac{1}{N} \sum_{i=1}^{N}\sum_{j=1}^{N}
+             \log \sigma\big( z_{ij}\,( t\, s_{ij} + b) \big),
+             \qquad z_{ij} = \begin{cases} +1 &amp; i = j \\ -1 &amp; i \ne j, \end{cases} $$
+          <p>
+            with a learnable inverse-temperature \( t \) and, crucially, a
+            learnable bias \( b \). The gradient with respect to one
+            similarity, using \( \frac{d}{dx}\log\sigma(x) = \sigma(-x) \),
+            is
+          </p>
+          $$ \frac{\partial \L_{\text{sig}}}{\partial s_{ij}}
+             = -\frac{1}{N}\, z_{ij}\, t\, \sigma\big( -z_{ij} (t\, s_{ij} + b) \big), $$
+          <p>
+            and the decoupling is right there: the gradient on pair
+            \( (i,j) \) depends only on that pair's own similarity, not on
+            any normalizer over the batch. Each pair is its own two-class
+            problem. Batch size no longer changes the definition of the
+            loss, it only changes how many negative pairs are sampled per
+            positive (\( N^2 - N \) negatives to \( N \) positives), and
+            the implementation can chunk: each device holds its own
+            embeddings, passes its text block around a ring of devices, and
+            accumulates loss terms blockwise, with no moment at which the
+            full matrix or the full gathered batch must exist anywhere.
+            Zhai et al. found quality saturates near batch 32k anyway, so
+            the practical win is efficiency and robustness at ordinary
+            batch sizes rather than million-size batches.
+          </p>
+          <p>
+            The bias \( b \) fixes the class imbalance that the sigmoid
+            formulation creates. At initialization with \( s_{ij} \approx
+            0 \), a bias-free loss gives every one of the \( N^2 - N \)
+            negatives the same loss \( \log 2 \) as each positive, so the
+            negative side outweighs the positive side by a factor of
+            \( N - 1 \) and the first optimizer steps collapse all
+            similarities downward. SigLIP initializes \( t = 10 \) and
+            \( b = -10 \): on the 3x3 matrix of Problem 1 those values give
+            pairwise logits \( t s_{ij} + b \) of \( -1, -2, -3 \) on the
+            diagonal and \( -6 \) to \( -10 \) off it, hence per-pair
+            losses of 1.313, 2.127, and 3.049 on the positives against at
+            most 0.0025 on any negative (computed in python): the
+            positives dominate the gradient from step one, the imbalance is
+            neutralized, and \( b \) is subsequently learned. The measured
+            SigLIP checkpoint later on this page carries \( t = e^{4.766}
+            = 117.4 \) and \( b = -12.93 \), and its calibrated pairwise
+            probabilities behave unlike CLIP's softmax: each caption gets
+            an independent probability, they do not sum to 1, and an image
+            matching none of the offered captions can score near zero on
+            all of them, which a softmax cannot express.
+          </p>
+
+          <pre class="flow">
+InfoNCE (softmax, per row/column)          SigLIP (sigmoid, per pair)
+
+  images ──► u_1..u_N ─┐                     images ──► u_1..u_N ─┐
+  texts  ──► v_1..v_N ─┤                     texts  ──► v_1..v_N ─┤
+                       ▼                                          ▼
+        S = U Vᵀ  (N x N, gathered)             S_block = U_dev V_ringᵀ
+        row softmax  + col softmax              per-pair  log σ(±(tS+b))
+        needs global normalizers                no normalizer: chunkable
+        batch size defines the loss             batch size = #negatives only
+          </pre>
+
+          <h3>The vision encoder: ViT patchification arithmetic</h3>
+          <p>
+            Both encoders in a CLIP-family model, and the vision side of
+            essentially every VLM, are Vision Transformers (Dosovitskiy et
+            al., 2021, Google). The design choice that matters for all the
+            budget arithmetic on this page is patchification: an image of
+            resolution \( R \times R \) with patch size \( P \) becomes
+            \( N = (R/P)^2 \) tokens, each token the flattened
+            \( P^2 \cdot C \) pixel values of one patch pushed through a
+            single linear layer into the model width \( d \). A learned
+            position embedding is added per patch, a class token may be
+            prepended, and from there the model is a plain pre-norm
+            transformer encoder with bidirectional attention, no causal
+            mask, since an image has no autoregressive order. The
+            consequences of \( N = (R/P)^2 \) are quadratic twice over:
+            doubling resolution quadruples the token count, and since
+            self-attention is quadratic in tokens, it multiplies attention
+            FLOPs by sixteen. Every resolution strategy in the AnyRes
+            section below is a negotiation with this arithmetic.
+          </p>
+
+          <div class="problem">
+            <span class="plabel">Problem 2</span>
+            <p>
+              Count the parameters and forward FLOPs of a ViT-B/16 encoder
+              at resolution 224: patch size 16, width \( d = 768 \), 12
+              layers, 12 heads, MLP width 3072, one class token, no
+              classification head. Count a multiply-accumulate as 2 FLOPs,
+              ignore normalization and softmax FLOPs, and include the patch
+              embedding. Then check the total against the quick
+              approximation \( 2 N_{\text{params}} T \), and against the
+              H100 measurement in this repository. All numbers verified in
+              python.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> Tokens first:
+                \( N = (224/16)^2 = 14^2 = 196 \) patches, plus the class
+                token, \( T = 197 \). Parameters. Patch embedding:
+                \( (16^2 \cdot 3) \cdot 768 + 768 = 768 \cdot 768 + 768 =
+                590{,}592 \). Position table: \( 197 \times 768 =
+                151{,}296 \); class token 768. Per block, attention has
+                four \( d \times d \) projections (Q, K, V, output) with
+                biases, \( 4(768^2 + 768) = 2{,}362{,}368 \); the MLP has
+                \( 768 \times 3072 + 3072 + 3072 \times 768 + 768 =
+                4{,}722{,}432 \); two LayerNorms contribute
+                \( 2 \times 2 \times 768 = 3{,}072 \). Block total
+                \( 7{,}087{,}872 \). Twelve blocks plus the final norm
+                (1,536) plus the embeddings give
+                \( 590{,}592 + 151{,}296 + 768 + 12 \times 7{,}087{,}872 +
+                1{,}536 = 85{,}798{,}656 \approx 85.8\text{M} \), matching
+                the 86M the ViT paper quotes for ViT-B.
+              </p>
+              <p>
+                FLOPs, forward, per block. Projections: four matmuls of
+                \( (T \times d)(d \times d) \), \( 2 \cdot 197 \cdot 4
+                \cdot 768^2 = 0.930 \) GFLOPs. Attention proper:
+                \( QK\T \) is \( 2 T^2 d \) and \( PV \) another
+                \( 2 T^2 d \), total \( 4 \cdot 197^2 \cdot 768 = 0.119 \)
+                GFLOPs. MLP: \( 2 T (d \cdot 4d + 4d \cdot d) = 2 \cdot
+                197 \cdot 2 \cdot 768 \cdot 3072 = 1.859 \) GFLOPs. Patch
+                embedding once: \( 2 \cdot 197 \cdot 768 \cdot 768 =
+                0.232 \) GFLOPs (counting the class row costs nothing
+                extra at this precision). Total:
+                \( 0.232 + 12 (0.930 + 0.119 + 1.859) = 35.1 \) GFLOPs
+                per image. The approximation \( 2 N_{\text{params}} T =
+                2 \times 85.8\text{M} \times 197 = 33.8 \) GFLOPs is 4%
+                low, the missing part being exactly the \( T^2 \)
+                attention term that does not scale with parameters. Note
+                the balance: at 197 tokens, attention proper is only
+                \( 0.119/2.908 = 4.1\% \) of block compute; the model is
+                matmul-dominated, which is why ViTs saturate accelerators
+                well at low resolution and why the quadratic term only
+                begins to bite when AnyRes-style tiling pushes \( T \)
+                into the thousands. Against hardware: the H100 in this
+                repository measures 744.6 TFLOPS on a 4096-square bf16
+                matmul, so a perfectly-batched ViT-B/16 forward is bounded
+                below by \( 35.1 \times 10^9 / 744.6 \times 10^{12}
+                \approx 47\ \mu s \) of pure math per image.
+              </p>
+            </div>
+          </div>
+
+          <h3>From encoder to language model: the connector design space</h3>
+          <p>
+            A contrastive encoder produces a grid of features; a language
+            model consumes a sequence of \( d_{\text{LM}} \)-dimensional
+            embeddings. Everything between them is "the connector", and the
+            design space is essentially one question: how many tokens does
+            an image get, and who pays for compressing it. Three archetypes
+            cover the field.
+          </p>
+          <p>
+            <strong>Linear projection (LLaVA).</strong> Take every patch
+            feature from the penultimate layer of a frozen CLIP ViT-L/14
+            encoder and multiply by one learned \( d_v \times
+            d_{\text{LM}} \) matrix (LLaVA-1.5 upgraded this to a two-layer
+            MLP with GELU). At the 336-pixel resolution LLaVA-1.5 uses,
+            that is \( (336/14)^2 = 576 \) visual tokens inserted directly
+            into the LM's input sequence. No information is discarded and
+            nothing decides what is salient; the language model's own
+            attention does all the reading. The cost is context: 576 tokens
+            per image, growing with resolution, each occupying KV cache in
+            every layer (the arithmetic is Problem 3). The result that made
+            this respectable is that it works: with two-stage training,
+            first the projection alone on image-caption pairs, then
+            projection plus LM on instruction data, LLaVA matched or beat
+            far heavier connectors.
+          </p>
+          <p>
+            <strong>Cross-attention resamplers (Flamingo's perceiver, Qwen-VL's
+            adapter).</strong> Fix a budget of \( M \) learned latent
+            vectors and let them attend over however many visual features
+            the encoder produced. The mechanics deserve deriving because
+            the asymmetry is the entire point. Cross-attention with latent
+            queries \( Z \in \R^{M \times d} \) and visual features
+            \( X_v \in \R^{N_v \times d} \) computes
+          </p>
+          $$ Q = Z W_Q, \quad K = X_v W_K, \quad V = X_v W_V, \qquad
+             \mathrm{XAttn}(Z, X_v) = \softmax\!\Big( \frac{Q K\T}{\sqrt{d_h}} \Big) V, $$
+          <p>
+            with \( QK\T \in \R^{M \times N_v} \): the score matrix is
+            rectangular, \( M \times N_v \), not \( N_v \times N_v \).
+            FLOPs are \( 2 M d^2 \) for queries, \( 4 N_v d^2 \) for keys
+            and values, and \( 4 M N_v d \) for scores and the weighted
+            sum: linear in \( N_v \), never quadratic, because the visual
+            features are only ever keys and values, never queries. The
+            output is \( M \) vectors regardless of input size, so a
+            variable number of frames or tiles compresses to a fixed token
+            bill. Flamingo's perceiver resampler uses \( M = 64 \) latents
+            over an arbitrary number of video frames, then feeds the
+            resampled features into gated cross-attention layers
+            interleaved into a frozen 70B-class LM, each gate a
+            \( \tanh(\alpha) \) scalar initialized at \( \alpha = 0 \) so
+            the pretrained LM is exactly recovered at step zero and vision
+            fades in as \( \alpha \) is learned. The original Qwen-VL used
+            the same idea as a single cross-attention layer compressing
+            each image's ViT grid to 256 tokens.
+          </p>
+          <p>
+            <strong>Q-Former (BLIP-2).</strong> Between the archetypes sits
+            Li et al.'s (2023, Salesforce) Q-Former: 32 learned queries
+            processed by a small BERT-initialized transformer whose blocks
+            self-attend among the queries and cross-attend into the frozen
+            image encoder. It is pretrained before ever meeting the LM,
+            with three objectives sharing the tower under different
+            attention masks: image-text contrastive (queries versus text,
+            CLIP-style), image-text matching (a binary head over fused
+            query-text states), and image-grounded text generation. The
+            queries thus learn to extract the text-relevant 32-token
+            summary of an image, and only then is a single linear layer
+            trained to hand that summary to a frozen OPT or FLAN-T5. The
+            economy is extreme, 32 tokens against LLaVA's 576, and BLIP-2
+            beat 80B-parameter Flamingo on VQA with a fraction of the
+            trainable parameters. The price is an information bottleneck
+            chosen before the question is known: 32 tokens cannot carry
+            every small text string or spatial relation in a dense
+            document, which is why OCR-heavy and fine-grained benchmarks
+            later pushed the field back toward projection-style connectors
+            at higher resolution.
+          </p>
+
+          <pre class="flow">
+                        connector design space (tokens per image / trainable interface)
+
+  frozen ViT grid ──► linear / MLP ────────────────► 576+ tokens ──► LM input   (LLaVA)
+                       keeps everything, LM reads it, context pays
+
+  frozen ViT grid ──► M latent queries ──► XAttn ──► 64 tokens  ──► gated XAttn (Flamingo)
+                       fixed bill, linear in N_v, gate tanh(0) = no-op at init
+
+  frozen ViT grid ──► 32 queries + BERT tower ─────► 32 tokens  ──► frozen LM   (BLIP-2)
+                       pretrained bottleneck: ITC + ITM + generation masks
+          </pre>
+
+          <h3>Early, late, and hybrid fusion</h3>
+          <p>
+            The taxonomy that organizes all of the above: where do the
+            modalities first interact. <em>Late fusion</em> is CLIP itself:
+            two towers that never exchange information until the final dot
+            product. It is the cheapest possible interaction, which is why
+            it powers retrieval at billion-image scale, embeddings can be
+            precomputed and indexed, but a single inner product cannot
+            express "count the chairs" or bind attributes to objects, so
+            late fusion caps out at matching. <em>Early fusion</em> puts
+            raw or lightly-encoded tokens of both modalities into one
+            transformer from layer 1 and lets every layer attend across
+            modalities; Chameleon and Fuyu-style models are the pure form.
+            Maximum expressivity, maximum cost: every image token pays
+            attention against every text token in every layer, and the
+            model must be trained jointly from early on. <em>Hybrid
+            fusion</em> is everything in between, and describes most
+            deployed VLMs: substantial unimodal encoding first (a full ViT,
+            most of an LM), interaction afterward, either by inserting
+            projected visual tokens into the LM sequence (LLaVA: hybrid
+            leaning early, interaction in every LM layer after insertion)
+            or by periodic cross-attention (Flamingo: interaction only at
+            the inserted gated layers). The engineering tradeoff is
+            KV-cache and FLOPs versus grounding fidelity, and the fact that
+            both LLaVA-style insertion and Flamingo-style cross-attention
+            remain competitive tells you the field has not found a
+            dominant point on that curve.
+          </p>
+
+          <h3>Native multimodal training versus adapter bridging</h3>
+          <p>
+            Orthogonal to fusion depth is a training question: is the model
+            multimodal from pretraining, or made multimodal afterward.
+            Adapter bridging, the LLaVA/BLIP-2/Flamingo route, freezes most
+            of both pretrained towers and trains the thin interface, plus
+            optionally the LM, on a comparatively tiny paired corpus
+            (LLaVA-1.5's entire recipe is roughly 1.2M examples). It is
+            astonishingly cheap, preserves the LM's text ability by
+            construction, and inherits both towers' blind spots: whatever
+            CLIP's encoder never represented, no adapter can recover, and
+            the LM's text-only priors remain fully intact, which the
+            hallucination section will blame for asserting absent objects.
+            Native training, the route publicly described for Gemini
+            (interleaved text, image, audio, and video tokens from the
+            start of pretraining) and demonstrated openly by Chameleon,
+            mixes modalities in the pretraining stream itself. It buys
+            uniform treatment, any-to-any potential, and no frozen-encoder
+            ceiling, at the price of frontier-scale pretraining cost,
+            delicate optimization (Chameleon reports that naive training
+            diverged from softmax logit drift, and stabilizing it required
+            query-key normalization and reordered layer norms), and a real
+            risk of degrading text-only quality since image tokens now
+            consume a share of the token budget. The industry's current
+            equilibrium is pragmatic: open efforts (LLaVA, InternVL,
+            Qwen-VL) mostly bridge, frontier labs increasingly pretrain
+            natively, and the gap between the two recipes is one of the
+            live empirical questions of the field.
+          </p>
+
+          <h3>Resolution: AnyRes tiling and native-resolution ViTs</h3>
+          <p>
+            A 336-pixel input reads a scene but not a receipt. Raising the
+            encoder's native resolution is expensive, position embeddings
+            must be re-interpolated and attention cost grows with
+            \( T^2 \), so LLaVA-NeXT popularized tiling, usually called
+            AnyRes: choose a grid from a candidate set (1x2, 2x2, 2x3,
+            ...), split the image into 336-pixel tiles, encode each tile
+            independently through the same frozen encoder, and append a
+            downscaled full-image overview so global layout survives the
+            cut. Token cost is \( 576 \times (\text{tiles} + 1) \): a 2x2
+            grid costs \( 576 \times 5 = 2880 \) tokens, a 3x3 grid
+            \( 576 \times 10 = 5760 \), already past a 4k context on its
+            own (worked in Problem 3). Tiling also fractures objects that
+            cross tile boundaries, which the overview only partly repairs.
+            The cleaner alternative is to make the ViT itself
+            resolution-native: NaViT (Dehghani et al., 2023, Google)
+            packs patches from images of arbitrary aspect ratio into
+            sequences, and Qwen2-VL adopts the same idea for VLMs, feeding
+            each image as \( \lceil H/28 \rceil \times \lceil W/28 \rceil \)
+            tokens after a 2x2 merge of 14-pixel patches, so a 1344x896
+            image costs \( 48 \times 32 = 1536 \) tokens with no tiling
+            artifacts, positions handled by a multimodal rotary embedding
+            (M-RoPE) that factors position into temporal, height, and
+            width axes. InternVL's line similarly scales a purpose-trained
+            6B-parameter vision encoder (InternViT-6B) with dynamic tiling
+            up to high resolutions. The common lesson: resolution is a
+            token-budget decision, and the connector and the position
+            scheme, not the encoder weights, are usually the binding
+            constraint.
+          </p>
+
+          <h3>Video: factorized spatio-temporal attention</h3>
+          <p>
+            Video multiplies the token bill by frame count: \( F \) frames
+            of \( N_p \) patches is \( T = F N_p \) tokens, and joint
+            attention over all of them costs \( 4 T^2 d = 4 F^2 N_p^2 d \)
+            FLOPs per layer, 16 frames of 256 patches is 4096 tokens and
+            68.7 GFLOPs per layer at \( d = 1024 \), before the MLP.
+            Factorized attention, systematized for video by ViViT (Arnab
+            et al., 2021, Google), splits each layer into spatial
+            attention within each frame (\( F \) independent
+            \( N_p \)-token problems) followed by temporal attention
+            within each patch position (\( N_p \) independent
+            \( F \)-token problems). The saving is derived as Problem 5:
+            the ratio of joint to factorized attention FLOPs is exactly
+            \( F N_p / (F + N_p) \), about 15x for the configuration
+            above, at the cost that no single attention operation ever
+            relates patch \( a \) of frame 1 to a different patch \( b \)
+            of frame 2 directly; such relations must compose across layers.
+            For VLM-style video understanding the coarser tools come
+            first: sample frames sparsely, encode each with the image
+            encoder, pool or resample per frame (Flamingo's perceiver
+            treats frames as extra rows of keys and values at fixed latent
+            cost), and only recent long-video models spend attention
+            across full token grids.
+          </p>
+
+          <h3>Audio, briefly</h3>
+          <p>
+            Audio enters the same machinery through a spectrogram. The
+            standard encoder recipe, exemplified by Whisper (Radford et
+            al., 2022, OpenAI), converts a waveform to a log-mel
+            spectrogram (80 mel bins, 25 ms windows, 10 ms hop), applies a
+            pair of strided convolutions that downsample time, and runs a
+            transformer encoder over the result, so 30 seconds of audio
+            becomes 1500 encoder states; a VLM-style connector can then
+            resample those states into LM tokens exactly as it does patch
+            features. For generation the discrete route mirrors the VQ
+            story of the next section: neural codecs such as SoundStream
+            (Zeghidour et al., 2021, Google) quantize audio into residual
+            vector-quantized token stacks at 50-75 tokens per second,
+            which an autoregressive model can emit and a decoder can
+            render back to a waveform. GPT-4o's publicly described design,
+            one model consuming and producing text, audio, and image
+            tokens in a single stream, is this recipe taken to its
+            conclusion; the latency win over the older
+            transcribe-then-respond-then-synthesize pipeline comes from
+            deleting the two boundary crossings, and the paralinguistic
+            win (hearing tone, emitting laughter) comes from the fact that
+            a transcript is a lossy projection that the token stream never
+            takes.
+          </p>
