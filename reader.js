@@ -24,6 +24,7 @@
       if (child.classList && (child.classList.contains("quiz") || child.classList.contains("qa") ||
         child.classList.contains("reader") || child.classList.contains("diagram"))) continue;
       if (READ_TAGS[tag]) {
+        if (window.getComputedStyle(child).display === "none") continue; // don't read hidden text
         var t = child.textContent.replace(/\s+/g, " ").trim();
         if (t) out.push({ el: child, text: t });
         continue;
@@ -68,7 +69,16 @@
     var note = document.createElement("span");
     note.className = "reader-note";
 
+    // scrubber: jump anywhere in the article while listening
+    var range = document.createElement("input");
+    range.type = "range"; range.className = "reader-range";
+    range.min = "0"; range.value = "0"; range.step = "1"; range.hidden = true;
+    range.setAttribute("aria-label", "Reading position");
+    var pos = document.createElement("span");
+    pos.className = "reader-pos"; pos.hidden = true;
+
     bar.appendChild(btn); bar.appendChild(stop);
+    bar.appendChild(range); bar.appendChild(pos);
     root.appendChild(bar); root.appendChild(note);
 
     var supportsSpeech = "speechSynthesis" in window;
@@ -95,7 +105,13 @@
         chunks[i].el.scrollIntoView({ block: "nearest" });
       }
     }
-    function finish() { speaking = false; paused = false; mode = null; clearHi(); note.textContent = ""; label(false); }
+    function showScrub(show) { range.hidden = !show; pos.hidden = !show; }
+    function setPos(text) { pos.textContent = text; }
+    function fmt(t) {
+      t = Math.max(0, Math.floor(t || 0));
+      return Math.floor(t / 60) + ":" + ("0" + (t % 60)).slice(-2);
+    }
+    function finish() { speaking = false; paused = false; mode = null; clearHi(); note.textContent = ""; showScrub(false); label(false); }
 
     /* ---- current-word highlight (CSS Custom Highlight API, no DOM edits) ----
        The utterance text is the element's textContent with whitespace collapsed,
@@ -152,33 +168,67 @@
       } catch (e) { /* never let highlighting break playback */ }
     }
 
+    var gen = 0; // bumped on every jump/start so stale utterance callbacks go quiet
+
     function speakFrom(i) {
       if (i >= chunks.length) { finish(); return; }
       idx = i; highlight(i); note.textContent = chunks[i].text;
+      range.value = String(i); setPos((i + 1) + " / " + chunks.length);
       wordMap = chunks[i].el ? buildWordMap(chunks[i].el) : null;
+      var myGen = gen;
       var u = new SpeechSynthesisUtterance(chunks[i].text);
       var v = pickVoice(); if (v) u.voice = v;
       u.onboundary = function (e) {
+        if (myGen !== gen) return;
         if (e.name === "word" || e.name === undefined) {
           highlightWord(chunks[i].text, e.charIndex || 0, e.charLength || 0);
         }
       };
-      u.onend = function () { clearWord(); if (speaking && !paused) speakFrom(i + 1); };
+      u.onend = function () {
+        if (myGen !== gen) return;
+        clearWord();
+        if (speaking && !paused) speakFrom(i + 1);
+      };
       window.speechSynthesis.speak(u);
     }
     function startSpeech() {
       chunks = articleChunks();
       if (!chunks.length) return;
       speaking = true; paused = false; mode = "speech";
+      gen++;
       window.speechSynthesis.cancel();
+      range.max = String(chunks.length - 1);
+      showScrub(true);
       label(true); speakFrom(0);
     }
     function startAudio() {
       mode = "audio"; audio = new Audio(audioUrl);
       note.textContent = "natural narration";
       audio.addEventListener("ended", finish);
+      audio.addEventListener("loadedmetadata", function () {
+        range.max = "1000"; range.value = "0"; showScrub(true);
+        setPos(fmt(0) + " / " + fmt(audio.duration));
+      });
+      audio.addEventListener("timeupdate", function () {
+        if (!audio.duration) return;
+        range.value = String(Math.round((audio.currentTime / audio.duration) * 1000));
+        setPos(fmt(audio.currentTime) + " / " + fmt(audio.duration));
+      });
       label(true); audio.play();
     }
+    range.addEventListener("input", function () {
+      var v = parseInt(range.value, 10) || 0;
+      if (mode === "speech") {
+        gen++;                          // silence the in-flight utterance
+        window.speechSynthesis.cancel();
+        paused = false; speaking = true;
+        label(true);
+        speakFrom(Math.min(v, chunks.length - 1));
+      } else if (mode === "audio" && audio && audio.duration) {
+        audio.currentTime = (v / 1000) * audio.duration;
+        if (audio.paused) { audio.play(); label(true); }
+      }
+    });
     function haveAudio() {
       if (!audioUrl) return Promise.resolve(false);
       return fetch(audioUrl, { method: "HEAD" }).then(function (r) { return r.ok; }).catch(function () { return false; });
