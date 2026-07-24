@@ -92,26 +92,29 @@ history.
 | Machine learning foundations | 5 | 5 (group complete) |
 | Language, generative, multimodal | 11 | 11 (group complete) |
 | Reinforcement learning and decisions | 7 | 7 (group complete) |
-| Systems, architecture, data at scale | 10 | 7 |
-| Algorithms, theory, optimization, security | 7 | 4 |
-| Graphics, rendering, 3D | 5 | 0 |
+| Systems, architecture, data at scale | 10 | 10 (group complete) |
+| Algorithms, theory, optimization, security | 7 | 7 (group complete) |
+| Graphics, rendering, 3D | 5 | 2 |
 | Robotics and embodied intelligence | 5 | 0 |
 | Applied domains, product, interfaces | 6 | 0 |
-| **Total** | **56** | **36** |
+| **Total** | **56** | **42** |
 
-Batch 4 complete: natural-language-understanding, speech-and-spoken-language,
-generative-adversarial-networks, advanced-rl-topics,
-decision-making-under-uncertainty, general-game-playing. Language and RL
-groups are both complete. 36/56 live, 0 validator errors.
+Batch 5 complete: compilers-and-program-analysis, programming-languages,
+advanced-data-structures, modern-algorithmic-toolbox, rendering-foundations,
+physically-based-rendering. Systems and algorithms groups are both complete;
+graphics group is 2/5. 42/56 live, 0 validator errors.
 
-Remaining (20): systems group — compilers-and-program-analysis,
-programming-languages (2); algorithms group — advanced-data-structures,
-modern-algorithmic-toolbox (2); graphics group (5, all todo); robotics
-group (5, all todo); applied-domains group (6, all todo). See
-classes_data.py for slugs. sequence-models-state-spaces is live but leaner
-than siblings (951 lines) — expand if time allows. Orphan data-prep scripts
-data/bench_genomics.py and data/bench_robotics.py are staged for the
-genomics and embodied-foundation-models pages.
+Remaining (14): graphics group — interactive-graphics,
+animation-and-simulation, neural-3d-representations (3); robotics group —
+robot-kinematics-and-control, advanced-manipulation, interactive-robotics,
+collaborative-robotics, embodied-foundation-models (5); applied-domains
+group — deep-learning-genomics, audio-signal-processing,
+computational-music-analysis, ios-swiftui, product-design,
+modern-web-development (6). See classes_data.py for slugs.
+sequence-models-state-spaces is live but leaner than siblings (951 lines) —
+expand if time allows. Orphan data-prep scripts data/bench_genomics.py and
+data/bench_robotics.py are staged for the genomics and
+embodied-foundation-models pages.
 
 Complete and validated: algorithm-design-and-analysis, computer-architecture,
 computer-networks, concurrent-systems-programming, deep-generative-models,

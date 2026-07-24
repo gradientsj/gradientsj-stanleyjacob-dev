@@ -1,0 +1,1540 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Compilers &amp; program analysis &middot; Stanley Jacob</title>
+    <meta name="description" content="SSA construction from dominance frontiers worked by hand, dataflow analysis as a lattice fixed point with liveness and reaching-definitions iteration tables, SCCP constant propagation, loop optimizations and tiling arithmetic, graph-coloring register allocation, the polyhedral model, and how all of it reappears in XLA, TorchInductor, Triton, and MLIR." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes" class="active">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/classes">Classes</a></div>
+        <h1>Compilers and program analysis: SSA, dataflow, and the optimizations that matter for ML</h1>
+        <p class="lead">
+          A compiler is a chain of meaning-preserving rewrites from a source language to
+          a machine, and almost every rewrite that matters rests on the same two ideas:
+          a normal form that makes def-use structure explicit (static single assignment),
+          and a way to compute facts about all runs of a program at once (dataflow analysis
+          as a fixed point over a lattice). This page derives dominance and dominance
+          frontiers and places phi-nodes by hand with the Cytron algorithm; sets up the
+          monotone dataflow framework and runs liveness and reaching-definitions to their
+          fixpoints with the full iteration table; works constant propagation up to SCCP;
+          covers natural loops, loop-invariant code motion, induction variables, and the
+          tiling and fusion transformations that dominate tensor code; colors a real
+          interference graph to allocate registers; sketches list scheduling and the
+          polyhedral model; and closes on how XLA, TorchInductor, Triton, and the MLIR
+          dialect stack are exactly these classical passes retargeted at tensors. Every
+          numeric claim was computed in Python and is reproduced in the text.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+
+          <h2>Why this subject matters now</h2>
+          <p>
+            For thirty years a compiler was something a systems programmer used and never
+            thought about: type in C, get an object file, trust that <code>-O2</code> did
+            something reasonable. The optimizations that ran inside were mature by the late
+            1990s, and the interesting work had moved to the hardware. Machine learning
+            reopened the field. A modern training or inference stack is a compiler stack:
+            a PyTorch program is traced to a graph, the graph is lowered through several
+            intermediate representations, fused into a handful of kernels, tiled to the
+            cache and register hierarchy, and finally emitted as PTX or a hardware-specific
+            binary. The people who build these systems, Google's XLA and MLIR teams, Meta's
+            TorchInductor team, OpenAI's Triton team, are doing classical compiler
+            construction with tensors as the primitive value instead of 64-bit integers.
+          </p>
+          <p>
+            The reason is economic in exactly the way it is for the kernels on the
+            <a href="/classes/parallel-computing/">parallel computing</a> page. A
+            transformer's arithmetic is a small number of operation types repeated billions
+            of times, and the gap between a naive lowering and a well-fused, well-tiled one
+            is a factor of several in wall-clock time and therefore in dollars. In this
+            repository, fusing a chain of elementwise operations that were memory-bound cut
+            a measured kernel from 0.911 ms to 0.214 ms on an NVIDIA H100 80GB, a
+            \(4.26\times\) speedup with no change to the arithmetic. That decision, whether
+            to fuse and where to cut the graph into kernels, is made by a compiler pass
+            whose correctness rests on a dependence analysis that is a hundred-year-old
+            idea about affine inequalities. The practitioner is now expected to read an
+            HLO or Inductor dump, understand why a fusion did or did not happen, and reason
+            about the transformation in the vocabulary below.
+          </p>
+          <p>
+            This page is deliberately scoped to the analyses and transformations that
+            recur, front end through back end, with the tensor-compiler payoff kept in
+            view. It does not teach language design or type theory; those live on the
+            companion <a href="/classes/programming-languages/">programming languages</a>
+            page, which owns lambda calculus, Hindley-Milner inference, and operational
+            semantics. It leans on the machine model developed in
+            <a href="/classes/advanced-systems-architecture/">advanced systems
+            architecture</a> whenever a transformation is justified by the memory
+            hierarchy. The anchors are the standard texts: Aho, Lam, Sethi, and Ullman's
+            Dragon Book, Muchnick, Appel, and Cooper and Torczon, plus the primary papers
+            for SSA, dataflow, register allocation, and the polyhedral model.
+          </p>
+
+          <h2>The front end, quickly</h2>
+          <p>
+            The front end turns text into a typed abstract syntax tree, and it is the part
+            of a compiler with the cleanest theory and the least remaining research. Two
+            layers do the work. Lexing partitions the character stream into tokens, and the
+            token classes are exactly the languages a finite automaton can recognize: the
+            regular languages. An identifier, a number, a keyword, an operator, each is
+            described by a regular expression, the regular expressions are compiled to a
+            single deterministic finite automaton by the Thompson construction followed by
+            the subset construction, and the DFA runs in one pass, one table lookup per
+            character. The reason lexers are generated rather than written is that this
+            construction is mechanical and easy to get subtly wrong by hand; tools like
+            lex, flex, and re2c emit the transition table from the regular expressions.
+          </p>
+          <p>
+            Parsing recognizes the nested structure that regular languages cannot express.
+            The canonical proof is that \(\{a^n b^n : n \ge 0\}\) is not regular, shown by
+            the pumping lemma: a DFA with \(k\) states reading \(a^{k}b^{k}\) must repeat a
+            state inside the run of \(a\)'s, and pumping that cycle produces a string with
+            unequal counts that the DFA still accepts, a contradiction. Balanced brackets
+            and nested expressions have exactly this shape, so parsing needs a stack, which
+            is a pushdown automaton, which recognizes the context-free languages. Grammars
+            are written in Backus-Naur form and parsed by one of two families. Top-down
+            LL(k) parsers predict the production from \(k\) tokens of lookahead and are what
+            hand-written recursive-descent parsers implement; they cannot handle left
+            recursion and must factor the grammar. Bottom-up LR(k) parsers, and the
+            practical LALR(1) subset produced by yacc and bison, build the parse from the
+            leaves using a shift-reduce automaton over item sets, and they accept a strictly
+            larger class of grammars. Parser generators exist because constructing the
+            LALR(1) automaton, computing FIRST and FOLLOW sets and detecting conflicts, is
+            again mechanical and error-prone by hand. The output of the front end, for the
+            rest of this page, is a control-flow graph of an intermediate representation,
+            and everything interesting happens there.
+          </p>
+
+          <h2>Intermediate representation and SSA</h2>
+          <h3>Why an IR, and why SSA</h3>
+          <p>
+            An intermediate representation is a small, regular instruction set that is
+            neither the source language nor the target machine. It exists so that the
+            optimizer can be written once against a fixed vocabulary and then retargeted,
+            and so that analyses do not have to cope with the irregularity of real source
+            syntax. The dominant modern form is a three-address, register-based IR arranged
+            as a control-flow graph: basic blocks of straight-line instructions, connected
+            by edges wherever control can flow. LLVM IR, described by Lattner and Adve in
+            2004, is the reference example and the one most ML compilers ultimately reach.
+          </p>
+          <p>
+            The single most important normal form on top of that IR is static single
+            assignment. In SSA form every variable is assigned exactly once, textually, and
+            every use refers to exactly one definition. A variable reassigned three times
+            in the source becomes three differently-named versions. This makes def-use
+            chains explicit and free: to find the definition reaching a use you read its
+            name, no analysis required. Constant propagation, value numbering, dead-code
+            elimination, and register allocation all become dramatically simpler because the
+            question "which definition does this use see" has a one-word answer. The
+            difficulty is control-flow merges. If \(x\) is assigned in one arm of an
+            <code>if</code> and differently in the other, the join block cannot name a
+            single reaching definition. SSA resolves this with the phi-function: at a merge
+            block, \(x_3 = \phi(x_1, x_2)\) selects \(x_1\) or \(x_2\) according to which
+            predecessor edge was taken. The whole problem of constructing SSA reduces to one
+            question: at which blocks, for which variables, must a phi-function be inserted.
+            Placing a phi at every join for every variable is correct but wasteful; the
+            minimal answer is computed from dominance.
+          </p>
+
+          <h3>Dominance</h3>
+          <p>
+            Fix a CFG with a unique entry node. A node \(d\) <em>dominates</em> a node
+            \(n\), written \(d \operatorname{dom} n\), if every path from entry to \(n\)
+            passes through \(d\). Dominance is reflexive (\(n\) dominates itself),
+            transitive, and antisymmetric, so it is a partial order; restricted to the nodes
+            reachable from entry it is in fact a tree. The <em>immediate dominator</em>
+            \(\operatorname{idom}(n)\) is the unique dominator of \(n\) other than \(n\)
+            itself that is dominated by every other dominator of \(n\); it is the parent of
+            \(n\) in the dominator tree. Dominance is the answer to "what must have already
+            run before control can be here," which is why it controls both phi placement and
+            code motion.
+          </p>
+          <p>
+            Dominance is itself a dataflow problem, computed as a fixed point. Let
+            \(D(n)\) be the set of dominators of \(n\). Then \(D(\text{entry}) =
+            \{\text{entry}\}\) and, for every other node,
+          </p>
+          $$ D(n) = \{n\} \cup \bigcap_{p \in \operatorname{pred}(n)} D(p). $$
+          <p>
+            The equation says a node's dominators are itself plus everything that dominates
+            all of its predecessors. Initializing every non-entry \(D(n)\) to the full node
+            set and iterating this equation to convergence gives the dominator sets; on a
+            reverse-postorder traversal it converges in a small number of passes. For the
+            worked CFG below, initialize and iterate.
+          </p>
+          <pre class="flow">          B0            edges:  B0->B1
+           |                    B1->B2   B1->B3
+          B1 &lt;-----+            B2->B4   B3->B4
+         /    \     |            B4->B5   B4->B6
+        B2    B3    |            B5->B1   (back edge)
+         \    /     |            B6  exit
+          B4        |
+         /    \     |
+        B5     B6   |
+        |           |
+        +-----------+</pre>
+          <p>
+            Iterating the dominance equation in reverse postorder converges in two passes
+            (one productive pass and one confirming pass) to
+          </p>
+          <div class="tbl-wrap">
+            <table class="data">
+              <thead><tr><th>node</th><th>dominators \(D(n)\)</th><th>\(\operatorname{idom}(n)\)</th></tr></thead>
+              <tbody>
+                <tr><td>B0</td><td>{B0}</td><td>&mdash;</td></tr>
+                <tr><td>B1</td><td>{B0, B1}</td><td>B0</td></tr>
+                <tr><td>B2</td><td>{B0, B1, B2}</td><td>B1</td></tr>
+                <tr><td>B3</td><td>{B0, B1, B3}</td><td>B1</td></tr>
+                <tr><td>B4</td><td>{B0, B1, B4}</td><td>B1</td></tr>
+                <tr><td>B5</td><td>{B0, B1, B4, B5}</td><td>B4</td></tr>
+                <tr><td>B6</td><td>{B0, B1, B4, B6}</td><td>B4</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>
+            Notice that B4 is dominated by B1 and not by B2 or B3, because control can reach
+            B4 through either arm of the branch, so neither arm is on every path. The
+            dominator tree therefore has B1 as the parent of B2, B3, and B4, and B4 as the
+            parent of B5 and B6. In production, nobody iterates the set equation; the
+            Lengauer-Tarjan algorithm computes the dominator tree in near-linear time, and
+            the Cooper-Harvey-Kennedy iterative formulation is the one most compilers ship
+            because it is simple and fast enough. The set equation is the definition; the
+            algorithms are engineering.
+          </p>
+
+          <h3>Dominance frontiers, derived</h3>
+          <p>
+            The dominance frontier of a node \(d\) is the set of nodes where \(d\)'s
+            dominance "just stops." Formally, \(n \in \operatorname{DF}(d)\) if \(d\)
+            dominates a predecessor of \(n\) but does not strictly dominate \(n\) itself:
+          </p>
+          $$ \operatorname{DF}(d) = \{\, n : (\exists p \in \operatorname{pred}(n))\; d \operatorname{dom} p \ \text{and}\ d \not\operatorname{sdom} n \,\}, $$
+          <p>
+            where \(\operatorname{sdom}\) is strict dominance (\(d \operatorname{dom} n\) and
+            \(d \ne n\)). The intuition is precisely the phi-placement condition. If a value
+            is defined in \(d\), that definition dominates everything in the subtree below
+            \(d\), so within the subtree every use sees it and no phi is needed. But at a
+            node \(n\) on the frontier, control can arrive both through \(d\) (carrying
+            \(d\)'s definition) and through some other path (carrying a different one), so
+            the definitions merge and \(n\) needs a phi. The dominance frontier is exactly
+            the set of merge points a single definition can reach without dominating.
+          </p>
+          <p>
+            Cytron, Ferrante, Rosen, Wegman, and Zadeck gave the algorithm in 1991. Compute
+            \(\operatorname{DF}\) bottom-up on the dominator tree. For each node \(b\) with
+            two or more predecessors, walk from each predecessor \(p\) up the dominator tree,
+            adding \(b\) to the frontier of every node visited, stopping just before
+            \(\operatorname{idom}(b)\):
+          </p>
+          <pre class="flow">for each join node b (|pred(b)| >= 2):
+    for each p in pred(b):
+        runner = p
+        while runner != idom(b):
+            DF[runner] = DF[runner] union {b}
+            runner = idom(runner)</pre>
+          <p>
+            Running this on the CFG above, the join nodes are B4 (predecessors B2, B3) and
+            B1 (predecessors B0, B5, since B5 has the back edge). For B4: from B2, runner=B2,
+            \(\operatorname{idom}(B4)=B1\), so add B4 to \(\operatorname{DF}(B2)\), move to
+            B1, stop. From B3 symmetrically, add B4 to \(\operatorname{DF}(B3)\). For B1:
+            from B5, runner walks B5, B4 up to \(\operatorname{idom}(B1)=B0\), adding B1 to
+            the frontier of B5 and of B4; from B0 the loop does not run. The result,
+            confirmed in Python:
+          </p>
+          <div class="tbl-wrap">
+            <table class="data">
+              <thead><tr><th>node</th><th>DF</th></tr></thead>
+              <tbody>
+                <tr><td>B0</td><td>{}</td></tr>
+                <tr><td>B1</td><td>{B1}</td></tr>
+                <tr><td>B2</td><td>{B4}</td></tr>
+                <tr><td>B3</td><td>{B4}</td></tr>
+                <tr><td>B4</td><td>{B1}</td></tr>
+                <tr><td>B5</td><td>{B1}</td></tr>
+                <tr><td>B6</td><td>{}</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>
+            The loop header B1 is in its own dominance frontier, which is the signature of a
+            loop: a value defined inside the loop reaches the header again through the back
+            edge, so the header needs a phi. This is why loop induction variables always
+            appear as phi-nodes at the header in SSA.
+          </p>
+
+          <h3>Phi placement by iterated dominance frontier</h3>
+          <p>
+            A single definition of \(x\) in block \(d\) forces phi-nodes at every node in
+            \(\operatorname{DF}(d)\). But a phi-node is itself a definition of \(x\), so it
+            can force further phi-nodes at <em>its</em> dominance frontier. The correct set
+            of phi locations for a variable defined in a set of blocks \(S\) is therefore the
+            <em>iterated dominance frontier</em> \(\operatorname{DF}^+(S)\), the least
+            fixed point of \(\operatorname{DF}\) starting from \(S\):
+          </p>
+          $$ \operatorname{DF}^+(S) = \lim_{k\to\infty} \operatorname{DF}_k, \quad \operatorname{DF}_1 = \operatorname{DF}(S), \quad \operatorname{DF}_{i+1} = \operatorname{DF}\!\big(S \cup \operatorname{DF}_i\big). $$
+          <p>
+            Suppose \(x\) is assigned in B0, B2, and B5 (an initialization, an update in one
+            branch, and an update at the loop tail). Take the union of their frontiers:
+            \(\operatorname{DF}(B0)=\{\}\), \(\operatorname{DF}(B2)=\{B4\}\),
+            \(\operatorname{DF}(B5)=\{B1\}\), giving \(\{B1, B4\}\). Now iterate: B1 and B4
+            are themselves definitions of \(x\) (they hold phis), and
+            \(\operatorname{DF}(B1)=\{B1\}\), \(\operatorname{DF}(B4)=\{B1\}\), which adds
+            nothing new. The fixed point is \(\{B1, B4\}\): phi-nodes for \(x\) go at the
+            loop header B1 and at the branch merge B4, and nowhere else. The Python
+            computation agrees exactly. After placement, a single pre-order walk of the
+            dominator tree renames variables into versions and wires each phi's operands to
+            the versions live along each incoming edge, completing SSA construction.
+          </p>
+
+          <div class="problem">
+            <span class="plabel">Problem 1</span>
+            <p>
+              Add an edge B3 &rarr; B6 to the CFG above (so B6 now has predecessors B4 and
+              B3), leaving all else unchanged. Recompute \(\operatorname{DF}(B3)\) and state
+              whether a variable defined only in B2 now needs a phi at B6.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> B6 becomes a join node with predecessors B4 and
+                B3. First recompute idom(B6): paths to B6 now go entry, B1, then either B4
+                or B3, so the last common dominator is B1, giving
+                \(\operatorname{idom}(B6)=B1\) (it is no longer B4, because the new B3 path
+                bypasses B4). Apply the Cytron walk at B6. From predecessor B3: runner=B3,
+                idom(B6)=B1, so add B6 to \(\operatorname{DF}(B3)\), move to
+                idom(B3)=B1, stop. From predecessor B4: runner=B4, add B6 to
+                \(\operatorname{DF}(B4)\), move to idom(B4)=B1, stop. So now
+                \(\operatorname{DF}(B3)=\{B4, B6\}\) and \(\operatorname{DF}(B4)=\{B1, B6\}\).
+                A variable defined only in B2 has frontier
+                \(\operatorname{DF}(B2)=\{B4\}\); iterating, B4's frontier is \(\{B1, B6\}\),
+                so the iterated frontier is \(\{B4, B1, B6\}\). Yes: the B2 definition now
+                needs a phi at B6, because control can reach B6 either through B4 (carrying
+                the B2 value via a phi at B4) or through B3 (carrying whatever value B3 sees),
+                and those merge at B6. Adding one edge changed the phi placement two levels
+                away, which is why phi placement must be computed, not guessed.
+              </p>
+            </div>
+          </div>
+
+          <h2>Dataflow analysis as a lattice fixed point</h2>
+          <h3>The framework</h3>
+          <p>
+            Almost every classical analysis, liveness, reaching definitions, available
+            expressions, constant propagation, is an instance of one framework, first stated
+            in this generality by Kildall in 1973 and refined by Kam and Ullman in 1976 and
+            1977. The framework has four ingredients. A <em>lattice</em> \((L, \sqsubseteq)\)
+            of dataflow facts, with a <em>meet</em> operation \(\sqcap\) that combines facts
+            arriving from different paths. A <em>transfer function</em> \(f_B : L \to L\) for
+            each basic block, describing how the block changes the facts. A <em>direction</em>,
+            forward or backward. And a starting value at the boundary. The analysis computes,
+            for each program point, the meet over the transfer functions along all paths
+            reaching it, as a fixed point of the system of equations
+          </p>
+          $$ \operatorname{IN}[B] = \bigsqcap_{P \in \operatorname{pred}(B)} \operatorname{OUT}[P], \qquad \operatorname{OUT}[B] = f_B\big(\operatorname{IN}[B]\big) $$
+          <p>
+            for a forward analysis, and the mirror image (successors, IN and OUT swapped) for
+            a backward one. The meet \(\sqcap\) is intersection or union depending on whether
+            the analysis wants facts true on <em>all</em> paths or on <em>some</em> path;
+            this is the choice that distinguishes "must" analyses from "may" analyses.
+          </p>
+          <p>
+            Three properties make this well-defined and computable. First, \(L\) must be a
+            complete lattice, so the meet of any set of facts exists. Second, every transfer
+            function must be <em>monotone</em>: if \(x \sqsubseteq y\) then \(f(x) \sqsubseteq
+            f(y)\); more information in produces no less information out. Third, \(L\) must
+            have <em>finite height</em>: no infinite strictly-descending chain
+            \(x_0 \sqsupset x_1 \sqsupset \cdots\). Under these three conditions the iterative
+            solver terminates, for a reason worth stating precisely.
+          </p>
+          <p>
+            <strong>Termination.</strong> Initialize every OUT to the lattice top \(\top\)
+            (the most optimistic fact) and apply the equations repeatedly. Each application
+            can only move a value down or leave it fixed, by monotonicity, so every program
+            point traces a monotonically descending chain in \(L\). A descending chain in a
+            finite-height lattice cannot descend more than \(h\) times, where \(h\) is the
+            height. With \(n\) program points the whole system therefore stabilizes after at
+            most \(n \cdot h\) value changes, and once no equation changes a value the system
+            is at a fixed point. Because the iteration always decreases and is bounded below,
+            it reaches the <em>greatest</em> fixed point consistent with the equations, which
+            is the most precise sound solution the framework can express. This is the
+            Knaster-Tarski theorem specialized to a finite lattice, and it is the entire
+            reason dataflow analysis is guaranteed to work.
+          </p>
+
+          <h3>Reaching definitions, worked to fixpoint</h3>
+          <p>
+            A definition \(d\) (an assignment to a variable) <em>reaches</em> a program point
+            if there is a path from \(d\) to that point along which the variable is not
+            reassigned. It is a forward, may analysis: the fact set is a set of definitions,
+            the meet is union (a definition reaches if it reaches along <em>any</em> path),
+            and the block transfer function is
+          </p>
+          $$ \operatorname{OUT}[B] = \operatorname{gen}[B] \cup \big(\operatorname{IN}[B] \setminus \operatorname{kill}[B]\big), $$
+          <p>
+            where \(\operatorname{gen}[B]\) is the definitions made in \(B\) and reaching its
+            end, and \(\operatorname{kill}[B]\) is all other definitions of the same variables,
+            which \(B\) overwrites. Consider this CFG, a branch that redefines the same
+            variables on each arm:
+          </p>
+          <pre class="flow">B1: d1: a = ...        gen={d1}  kill={d3}
+     |
+B2: d2: b = ...        gen={d2}  kill={d4}
+    /  \
+   /    \
+B3:d3   B4:d4          B3 gen={d3} kill={d1}
+ a=..    b=..          B4 gen={d4} kill={d2}
+   \    /
+    \  /
+B5: (use a, b)         gen={}   kill={}
+
+edges: B1->B2, B2->B3, B2->B4, B3->B5, B4->B5</pre>
+          <p>
+            Here d1 and d3 both define \(a\), so each kills the other; d2 and d4 both define
+            \(b\), likewise. Iterating the forward equations with meet = union, in block order,
+            starting from empty sets:
+          </p>
+          <div class="tbl-wrap">
+            <table class="data">
+              <thead><tr><th>block</th><th>IN (pass 1 = pass 2)</th><th>OUT (pass 1 = pass 2)</th></tr></thead>
+              <tbody>
+                <tr><td>B1</td><td>{}</td><td>{d1}</td></tr>
+                <tr><td>B2</td><td>{d1}</td><td>{d1, d2}</td></tr>
+                <tr><td>B3</td><td>{d1, d2}</td><td>{d2, d3}</td></tr>
+                <tr><td>B4</td><td>{d1, d2}</td><td>{d1, d4}</td></tr>
+                <tr><td>B5</td><td>{d1, d2, d3, d4}</td><td>{d1, d2, d3, d4}</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>
+            The system reaches its fixed point in a single productive pass here (a second
+            pass confirms nothing changes) because the CFG is acyclic and the blocks were
+            visited in topological order. Read B3's OUT: d1 was killed (B3 redefines \(a\)),
+            so only d2 and the new d3 survive. At the join B5, the union brings in all four
+            definitions, but note that both a-definitions (d1 and d3) reach B5: along the B3
+            arm \(a\) is d3, along the B4 arm \(a\) is still d1. That ambiguity, two
+            definitions of one variable reaching one point, is precisely the situation SSA
+            eliminates with a phi at B5. Reaching definitions and phi placement are the same
+            fact viewed two ways.
+          </p>
+
+          <h3>Liveness, worked to fixpoint</h3>
+          <p>
+            A variable is <em>live</em> at a point if its current value may be read before it
+            is overwritten. It is a backward, may analysis: facts are sets of variables, meet
+            is union over successors, and the transfer function is
+          </p>
+          $$ \operatorname{IN}[B] = \operatorname{use}[B] \cup \big(\operatorname{OUT}[B] \setminus \operatorname{def}[B]\big), \qquad \operatorname{OUT}[B] = \bigcup_{S \in \operatorname{succ}(B)} \operatorname{IN}[S], $$
+          <p>
+            where \(\operatorname{use}[B]\) is the variables read in \(B\) before any
+            redefinition in \(B\) (upward-exposed uses) and \(\operatorname{def}[B]\) is the
+            variables \(B\) assigns. Liveness is the analysis register allocation runs on:
+            two variables that are never simultaneously live can share a register. Consider an
+            accumulator loop, where \(c\) enters as a parameter:
+          </p>
+          <pre class="flow">B1: a = 0                use={}      def={a}
+     |
+B2: b = a + 1            (loop head)
+    c = c + b            use={a,c}   def={a,b,c}
+    a = b * 2
+    if a &lt; N goto B2 else B3
+     |
+B3: return c             use={c}     def={}
+
+edges: B1->B2, B2->B2 (loop back), B2->B3</pre>
+          <p>
+            The use set of B2 is \(\{a, c\}\): \(a\) is read by <code>b = a + 1</code> before
+            B2 redefines \(a\), and \(c\) is read by <code>c = c + b</code> before B2
+            redefines \(c\); \(b\) is defined in B2 before its use, so it is not
+            upward-exposed. Iterating the backward equations, processing blocks in reverse
+            order B3, B2, B1, starting from empty:
+          </p>
+          <div class="tbl-wrap">
+            <table class="data">
+              <thead><tr><th>pass</th><th>B1 IN / OUT</th><th>B2 IN / OUT</th><th>B3 IN / OUT</th></tr></thead>
+              <tbody>
+                <tr><td>1</td><td>{c} / {a,c}</td><td>{a,c} / {c}</td><td>{c} / {}</td></tr>
+                <tr><td>2</td><td>{c} / {a,c}</td><td>{a,c} / {a,c}</td><td>{c} / {}</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>
+            Pass 1 processes B2 before its own loop-back fact has stabilized: at that point
+            \(\operatorname{IN}[B2]\) has not yet been fed back into
+            \(\operatorname{OUT}[B2]\), so \(\operatorname{OUT}[B2]=\{c\}\) (only the B3
+            successor contributes). Pass 2 picks up the loop edge: now
+            \(\operatorname{OUT}[B2] = \operatorname{IN}[B2] \cup \operatorname{IN}[B3] =
+            \{a,c\}\), because \(a\) computed in one iteration is read by the next. A third
+            pass changes nothing, so the fixed point is reached in two productive passes. The
+            back edge is exactly why more than one pass is needed: an acyclic CFG converges in
+            a single reverse pass, a loop needs one extra pass per level of nesting to
+            propagate a fact around the cycle. Reading the result, \(c\) is live throughout
+            (it is the accumulator, correctly live on entry as a parameter), and \(a\) and
+            \(b\) are live only across short ranges, so they could share physical storage.
+          </p>
+
+          <h3>The worklist algorithm</h3>
+          <p>
+            Re-evaluating every block on every pass, the "round-robin" solver above, is
+            wasteful: most blocks' facts do not change on most passes. The worklist algorithm
+            only re-evaluates a block when an input it depends on has changed. Seed a worklist
+            with all blocks; pop a block, recompute its OUT (forward) or IN (backward), and if
+            it changed, push the neighbors that read it. Terminate when the worklist is empty.
+          </p>
+          <pre class="flow">worklist = all blocks
+while worklist not empty:
+    B = worklist.pop()
+    in  = meet over predecessors' out    (forward)
+    out = transfer(B, in)
+    if out changed:
+        for S in successors(B):
+            worklist.push(S)</pre>
+          <p>
+            It computes the same fixed point as round-robin, because it applies the same
+            monotone equations until none changes; it just skips the applications that would
+            not change anything. Termination is the same argument: each block's value only
+            descends, the lattice has finite height, so only finitely many pushes cause a
+            change and the queue drains. Visiting order affects speed but not the answer;
+            reverse postorder for forward problems and postorder for backward ones minimize
+            the number of re-evaluations. The runnable analyzer in the implementation section
+            is a worklist solver, and its output on the reaching-definitions CFG above matches
+            the table exactly.
+          </p>
+
+          <h3>MOP versus the fixpoint solution</h3>
+          <p>
+            There are two things one might mean by "the dataflow answer." The
+            <em>meet-over-all-paths</em> (MOP) solution at a point is the meet, over every
+            executable path \(P\) from entry to that point, of the composed transfer functions
+            along \(P\) applied to the boundary fact:
+          </p>
+          $$ \operatorname{MOP}[n] = \bigsqcap_{P : \text{entry} \rightsquigarrow n} f_P(\text{init}), \qquad f_P = f_{B_k} \circ \cdots \circ f_{B_1}. $$
+          <p>
+            The MOP is what we actually want: the meet of the facts that hold on each real
+            path. But the number of paths through a CFG with loops is infinite, so MOP is not
+            directly computable. The iterative solver computes the <em>maximum fixed point</em>
+            (MFP) instead, which merges facts at every join before continuing rather than
+            keeping paths separate. Kam and Ullman proved the relationship: MFP
+            \(\sqsubseteq\) MOP always (the fixpoint is a sound, possibly conservative,
+            approximation of the meet-over-paths), and MFP \(=\) MOP exactly when all transfer
+            functions are <em>distributive</em>, meaning \(f(x \sqcap y) = f(x) \sqcap f(y)\).
+            The classic bit-vector analyses, liveness, reaching definitions, available
+            expressions, are all distributive, so for them the iterative solution is exactly
+            the meet-over-paths, no precision is lost. Constant propagation is the standard
+            example that is monotone but <em>not</em> distributive, so its iterative solution
+            can be strictly weaker than MOP, which is the subtlety the next section confronts.
+          </p>
+
+          <h2>Constant propagation and SCCP</h2>
+          <h3>The lattice and the non-distributivity</h3>
+          <p>
+            Constant propagation asks which variables hold a known constant at each point. The
+            per-variable lattice has three levels: \(\top\) meaning "not yet known to be
+            anything" (optimistically assumed constant), a middle layer with one element per
+            concrete constant \(c\), and \(\bot\) meaning "known to vary" (not a constant).
+            The order is \(\top \sqsupset c \sqsupset \bot\), and the meet of two different
+            constants is \(\bot\): if two paths deliver 3 and 5, the value is not constant.
+            This lattice has height 2, so it satisfies the finite-height requirement, and the
+            transfer functions (evaluate the right-hand side when all inputs are constant,
+            otherwise \(\bot\)) are monotone.
+          </p>
+          <p>
+            It is not distributive. Take <code>z = x + y</code> where one path supplies
+            \((x,y)=(1,4)\) and another \((x,y)=(4,1)\). On each path \(z = 5\), so the
+            meet-over-paths says \(z\) is the constant 5. But the iterative solver meets the
+            inputs first: \(x = 1 \sqcap 4 = \bot\), \(y = 4 \sqcap 1 = \bot\), and then
+            \(z = \bot + \bot = \bot\), losing the constant. This is the price of merging at
+            joins, and it is why plain iterative constant propagation misses correlated
+            constants. It is still sound, it never claims a non-constant is constant, just
+            conservative.
+          </p>
+
+          <h3>Sparse conditional constant propagation</h3>
+          <p>
+            Wegman and Zadeck's 1991 sparse conditional constant propagation (SCCP) is
+            strictly more powerful than the naive analysis, not by fixing non-distributivity
+            but by exploiting SSA and by tracking reachability. It runs on SSA form with two
+            interacting worklists, one for CFG edges and one for SSA def-use edges, and it
+            maintains a lattice value per SSA variable and a reachable flag per CFG edge.
+            Two ideas give it its power. First, because it is on SSA, def-use edges are
+            explicit and it only re-evaluates the instructions that actually read a changed
+            value, which is the "sparse" part and makes it fast. Second, it evaluates branch
+            conditions with the current lattice values, and if a condition is a known constant
+            it marks only the taken edge reachable and never propagates facts along the
+            other. This is the "conditional" part, and it is what lets SCCP fold away entire
+            dead branches: if <code>if (false)</code> is discovered, the then-arm's
+            assignments never contribute to any phi, so constants survive the merge that a
+            path-insensitive analysis would have destroyed. SCCP simultaneously discovers
+            constants and unreachable code, and each discovery feeds the other; it is the
+            constant-propagation pass in production compilers for exactly this reason.
+          </p>
+
+          <div class="problem">
+            <span class="plabel">Problem 2</span>
+            <p>
+              A block computes <code>t = a * b</code> where the incoming lattice values are
+              \(a = \top\) and \(b = 0\). What is the lattice value of \(t\), and what general
+              principle about SCCP transfer functions does this illustrate?
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> Naively, \(a = \top\) means "not yet known,"
+                \(b = 0\) is the constant 0, and a strict rule "output is \(\bot\) unless all
+                inputs are known constants" would leave \(t\) waiting on \(a\). But
+                multiplication by 0 is 0 regardless of the other operand: \(t = a \cdot 0 = 0\)
+                for every value of \(a\). A good SCCP implementation encodes these algebraic
+                identities, so it returns \(t = 0\) even with \(a = \top\), and certainly with
+                \(a = \bot\). The principle is that transfer functions should be as precise as
+                the algebra allows while staying monotone: exploiting \(x \cdot 0 = 0\),
+                \(x \wedge \text{false} = \text{false}\), and \(x \vee \text{true} =
+                \text{true}\) lets SCCP resolve values that a purely structural rule would
+                mark unknown. Monotonicity still holds: lowering \(a\) from \(\top\) to \(\bot\)
+                does not raise \(t\), it stays 0. This is why SCCP can constant-fold guards
+                like <code>if (n * 0 &lt; 1)</code> that a naive analysis leaves symbolic.
+              </p>
+            </div>
+          </div>
+
+          <h2>Loops and the transformations that matter</h2>
+          <h3>Natural loops from dominance</h3>
+          <p>
+            Loops are found from the dominator tree, not from source syntax, so that the
+            optimizer handles <code>goto</code>-built loops and reducible control flow
+            uniformly. A <em>back edge</em> is a CFG edge \(n \to h\) whose head \(h\)
+            dominates its tail \(n\). The <em>natural loop</em> of that back edge is \(h\)
+            together with every node that can reach \(n\) without passing through \(h\); \(h\)
+            is the loop header, the single entry through which all iterations pass. In the
+            first worked CFG, B5 &rarr; B1 is a back edge because B1 dominates B5, and the
+            natural loop is \(\{B1, B2, B3, B4, B5\}\), header B1. Identifying the header
+            matters because it is where loop-invariant code is hoisted to (into a
+            <em>preheader</em> inserted just before it) and where induction-variable phis
+            live. When every back edge's head dominates its tail the CFG is <em>reducible</em>,
+            which real structured code always is, and the loops nest cleanly; irreducible
+            CFGs (from unrestricted gotos) need node splitting first.
+          </p>
+
+          <h3>Loop-invariant code motion</h3>
+          <p>
+            An instruction inside a loop is <em>loop-invariant</em> if every operand is either
+            defined outside the loop or is itself loop-invariant, and its value therefore does
+            not change across iterations. LICM hoists such an instruction to the preheader so
+            it runs once instead of once per iteration. Correctness has a subtlety: hoisting is
+            only safe if the instruction dominates all loop exits (so it would have executed
+            anyway on every path that leaves the loop) or is otherwise known to be
+            side-effect-free and non-faulting, because hoisting a faulting operation, a
+            division or a load, out of a loop that might execute zero times would introduce a
+            fault the original never had. In SSA the invariance test is nearly free: an
+            operation is invariant exactly when all its SSA operands are defined outside the
+            loop or by already-hoisted instructions, which is a simple fixpoint over the loop
+            body. The payoff on tensor code is large because address computations,
+            <code>base + i*stride</code> with a loop-invariant base and stride, are the most
+            common hoisting target and feed directly into the next transformation.
+          </p>
+
+          <h3>Induction variables and strength reduction</h3>
+          <p>
+            A <em>basic induction variable</em> is one incremented by a loop-invariant amount
+            each iteration, the loop counter <code>i += 1</code> being the archetype. A
+            <em>derived</em> induction variable is an affine function of a basic one,
+            \(j = c_1 \cdot i + c_2\) with loop-invariant \(c_1, c_2\). Induction-variable
+            analysis finds these families, and <em>strength reduction</em> replaces the
+            expensive recomputation \(j = c_1 \cdot i + c_2\) with a cheap running update
+            \(j \mathrel{+}= c_1\) each iteration, turning a multiply into an add. This is the
+            transformation that makes array-address arithmetic cheap: an access
+            <code>A[i]</code> at byte address \(\text{base} + i \cdot \text{elt}\) becomes a
+            pointer that advances by \(\text{elt}\) per iteration. Concretely, with
+            <code>j = 4*i + 7</code> and <code>i</code> stepping by 3, the derived variable
+            starts at \(4\cdot 2 + 7 = 15\) (for \(i_0 = 2\)) and increments by
+            \(4 \cdot 3 = 12\) each iteration, so the multiply-add per iteration collapses to a
+            single add of 12. Trip-count analysis, counting iterations, follows from the same
+            affine description: for <code>for (i = 2; i &lt; 100; i += 3)</code> the count is
+            \(\lceil (100 - 2)/3 \rceil = 33\) and the final value is
+            \(2 + 3 \cdot 32 = 98\). Trip counts drive unrolling and vectorization decisions.
+          </p>
+
+          <h3>Tiling, fusion, and unrolling for tensors</h3>
+          <p>
+            Three loop transformations dominate tensor compilation. <em>Unrolling</em>
+            replicates the loop body to expose instruction-level parallelism and amortize the
+            loop overhead, at the cost of code size and register pressure. <em>Fusion</em>
+            merges two loops with compatible iteration spaces into one, so a value produced by
+            the first is consumed by the second while still in a register or cache rather than
+            being written to and reread from memory; this is the graph-level decision that
+            produced the measured \(4.26\times\) elementwise speedup on the H100. <em>Tiling</em>
+            (also called blocking) splits a loop over a large index into an outer loop over
+            tiles and an inner loop within a tile, so that the working set of the inner loop
+            fits in a fast level of the memory hierarchy and is reused there instead of being
+            streamed repeatedly from DRAM. Tiling is the single most important transformation
+            for matrix and tensor code, and its benefit is a reuse computation worth doing
+            exactly.
+          </p>
+          <p>
+            Take \(C = A B\) with \(A, B\) both \(N \times N\), \(N = 1024\), fp32 (4 bytes
+            per element). The untiled triple loop, for each \((i,j)\) streaming a full row of
+            \(A\) and column of \(B\), issues \(2N^3\) element loads of \(A\) and \(B\)
+            combined: \(2 \cdot 1024^3 = 2.147 \times 10^9\) loads, which at 4 bytes each is
+            8.590 GB moved through the memory system for a problem whose inputs are only 8 MB.
+            Every element of \(A\) is fetched \(N = 1024\) times. Tiling all three loops into
+            \(T \times T\) blocks changes the reuse: an \(A\) tile is loaded once and reused
+            across the \(N/T\) tiles of the \(j\) dimension, so each element of \(A\) is
+            fetched \(N/T\) times instead of \(N\). The combined \(A\)-and-\(B\) load count
+            drops to \(2 N^2 (N/T)\), a reduction of exactly \(T\times\):
+          </p>
+          <div class="tbl-wrap">
+            <table class="data">
+              <thead><tr><th>tile \(T\)</th><th>AB element loads</th><th>vs untiled</th><th>DRAM moved</th><th>3-tile footprint</th><th>AI (flop/byte)</th></tr></thead>
+              <tbody>
+                <tr><td>untiled</td><td>\(2.147\times 10^9\)</td><td>1&times;</td><td>8.590 GB</td><td>&mdash;</td><td>0.25</td></tr>
+                <tr><td>16</td><td>\(1.342\times 10^8\)</td><td>16&times;</td><td>536.9 MB</td><td>3.0 KB</td><td>4.0</td></tr>
+                <tr><td>32</td><td>\(6.711\times 10^7\)</td><td>32&times;</td><td>268.4 MB</td><td>12.0 KB</td><td>8.0</td></tr>
+                <tr><td>64</td><td>\(3.355\times 10^7\)</td><td>64&times;</td><td>134.2 MB</td><td>48.0 KB</td><td>16.0</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>
+            The arithmetic intensity, useful flops per byte moved, rises in lockstep: the
+            \(2N^3\) flops divided by the bytes moved climbs from 0.25 flop/byte untiled to
+            16 flop/byte at \(T = 64\). The footprint column is the constraint: three
+            \(T \times T\) fp32 tiles must fit in the fast memory being targeted, and at
+            \(T = 64\) that is 48 KB, exactly the shared-memory budget of an H100 streaming
+            multiprocessor, which is not a coincidence: production GPU matmul tiles are sized
+            to that budget. Larger tiles give more reuse but overflow the cache and stop
+            helping, so the optimum is the largest tile whose footprint fits, precisely the
+            reasoning behind the tiled kernels on the
+            <a href="/classes/parallel-computing/">parallel computing</a> page. Multi-level
+            tiling (register tile inside cache tile inside a DRAM-blocked tile) applies the
+            same computation at each level of the hierarchy.
+          </p>
+
+          <div class="problem">
+            <span class="plabel">Problem 3</span>
+            <p>
+              For the \(1024 \times 1024\) fp32 matmul above, a target cache holds 256 KB.
+              What is the largest square tile \(T\) (power of two) whose three-tile working
+              set fits, and what data-reuse factor and arithmetic intensity does it deliver?
+              Compare the DRAM traffic to the untiled 8.590 GB.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> Three \(T \times T\) fp32 tiles occupy
+                \(3 T^2 \cdot 4 = 12 T^2\) bytes. Require \(12 T^2 \le 256{,}000\), so
+                \(T^2 \le 21{,}333\) and \(T \le 146\). The largest power of two is
+                \(T = 128\), with footprint \(12 \cdot 128^2 = 196{,}608\) bytes = 192 KB,
+                which fits; \(T = 256\) would need 768 KB and does not. At \(T = 128\), each
+                element of \(A\) is fetched \(N/T = 1024/128 = 8\) times instead of 1024, a
+                reuse improvement of \(128\times\). Combined AB loads are
+                \(2 N^2 (N/T) = 2 \cdot 1024^2 \cdot 8 = 1.678 \times 10^7\), which at 4 bytes
+                is 67.1 MB, down from 8.590 GB, a \(128\times\) reduction. Arithmetic intensity
+                is \(2N^3 / (67.1\,\text{MB}) = 2.147\times 10^9 \cdot 2 / (6.71\times 10^7)
+                \approx 32\) flop/byte, up from 0.25. The lesson is quantitative: tile size is
+                set by the cache, and the reuse factor equals \(T\), so a compiler that knows
+                the cache size can compute the optimal tile directly rather than searching, and
+                the resulting intensity is what moves a matmul from memory-bound to
+                compute-bound.
+              </p>
+            </div>
+          </div>
+
+          <h2>Register allocation by graph coloring</h2>
+          <h3>The reduction to coloring</h3>
+          <p>
+            After optimization the IR still has unboundedly many virtual registers; the
+            machine has \(k\) physical ones. Register allocation assigns each live value to a
+            physical register or, failing that, to a memory slot (a <em>spill</em>). Chaitin's
+            1982 insight is that this is graph coloring. Build the <em>interference graph</em>:
+            one node per value, an edge between two values that are simultaneously live and
+            therefore cannot share a register. Liveness analysis, computed exactly as above,
+            supplies the interferences: two values interfere if one is live at a point where
+            the other is defined. A valid assignment of \(k\) registers is then a proper
+            \(k\)-coloring of this graph, an assignment of one of \(k\) colors to each node so
+            that adjacent nodes differ. Graph \(k\)-coloring is NP-complete in general, so
+            compilers use a heuristic that is fast and usually optimal in practice.
+          </p>
+          <h3>Chaitin's algorithm and the k-coloring heuristic</h3>
+          <p>
+            The heuristic rests on one observation: a node with fewer than \(k\) neighbors can
+            always be colored, whatever its neighbors get, because at most \(k-1\) colors are
+            blocked and a \(k\)-th remains. So <em>simplify</em>: repeatedly remove a node of
+            degree \(&lt; k\) from the graph and push it on a stack, which lowers its
+            neighbors' degrees and may expose more low-degree nodes. If the graph empties, pop
+            the stack and give each node a color avoiding its already-colored neighbors;
+            success is guaranteed by construction. If at some point every remaining node has
+            degree \(\ge k\), pick a <em>spill candidate</em> (a high-degree, low-use node),
+            optimistically push it anyway, and continue; on the way back, it might still find a
+            free color (Briggs' improvement), and only if it genuinely cannot is it spilled to
+            memory, its live range split by loads and stores, and the whole process repeated.
+          </p>
+          <p>
+            Work a concrete interference graph over values \(\{a, b, c, d, e\}\) with edges
+            \(a\!-\!b\), \(a\!-\!c\), \(a\!-\!e\), \(b\!-\!c\), \(b\!-\!d\), \(c\!-\!d\),
+            \(c\!-\!e\), \(d\!-\!e\). Degrees are \(a{:}3\), \(b{:}3\), \(c{:}4\), \(d{:}3\),
+            \(e{:}3\). Try \(k = 3\).
+          </p>
+          <pre class="flow">interference graph (degrees):    a(3)  b(3)  c(4)  d(3)  e(3)
+
+        a --- b
+        |\   /|
+        | \ / |
+        |  c  |        c is adjacent to a,b,d,e
+        | / \ |
+        |/   \|
+        e --- d</pre>
+          <p>
+            No node has degree \(&lt; 3\) initially (the minimum degree is 3), so Chaitin's
+            original algorithm would declare a spill immediately. Briggs' optimistic variant
+            instead picks the highest-degree node, \(c\) (degree 4), and pushes it as a
+            <em>potential</em> spill without committing. Removing \(c\) drops every other node
+            to degree 2, all now trivially colorable: push \(a, b, d, e\) in turn. The push
+            order is \([c, a, b, d, e]\) (computed in Python). Now pop and color, each node
+            taking the lowest color not used by an already-colored neighbor: \(e \to 0\),
+            \(d \to 1\), \(b \to 0\), \(a \to 1\), and finally \(c\), whose neighbors
+            \(a, b, d, e\) hold colors \(\{1, 0, 1, 0\} = \{0, 1\}\), leaving color 2 free, so
+            \(c \to 2\). The coloring \(\{a{:}1, b{:}0, c{:}2, d{:}1, e{:}0\}\) uses 3 colors
+            and is legal on every edge, verified in Python. The teaching point is exactly the
+            Chaitin-versus-Briggs distinction: the pessimistic algorithm spilled \(c\)
+            needlessly, the optimistic one found that \(c\) fit after its neighbors were
+            constrained. This graph is 3-colorable, and only optimistic coloring finds it
+            without a spill.
+          </p>
+          <p>
+            Now try \(k = 2\). The same simplify loop finds no degree-\(&lt;2\) node and pushes
+            \(c\) then \(e\) as potential spills; on the way back \(c\) cannot be colored
+            (its neighbors already use both colors 0 and 1), so \(c\) is a real spill. With
+            two registers this graph genuinely cannot be colored, because it contains a
+            triangle (\(a, b, c\) are mutually adjacent) and a triangle needs 3 colors; the
+            algorithm correctly reports that no 2-coloring exists and spills. The chromatic
+            number of an interference graph is a hard lower bound on registers, and any
+            allocator confronted with fewer must spill; the art is spilling the cheapest value,
+            typically the one used least inside the hottest loop.
+          </p>
+
+          <div class="problem">
+            <span class="plabel">Problem 4</span>
+            <p>
+              Explain why simplifying away any node of degree strictly less than \(k\) is
+              always safe, and use it to prove that any graph in which every node has degree at
+              most \(k-1\) is \(k\)-colorable. Then say what this bound implies for a straight-line
+              basic block with no more than \(k\) simultaneously live values.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> When a node \(v\) has degree \(&lt; k\), its
+                neighbors can use at most \(k - 1\) distinct colors, so however they are
+                colored, at least one of the \(k\) colors is free for \(v\). Removing \(v\)
+                cannot make the rest harder to color (deleting a node only removes constraints),
+                so if the remaining graph is \(k\)-colorable, adding \(v\) back and giving it a
+                free color keeps it \(k\)-colorable. This is the induction step. For the claim:
+                if every node has degree \(\le k-1\), then at every stage of removal some node
+                has degree \(&lt; k\) (in fact all do), so simplify empties the graph completely
+                with no spills, and popping the stack colors every node, proving
+                \(k\)-colorability. This is the classical greedy bound: a graph of maximum
+                degree \(\Delta\) is \((\Delta + 1)\)-colorable. For a basic block, the number
+                of simultaneously live values at a point is the height of the interference at
+                that point; if it never exceeds \(k\), the interference graph of the block is an
+                interval graph whose clique number is \(\le k\), it is perfectly colorable, and
+                no spill is ever needed. Spilling within a single block only becomes necessary
+                when the live-value count exceeds the register count, which is precisely the
+                register-pressure figure a scheduler tries to keep below \(k\).
+              </p>
+            </div>
+          </div>
+
+          <h2>Instruction scheduling</h2>
+          <p>
+            The last back-end analysis reorders instructions to keep a pipelined,
+            multiple-issue machine busy without changing results. Two instructions may be
+            swapped only if they are not dependent: a <em>true</em> (read-after-write)
+            dependence, an <em>anti</em> (write-after-read) dependence, or an <em>output</em>
+            (write-after-write) dependence forces order. These dependences form a directed
+            acyclic graph within a basic block, edges weighted by the latency of the producing
+            instruction, and scheduling is choosing a topological order that minimizes total
+            cycles subject to the machine's issue width and functional-unit counts. Optimal
+            scheduling of a general DAG is NP-hard, so compilers use <em>list scheduling</em>:
+            maintain the set of ready instructions (all predecessors scheduled and their
+            latencies elapsed), and each cycle greedily issue the ready instruction of highest
+            priority, where priority is usually the length of the longest dependence path to
+            the end of the block (the "critical path"), breaking ties toward instructions that
+            unblock the most successors. List scheduling is not optimal but is within a small
+            constant of optimal in practice and runs in near-linear time.
+          </p>
+          <p>
+            Scheduling and register allocation are in tension: aggressive reordering to fill
+            pipeline slots lengthens live ranges and raises register pressure, which can force
+            spills that cost more than the stalls the scheduling avoided. This phase-ordering
+            conflict, schedule-then-allocate versus allocate-then-schedule, has no universally
+            right answer, and production compilers run a prepass schedule, then allocation,
+            then a postpass schedule to repair damage from spill code. For tensor code the
+            scheduling that matters most is software pipelining of the innermost loop:
+            overlapping the memory loads of iteration \(i+1\) with the arithmetic of iteration
+            \(i\), which is exactly what a good GPU matmul does to hide HBM latency behind
+            tensor-core math, and what Triton's pipeliner inserts automatically.
+          </p>
+
+          <h2>The polyhedral model</h2>
+          <p>
+            The loop transformations above, tiling, fusion, interchange, skewing, are ad-hoc
+            when done one at a time. The polyhedral model, developed by Feautrier in the late
+            1980s and early 1990s and made practical by tools like Pluto (Bondhugula and
+            colleagues, 2008), gives them a single algebraic foundation. It represents a loop
+            nest not as syntax but as geometry. The set of iterations of a nest is its
+            <em>iteration domain</em>, a polyhedron carved out of \(\mathbb{Z}^d\) by the affine
+            loop bounds: a nest <code>for i in 0..N, for j in 0..i</code> is the integer points
+            of \(\{(i, j) : 0 \le i &lt; N,\; 0 \le j \le i\}\), a triangle. Each array access
+            is an affine map from the iteration vector to a memory location. A <em>dependence</em>
+            between two iterations, one writes a location a later one reads, is itself described
+            by an affine relation, and the whole dependence structure is a union of polyhedra
+            computable by integer linear programming.
+          </p>
+          <p>
+            A program transformation is then a <em>schedule</em>: an affine map assigning each
+            iteration a logical execution time. Loop interchange, skewing, tiling, and fusion
+            are all just different affine schedules over the same domain, and the model can
+            search the space of legal schedules, those that preserve every dependence, meaning
+            no iteration is moved before one it depends on, by solving a linear program. The
+            payoff is that the model can find a tiling and fusion automatically, together,
+            optimizing for locality and parallelism at once, rather than relying on a fixed
+            pattern-matcher. This is why the polyhedral model underlies the most aggressive
+            automatic parallelizers and appears inside ML compilers wherever the loop structure
+            is affine, which for dense tensor operators it almost always is. Its limitation is
+            equally clear: it requires affine bounds and affine accesses, so data-dependent
+            control flow and indirect indexing (gather/scatter, sparse formats) fall outside it,
+            which is why production stacks use it for the dense core and fall back to
+            pattern-based rewrites elsewhere.
+          </p>
+
+          <h2>All of it, applied to tensor programs</h2>
+          <p>
+            A tensor compiler is the whole pipeline above with a tensor as the primitive value.
+            The front end is a tracer that turns an eager PyTorch or JAX program into a graph;
+            the IR is a graph of tensor operations; the analyses are shape and layout inference,
+            dependence, and fusibility; the transformations are fusion, tiling, and layout
+            assignment; the back end is code generation to PTX, LLVM IR, or a hardware ISA. Four
+            systems, from three groups, define the current landscape.
+          </p>
+          <p>
+            <strong>XLA and HLO</strong> (Google) compile JAX and TensorFlow graphs. HLO
+            (High-Level Optimizer IR) is the tensor IR; XLA runs algebraic simplification,
+            common-subexpression elimination, layout assignment, and, centrally, operator
+            fusion, deciding which elementwise and reduction operators to merge into a single
+            kernel so intermediates never touch HBM. Its fusion heuristics are the graph-level
+            analogue of the classical loop fusion above. <strong>TorchInductor</strong> (Meta),
+            the default backend of <code>torch.compile</code> introduced with PyTorch 2, lowers
+            captured FX graphs to a loop-level IR, performs fusion and tiling, and generates
+            Triton for GPUs and C++/OpenMP for CPUs; Ansel and colleagues described it in 2024.
+            <strong>Triton</strong> (OpenAI), from Tillet, Kung, and Cox in 2019, is a
+            block-level programming language and compiler: the programmer writes a kernel over
+            tiles and Triton's compiler does the register allocation, instruction scheduling,
+            software pipelining, and shared-memory management, all the back-end passes above,
+            automatically. <strong>MLIR</strong> (Google, led by Lattner and colleagues, 2021)
+            is not a compiler but the infrastructure the others increasingly sit on: a framework
+            for defining multiple IRs ("dialects") at different abstraction levels, from a
+            high-level tensor dialect down through affine and vector dialects to LLVM, with
+            reusable passes that lower progressively between them. The whole XLA and Triton
+            stacks are being rebuilt on MLIR dialects.
+          </p>
+          <p>
+            The unifying observation is that nothing in these systems is new theory. Operator
+            fusion is loop fusion; tiling a matmul in HLO is the same reuse computation done in
+            the tiling table above; Triton's pipeliner is software pipelining; layout assignment
+            is a dataflow analysis over a lattice of layouts; the affine dialect in MLIR is the
+            polyhedral model. The novelty is entirely in the primitive value and the scale, and
+            the measured payoff is real: the same fusion that classical compilers apply to scalar
+            loops cut a memory-bound elementwise chain from 0.911 ms to 0.214 ms on an H100 in
+            this repository, and on a matmul the tiling arithmetic above is what carries the
+            kernel from tens to hundreds of measured TFLOPS.
+          </p>
+
+          <h2>Implementation</h2>
+          <p>
+            The first block is a complete, runnable worklist dataflow solver, instantiated for
+            reaching definitions on the branch CFG worked above. It builds the predecessor map,
+            iterates the monotone equations off a worklist until no OUT set changes, and prints
+            the fixpoint. Running it reproduces the table exactly: B5 receives
+            \(\{d1, d2, d3, d4\}\), the two definitions of \(a\) both reaching the join. The JAX
+            tab shows the same solver written functionally with frozensets, to make the point
+            that a dataflow solver is pure and has no framework dependency.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="python" class="active">Python</button>
+              <button data-lang="jax">JAX</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="python" class="shl lang active"><code class="language-python"><span class="k">from</span> <span class="m1">collections</span> <span class="k">import</span> <span class="m1">deque</span>
+
+<span class="c"># CFG: B1-&gt;B2, B2-&gt;{B3,B4}, B3-&gt;B5, B4-&gt;B5  (a branch that redefines a,b)</span>
+<span class="v0">succ</span> = <span class="b0">{</span><span class="s">"B1"</span>: <span class="b1">[</span><span class="s">"B2"</span><span class="b1">]</span>, <span class="s">"B2"</span>: <span class="b1">[</span><span class="s">"B3"</span>, <span class="s">"B4"</span><span class="b1">]</span>, <span class="s">"B3"</span>: <span class="b1">[</span><span class="s">"B5"</span><span class="b1">]</span>, <span class="s">"B4"</span>: <span class="b1">[</span><span class="s">"B5"</span><span class="b1">]</span>, <span class="s">"B5"</span>: <span class="b1">[]</span><span class="b0">}</span>
+<span class="v0">pred</span> = <span class="b0">{</span><span class="v6">b</span>: <span class="b1">[]</span> <span class="k">for</span> <span class="v6">b</span> <span class="k">in</span> <span class="v0">succ</span><span class="b0">}</span>
+<span class="k">for</span> <span class="v2">u</span>, <span class="v6">vs</span> <span class="k">in</span> <span class="v0">succ</span>.<span class="m2">items</span><span class="b0">()</span>:
+    <span class="k">for</span> <span class="v3">v</span> <span class="k">in</span> <span class="v6">vs</span>:
+        <span class="v0">pred</span><span class="b0">[</span><span class="v3">v</span><span class="b0">]</span>.<span class="m2">append</span><span class="b0">(</span><span class="v2">u</span><span class="b0">)</span>
+
+<span class="c"># d1:a  d2:b  d3:a  d4:b  ; defs of the same variable kill each other</span>
+<span class="v3">gen</span>  = <span class="b0">{</span><span class="s">"B1"</span>: <span class="b1">{</span><span class="s">"d1"</span><span class="b1">}</span>, <span class="s">"B2"</span>: <span class="b1">{</span><span class="s">"d2"</span><span class="b1">}</span>, <span class="s">"B3"</span>: <span class="b1">{</span><span class="s">"d3"</span><span class="b1">}</span>, <span class="s">"B4"</span>: <span class="b1">{</span><span class="s">"d4"</span><span class="b1">}</span>, <span class="s">"B5"</span>: <span class="m1">set</span><span class="b1">()</span><span class="b0">}</span>
+<span class="v5">kill</span> = <span class="b0">{</span><span class="s">"B1"</span>: <span class="b1">{</span><span class="s">"d3"</span><span class="b1">}</span>, <span class="s">"B2"</span>: <span class="b1">{</span><span class="s">"d4"</span><span class="b1">}</span>, <span class="s">"B3"</span>: <span class="b1">{</span><span class="s">"d1"</span><span class="b1">}</span>, <span class="s">"B4"</span>: <span class="b1">{</span><span class="s">"d2"</span><span class="b1">}</span>, <span class="s">"B5"</span>: <span class="m1">set</span><span class="b1">()</span><span class="b0">}</span>
+
+<span class="k">def</span> <span class="m1">reaching_definitions</span><span class="b0">(</span><span class="v0">succ</span>, <span class="v0">pred</span>, <span class="v3">gen</span>, <span class="v5">kill</span><span class="b0">)</span>:
+    <span class="v5">IN</span>  = <span class="b0">{</span><span class="v6">b</span>: <span class="m1">set</span><span class="b1">()</span> <span class="k">for</span> <span class="v6">b</span> <span class="k">in</span> <span class="v0">succ</span><span class="b0">}</span>
+    <span class="v6">OUT</span> = <span class="b0">{</span><span class="v6">b</span>: <span class="m1">set</span><span class="b1">()</span> <span class="k">for</span> <span class="v6">b</span> <span class="k">in</span> <span class="v0">succ</span><span class="b0">}</span>
+    <span class="v1">work</span> = <span class="m1">deque</span><span class="b0">(</span><span class="v0">succ</span><span class="b0">)</span>                       <span class="c"># seed with all blocks</span>
+    <span class="k">while</span> <span class="v1">work</span>:
+        <span class="v6">b</span> = <span class="v1">work</span>.<span class="m2">popleft</span><span class="b0">()</span>
+        <span class="v5">IN</span><span class="b0">[</span><span class="v6">b</span><span class="b0">]</span> = <span class="m1">set</span><span class="b0">()</span>
+        <span class="k">for</span> <span class="v6">p</span> <span class="k">in</span> <span class="v0">pred</span><span class="b0">[</span><span class="v6">b</span><span class="b0">]</span>:                    <span class="c"># meet = union (may analysis)</span>
+            <span class="v5">IN</span><span class="b0">[</span><span class="v6">b</span><span class="b0">]</span> |= <span class="v6">OUT</span><span class="b0">[</span><span class="v6">p</span><span class="b0">]</span>
+        <span class="v5">new_out</span> = <span class="v3">gen</span><span class="b0">[</span><span class="v6">b</span><span class="b0">]</span> | <span class="b0">(</span><span class="v5">IN</span><span class="b1">[</span><span class="v6">b</span><span class="b1">]</span> - <span class="v5">kill</span><span class="b1">[</span><span class="v6">b</span><span class="b1">]</span><span class="b0">)</span> <span class="c"># transfer function</span>
+        <span class="k">if</span> <span class="v5">new_out</span> != <span class="v6">OUT</span><span class="b0">[</span><span class="v6">b</span><span class="b0">]</span>:
+            <span class="v6">OUT</span><span class="b0">[</span><span class="v6">b</span><span class="b0">]</span> = <span class="v5">new_out</span>
+            <span class="k">for</span> <span class="v4">s</span> <span class="k">in</span> <span class="v0">succ</span><span class="b0">[</span><span class="v6">b</span><span class="b0">]</span>:                <span class="c"># only re-examine dependents</span>
+                <span class="v1">work</span>.<span class="m2">append</span><span class="b0">(</span><span class="v4">s</span><span class="b0">)</span>
+    <span class="k">return</span> <span class="v5">IN</span>, <span class="v6">OUT</span>
+
+<span class="v5">IN</span>, <span class="v6">OUT</span> = <span class="m1">reaching_definitions</span><span class="b0">(</span><span class="v0">succ</span>, <span class="v0">pred</span>, <span class="v3">gen</span>, <span class="v5">kill</span><span class="b0">)</span>
+<span class="k">for</span> <span class="v6">b</span> <span class="k">in</span> <span class="m1">sorted</span><span class="b0">(</span><span class="v0">succ</span><span class="b0">)</span>:
+    <span class="m1">print</span><span class="b0">(</span><span class="v6">b</span>, <span class="s">"IN="</span>, <span class="m1">sorted</span><span class="b1">(</span><span class="v5">IN</span><span class="b2">[</span><span class="v6">b</span><span class="b2">]</span><span class="b1">)</span>, <span class="s">"OUT="</span>, <span class="m1">sorted</span><span class="b1">(</span><span class="v6">OUT</span><span class="b2">[</span><span class="v6">b</span><span class="b2">]</span><span class="b1">)</span><span class="b0">)</span>
+<span class="c"># B5 IN= ['d1', 'd2', 'd3', 'd4']  OUT= ['d1', 'd2', 'd3', 'd4']</span>
+<span class="c"># two definitions of 'a' (d1, d3) reach B5 -&gt; SSA would insert a phi there</span>
+</code></pre>
+            <pre data-lang="jax" class="shl lang"><code class="language-python"><span class="c"># The same fixpoint written functionally; no jax arrays are needed because a</span>
+<span class="c"># dataflow lattice is a set lattice, but the structure mirrors a jax fixpoint.</span>
+<span class="k">from</span> <span class="m1">functools</span> <span class="k">import</span> <span class="m1">reduce</span>
+
+<span class="v0">succ</span> = <span class="b0">{</span><span class="s">"B1"</span>: <span class="b1">[</span><span class="s">"B2"</span><span class="b1">]</span>, <span class="s">"B2"</span>: <span class="b1">[</span><span class="s">"B3"</span>, <span class="s">"B4"</span><span class="b1">]</span>, <span class="s">"B3"</span>: <span class="b1">[</span><span class="s">"B5"</span><span class="b1">]</span>, <span class="s">"B4"</span>: <span class="b1">[</span><span class="s">"B5"</span><span class="b1">]</span>, <span class="s">"B5"</span>: <span class="b1">[]</span><span class="b0">}</span>
+<span class="v0">pred</span> = <span class="b0">{</span><span class="v6">b</span>: <span class="b1">[</span><span class="v6">p</span> <span class="k">for</span> <span class="v6">p</span> <span class="k">in</span> <span class="v0">succ</span> <span class="k">if</span> <span class="v6">b</span> <span class="k">in</span> <span class="v0">succ</span><span class="b2">[</span><span class="v6">p</span><span class="b2">]</span><span class="b1">]</span> <span class="k">for</span> <span class="v6">b</span> <span class="k">in</span> <span class="v0">succ</span><span class="b0">}</span>
+<span class="v3">gen</span>  = <span class="b0">{</span><span class="s">"B1"</span>: <span class="b1">{</span><span class="s">"d1"</span><span class="b1">}</span>, <span class="s">"B2"</span>: <span class="b1">{</span><span class="s">"d2"</span><span class="b1">}</span>, <span class="s">"B3"</span>: <span class="b1">{</span><span class="s">"d3"</span><span class="b1">}</span>, <span class="s">"B4"</span>: <span class="b1">{</span><span class="s">"d4"</span><span class="b1">}</span>, <span class="s">"B5"</span>: <span class="m1">set</span><span class="b1">()</span><span class="b0">}</span>
+<span class="v5">kill</span> = <span class="b0">{</span><span class="s">"B1"</span>: <span class="b1">{</span><span class="s">"d3"</span><span class="b1">}</span>, <span class="s">"B2"</span>: <span class="b1">{</span><span class="s">"d4"</span><span class="b1">}</span>, <span class="s">"B3"</span>: <span class="b1">{</span><span class="s">"d1"</span><span class="b1">}</span>, <span class="s">"B4"</span>: <span class="b1">{</span><span class="s">"d2"</span><span class="b1">}</span>, <span class="s">"B5"</span>: <span class="m1">set</span><span class="b1">()</span><span class="b0">}</span>
+
+<span class="k">def</span> <span class="m1">step</span><span class="b0">(</span><span class="v6">OUT</span><span class="b0">)</span>:                               <span class="c"># one round-robin sweep</span>
+    <span class="v4">new</span> = <span class="b0">{}</span>
+    <span class="k">for</span> <span class="v6">b</span> <span class="k">in</span> <span class="v0">succ</span>:
+        <span class="v1">inb</span> = <span class="m1">reduce</span><span class="b0">(</span><span class="k">lambda</span> <span class="v5">a</span>, <span class="v6">p</span>: <span class="v5">a</span> | <span class="v6">OUT</span><span class="b1">[</span><span class="v6">p</span><span class="b1">]</span>, <span class="v0">pred</span><span class="b1">[</span><span class="v6">b</span><span class="b1">]</span>, <span class="m1">frozenset</span><span class="b1">()</span><span class="b0">)</span>
+        <span class="v4">new</span><span class="b0">[</span><span class="v6">b</span><span class="b0">]</span> = <span class="m1">frozenset</span><span class="b0">(</span><span class="v3">gen</span><span class="b1">[</span><span class="v6">b</span><span class="b1">]</span><span class="b0">)</span> | <span class="b0">(</span><span class="v1">inb</span> - <span class="m1">frozenset</span><span class="b1">(</span><span class="v5">kill</span><span class="b2">[</span><span class="v6">b</span><span class="b2">]</span><span class="b1">)</span><span class="b0">)</span>
+    <span class="k">return</span> <span class="v4">new</span>
+
+<span class="k">def</span> <span class="m1">fixpoint</span><span class="b0">(</span><span class="m1">f</span>, <span class="v4">x</span><span class="b0">)</span>:                           <span class="c"># iterate to a fixed point</span>
+    <span class="k">while</span> <span class="k">True</span>:
+        <span class="v6">y</span> = <span class="m1">f</span><span class="b0">(</span><span class="v4">x</span><span class="b0">)</span>
+        <span class="k">if</span> <span class="v6">y</span> == <span class="v4">x</span>:
+            <span class="k">return</span> <span class="v4">x</span>
+        <span class="v4">x</span> = <span class="v6">y</span>
+
+<span class="v6">OUT</span> = <span class="m1">fixpoint</span><span class="b0">(</span><span class="m1">step</span>, <span class="b1">{</span><span class="v6">b</span>: <span class="m1">frozenset</span><span class="b2">()</span> <span class="k">for</span> <span class="v6">b</span> <span class="k">in</span> <span class="v0">succ</span><span class="b1">}</span><span class="b0">)</span>
+<span class="k">for</span> <span class="v6">b</span> <span class="k">in</span> <span class="m1">sorted</span><span class="b0">(</span><span class="v0">succ</span><span class="b0">)</span>:
+    <span class="m1">print</span><span class="b0">(</span><span class="v6">b</span>, <span class="s">"OUT="</span>, <span class="m1">sorted</span><span class="b1">(</span><span class="v6">OUT</span><span class="b2">[</span><span class="v6">b</span><span class="b2">]</span><span class="b1">)</span><span class="b0">)</span>
+<span class="c"># B5 OUT= ['d1', 'd2', 'd3', 'd4']  -- identical fixpoint, reached monotonically</span>
+</code></pre>
+          </div>
+          <p>
+            The second block computes dominators and dominance frontiers on the seven-node CFG
+            from the SSA section, then places phi-nodes by iterated dominance frontier. It is
+            the code that produced every dominance number quoted above; run it and it prints
+            \(\operatorname{DF}(B1) = \{B1\}\) and phi-nodes at \(\{B1, B4\}\) for a variable
+            defined in \(\{B0, B2, B5\}\).
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="python" class="active">Python</button>
+              <button data-lang="cpp">C++</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="python" class="shl lang active"><code class="language-python"><span class="v0">succ</span> = <span class="b0">{</span><span class="n">0</span>: <span class="b1">[</span><span class="n">1</span><span class="b1">]</span>, <span class="n">1</span>: <span class="b1">[</span><span class="n">2</span>, <span class="n">3</span><span class="b1">]</span>, <span class="n">2</span>: <span class="b1">[</span><span class="n">4</span><span class="b1">]</span>, <span class="n">3</span>: <span class="b1">[</span><span class="n">4</span><span class="b1">]</span>, <span class="n">4</span>: <span class="b1">[</span><span class="n">5</span>, <span class="n">6</span><span class="b1">]</span>, <span class="n">5</span>: <span class="b1">[</span><span class="n">1</span><span class="b1">]</span>, <span class="n">6</span>: <span class="b1">[]</span><span class="b0">}</span>
+<span class="v0">nodes</span> = <span class="m1">sorted</span><span class="b0">(</span><span class="v0">succ</span><span class="b0">)</span>
+<span class="v0">pred</span> = <span class="b0">{</span><span class="v5">n</span>: <span class="b1">[]</span> <span class="k">for</span> <span class="v5">n</span> <span class="k">in</span> <span class="v0">nodes</span><span class="b0">}</span>
+<span class="k">for</span> <span class="v2">u</span> <span class="k">in</span> <span class="v0">nodes</span>:
+    <span class="k">for</span> <span class="v3">v</span> <span class="k">in</span> <span class="v0">succ</span><span class="b0">[</span><span class="v2">u</span><span class="b0">]</span>:
+        <span class="v0">pred</span><span class="b0">[</span><span class="v3">v</span><span class="b0">]</span>.<span class="m2">append</span><span class="b0">(</span><span class="v2">u</span><span class="b0">)</span>
+
+<span class="k">def</span> <span class="m1">dominators</span><span class="b0">(</span><span class="v0">nodes</span>, <span class="v0">pred</span>, <span class="v3">entry</span>=<span class="n">0</span><span class="b0">)</span>:
+    <span class="v6">alln</span> = <span class="m1">set</span><span class="b0">(</span><span class="v0">nodes</span><span class="b0">)</span>
+    <span class="v2">Dom</span> = <span class="b0">{</span><span class="v5">n</span>: <span class="m1">set</span><span class="b1">(</span><span class="v6">alln</span><span class="b1">)</span> <span class="k">for</span> <span class="v5">n</span> <span class="k">in</span> <span class="v0">nodes</span><span class="b0">}</span>
+    <span class="v2">Dom</span><span class="b0">[</span><span class="v3">entry</span><span class="b0">]</span> = <span class="b0">{</span><span class="v3">entry</span><span class="b0">}</span>
+    <span class="v3">changed</span> = <span class="k">True</span>
+    <span class="k">while</span> <span class="v3">changed</span>:                            <span class="c"># fixpoint of the dom equation</span>
+        <span class="v3">changed</span> = <span class="k">False</span>
+        <span class="k">for</span> <span class="v5">n</span> <span class="k">in</span> <span class="v0">nodes</span>:
+            <span class="k">if</span> <span class="v5">n</span> == <span class="v3">entry</span>:
+                <span class="k">continue</span>
+            <span class="v2">inter</span> = <span class="m1">set</span><span class="b0">(</span><span class="v6">alln</span><span class="b0">)</span>
+            <span class="k">for</span> <span class="v6">p</span> <span class="k">in</span> <span class="v0">pred</span><span class="b0">[</span><span class="v5">n</span><span class="b0">]</span>:
+                <span class="v2">inter</span> &amp;= <span class="v2">Dom</span><span class="b0">[</span><span class="v6">p</span><span class="b0">]</span>
+            <span class="v4">new</span> = <span class="b0">{</span><span class="v5">n</span><span class="b0">}</span> | <span class="v2">inter</span>
+            <span class="k">if</span> <span class="v4">new</span> != <span class="v2">Dom</span><span class="b0">[</span><span class="v5">n</span><span class="b0">]</span>:
+                <span class="v2">Dom</span><span class="b0">[</span><span class="v5">n</span><span class="b0">]</span>, <span class="v3">changed</span> = <span class="v4">new</span>, <span class="k">True</span>
+    <span class="k">return</span> <span class="v2">Dom</span>
+
+<span class="v2">Dom</span> = <span class="m1">dominators</span><span class="b0">(</span><span class="v0">nodes</span>, <span class="v0">pred</span><span class="b0">)</span>
+<span class="v0">idom</span> = <span class="b0">{</span><span class="v5">n</span>: <span class="m1">max</span><span class="b1">(</span><span class="v2">Dom</span><span class="b2">[</span><span class="v5">n</span><span class="b2">]</span> - <span class="b2">{</span><span class="v5">n</span><span class="b2">}</span>, <span class="v4">key</span>=<span class="k">lambda</span> <span class="v4">d</span>: <span class="m1">len</span><span class="b2">(</span><span class="v2">Dom</span><span class="b0">[</span><span class="v4">d</span><span class="b0">]</span><span class="b2">)</span><span class="b1">)</span>
+        <span class="k">for</span> <span class="v5">n</span> <span class="k">in</span> <span class="v0">nodes</span> <span class="k">if</span> <span class="v5">n</span> != <span class="n">0</span><span class="b0">}</span>
+
+<span class="k">def</span> <span class="m1">dominance_frontiers</span><span class="b0">(</span><span class="v0">nodes</span>, <span class="v0">pred</span>, <span class="v0">idom</span><span class="b0">)</span>:
+    <span class="v0">DF</span> = <span class="b0">{</span><span class="v5">n</span>: <span class="m1">set</span><span class="b1">()</span> <span class="k">for</span> <span class="v5">n</span> <span class="k">in</span> <span class="v0">nodes</span><span class="b0">}</span>
+    <span class="k">for</span> <span class="v6">b</span> <span class="k">in</span> <span class="v0">nodes</span>:
+        <span class="k">if</span> <span class="m1">len</span><span class="b0">(</span><span class="v0">pred</span><span class="b1">[</span><span class="v6">b</span><span class="b1">]</span><span class="b0">)</span> &lt; <span class="n">2</span>:
+            <span class="k">continue</span>
+        <span class="k">for</span> <span class="v6">p</span> <span class="k">in</span> <span class="v0">pred</span><span class="b0">[</span><span class="v6">b</span><span class="b0">]</span>:                     <span class="c"># Cytron et al. 1991</span>
+            <span class="v3">runner</span> = <span class="v6">p</span>
+            <span class="k">while</span> <span class="v3">runner</span> != <span class="v0">idom</span>.<span class="m2">get</span><span class="b0">(</span><span class="v6">b</span>, <span class="n">0</span><span class="b0">)</span>:
+                <span class="v0">DF</span><span class="b0">[</span><span class="v3">runner</span><span class="b0">]</span>.<span class="m2">add</span><span class="b0">(</span><span class="v6">b</span><span class="b0">)</span>
+                <span class="k">if</span> <span class="v3">runner</span> == <span class="n">0</span>:
+                    <span class="k">break</span>
+                <span class="v3">runner</span> = <span class="v0">idom</span><span class="b0">[</span><span class="v3">runner</span><span class="b0">]</span>
+    <span class="k">return</span> <span class="v0">DF</span>
+
+<span class="v0">DF</span> = <span class="m1">dominance_frontiers</span><span class="b0">(</span><span class="v0">nodes</span>, <span class="v0">pred</span>, <span class="v0">idom</span><span class="b0">)</span>
+
+<span class="k">def</span> <span class="m1">place_phis</span><span class="b0">(</span><span class="v2">defsites</span>, <span class="v0">DF</span><span class="b0">)</span>:                 <span class="c"># iterated dominance frontier</span>
+    <span class="v1">phi</span>, <span class="v1">work</span> = <span class="m1">set</span><span class="b0">()</span>, <span class="m1">set</span><span class="b0">(</span><span class="v2">defsites</span><span class="b0">)</span>
+    <span class="k">while</span> <span class="v1">work</span>:
+        <span class="v5">n</span> = <span class="v1">work</span>.<span class="m2">pop</span><span class="b0">()</span>
+        <span class="k">for</span> <span class="v6">y</span> <span class="k">in</span> <span class="v0">DF</span><span class="b0">[</span><span class="v5">n</span><span class="b0">]</span>:
+            <span class="k">if</span> <span class="v6">y</span> <span class="k">not</span> <span class="k">in</span> <span class="v1">phi</span>:
+                <span class="v1">phi</span>.<span class="m2">add</span><span class="b0">(</span><span class="v6">y</span><span class="b0">)</span>
+                <span class="k">if</span> <span class="v6">y</span> <span class="k">not</span> <span class="k">in</span> <span class="v2">defsites</span>:
+                    <span class="v1">work</span>.<span class="m2">add</span><span class="b0">(</span><span class="v6">y</span><span class="b0">)</span>
+    <span class="k">return</span> <span class="v1">phi</span>
+
+<span class="m1">print</span><span class="b0">(</span><span class="s">"DF(1) ="</span>, <span class="m1">sorted</span><span class="b1">(</span><span class="v0">DF</span><span class="b2">[</span><span class="n">1</span><span class="b2">]</span><span class="b1">)</span><span class="b0">)</span>               <span class="c"># [1]  (loop header in own DF)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">"phis  ="</span>, <span class="m1">sorted</span><span class="b1">(</span><span class="m1">place_phis</span><span class="b2">(</span><span class="b0">{</span><span class="n">0</span>, <span class="n">2</span>, <span class="n">5</span><span class="b0">}</span>, <span class="v0">DF</span><span class="b2">)</span><span class="b1">)</span><span class="b0">)</span>  <span class="c"># [1, 4]</span>
+</code></pre>
+            <pre data-lang="cpp" class="shl lang"><code class="language-cpp"><span class="c">// Iterative dominators + Cytron dominance frontiers, LLVM-flavored but</span>
+<span class="c">// self-contained. Nodes are ints; entry is 0.</span>
+<span class="k">#include</span> <span class="s">&lt;vector&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;set&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;map&gt;</span>
+<span class="k">using</span> <span class="k">namespace</span> <span class="m1">std</span>;
+
+<span class="m1">map</span>&lt;<span class="k">int</span>, <span class="m1">set</span>&lt;<span class="k">int</span>&gt;&gt; <span class="m1">dominators</span><span class="b0">(</span><span class="k">const</span> <span class="m1">vector</span>&lt;<span class="m1">vector</span>&lt;<span class="k">int</span>&gt;&gt;<span class="k">&amp;</span> <span class="v0">pred</span>, <span class="k">int</span> <span class="v5">n</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="m1">set</span>&lt;<span class="k">int</span>&gt; <span class="v1">all</span>;
+    <span class="k">for</span> <span class="b1">(</span><span class="k">int</span> <span class="v3">i</span> = <span class="n">0</span>; <span class="v3">i</span> &lt; <span class="v5">n</span>; ++<span class="v3">i</span><span class="b1">)</span> <span class="v1">all</span>.<span class="m1">insert</span><span class="b1">(</span><span class="v3">i</span><span class="b1">)</span>;
+    <span class="m1">map</span>&lt;<span class="k">int</span>, <span class="m1">set</span>&lt;<span class="k">int</span>&gt;&gt; <span class="v2">Dom</span>;
+    <span class="k">for</span> <span class="b1">(</span><span class="k">int</span> <span class="v3">i</span> = <span class="n">0</span>; <span class="v3">i</span> &lt; <span class="v5">n</span>; ++<span class="v3">i</span><span class="b1">)</span> <span class="v2">Dom</span><span class="b1">[</span><span class="v3">i</span><span class="b1">]</span> = <span class="v1">all</span>;
+    <span class="v2">Dom</span><span class="b1">[</span><span class="n">0</span><span class="b1">]</span> = <span class="b1">{</span><span class="n">0</span><span class="b1">}</span>;
+    <span class="k">bool</span> <span class="v3">changed</span> = <span class="k">true</span>;
+    <span class="k">while</span> <span class="b1">(</span><span class="v3">changed</span><span class="b1">)</span> <span class="b1">{</span><span class="c">                       // fixpoint of D(n)={n} U cap D(preds)</span>
+        <span class="v3">changed</span> = <span class="k">false</span>;
+        <span class="k">for</span> <span class="b2">(</span><span class="k">int</span> <span class="v1">nd</span> = <span class="n">1</span>; <span class="v1">nd</span> &lt; <span class="v5">n</span>; ++<span class="v1">nd</span><span class="b2">)</span> <span class="b2">{</span>
+            <span class="m1">set</span>&lt;<span class="k">int</span>&gt; <span class="v2">inter</span> = <span class="v1">all</span>;
+            <span class="k">for</span> <span class="b0">(</span><span class="k">int</span> <span class="v6">p</span> : <span class="v0">pred</span><span class="b1">[</span><span class="v1">nd</span><span class="b1">]</span><span class="b0">)</span> <span class="b0">{</span>
+                <span class="m1">set</span>&lt;<span class="k">int</span>&gt; <span class="v3">tmp</span>;
+                <span class="k">for</span> <span class="b1">(</span><span class="k">int</span> <span class="v4">x</span> : <span class="v2">inter</span><span class="b1">)</span>
+                    <span class="k">if</span> <span class="b1">(</span><span class="v2">Dom</span><span class="b2">[</span><span class="v6">p</span><span class="b2">]</span>.<span class="m1">count</span><span class="b2">(</span><span class="v4">x</span><span class="b2">)</span><span class="b1">)</span> <span class="v3">tmp</span>.<span class="m1">insert</span><span class="b1">(</span><span class="v4">x</span><span class="b1">)</span>;
+                <span class="v2">inter</span> = <span class="v3">tmp</span>;
+            <span class="b0">}</span>
+            <span class="m1">set</span>&lt;<span class="k">int</span>&gt; <span class="v3">nw</span> = <span class="v2">inter</span>; <span class="v3">nw</span>.<span class="m1">insert</span><span class="b0">(</span><span class="v1">nd</span><span class="b0">)</span>;
+            <span class="k">if</span> <span class="b0">(</span><span class="v3">nw</span> != <span class="v2">Dom</span><span class="b1">[</span><span class="v1">nd</span><span class="b1">]</span><span class="b0">)</span> <span class="b0">{</span> <span class="v2">Dom</span><span class="b1">[</span><span class="v1">nd</span><span class="b1">]</span> = <span class="v3">nw</span>; <span class="v3">changed</span> = <span class="k">true</span>; <span class="b0">}</span>
+        <span class="b2">}</span>
+    <span class="b1">}</span>
+    <span class="k">return</span> <span class="v2">Dom</span>;
+<span class="b0">}</span>
+
+<span class="c">// idom(n) = strict dominator with the largest dominator set (closest above n).</span>
+<span class="m1">map</span>&lt;<span class="k">int</span>,<span class="k">int</span>&gt; <span class="m1">immediate_doms</span><span class="b0">(</span><span class="m1">map</span>&lt;<span class="k">int</span>,<span class="m1">set</span>&lt;<span class="k">int</span>&gt;&gt;<span class="k">&amp;</span> <span class="v2">Dom</span>, <span class="k">int</span> <span class="v5">n</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="m1">map</span>&lt;<span class="k">int</span>,<span class="k">int</span>&gt; <span class="v0">idom</span>;
+    <span class="k">for</span> <span class="b1">(</span><span class="k">int</span> <span class="v1">nd</span> = <span class="n">1</span>; <span class="v1">nd</span> &lt; <span class="v5">n</span>; ++<span class="v1">nd</span><span class="b1">)</span> <span class="b1">{</span>
+        <span class="k">int</span> <span class="v3">best</span> = -<span class="n">1</span>; <span class="k">size_t</span> <span class="v3">bestsz</span> = <span class="n">0</span>;
+        <span class="k">for</span> <span class="b2">(</span><span class="k">int</span> <span class="v4">d</span> : <span class="v2">Dom</span><span class="b0">[</span><span class="v1">nd</span><span class="b0">]</span><span class="b2">)</span>
+            <span class="k">if</span> <span class="b2">(</span><span class="v4">d</span> != <span class="v1">nd</span> &amp;&amp; <span class="v2">Dom</span><span class="b0">[</span><span class="v4">d</span><span class="b0">]</span>.<span class="m1">size</span><span class="b0">()</span> &gt; <span class="v3">bestsz</span><span class="b2">)</span> <span class="b2">{</span> <span class="v3">best</span> = <span class="v4">d</span>; <span class="v3">bestsz</span> = <span class="v2">Dom</span><span class="b0">[</span><span class="v4">d</span><span class="b0">]</span>.<span class="m1">size</span><span class="b0">()</span>; <span class="b2">}</span>
+        <span class="v0">idom</span><span class="b2">[</span><span class="v1">nd</span><span class="b2">]</span> = <span class="v3">best</span>;
+    <span class="b1">}</span>
+    <span class="k">return</span> <span class="v0">idom</span>;<span class="c">                            // walk idom up to build DF (Cytron)</span>
+<span class="b0">}</span>
+</code></pre>
+          </div>
+          <p>
+            The last block illustrates the fusion decision a tensor compiler makes, at the level
+            a Triton kernel exposes. The unfused version applies three elementwise operations as
+            three PyTorch calls, materializing two intermediate tensors in HBM; the fused Triton
+            kernel does all three inside one program, reading the input once and writing the
+            output once, so the intermediates never leave registers. This is precisely the loop
+            fusion of the theory section, and it is the transformation that produced the measured
+            \(4.26\times\) elementwise speedup on the H100 in this repository.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="triton" class="active">Triton (fused)</button>
+              <button data-lang="pytorch">PyTorch (unfused)</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="triton" class="shl lang active"><code class="language-python"><span class="k">import</span> <span class="m1">triton</span>
+<span class="k">import</span> <span class="m1">triton</span>.<span class="m2">language</span> <span class="k">as</span> <span class="m1">tl</span>
+
+<span class="m1">@triton.jit</span>
+<span class="k">def</span> <span class="m1">fused_gelu_scale</span><span class="b0">(</span><span class="v5">x_ptr</span>, <span class="v3">out_ptr</span>, <span class="v6">scale</span>, <span class="v5">n</span>, <span class="v5">BLOCK</span>: <span class="m1">tl</span>.<span class="m2">constexpr</span><span class="b0">)</span>:
+    <span class="v5">pid</span> = <span class="m1">tl</span>.<span class="m2">program_id</span><span class="b0">(</span><span class="n">0</span><span class="b0">)</span>
+    <span class="v4">offs</span> = <span class="v5">pid</span> * <span class="v5">BLOCK</span> + <span class="m1">tl</span>.<span class="m2">arange</span><span class="b0">(</span><span class="n">0</span>, <span class="v5">BLOCK</span><span class="b0">)</span>     <span class="c"># this block's element indices</span>
+    <span class="v3">mask</span> = <span class="v4">offs</span> &lt; <span class="v5">n</span>
+    <span class="v4">x</span> = <span class="m1">tl</span>.<span class="m2">load</span><span class="b0">(</span><span class="v5">x_ptr</span> + <span class="v4">offs</span>, <span class="v3">mask</span>=<span class="v3">mask</span><span class="b0">)</span>         <span class="c"># one HBM read</span>
+    <span class="c"># three elementwise ops fused: all stay in registers, no intermediate in HBM</span>
+    <span class="v6">y</span> = <span class="v4">x</span> * <span class="v6">scale</span>                                <span class="c"># op 1: scale</span>
+    <span class="v2">g</span> = <span class="n">0.5</span> * <span class="v6">y</span> * <span class="b0">(</span><span class="n">1.0</span> + <span class="m1">tl</span>.<span class="m2">math</span>.<span class="m2">erf</span><span class="b1">(</span><span class="v6">y</span> * <span class="n">0.70710678</span><span class="b1">)</span><span class="b0">)</span>  <span class="c"># op 2: gelu</span>
+    <span class="v0">z</span> = <span class="v2">g</span> * <span class="v2">g</span>                                    <span class="c"># op 3: square</span>
+    <span class="m1">tl</span>.<span class="m2">store</span><span class="b0">(</span><span class="v3">out_ptr</span> + <span class="v4">offs</span>, <span class="v0">z</span>, <span class="v3">mask</span>=<span class="v3">mask</span><span class="b0">)</span>       <span class="c"># one HBM write</span>
+    <span class="c"># unfused this touches HBM 6 times (3 reads + 3 writes); fused, twice.</span>
+
+<span class="k">def</span> <span class="m1">run</span><span class="b0">(</span><span class="v4">x</span>, <span class="v6">scale</span><span class="b0">)</span>:
+    <span class="v2">out</span> = <span class="m1">torch</span>.<span class="m2">empty_like</span><span class="b0">(</span><span class="v4">x</span><span class="b0">)</span>
+    <span class="v5">n</span> = <span class="v4">x</span>.<span class="m2">numel</span><span class="b0">()</span>
+    <span class="v1">grid</span> = <span class="b0">(</span><span class="m1">triton</span>.<span class="m2">cdiv</span><span class="b1">(</span><span class="v5">n</span>, <span class="n">1024</span><span class="b1">)</span>,<span class="b0">)</span>
+    <span class="m1">fused_gelu_scale</span><span class="b0">[</span><span class="v1">grid</span><span class="b0">](</span><span class="v4">x</span>, <span class="v2">out</span>, <span class="v6">scale</span>, <span class="v5">n</span>, <span class="v5">BLOCK</span>=<span class="n">1024</span><span class="b0">)</span>
+    <span class="k">return</span> <span class="v2">out</span>
+</code></pre>
+            <pre data-lang="pytorch" class="shl lang"><code class="language-python"><span class="k">import</span> <span class="m1">torch</span>
+<span class="k">import</span> <span class="m1">torch</span>.<span class="m2">nn</span>.<span class="m2">functional</span> <span class="k">as</span> <span class="m1">F</span>
+
+<span class="c"># Unfused: each op is a separate kernel that reads and writes all of HBM.</span>
+<span class="k">def</span> <span class="m1">run_unfused</span><span class="b0">(</span><span class="v4">x</span>, <span class="v6">scale</span><span class="b0">)</span>:
+    <span class="v6">y</span> = <span class="v4">x</span> * <span class="v6">scale</span>          <span class="c"># kernel 1: read x, write y   (y materialized in HBM)</span>
+    <span class="v2">g</span> = <span class="m1">F</span>.<span class="m2">gelu</span><span class="b0">(</span><span class="v6">y</span><span class="b0">)</span>          <span class="c"># kernel 2: read y, write g   (g materialized in HBM)</span>
+    <span class="v0">z</span> = <span class="v2">g</span> * <span class="v2">g</span>              <span class="c"># kernel 3: read g, write z</span>
+    <span class="k">return</span> <span class="v0">z</span>
+    <span class="c"># 3 reads + 3 writes of an N-element tensor. For a memory-bound chain the</span>
+    <span class="c"># runtime is (bytes moved)/(bandwidth), so removing the 4 intermediate</span>
+    <span class="c"># touches is the entire speedup -- flops are unchanged.</span>
+
+<span class="c"># torch.compile fuses this automatically via TorchInductor, emitting one Triton</span>
+<span class="c"># kernel equivalent to the hand-written fused version:</span>
+<span class="v3">run_fused</span> = <span class="m1">torch</span>.<span class="m2">compile</span><span class="b0">(</span><span class="m1">run_unfused</span><span class="b0">)</span>
+<span class="c"># measured on an H100 80GB in this repo: 0.911 ms unfused -&gt; 0.214 ms fused (4.26x)</span>
+</code></pre>
+          </div>
+
+          <h2>How it is done in practice</h2>
+          <p>
+            The gap between the framework and a shipping compiler is mostly engineering
+            discipline around the same ideas. Dominators are computed by Lengauer-Tarjan or the
+            Cooper-Harvey-Kennedy iterative method, not by the set equation, because the set
+            equation is quadratic in space. SSA is constructed once early and maintained
+            incrementally through every subsequent pass, because reconstructing it is expensive;
+            LLVM keeps values in SSA from the first optimization to just before register
+            allocation, where it leaves SSA via a phi-elimination pass that inserts copies on the
+            incoming edges. Dataflow analyses are run with bit-vectors, one bit per fact, so the
+            meet is a machine <code>AND</code> or <code>OR</code> over words and a whole block's
+            transfer is a couple of instructions; this is why the classical analyses are
+            effectively free and run many times during a compilation.
+          </p>
+          <p>
+            Register allocation in production is more than textbook Chaitin. LLVM's default
+            allocator is not graph coloring at all but a greedy linear-scan-derived allocator
+            with live-range splitting, chosen because it is faster to run and its results are
+            close; graph coloring survives in GCC and in JITs where compile time is less
+            critical. Spilling is guided by loop-nesting depth: a value used inside a triply
+            nested loop is spilled only as a last resort because each spill costs a memory access
+            per iteration, multiplied by the trip counts. Instruction scheduling is often folded
+            into the same phase to manage the pressure-versus-latency tension described above.
+          </p>
+          <p>
+            In the tensor world the same engineering shows up at graph scale. TorchInductor's
+            fusion is a scheduling pass over a dependency graph of loop-level operations, with
+            heuristics for when a fusion helps (memory-bound producers and consumers) versus hurts
+            (fusing past a reduction, or into a kernel already register-starved). XLA's layout
+            assignment is a dataflow analysis choosing tensor layouts to minimize transposes, a
+            direct analogue of register-class assignment. Triton's compiler runs the full back
+            end, an autotuner searches tile sizes and pipeline depths, and the winning
+            configuration is cached, which is tiling and scheduling with an empirical cost model
+            substituting for a static one. Across all of them the measured lesson is the one the
+            tiling table makes precise: the transformation that moves a kernel from memory-bound to
+            compute-bound is worth more than any local micro-optimization, and it is a compiler
+            pass, not a hand edit.
+          </p>
+
+          <h2>The current research frontier</h2>
+          <p>
+            Four threads are active. The first is <em>MLIR as a universal substrate</em>: the
+            Google-led effort (Lattner and colleagues, 2021) to express every level of a tensor
+            compiler as a dialect and reuse lowering passes between them, now adopted well beyond
+            Google, including by parts of the Triton and IREE stacks. The bet is that the
+            historical fragmentation of ML compilers, each reinventing SSA, dataflow, and tiling,
+            collapses onto one infrastructure. The second is <em>autotuning and learned cost
+            models</em>: rather than a static machine model, systems like TVM (from the Washington
+            group, Chen and colleagues) and Triton's autotuner search the transformation space and
+            fit a cost model to measurements, trading compile time for kernel quality, an approach
+            that is winning on hardware too irregular to model analytically.
+          </p>
+          <p>
+            The third is <em>the polyhedral model meeting machine learning</em>: extending affine
+            scheduling to the fusion and tiling decisions of full networks, and coping with the
+            non-affine parts (dynamic shapes, data-dependent control) that classical polyhedral
+            compilation excludes; the tension between the model's optimality guarantees and its
+            restricted applicability is the open problem. The fourth is <em>verified and
+            translation-validated optimization</em>: as compilers grow, so does the risk that an
+            optimization is subtly wrong, and lines of work on translation validation (checking
+            after the fact that a specific compilation preserved semantics, as in the Alive tooling
+            for LLVM peephole optimizations from the Utah and collaborators) and on fully verified
+            compilers (CompCert, from Leroy and INRIA, a C compiler proved correct in Coq) are
+            increasingly relevant as tensor compilers make ever more aggressive, ever less
+            obviously-correct rewrites. The unifying question across all four is how to get the
+            aggressiveness of an autotuned, fusing, tiling compiler with the correctness guarantees
+            of the classical framework, whose soundness the lattice theory above actually
+            establishes.
+          </p>
+
+          <h2>Open source to read</h2>
+          <ul>
+            <li>
+              <a href="https://github.com/llvm/llvm-project" target="_blank" rel="noreferrer">llvm/llvm-project</a>
+              &mdash; the reference production compiler. Read <code>llvm/lib/Analysis/</code> for
+              the dataflow and dominator implementations and <code>llvm/lib/Transforms/Scalar/</code>
+              for SSA-based passes; <code>SROA.cpp</code> and <code>SCCP.cpp</code> are the concrete
+              versions of the algorithms on this page.
+            </li>
+            <li>
+              <a href="https://github.com/llvm/llvm-project/tree/main/mlir" target="_blank" rel="noreferrer">llvm/mlir</a>
+              &mdash; the multi-level IR infrastructure. Start with the <code>Affine</code> and
+              <code>Linalg</code> dialects to see the polyhedral model and tensor tiling as
+              first-class passes.
+            </li>
+            <li>
+              <a href="https://github.com/openai/triton" target="_blank" rel="noreferrer">openai/triton</a>
+              &mdash; the block-level kernel compiler. Read <code>python/triton/language/</code> for
+              the programming model and the <code>lib/</code> passes for the automatic register
+              allocation, scheduling, and pipelining.
+            </li>
+            <li>
+              <a href="https://github.com/pytorch/pytorch" target="_blank" rel="noreferrer">pytorch/pytorch</a>
+              &mdash; <code>torch/_inductor/</code> is TorchInductor. Open <code>scheduler.py</code>
+              for the fusion decisions and <code>codegen/triton.py</code> for the lowering to Triton.
+            </li>
+            <li>
+              <a href="https://github.com/openxla/xla" target="_blank" rel="noreferrer">openxla/xla</a>
+              &mdash; the XLA compiler and HLO IR. The <code>xla/service/</code> directory holds the
+              fusion, layout-assignment, and algebraic-simplification passes.
+            </li>
+            <li>
+              <a href="https://github.com/halide/Halide" target="_blank" rel="noreferrer">halide/Halide</a>
+              &mdash; the language that separated algorithm from schedule and inspired much of the
+              tensor-compiler wave; the clearest place to internalize tiling and fusion as explicit,
+              composable schedule directives.
+            </li>
+            <li>
+              <a href="https://github.com/google/jax" target="_blank" rel="noreferrer">google/jax</a>
+              &mdash; the tracing front end and its lowering to XLA; <code>jax/_src/interpreters/</code>
+              shows how an eager program becomes a graph an optimizing compiler can consume.
+            </li>
+          </ul>
+
+          <h2>Common misconceptions</h2>
+          <p>
+            <strong>"SSA is just renaming variables."</strong> Renaming is the easy half. The
+            content of SSA is the phi placement, and placing phis minimally requires computing
+            dominance frontiers and their iterated closure. A naive "phi at every join for every
+            variable" is correct but bloats the IR by an order of magnitude and slows every later
+            pass; the Cytron algorithm exists precisely to place the few phis that are actually
+            needed.
+          </p>
+          <p>
+            <strong>"Dataflow analysis needs the program to halt or to be executed."</strong> It
+            is a purely static fixed-point computation over a lattice, and it terminates by the
+            finite-height-plus-monotonicity argument regardless of whether the analyzed program
+            terminates. It never runs the program; it computes facts true of all runs at once,
+            which is exactly why it can reason about infinite loops.
+          </p>
+          <p>
+            <strong>"The iterative solver gives the exact meet-over-all-paths answer."</strong>
+            Only when the transfer functions are distributive, which the bit-vector analyses
+            (liveness, reaching definitions, available expressions) happen to be. Constant
+            propagation is monotone but not distributive, so its fixpoint solution can be strictly
+            less precise than the meet-over-paths, which is the entire motivation for the smarter
+            SCCP algorithm.
+          </p>
+          <p>
+            <strong>"More registers always means no spilling."</strong> Spilling is forced by the
+            chromatic number of the interference graph, not by a shortage relative to some average.
+            A single point where \(k+1\) values are simultaneously live forces a spill on a
+            \(k\)-register machine no matter how few values the rest of the function uses, because
+            that point contains a \((k{+}1)\)-clique. The remedy is live-range splitting to break the
+            clique, not more registers.
+          </p>
+          <p>
+            <strong>"Fusion is always a win."</strong> Fusion removes intermediate memory traffic,
+            which helps only while the operations are memory-bound. Fusing into a kernel that is
+            already compute-bound adds register pressure and can force spills or cut occupancy;
+            fusing across a reduction forces a grid-wide synchronization or recomputation. The
+            measured \(4.26\times\) came from a chain that lived far on the memory-bound side; the
+            same fusion applied to a saturated matmul would gain nothing. Fusion is a decision the
+            cost model makes, not a universal good.
+          </p>
+          <p>
+            <strong>"Tiling helps because it reduces the number of operations."</strong> Tiling
+            changes no arithmetic at all; the flop count is identical. It reduces the number of times
+            each datum is fetched from slow memory, raising arithmetic intensity from 0.25 to tens of
+            flop/byte in the worked example, which is a memory-traffic win, not a compute win.
+            Confusing the two leads to wrong predictions everywhere, because it is the traffic
+            reduction, capped by cache size, that sets the achievable speedup.
+          </p>
+          <p>
+            <strong>"The polyhedral model can optimize any loop nest."</strong> It requires affine
+            loop bounds and affine array subscripts. Data-dependent bounds, indirect indexing
+            (gather/scatter), and sparse formats fall outside it, which is why production tensor
+            compilers use it for the dense affine core and fall back to pattern-based rewriting for
+            everything else. Its strength (a complete algebraic search over legal schedules) and its
+            limitation (only affine programs) are two sides of the same restriction.
+          </p>
+          <p>
+            <strong>"A tensor compiler is a fundamentally new kind of compiler."</strong> It is the
+            classical pipeline with a tensor as the primitive value. Operator fusion is loop fusion,
+            layout assignment is a dataflow analysis, the affine dialect is the polyhedral model,
+            Triton's pipeliner is software pipelining, and its allocator is graph coloring or linear
+            scan. The novelty is the value type and the scale, not the theory, which is exactly why
+            the framework on this page transfers directly.
+          </p>
+
+          <h2>Self-check</h2>
+          <div class="quiz" data-quiz>
+            <script type="application/json" class="quiz-data">[
+              {"id": "q1", "qtype": "mcq",
+               "stem": "A node d is in the dominance frontier of a node b when:",
+               "options": ["b dominates d", "d dominates b strictly", "b dominates a predecessor of d but does not strictly dominate d", "d and b share a common dominator"],
+               "correctIndex": 2,
+               "explanation": "DF(b) is where b's dominance just stops: b dominates some predecessor of the frontier node but not the node itself, so control can also arrive by another path and the definitions merge. That is exactly the phi-placement condition."},
+              {"id": "q2", "qtype": "truefalse",
+               "stem": "A loop header always appears in its own dominance frontier.",
+               "options": ["True", "False"],
+               "correctIndex": 0,
+               "explanation": "The back edge feeds a value defined inside the loop back to the header, where it merges with the value entering from outside, so the header is on the frontier of nodes inside the loop and of itself. That is why loop induction variables are phi-nodes at the header."},
+              {"id": "q3", "qtype": "mcq",
+               "stem": "Why does the iterative dataflow solver terminate?",
+               "options": ["The analyzed program is assumed to halt", "Transfer functions are monotone and the lattice has finite height, so every point traces a bounded descending chain", "The worklist is bounded by the number of blocks", "The meet operation is commutative"],
+               "correctIndex": 1,
+               "explanation": "Monotone updates only move each point down the lattice, and a finite-height lattice has no infinite descending chain, so after at most (points times height) changes the system is at a fixed point. Termination is independent of whether the program halts."},
+              {"id": "q4", "qtype": "mcq",
+               "stem": "For which class of analyses does the maximum-fixed-point solution equal the meet-over-all-paths solution?",
+               "options": ["All monotone analyses", "Only backward analyses", "Analyses whose transfer functions are distributive", "Only analyses on acyclic CFGs"],
+               "correctIndex": 2,
+               "explanation": "Kam and Ullman showed MFP <= MOP always, with equality exactly when transfer functions distribute over meet. Bit-vector analyses are distributive; constant propagation is not, so its fixpoint can be strictly weaker than MOP."},
+              {"id": "q5", "qtype": "mcq",
+               "stem": "In the reaching-definitions example, block B5 (the join) receives both d1 and d3, which both define variable a. This is the situation that:",
+               "options": ["Indicates a bug in the analysis", "SSA form resolves by inserting a phi-node at B5", "Means a is dead at B5", "Forces a spill"],
+               "correctIndex": 1,
+               "explanation": "Two definitions of one variable reaching one point is exactly the ambiguity SSA removes: a phi-node at the join selects the definition according to the incoming edge. Reaching definitions and phi placement are the same fact."},
+              {"id": "q6", "qtype": "truefalse",
+               "stem": "In the liveness example, the loop back edge is the reason more than one pass over the blocks is required to reach the fixed point.",
+               "options": ["True", "False"],
+               "correctIndex": 0,
+               "explanation": "An acyclic CFG converges in one reverse pass; the back edge feeds a fact (a live across iterations) that only appears once the loop's own IN has stabilized, requiring a second pass. Each level of loop nesting adds a pass."},
+              {"id": "q7", "qtype": "mcq",
+               "stem": "Naive iterative constant propagation loses a constant when z = x + y gets (x,y) = (1,4) on one path and (4,1) on another because:",
+               "options": ["Addition is not associative", "It meets x and y to bottom at the join before evaluating z, and bottom + bottom = bottom", "The lattice has infinite height", "Constant propagation is a backward analysis"],
+               "correctIndex": 1,
+               "explanation": "Merging inputs at the join gives x = 1 meet 4 = bottom and y = bottom, so z = bottom, even though z = 5 on every actual path. This non-distributivity is why the fixpoint is weaker than MOP and why SCCP is needed."},
+              {"id": "q8", "qtype": "mcq",
+               "stem": "Tiling a 1024x1024 matmul with 64x64 tiles reduces DRAM traffic by 64x. The speedup comes from:",
+               "options": ["Fewer floating-point operations", "Fetching each element N/T = 16 times instead of N = 1024, raising arithmetic intensity", "Using tensor cores", "Better branch prediction"],
+               "correctIndex": 1,
+               "explanation": "Tiling changes no arithmetic; it improves reuse so each element is fetched N/T times, cutting traffic by a factor of T and raising intensity from 0.25 to 16 flop/byte. It is a memory-traffic win, capped by the cache size that bounds T."},
+              {"id": "q9", "qtype": "mcq",
+               "stem": "The interference graph with a triangle {a,b,c} cannot be colored with k = 2 registers because:",
+               "options": ["It has too many edges", "A triangle is a 3-clique and needs 3 distinct colors, so 2 registers force a spill", "Chaitin's algorithm is heuristic", "The graph is not connected"],
+               "correctIndex": 1,
+               "explanation": "Three mutually adjacent nodes must all differ, requiring 3 colors. The chromatic number is a hard lower bound on registers, so any allocator with fewer than the clique number must spill."},
+              {"id": "q10", "qtype": "truefalse",
+               "stem": "Chaitin's original (pessimistic) coloring can spill a node that Briggs' optimistic variant colors successfully.",
+               "options": ["True", "False"],
+               "correctIndex": 0,
+               "explanation": "In the worked graph, node c (degree 4) is spilled immediately by the pessimistic rule but colored 2 by the optimistic one, because after its neighbors are constrained a color remains free. Optimistic coloring only commits to a spill when no color is actually available."},
+              {"id": "q11", "qtype": "mcq",
+               "stem": "The polyhedral model represents a loop nest as:",
+               "options": ["A regular expression", "An iteration domain (a polyhedron) with affine access maps and affine dependences", "A finite automaton", "A hash table of array accesses"],
+               "correctIndex": 1,
+               "explanation": "Iterations are integer points of a polyhedron cut out by affine bounds, accesses are affine maps, dependences are affine relations, and a transformation is an affine schedule. Legal schedules preserve every dependence and are found by linear programming."},
+              {"id": "q12", "qtype": "ordering",
+               "stem": "Order the steps of SSA construction for one variable.",
+               "options": ["Compute the dominator tree and immediate dominators", "Compute dominance frontiers from the dominator tree (Cytron)", "Place phi-nodes at the iterated dominance frontier of the definition sites", "Rename in a pre-order walk of the dominator tree, wiring phi operands per edge"],
+               "correctIndex": -1,
+               "explanation": "Dominators come first, then frontiers, then phi placement by iterated frontier, then a single renaming walk. Each step consumes the previous one's output."}
+            ]</script>
+          </div>
+
+          <h2>References</h2>
+          <ol class="refs">
+            <li>Aho, A., Lam, M., Sethi, R., and Ullman, J. <em>Compilers: Principles, Techniques, and Tools</em> (the Dragon Book), 2nd ed., Addison-Wesley, 2006.</li>
+            <li>Muchnick, S. <em>Advanced Compiler Design and Implementation</em>, Morgan Kaufmann, 1997.</li>
+            <li>Appel, A. <em>Modern Compiler Implementation in ML</em>, Cambridge University Press, 1998.</li>
+            <li>Cooper, K. and Torczon, L. <em>Engineering a Compiler</em>, 2nd ed., Morgan Kaufmann, 2011.</li>
+            <li>Cytron, R., Ferrante, J., Rosen, B., Wegman, M., and Zadeck, F. K. "Efficiently Computing Static Single Assignment Form and the Control Dependence Graph," <em>ACM TOPLAS</em> 13(4), 1991. <a href="https://doi.org/10.1145/115372.115320" target="_blank" rel="noreferrer">doi:10.1145/115372.115320</a></li>
+            <li>Kildall, G. "A Unified Approach to Global Program Optimization," <em>POPL</em>, 1973. <a href="https://doi.org/10.1145/512927.512945" target="_blank" rel="noreferrer">doi:10.1145/512927.512945</a></li>
+            <li>Kam, J. and Ullman, J. "Global Data Flow Analysis and Iterative Algorithms," <em>JACM</em> 23(1), 1976. <a href="https://doi.org/10.1145/321921.321938" target="_blank" rel="noreferrer">doi:10.1145/321921.321938</a></li>
+            <li>Kam, J. and Ullman, J. "Monotone Data Flow Analysis Frameworks," <em>Acta Informatica</em> 7, 1977. <a href="https://doi.org/10.1007/BF00290339" target="_blank" rel="noreferrer">doi:10.1007/BF00290339</a></li>
+            <li>Wegman, M. and Zadeck, F. K. "Constant Propagation with Conditional Branches," <em>ACM TOPLAS</em> 13(2), 1991. <a href="https://doi.org/10.1145/103135.103136" target="_blank" rel="noreferrer">doi:10.1145/103135.103136</a></li>
+            <li>Chaitin, G. "Register Allocation and Spilling via Graph Coloring," <em>SIGPLAN Symposium on Compiler Construction</em>, 1982. <a href="https://doi.org/10.1145/800230.806984" target="_blank" rel="noreferrer">doi:10.1145/800230.806984</a></li>
+            <li>Briggs, P., Cooper, K., and Torczon, L. "Improvements to Graph Coloring Register Allocation," <em>ACM TOPLAS</em> 16(3), 1994. <a href="https://doi.org/10.1145/177492.177575" target="_blank" rel="noreferrer">doi:10.1145/177492.177575</a></li>
+            <li>Lengauer, T. and Tarjan, R. "A Fast Algorithm for Finding Dominators in a Flowgraph," <em>ACM TOPLAS</em> 1(1), 1979. <a href="https://doi.org/10.1145/357062.357071" target="_blank" rel="noreferrer">doi:10.1145/357062.357071</a></li>
+            <li>Cooper, K., Harvey, T., and Kennedy, K. "A Simple, Fast Dominance Algorithm," Rice University technical report, 2001. <a href="https://www.cs.rice.edu/~keith/EMBED/dom.pdf" target="_blank" rel="noreferrer">cs.rice.edu/~keith/EMBED/dom.pdf</a></li>
+            <li>Lattner, C. and Adve, V. "LLVM: A Compilation Framework for Lifelong Program Analysis &amp; Transformation," <em>CGO</em>, 2004. <a href="https://doi.org/10.1109/CGO.2004.1281665" target="_blank" rel="noreferrer">doi:10.1109/CGO.2004.1281665</a></li>
+            <li>Feautrier, P. "Some Efficient Solutions to the Affine Scheduling Problem, Part I &amp; II," <em>International Journal of Parallel Programming</em> 21, 1992. <a href="https://doi.org/10.1007/BF01407835" target="_blank" rel="noreferrer">doi:10.1007/BF01407835</a></li>
+            <li>Bondhugula, U., Hartono, A., Ramanujam, J., and Sadayappan, P. "A Practical Automatic Polyhedral Parallelizer and Locality Optimizer" (Pluto), <em>PLDI</em>, 2008. <a href="https://doi.org/10.1145/1375581.1375595" target="_blank" rel="noreferrer">doi:10.1145/1375581.1375595</a></li>
+            <li>Lattner, C., Amini, M., Bondhugula, U., Cohen, A., Davis, A., Pienaar, J., Riddle, R., Shpeisman, T., Vasilache, N., and Zinenko, O. "MLIR: Scaling Compiler Infrastructure for Domain Specific Computation," <em>CGO</em>, 2021. <a href="https://arxiv.org/abs/2002.11054" target="_blank" rel="noreferrer">arXiv:2002.11054</a></li>
+            <li>Tillet, P., Kung, H. T., and Cox, D. "Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations," <em>MAPL</em>, 2019. <a href="https://doi.org/10.1145/3315508.3329973" target="_blank" rel="noreferrer">doi:10.1145/3315508.3329973</a></li>
+            <li>Ansel, J. et al. "PyTorch 2: Faster Machine Learning Through Dynamic Python Bytecode Transformation and Graph Compilation" (TorchInductor), <em>ASPLOS</em>, 2024. <a href="https://doi.org/10.1145/3620665.3640366" target="_blank" rel="noreferrer">doi:10.1145/3620665.3640366</a></li>
+            <li>Chen, T. et al. "TVM: An Automated End-to-End Optimizing Compiler for Deep Learning," <em>OSDI</em>, 2018. <a href="https://arxiv.org/abs/1802.04799" target="_blank" rel="noreferrer">arXiv:1802.04799</a></li>
+            <li>Ragan-Kelley, J., Barnes, C., Adams, A., Paris, S., Durand, F., and Amarasinghe, S. "Halide: A Language and Compiler for Optimizing Parallelism, Locality, and Recomputation in Image Processing Pipelines," <em>PLDI</em>, 2013. <a href="https://doi.org/10.1145/2491956.2462176" target="_blank" rel="noreferrer">doi:10.1145/2491956.2462176</a></li>
+            <li>Leroy, X. "Formal Verification of a Realistic Compiler" (CompCert), <em>CACM</em> 52(7), 2009. <a href="https://doi.org/10.1145/1538788.1538814" target="_blank" rel="noreferrer">doi:10.1145/1538788.1538814</a></li>
+            <li>Lopes, N., Menendez, D., Nagarakatte, S., and Regehr, J. "Provably Correct Peephole Optimizations with Alive," <em>PLDI</em>, 2015. <a href="https://doi.org/10.1145/2737924.2737965" target="_blank" rel="noreferrer">doi:10.1145/2737924.2737965</a></li>
+          </ol>
+
+          <div class="takeaway">
+            <p>
+              A compiler is a sequence of meaning-preserving rewrites, and two ideas carry
+              almost all of them. Static single assignment makes def-use structure explicit,
+              and its only hard part, minimal phi placement, is computed from dominance
+              frontiers and their iterated closure, worked here to \(\{B1, B4\}\) on a concrete
+              seven-node CFG. Dataflow analysis computes facts about every run at once as a
+              fixed point over a lattice, and it terminates for one reason: monotone transfer
+              functions can only descend a lattice of finite height, which is the whole
+              guarantee behind liveness, reaching definitions, constant propagation, and their
+              worklist solvers. The back-end transformations are the same discipline applied to
+              performance: natural loops from dominance, invariant hoisting and induction-variable
+              strength reduction, register allocation as graph coloring (where optimistic Briggs
+              coloring 3-colors a graph pessimistic Chaitin would spill), list scheduling, and,
+              above all, tiling, whose reuse arithmetic turns a memory-bound matmul into a
+              compute-bound one by raising arithmetic intensity from 0.25 to tens of flop/byte.
+              Every one of these reappears, unchanged in theory, inside XLA, TorchInductor,
+              Triton, and MLIR, where the primitive value is a tensor and the measured payoff is
+              a fusion that cut a real H100 kernel from 0.911 ms to 0.214 ms. Learn the framework
+              once and the tensor compilers read as instances of it.
+            </p>
+          </div>
+
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>&copy; <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;&middot;&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/classes/math.js"></script>
+    <script defer src="/code-tabs.js"></script>
+    <script defer src="/quiz.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/code-copy.js"></script>
+  </body>
+</html>
