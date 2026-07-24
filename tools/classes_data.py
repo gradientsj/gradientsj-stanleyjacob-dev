@@ -187,6 +187,19 @@ GROUPS = [
                 "tags": ["LoRA", "DPO", "Serving"],
             },
             {
+                "slug": "data-pipelines-and-evaluation",
+                "title": "Data pipelines and evaluation: better data, LLM judges, and honest measurement",
+                "blurb": "How strong corpora are actually built and how model quality is "
+                         "actually measured. Gathering and cleaning at scale with extraction, "
+                         "language identification, quality filtering, and MinHash "
+                         "deduplication with the banding math derived, then LLM-as-a-judge "
+                         "used carefully with its documented biases and a kappa calibration "
+                         "workflow, and finally when one sample is enough versus when "
+                         "majority voting, pass@k, and confidence intervals are the honest "
+                         "answer.",
+                "tags": ["Dedup", "LLM judges", "Error bars"],
+            },
+            {
                 "slug": "audio-and-voice-models",
                 "title": "Audio and voice models: from signal processing to full-duplex interaction",
                 "blurb": "A survey of the whole audio stack as it stands now: the classic "
