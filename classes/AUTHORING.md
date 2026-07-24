@@ -51,8 +51,11 @@ Match the existing site: calm, declarative, technical, no marketing language,
 no exclamation marks, no "let's dive in", no bulleted fragments where a
 paragraph belongs. Prefer prose that explains *why* a design is the way it is.
 Read `/ml/attention/index.html` before writing your first page; it is the
-reference for tone and density. Do not use em dashes; use commas, colons, or
-semicolons. Do not address the reader as "you" more than sparingly.
+reference for tone and density. Do not use em dashes. The owner also dislikes
+colons and semicolons in prose, so rework sentences to flow with commas and
+periods instead (code is exempt). Keep the voice calm, with no exuberant
+phrasing like "I love building". Do not address the reader as "you" more than
+sparingly.
 
 ## Page skeleton
 

@@ -187,6 +187,18 @@ GROUPS = [
                 "tags": ["LoRA", "DPO", "Serving"],
             },
             {
+                "slug": "audio-and-voice-models",
+                "title": "Audio and voice models: from signal processing to full-duplex interaction",
+                "blurb": "A survey of the whole audio stack as it stands now: the classic "
+                         "DSP-and-HMM pipeline versus learned features and neural codecs, the "
+                         "model families from Whisper and wav2vec through VALL-E, VITS, and "
+                         "Moshi to gpt-realtime and full-duplex interaction models, what is "
+                         "known about model sizes, how to fine-tune ASR and TTS, and an honest "
+                         "comparison of the labs and products, from ElevenLabs and Cartesia to "
+                         "the orchestration layers like Vapi that wire them into agents.",
+                "tags": ["Whisper", "Neural codecs", "Full-duplex"],
+            },
+            {
                 "slug": "graph-machine-learning",
                 "title": "Graph machine learning: message passing, expressiveness, and scale",
                 "blurb": "Node embeddings from random walks, the message-passing framework with "
