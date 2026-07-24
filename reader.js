@@ -3,8 +3,8 @@
    - Plays a listen.mp3 if present, else falls back to the browser's best voice.
    - Highlights three levels while speaking: the passage block, the current
      sentence, and the exact word being spoken (CSS Custom Highlight API).
-   - A granularity control switches the reading unit between paragraphs and
-     sentences; the scrubber jumps by that unit.
+   - Reading advances sentence by sentence, and the scrubber jumps by
+     sentence (short blocks like headings stay whole).
    - Floating controls follow the reader down the page when the main bar
      scrolls out of view, so playback can be paused from anywhere. Auto-scroll
      follows the text but yields as soon as the reader scrolls away, and the
@@ -100,19 +100,8 @@
     var pos = document.createElement("span");
     pos.className = "reader-pos"; pos.hidden = true;
 
-    // granularity: what one reading unit (and one scrubber step) means
-    var gran = document.createElement("select");
-    gran.className = "reader-gran"; gran.hidden = true;
-    gran.setAttribute("aria-label", "Reading granularity");
-    [["paragraph", "By paragraph"], ["sentence", "By sentence"]].forEach(function (o) {
-      var opt = document.createElement("option");
-      opt.value = o[0]; opt.textContent = o[1];
-      gran.appendChild(opt);
-    });
-    try { gran.value = localStorage.getItem("reader-gran") || "paragraph"; } catch (e) {}
-
     bar.appendChild(btn); bar.appendChild(stop);
-    bar.appendChild(range); bar.appendChild(pos); bar.appendChild(gran);
+    bar.appendChild(range); bar.appendChild(pos);
     root.appendChild(bar); root.appendChild(note);
 
     // floating controls that follow the reader down the page
@@ -161,7 +150,7 @@
         if (!userAway) chunks[ci].el.scrollIntoView({ block: "nearest" });
       }
     }
-    function showScrub(show) { range.hidden = !show; pos.hidden = !show; gran.hidden = !show; }
+    function showScrub(show) { range.hidden = !show; pos.hidden = !show; }
     function setPos(text) { pos.textContent = text; fPos.textContent = text; }
     function fmt(t) {
       t = Math.max(0, Math.floor(t || 0));
@@ -231,10 +220,9 @@
 
     function buildUnits() {
       units = [];
-      var byСentence = gran.value === "sentence";
       for (var ci = 0; ci < chunks.length; ci++) {
         var text = chunks[ci].text;
-        if (!byСentence || text.length < 90) {
+        if (text.length < 90) {
           units.push({ ci: ci, start: 0, end: text.length, text: text, whole: true });
         } else {
           var ss = splitSentences(text);
@@ -296,7 +284,7 @@
       note.textContent = "natural narration";
       audio.addEventListener("ended", finish);
       audio.addEventListener("loadedmetadata", function () {
-        range.max = "1000"; range.value = "0"; showScrub(true); gran.hidden = true;
+        range.max = "1000"; range.value = "0"; showScrub(true);
         setPos(fmt(0) + " / " + fmt(audio.duration));
       });
       audio.addEventListener("timeupdate", function () {
@@ -314,20 +302,6 @@
         audio.currentTime = (v / 1000) * audio.duration;
         if (audio.paused) { audio.play(); label(true); }
       }
-    });
-    gran.addEventListener("change", function () {
-      try { localStorage.setItem("reader-gran", gran.value); } catch (e) {}
-      if (mode !== "speech") return;
-      // keep the current position across the granularity switch
-      var u = units[idx] || { ci: 0, start: 0 };
-      buildUnits();
-      range.max = String(units.length - 1);
-      var target = 0;
-      for (var i = 0; i < units.length; i++) {
-        if (units[i].ci < u.ci) continue;
-        if (units[i].ci > u.ci || units[i].end > u.start) { target = i; break; }
-      }
-      jumpTo(target);
     });
     function haveAudio() {
       if (!audioUrl) return Promise.resolve(false);
