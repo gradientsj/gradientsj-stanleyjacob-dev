@@ -131,7 +131,11 @@ the index.
   computer-networks (2203), language-models-from-scratch (1958),
   statistical-learning (1578). All arithmetic in worked problems was verified
   by running Python; CUDA snippets compiled with nvcc sm_90; PyTorch/JAX tabs
-  executed before inclusion. 17/56 live, 0 validator errors.
+  executed before inclusion. 17/56 live, 0 validator errors. Pushed as
+  8a14896.
+- Batch 2 in flight (wip, claimed by agents): learning-theory, ai-principles,
+  operating-systems, databases, self-improving-agents,
+  combinatorial-optimization.
 
 ### Session 1 (2026-07-23)
 
