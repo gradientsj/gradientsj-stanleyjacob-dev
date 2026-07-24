@@ -1,14 +1,19 @@
 /* "Listen" (read-aloud) control for the articles. No dependencies.
    Markup:  <div class="reader" data-reader data-audio="listen.mp3"></div>
-   - Plays an ElevenLabs listen.mp3 if present (natural voice), else falls back to the
-     browser's best available voice (prefers a natural male voice over the robotic default).
-   - Speed control (1x / 2x / 3x / 4x), pause/stop, and it highlights the block being read. */
+   - Plays a listen.mp3 if present, else falls back to the browser's best voice.
+   - Highlights three levels while speaking: the passage block, the current
+     sentence, and the exact word being spoken (CSS Custom Highlight API).
+   - A granularity control switches the reading unit between paragraphs and
+     sentences; the scrubber jumps by that unit.
+   - Floating controls follow the reader down the page when the main bar
+     scrolls out of view, so playback can be paused from anywhere. Auto-scroll
+     follows the text but yields as soon as the reader scrolls away, and the
+     floating "Go to text" button returns to the passage and re-engages it. */
 (function () {
   "use strict";
 
   var SKIP_TAGS = { pre: 1, svg: 1, script: 1, style: 1, noscript: 1, code: 1 };
   var READ_TAGS = { p: 1, h1: 1, h2: 1, h3: 1, h4: 1, li: 1, blockquote: 1, figcaption: 1 };
-  // browser voices, most natural / male first
   var VOICE_PREFS = [
     "Microsoft Guy Online", "Microsoft Andrew Online", "Microsoft Brian",
     "Google UK English Male", "Alex", "Daniel", "Aaron", "Arthur", "Rishi",
@@ -56,6 +61,25 @@
     return vs[0];
   }
 
+  // sentence boundaries: punctuation, whitespace, then something that starts a
+  // sentence, with common abbreviations excluded so "e.g. the" stays together
+  var SENT_RE = /(?<!\be\.g\.)(?<!\bi\.e\.)(?<!\bvs\.)(?<!\bDr\.)(?<!\bMr\.)(?<!\bMs\.)(?<!\bProf\.)(?<!\bFig\.)(?<!\bNo\.)(?<!\bet al\.)(?<=[.!?])\s+(?=["'“‘(]?[A-Z0-9])/;
+
+  function splitSentences(text) {
+    var parts;
+    try { parts = text.split(SENT_RE); }
+    catch (e) { parts = [text]; }               // engines without lookbehind
+    var out = [], off = 0;
+    for (var i = 0; i < parts.length; i++) {
+      var s = parts[i];
+      var start = text.indexOf(s, off);
+      if (start < 0) start = off;
+      out.push({ start: start, end: start + s.length, text: s });
+      off = start + s.length;
+    }
+    return out;
+  }
+
   function initReader(root) {
     var audioUrl = root.getAttribute("data-audio");
     var bar = document.createElement("div");
@@ -69,7 +93,6 @@
     var note = document.createElement("span");
     note.className = "reader-note";
 
-    // scrubber: jump anywhere in the article while listening
     var range = document.createElement("input");
     range.type = "range"; range.className = "reader-range";
     range.min = "0"; range.value = "0"; range.step = "1"; range.hidden = true;
@@ -77,59 +100,90 @@
     var pos = document.createElement("span");
     pos.className = "reader-pos"; pos.hidden = true;
 
+    // granularity: what one reading unit (and one scrubber step) means
+    var gran = document.createElement("select");
+    gran.className = "reader-gran"; gran.hidden = true;
+    gran.setAttribute("aria-label", "Reading granularity");
+    [["paragraph", "By paragraph"], ["sentence", "By sentence"]].forEach(function (o) {
+      var opt = document.createElement("option");
+      opt.value = o[0]; opt.textContent = o[1];
+      gran.appendChild(opt);
+    });
+    try { gran.value = localStorage.getItem("reader-gran") || "paragraph"; } catch (e) {}
+
     bar.appendChild(btn); bar.appendChild(stop);
-    bar.appendChild(range); bar.appendChild(pos);
+    bar.appendChild(range); bar.appendChild(pos); bar.appendChild(gran);
     root.appendChild(bar); root.appendChild(note);
+
+    // floating controls that follow the reader down the page
+    var float_ = document.createElement("div");
+    float_.className = "reader-float"; float_.hidden = true;
+    var fBtn = document.createElement("button");
+    fBtn.type = "button"; fBtn.className = "reader-btn reader-float-btn";
+    var fStop = document.createElement("button");
+    fStop.type = "button"; fStop.className = "reader-stop"; fStop.textContent = "Stop";
+    var fJump = document.createElement("button");
+    fJump.type = "button"; fJump.className = "reader-stop reader-jump"; fJump.textContent = "Go to text";
+    var fPos = document.createElement("span");
+    fPos.className = "reader-pos";
+    float_.appendChild(fBtn); float_.appendChild(fStop); float_.appendChild(fJump); float_.appendChild(fPos);
+    document.body.appendChild(float_);
 
     var supportsSpeech = "speechSynthesis" in window;
     var mode = null, audio = null;
-    var chunks = [], idx = 0, speaking = false, paused = false;
+    var chunks = [], units = [], idx = 0, speaking = false, paused = false;
+    var barVisible = true, userAway = false;
 
     function label(playing) {
-      btn.textContent = "";
-      var ic = document.createElement("span");
-      ic.className = "reader-ic"; ic.textContent = playing ? "❚❚" : "▶";
-      btn.appendChild(ic);
-      btn.appendChild(document.createTextNode(playing ? " Pause" : " Listen"));
+      [btn, fBtn].forEach(function (b) {
+        b.textContent = "";
+        var ic = document.createElement("span");
+        ic.className = "reader-ic"; ic.textContent = playing ? "❚❚" : "▶";
+        b.appendChild(ic);
+        b.appendChild(document.createTextNode(playing ? " Pause" : (b === btn ? " Listen" : " Play")));
+      });
       btn.classList.toggle("playing", playing);
-      stop.hidden = !playing;
+      stop.hidden = !playing && mode === null;
+      updateFloat();
+    }
+    function updateFloat() {
+      var active = mode !== null;
+      float_.hidden = !(active && !barVisible);
     }
     function clearHi() {
       chunks.forEach(function (c) { if (c.el) c.el.classList.remove("reader-reading"); });
-      clearWord();
+      clearRange("reader-word"); clearRange("reader-sentence");
     }
-    function highlight(i) {
-      clearHi();
-      if (chunks[i] && chunks[i].el) {
-        chunks[i].el.classList.add("reader-reading");
-        chunks[i].el.scrollIntoView({ block: "nearest" });
+    function highlight(ci) {
+      chunks.forEach(function (c) { if (c.el) c.el.classList.remove("reader-reading"); });
+      if (chunks[ci] && chunks[ci].el) {
+        chunks[ci].el.classList.add("reader-reading");
+        if (!userAway) chunks[ci].el.scrollIntoView({ block: "nearest" });
       }
     }
-    function showScrub(show) { range.hidden = !show; pos.hidden = !show; }
-    function setPos(text) { pos.textContent = text; }
+    function showScrub(show) { range.hidden = !show; pos.hidden = !show; gran.hidden = !show; }
+    function setPos(text) { pos.textContent = text; fPos.textContent = text; }
     function fmt(t) {
       t = Math.max(0, Math.floor(t || 0));
       return Math.floor(t / 60) + ":" + ("0" + (t % 60)).slice(-2);
     }
-    function finish() { speaking = false; paused = false; mode = null; clearHi(); note.textContent = ""; showScrub(false); label(false); }
-
-    /* ---- current-word highlight (CSS Custom Highlight API, no DOM edits) ----
-       The utterance text is the element's textContent with whitespace collapsed,
-       so a map from collapsed-text offsets back to (text node, offset) lets a
-       word boundary event place a Range over the exact word being spoken, even
-       when the word spans inline markup. Falls back silently where the API or
-       boundary events are missing. */
-    var wordApiOk = typeof window.Highlight === "function" && window.CSS && CSS.highlights;
-    var wordMap = null;
-
-    function clearWord() {
-      if (wordApiOk) CSS.highlights.delete("reader-word");
+    function finish() {
+      speaking = false; paused = false; mode = null; clearHi();
+      note.textContent = ""; showScrub(false); label(false); updateFloat();
     }
 
+    /* ---- range highlights (CSS Custom Highlight API, no DOM edits) ----
+       The utterance text is the element's textContent with whitespace
+       collapsed, so a map from collapsed offsets back to (text node, offset)
+       lets boundary events and sentence spans place Ranges over the live
+       markup, even across inline elements. Silent no-op where unsupported. */
+    var hiApiOk = typeof window.Highlight === "function" && window.CSS && CSS.highlights;
+    var mapCache = {};   // chunk index -> { text, map }
+
+    function clearRange(name) { if (hiApiOk) CSS.highlights.delete(name); }
+
     function buildWordMap(el) {
-      var map = [];       // collapsed index -> { node, offset }
-      var out = "";
-      var lastSpace = true;
+      var map = [], out = "", lastSpace = true;
       var walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
       var node;
       while ((node = walker.nextNode())) {
@@ -146,67 +200,103 @@
       if (out.charAt(out.length - 1) === " ") { out = out.slice(0, -1); map.pop(); }
       return { text: out, map: map };
     }
-
-    function highlightWord(chunkText, charIndex, charLength) {
-      if (!wordApiOk || !wordMap) return;
+    function chunkMap(ci) {
+      if (!mapCache[ci] && chunks[ci] && chunks[ci].el) mapCache[ci] = buildWordMap(chunks[ci].el);
+      return mapCache[ci] || null;
+    }
+    function setRange(name, ci, start, end) {
+      if (!hiApiOk) return;
+      var wm = chunkMap(ci);
+      if (!wm) return;
       try {
-        var end = charIndex + (charLength || 0);
-        if (!charLength) {
-          var m = /\S+/.exec(chunkText.slice(charIndex));
-          if (!m) return;
-          end = charIndex + m.index + m[0].length;
-          charIndex = charIndex + m.index;
-        }
-        if (charIndex >= wordMap.map.length) return;
-        var a = wordMap.map[charIndex];
-        var b = wordMap.map[Math.min(end, wordMap.map.length) - 1];
+        var a = wm.map[Math.max(0, Math.min(start, wm.map.length - 1))];
+        var b = wm.map[Math.max(0, Math.min(end, wm.map.length) - 1)];
         if (!a || !b) return;
         var r = document.createRange();
         r.setStart(a.node, a.offset);
         r.setEnd(b.node, b.offset + 1);
-        CSS.highlights.set("reader-word", new Highlight(r));
+        CSS.highlights.set(name, new Highlight(r));
       } catch (e) { /* never let highlighting break playback */ }
     }
+    function highlightWord(ci, absIndex, charLength, unitText, relIndex) {
+      var end = absIndex + (charLength || 0);
+      if (!charLength) {
+        var m = /\S+/.exec(unitText.slice(relIndex));
+        if (!m) return;
+        absIndex = absIndex + m.index;
+        end = absIndex + m[0].length;
+      }
+      setRange("reader-word", ci, absIndex, end);
+    }
 
-    var gen = 0; // bumped on every jump/start so stale utterance callbacks go quiet
+    function buildUnits() {
+      units = [];
+      var byСentence = gran.value === "sentence";
+      for (var ci = 0; ci < chunks.length; ci++) {
+        var text = chunks[ci].text;
+        if (!byСentence || text.length < 90) {
+          units.push({ ci: ci, start: 0, end: text.length, text: text, whole: true });
+        } else {
+          var ss = splitSentences(text);
+          for (var k = 0; k < ss.length; k++) {
+            units.push({ ci: ci, start: ss[k].start, end: ss[k].end, text: ss[k].text, whole: ss.length === 1 });
+          }
+        }
+      }
+    }
+
+    var gen = 0; // bumped on jump/start so stale utterance callbacks go quiet
 
     function speakFrom(i) {
-      if (i >= chunks.length) { finish(); return; }
-      idx = i; highlight(i); note.textContent = chunks[i].text;
-      range.value = String(i); setPos((i + 1) + " / " + chunks.length);
-      wordMap = chunks[i].el ? buildWordMap(chunks[i].el) : null;
+      if (i >= units.length) { finish(); return; }
+      idx = i;
+      var u = units[i];
+      highlight(u.ci);
+      if (!u.whole) setRange("reader-sentence", u.ci, u.start, u.end);
+      else clearRange("reader-sentence");
+      note.textContent = u.text;
+      range.value = String(i); setPos((i + 1) + " / " + units.length);
       var myGen = gen;
-      var u = new SpeechSynthesisUtterance(chunks[i].text);
-      var v = pickVoice(); if (v) u.voice = v;
-      u.onboundary = function (e) {
+      var utt = new SpeechSynthesisUtterance(u.text);
+      var v = pickVoice(); if (v) utt.voice = v;
+      utt.onboundary = function (e) {
         if (myGen !== gen) return;
         if (e.name === "word" || e.name === undefined) {
-          highlightWord(chunks[i].text, e.charIndex || 0, e.charLength || 0);
+          highlightWord(u.ci, u.start + (e.charIndex || 0), e.charLength || 0, u.text, e.charIndex || 0);
         }
       };
-      u.onend = function () {
+      utt.onend = function () {
         if (myGen !== gen) return;
-        clearWord();
+        clearRange("reader-word");
         if (speaking && !paused) speakFrom(i + 1);
       };
-      window.speechSynthesis.speak(u);
+      window.speechSynthesis.speak(utt);
     }
     function startSpeech() {
       chunks = articleChunks();
       if (!chunks.length) return;
-      speaking = true; paused = false; mode = "speech";
+      mapCache = {};
+      buildUnits();
+      speaking = true; paused = false; mode = "speech"; userAway = false;
       gen++;
       window.speechSynthesis.cancel();
-      range.max = String(chunks.length - 1);
+      range.max = String(units.length - 1);
       showScrub(true);
       label(true); speakFrom(0);
+    }
+    function jumpTo(i) {
+      gen++;
+      window.speechSynthesis.cancel();
+      paused = false; speaking = true;
+      label(true);
+      speakFrom(Math.max(0, Math.min(i, units.length - 1)));
     }
     function startAudio() {
       mode = "audio"; audio = new Audio(audioUrl);
       note.textContent = "natural narration";
       audio.addEventListener("ended", finish);
       audio.addEventListener("loadedmetadata", function () {
-        range.max = "1000"; range.value = "0"; showScrub(true);
+        range.max = "1000"; range.value = "0"; showScrub(true); gran.hidden = true;
         setPos(fmt(0) + " / " + fmt(audio.duration));
       });
       audio.addEventListener("timeupdate", function () {
@@ -218,23 +308,32 @@
     }
     range.addEventListener("input", function () {
       var v = parseInt(range.value, 10) || 0;
-      if (mode === "speech") {
-        gen++;                          // silence the in-flight utterance
-        window.speechSynthesis.cancel();
-        paused = false; speaking = true;
-        label(true);
-        speakFrom(Math.min(v, chunks.length - 1));
-      } else if (mode === "audio" && audio && audio.duration) {
+      userAway = false;
+      if (mode === "speech") jumpTo(v);
+      else if (mode === "audio" && audio && audio.duration) {
         audio.currentTime = (v / 1000) * audio.duration;
         if (audio.paused) { audio.play(); label(true); }
       }
+    });
+    gran.addEventListener("change", function () {
+      try { localStorage.setItem("reader-gran", gran.value); } catch (e) {}
+      if (mode !== "speech") return;
+      // keep the current position across the granularity switch
+      var u = units[idx] || { ci: 0, start: 0 };
+      buildUnits();
+      range.max = String(units.length - 1);
+      var target = 0;
+      for (var i = 0; i < units.length; i++) {
+        if (units[i].ci < u.ci) continue;
+        if (units[i].ci > u.ci || units[i].end > u.start) { target = i; break; }
+      }
+      jumpTo(target);
     });
     function haveAudio() {
       if (!audioUrl) return Promise.resolve(false);
       return fetch(audioUrl, { method: "HEAD" }).then(function (r) { return r.ok; }).catch(function () { return false; });
     }
-
-    btn.addEventListener("click", function () {
+    function togglePlay() {
       if (mode === "audio") {
         if (audio.paused) { audio.play(); label(true); } else { audio.pause(); label(false); }
         return;
@@ -249,12 +348,43 @@
         else if (supportsSpeech) startSpeech();
         else note.textContent = "read-aloud is not supported in this browser";
       });
-    });
-    stop.addEventListener("click", function () {
-      if (mode === "speech") window.speechSynthesis.cancel();
+    }
+    function stopAll() {
+      if (mode === "speech") { gen++; window.speechSynthesis.cancel(); }
       if (audio) { audio.pause(); audio.currentTime = 0; }
       finish();
+    }
+
+    btn.addEventListener("click", togglePlay);
+    fBtn.addEventListener("click", togglePlay);
+    stop.addEventListener("click", stopAll);
+    fStop.addEventListener("click", stopAll);
+    fJump.addEventListener("click", function () {
+      userAway = false;
+      var target = (mode === "speech" && units[idx]) ? chunks[units[idx].ci].el : bar;
+      if (target) target.scrollIntoView({ block: "center", behavior: "smooth" });
     });
+
+    // auto-scroll yields to the reader: any manual scroll intent while playing
+    // parks the follow behavior until "Go to text" or the scrubber re-engages
+    ["wheel", "touchmove"].forEach(function (ev) {
+      window.addEventListener(ev, function () { if (mode !== null) userAway = true; }, { passive: true });
+    });
+    window.addEventListener("keydown", function (e) {
+      if (mode === null) return;
+      if (["PageDown", "PageUp", "Home", "End", " ", "ArrowDown", "ArrowUp"].indexOf(e.key) >= 0) userAway = true;
+    });
+
+    // show the floating controls when the main bar leaves the viewport
+    if (window.IntersectionObserver) {
+      new IntersectionObserver(function (entries) {
+        barVisible = entries[0].isIntersecting;
+        updateFloat();
+      }, { threshold: 0 }).observe(bar);
+    } else {
+      barVisible = true;
+    }
+
     window.addEventListener("beforeunload", function () {
       if (mode === "speech") window.speechSynthesis.cancel();
     });
