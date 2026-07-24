@@ -142,9 +142,22 @@ the index.
   with Qwen2.5-0.5B), combinatorial-optimization (1426, AdamW verified
   against torch.optim to 1.5e-7). ML foundations group is complete.
   23/56 live, 0 validator errors.
-- Batch 3 in flight (wip, claimed by agents): multimodal-foundation-models,
-  applied-generative-ai, sequence-models-state-spaces,
-  advanced-systems-architecture, numerical-methods, cryptography.
+- Batch 3 hit the session usage limit mid-write. Salvage: cryptography
+  finished and is live (3819 lines, valid) and was committed as 7876c1a.
+  The other five agents died before writing a complete page. On disk after
+  the cutoff: multimodal-foundation-models and advanced-systems-architecture
+  were PARTIAL stubs (~700/650 lines, no refs/takeaway, not linked from the
+  index); applied-generative-ai, sequence-models-state-spaces, and
+  numerical-methods were MISSING. Two orphan benchmark scripts,
+  data/bench_genomics.py and data/bench_robotics.py, were dropped by killed
+  data-prep agents (kept, untracked, for the future genomics/robotics pages).
+  Note: computer-security (3930 lines, commit 0df77f3) was authored before
+  this session and is live; the earlier "11 done" count was off by one, the
+  true baseline was 12.
+- Batch 3 relaunch (wip, claimed by agents): multimodal-foundation-models
+  (overwrite stub), applied-generative-ai (new), sequence-models-state-spaces
+  (new), advanced-systems-architecture (overwrite stub), numerical-methods
+  (new). Live count is 25/56 with cryptography and computer-security counted.
 
 ### Session 1 (2026-07-23)
 
