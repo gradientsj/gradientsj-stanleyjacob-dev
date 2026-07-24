@@ -1,0 +1,1135 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Megatron-LM walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A full chapter on NVIDIA/Megatron-LM: a practical tutorial, the complete life of one GPT training step from pretrain_gpt.py through the tensor-parallel collectives and the pipeline schedule to the gradient all-reduce, deep dives on column and row parallel linear layers, sequence parallelism, interleaved pipelining, and Megatron-Core, the communication-volume arithmetic for every parallelism dimension, a staged reading plan, labs, and understanding checks." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+      <script>(function(){try{var t=localStorage.getItem("theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>Megatron-LM</h1>
+        <p class="lead">
+          <a href="https://github.com/NVIDIA/Megatron-LM" target="_blank" rel="noreferrer">Megatron-LM</a>
+          is NVIDIA's reference implementation for training transformer
+          language models at the largest scales, and the codebase where
+          several now-standard parallelism techniques were first published
+          and first shipped. This chapter is three things at once, a
+          practical guide to launching a real GPT pretraining run, a systems
+          walkthrough that follows one training step from
+          <code>pretrain_gpt.py</code> down through the tensor-parallel
+          collectives and the pipeline schedule and back up to the gradient
+          all-reduce, and a staged plan for reading the repository. The
+          load-bearing ideas are tensor parallelism with its carefully placed
+          all-reduces, pipeline parallelism with interleaving, sequence
+          parallelism, and Megatron-Core, the reusable library the rest of
+          the ecosystem builds on. It ends with runnable labs, understanding
+          checks with model answers, and the communication-volume arithmetic
+          that tells you which parallelism can cross which wire.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">torchrun --nproc_per_node=8   one process per GPU, SPMD from here on
+      |
+      v
+pretrain_gpt.py               model_provider + forward_step, then pretrain()
+      |
+      v
+megatron/training/training.py initialize_megatron, build model/opt/data, train loop
+      |
+      v
+parallel_state.py             initialize_model_parallel(tp, pp, cp, ...) builds groups
+      |                         rank order puts tp innermost (node-local), pp outermost
+      v
+GPTModel for this stage       only this rank's layers, every linear TP-sharded
+      |
+      v
+get_forward_backward_func()   no-pipeline / 1F1B / interleaved-1F1B schedule
+      |
+      |  per microbatch: forward -&gt; 2 TP all-reduces per layer -&gt; P2P to next stage
+      v
+backward                      mirrors forward, P2P activation-gradients upstream
+      |
+      v
+finalize_model_grads          DP all-reduce (or reduce-scatter), shared-embedding
+      |                         and sequence-parallel layernorm grad syncs
+      v
+optimizer.step()              distributed optimizer all-gathers updated params</pre>
+          <p>
+            The one-sentence identity: <mark>Megatron-LM is the reference
+            that showed a transformer can be split across GPUs by splitting
+            its two big matrix multiplies in complementary directions,
+            column-parallel then row-parallel, so a single all-reduce per
+            block collects the result, and then stacked that intra-layer
+            tensor parallelism with pipeline, sequence, and data parallelism
+            into a layout you choose to match your interconnect.</mark>
+            Where <a href="/oss/torchtitan">torchtitan</a> keeps the model
+            single-device and applies every parallelism from outside as a
+            transformation, Megatron takes the opposite stance. The
+            parallelism lives inside the model. A Megatron transformer block
+            is built from <code>ColumnParallelLinear</code> and
+            <code>RowParallelLinear</code> layers that already know they are
+            sharded, and the collectives are placed by hand in exactly the
+            spots the math demands. That is more invasive, and it is also why
+            Megatron has historically extracted the highest model-flops
+            utilization on NVIDIA clusters.
+          </p>
+          <p>
+            Two ideas carry the whole design. The first is that a nonlinearity
+            decides where you may shard for free. In an MLP the first
+            projection is split by columns, so each rank computes a full slice
+            of the hidden activation and can apply GeLU to it with no
+            communication, because GeLU is element-wise and never mixes
+            columns. The second projection is split by rows, which produces a
+            partial sum that one all-reduce turns into the answer. Column then
+            row means one synchronization point per block instead of two. The
+            second idea is that the four parallelism dimensions have wildly
+            different communication profiles, and the job of a good
+            configuration is to map each dimension onto a wire fast enough for
+            it. Tensor parallelism fires every layer and needs NVLink.
+            Pipeline and data parallelism fire once per microbatch or once per
+            step and tolerate Ethernet or InfiniBand between nodes. Most of
+            this chapter is teaching you to see that mapping. Everything here
+            is verified against recent main in July 2026, the repository
+            reorganized the training harness into <code>megatron/training/</code>
+            and the reusable primitives into <code>megatron/core/</code>, so
+            where a path is likely to differ on an older fork I say so.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <p>
+            Megatron-LM is a Linux-and-NVIDIA-GPUs project. The path of least
+            resistance is the NGC PyTorch container, which already has CUDA,
+            cuDNN, NCCL, Apex, and Transformer Engine built and matched:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">git</span> <span class="s">clone</span> <span class="s">https://github.com/NVIDIA/Megatron-LM</span>
+<span class="m1">cd</span> <span class="s">Megatron-LM</span>
+<span class="c"># run inside NVIDIA's PyTorch container, which ships the matched CUDA stack</span>
+<span class="m1">docker</span> <span class="s">run</span> <span class="s">--gpus</span> <span class="s">all</span> <span class="s">-it</span> <span class="s">--rm</span> <span class="s">-v</span> $<span class="v0">PWD</span><span class="s">:/workspace/megatron</span> <span class="s">\</span>
+  <span class="s">nvcr.io/nvidia/pytorch:24.05-py3</span>
+<span class="c"># the reusable library is also pip-installable on its own</span>
+<span class="m1">pip</span> <span class="s">install</span> <span class="s">megatron-core</span></code></pre></div>
+          <p>
+            The reference training scripts live at the top level
+            (<code>pretrain_gpt.py</code>, <code>pretrain_bert.py</code>,
+            <code>pretrain_t5.py</code>, plus mixture-of-experts and
+            multimodal variants), and worked examples with real
+            hyperparameters live under <code>examples/</code>. Training reads
+            a preprocessed indexed dataset rather than raw text, so the first
+            real step is tokenizing a corpus into the binary
+            <code>.bin</code> and <code>.idx</code> pair that Megatron's
+            dataset code memory-maps:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">python</span> <span class="s">tools/preprocess_data.py</span> <span class="s">\</span>
+  <span class="s">--input</span> <span class="s">my_corpus.jsonl</span> <span class="s">\</span>
+  <span class="s">--output-prefix</span> <span class="s">my-gpt2</span> <span class="s">\</span>
+  <span class="s">--tokenizer-type</span> <span class="s">GPT2BPETokenizer</span> <span class="s">\</span>
+  <span class="s">--vocab-file</span> <span class="s">gpt2-vocab.json</span> <span class="s">--merge-file</span> <span class="s">gpt2-merges.txt</span> <span class="s">\</span>
+  <span class="s">--append-eod</span> <span class="s">--workers</span> <span class="s">32</span>
+<span class="c"># produces my-gpt2_text_document.bin and my-gpt2_text_document.idx</span></code></pre></div>
+          <p>
+            A run is launched with <code>torchrun</code>, and the whole
+            configuration is command-line flags. There is no config file
+            format to learn. A small single-node example that exercises
+            tensor and sequence parallelism looks like this:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">torchrun</span> <span class="s">--nproc_per_node=8</span> <span class="s">--nnodes=1</span> <span class="s">pretrain_gpt.py</span> <span class="s">\</span>
+  <span class="s">--tensor-model-parallel-size</span> <span class="s">8</span> <span class="s">\</span>
+  <span class="s">--pipeline-model-parallel-size</span> <span class="s">1</span> <span class="s">\</span>
+  <span class="s">--sequence-parallel</span> <span class="s">\</span>
+  <span class="s">--num-layers</span> <span class="s">24</span> <span class="s">--hidden-size</span> <span class="s">2048</span> <span class="s">--num-attention-heads</span> <span class="s">16</span> <span class="s">\</span>
+  <span class="s">--seq-length</span> <span class="s">2048</span> <span class="s">--max-position-embeddings</span> <span class="s">2048</span> <span class="s">\</span>
+  <span class="s">--micro-batch-size</span> <span class="s">4</span> <span class="s">--global-batch-size</span> <span class="s">256</span> <span class="s">\</span>
+  <span class="s">--train-iters</span> <span class="s">500000</span> <span class="s">--lr</span> <span class="s">1.5e-4</span> <span class="s">--min-lr</span> <span class="s">1e-5</span> <span class="s">\</span>
+  <span class="s">--lr-decay-style</span> <span class="s">cosine</span> <span class="s">--weight-decay</span> <span class="s">0.1</span> <span class="s">--clip-grad</span> <span class="s">1.0</span> <span class="s">\</span>
+  <span class="s">--data-path</span> <span class="s">my-gpt2_text_document</span> <span class="s">\</span>
+  <span class="s">--vocab-file</span> <span class="s">gpt2-vocab.json</span> <span class="s">--merge-file</span> <span class="s">gpt2-merges.txt</span> <span class="s">\</span>
+  <span class="s">--use-distributed-optimizer</span> <span class="s">--bf16</span></code></pre></div>
+          <p>
+            The parallelism dimensions are the first three flags.
+            <code>--tensor-model-parallel-size</code> is the TP degree,
+            <code>--pipeline-model-parallel-size</code> is the PP degree, and
+            <code>--sequence-parallel</code> turns on sequence parallelism,
+            which is only legal when TP is greater than one because it rides
+            on the tensor-parallel group. Data parallelism is the remainder,
+            world size divided by the product of the model-parallel degrees,
+            and Megatron fills it in automatically. To move from this toy to a
+            multi-node run you change <code>--nnodes</code>, add a rendezvous
+            endpoint, and grow the degrees so their product still divides the
+            world size.
+          </p>
+          <p>
+            The model itself is assembled from parallel layers. You rarely
+            write them directly, the transformer block does, but seeing them
+            is the fastest way to understand what tensor parallelism actually
+            is. A Megatron MLP is essentially this:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">megatron</span>.<span class="m2">core</span>.<span class="m2">tensor_parallel</span> <span class="k">import</span> <span class="m1">ColumnParallelLinear</span>, <span class="m1">RowParallelLinear</span>
+
+<span class="k">class</span> <span class="m1">ParallelMLP</span><span class="b0">(</span><span class="m1">nn</span>.<span class="m1">Module</span><span class="b0">)</span>:
+    <span class="k">def</span> <span class="m1">__init__</span><span class="b0">(</span><span class="k">self</span>, <span class="v4">config</span><span class="b0">)</span>:
+        <span class="m1">super</span><span class="b0">()</span>.<span class="m1">__init__</span><span class="b0">()</span>
+        <span class="c"># first projection: split the ffn (output) dimension across TP ranks</span>
+        <span class="k">self</span>.<span class="m2">fc1</span> = <span class="m1">ColumnParallelLinear</span><span class="b0">(</span>
+            <span class="v4">config</span>.<span class="m2">hidden_size</span>, <span class="v4">config</span>.<span class="m2">ffn_hidden_size</span>,
+            <span class="v4">config</span>=<span class="v4">config</span>, <span class="v3">gather_output</span>=<span class="k">False</span>,   <span class="c"># keep the output sharded</span>
+            <span class="v4">bias</span>=<span class="k">True</span>, <span class="v0">skip_bias_add</span>=<span class="k">True</span>,
+        <span class="b0">)</span>
+        <span class="c"># second projection: split the ffn (input) dimension across TP ranks</span>
+        <span class="k">self</span>.<span class="m2">fc2</span> = <span class="m1">RowParallelLinear</span><span class="b0">(</span>
+            <span class="v4">config</span>.<span class="m2">ffn_hidden_size</span>, <span class="v4">config</span>.<span class="m2">hidden_size</span>,
+            <span class="v4">config</span>=<span class="v4">config</span>, <span class="v2">input_is_parallel</span>=<span class="k">True</span>, <span class="c"># input is already sharded</span>
+            <span class="v4">bias</span>=<span class="k">True</span>, <span class="v0">skip_bias_add</span>=<span class="k">True</span>,
+        <span class="b0">)</span>
+
+    <span class="k">def</span> <span class="m1">forward</span><span class="b0">(</span><span class="k">self</span>, <span class="v4">x</span><span class="b0">)</span>:
+        <span class="v6">y</span>, <span class="v4">_</span> = <span class="k">self</span>.<span class="m2">fc1</span><span class="b0">(</span><span class="v4">x</span><span class="b0">)</span>   <span class="c"># f operator: identity forward, all-reduce in backward</span>
+        <span class="v6">y</span> = <span class="m1">gelu</span><span class="b0">(</span><span class="v6">y</span><span class="b0">)</span>          <span class="c"># element-wise on a column shard, no communication</span>
+        <span class="v0">z</span>, <span class="v4">_</span> = <span class="k">self</span>.<span class="m2">fc2</span><span class="b0">(</span><span class="v6">y</span><span class="b0">)</span>   <span class="c"># g operator: all-reduce forward, identity in backward</span>
+        <span class="k">return</span> <span class="v0">z</span></code></pre></div>
+          <p>
+            Now the mistakes people make. First,
+            <code>--sequence-parallel</code> without <code>--tensor-model-parallel-size</code>
+            greater than one is either rejected or a silent no-op depending on
+            the version, because sequence parallelism shards the same regions
+            the tensor-parallel group owns. Second, the degrees have divisibility
+            rules that are easy to trip. The number of attention heads must be
+            divisible by the tensor-parallel size, because heads are what TP
+            splits, and the number of transformer layers must be divisible by
+            the pipeline-parallel size, and when interleaving is on it must be
+            divisible again by the number of virtual stages. Third, batch-size
+            confusion. <code>--micro-batch-size</code> is what one pipeline
+            stage processes at a time, <code>--global-batch-size</code> is the
+            optimizer-step batch summed over all data-parallel ranks and
+            microbatches, and the number of microbatches is the global batch
+            divided by the microbatch size divided by the data-parallel degree.
+            Set a global batch that is not divisible by that product and startup
+            fails with an assertion. Fourth, and most consequential:
+            <mark>if your tensor-parallel group spans two nodes, the every-layer
+            all-reduces cross the slow link and step time collapses, with no
+            error to tell you why.</mark> Keep TP inside a node.
+          </p>
+
+          <h2>Part III: When it is the right tool</h2>
+          <p>
+            Megatron-LM is the right tool when you are pretraining large
+            transformers on NVIDIA hardware and want the configuration that
+            squeezes the most model-flops utilization out of the cluster,
+            including the last few percent that come from Transformer Engine
+            kernels and FP8 on Hopper and Blackwell, communication-computation
+            overlap, and a distributed optimizer tuned over years of
+            trillion-token runs. It is also the substrate under a good deal of
+            the ecosystem. NVIDIA NeMo builds its LLM training on Megatron-Core,
+            and many frontier-lab stacks either use it directly or borrow its
+            tensor-parallel layout wholesale. If your goal is peak throughput on
+            a known GPU fleet, this is the honest default.
+          </p>
+          <p>
+            The honest cases for alternatives. <a href="/oss/torchtitan">torchtitan</a>
+            when you want a smaller, PyTorch-native codebase you can read in an
+            afternoon, where every parallelism is applied to a plain model from
+            outside via DTensor, and portability across hardware and clean
+            composition matter more than the last percent of MFU. DeepSpeed when
+            you are invested in its ZeRO sharding and its Hugging Face
+            integration, or when CPU and NVMe offload for fitting a model on
+            modest hardware is the point. Ordinary fine-tuning stacks when you
+            are adapting an existing checkpoint rather than pretraining, which is
+            a different problem with different defaults. The trade Megatron asks
+            you to accept is that it owns your model code. You express a model as
+            Megatron parallel layers and specs, not as a plain
+            <a href="/oss/nanogpt">nanoGPT</a>-style module, and the reward for
+            that coupling is control over exactly where every collective fires.
+          </p>
+          <p>
+            The architecture-shaped warning is the same one that governs every
+            multi-dimensional trainer, and Megatron is where it was first
+            written down clearly. Match each parallelism to the interconnect it
+            can survive on. Tensor and sequence parallelism communicate inside
+            every layer and only tolerate NVLink-class bandwidth. Pipeline and
+            data parallelism communicate far less often and tolerate the network
+            between nodes. Composing them in the wrong orientation is the
+            classic scaling failure of this domain:
+          </p>
+          <pre class="flow">dangerous:  TP group spans nodes
+   node0 [g0 g1 g2 g3] --InfiniBand/Ethernet-- node1 [g4 g5 g6 g7]
+            &lt;----- TP all-reduces cross the slow link, twice per layer ----&gt;
+
+safe:       TP inside the node, PP/DP across nodes
+   node0 [g0 g1 g2 g3]  = one TP group of 4 on NVLink
+   node1 [g4 g5 g6 g7]  = another TP group of 4 on NVLink
+            &lt;-- only pipeline P2P or the once-per-step DP all-reduce cross --&gt;</pre>
+          <p>
+            Megatron's rank ordering is built to make the safe layout the
+            default. <code>initialize_model_parallel</code> in
+            <code>parallel_state.py</code> lays ranks out with the
+            tensor-parallel dimension innermost, so consecutive ranks on one
+            node form a TP group, and the pipeline dimension outermost, so
+            pipeline stages sit on different nodes. Nothing stops a bad degree
+            choice from spilling a TP group across a node boundary, and the
+            symptom is simply catastrophic step time.
+          </p>
+
+          <h2>Part IV: The full life of one training step</h2>
+          <p>
+            The specimen is one step of a GPT model launched with the
+            <code>pretrain_gpt.py</code> command above, on a mesh that has
+            tensor, pipeline, and data parallelism all greater than one. Most
+            of the path runs identically with only one dimension active, and
+            where it forks I follow the interesting branch.
+          </p>
+
+          <h3>Stage 1: torchrun and pretrain_gpt.py</h3>
+          <p>
+            <code>torchrun</code> spawns one process per GPU and sets
+            <code>RANK</code>, <code>LOCAL_RANK</code>, and
+            <code>WORLD_SIZE</code>. From here everything is SPMD, the same
+            program on every rank. <code>pretrain_gpt.py</code> is short. It
+            defines a <code>model_provider</code> that returns a
+            <code>GPTModel</code>, a <code>forward_step</code> that reads a
+            batch and returns the loss, and then hands both to
+            <code>pretrain(...)</code>, the driver in
+            <code>megatron/training/training.py</code> (on older forks this
+            lived at <code>megatron/training.py</code>). Nothing about the
+            model is built yet.
+          </p>
+
+          <h3>Stage 2: initialize_megatron and the process groups</h3>
+          <p>
+            <code>pretrain</code> first calls <code>initialize_megatron</code>,
+            which parses the hundreds of flags in
+            <code>megatron/training/arguments.py</code> into a single args
+            object, seeds RNGs, and calls
+            <code>initialize_model_parallel</code> in
+            <code>megatron/core/parallel_state.py</code>. This is the step that
+            turns a flat list of ranks into a grid. It creates the NCCL process
+            groups for each dimension, the tensor-model-parallel group, the
+            pipeline-model-parallel group, the data-parallel group, and, when
+            enabled, context-parallel and expert-parallel groups, and it stores
+            them behind accessors like
+            <code>get_tensor_model_parallel_group()</code> and
+            <code>get_pipeline_model_parallel_group()</code> that the rest of
+            the code reaches for. The rank ordering here is what puts TP inside
+            a node and PP across nodes, and it is configurable through an order
+            string for exotic topologies. <mark>The parallel layers never take a
+            process group as an argument, they ask
+            <code>parallel_state</code> for the right one, which is how a single
+            <code>ColumnParallelLinear</code> can be dropped into any model and
+            still shard along the correct axis.</mark>
+          </p>
+
+          <h3>Stage 3: building only this rank's slice of the model</h3>
+          <p>
+            <code>model_provider</code> now builds a <code>GPTModel</code>
+            (<code>megatron/core/models/gpt/gpt_model.py</code>), but not the
+            whole thing. Pipeline parallelism means each rank constructs only
+            the transformer layers assigned to its stage, so the first stage
+            holds the input embedding and the early blocks, the last stage
+            holds the final norm and the output projection, and the middle
+            stages hold only blocks. Within a stage, every linear is a parallel
+            layer sharded across the tensor-model-parallel group, the attention
+            heads split across TP, the MLP hidden dimension split across TP, and
+            the vocabulary embedding split by
+            <code>VocabParallelEmbedding</code>. The concrete layer is chosen by
+            a spec (<code>megatron/core/models/gpt/gpt_layer_specs.py</code>),
+            which selects either Transformer Engine modules for fused,
+            FP8-capable kernels or the local pure-PyTorch modules, so the same
+            model definition runs with or without Transformer Engine. Weights
+            are initialized so that each rank holds exactly its shard, and no
+            rank ever allocates the full model.
+          </p>
+
+          <h3>Stage 4: the data, and the forward-backward schedule</h3>
+          <p>
+            The optimizer, learning-rate schedule, and the indexed dataset and
+            its dataloader are built, then the loop in
+            <code>train()</code> begins. Each iteration first pulls a global
+            batch and splits it into microbatches. Only the first and last
+            pipeline stages actually need the tokens, and within a
+            tensor-parallel group the data is broadcast from one rank so every
+            TP rank sees the same input. The step is then handed to the
+            schedule returned by <code>get_forward_backward_func()</code> in
+            <code>megatron/core/pipeline_parallel/schedules.py</code>, which is
+            one of three functions. With no pipeline parallelism it is a plain
+            loop over microbatches. With pipeline parallelism it is
+            <code>forward_backward_pipelining_without_interleaving</code>, the
+            1F1B schedule, and when virtual stages are configured it is
+            <code>forward_backward_pipelining_with_interleaving</code>. The
+            schedule owns the choreography of which microbatch runs forward,
+            which runs backward, and when each stage sends or receives.
+          </p>
+
+          <h3>Stage 5: what fires inside one layer's forward</h3>
+          <p>
+            Follow one microbatch through one transformer block on a middle
+            stage. The activation arrives from the previous stage over a P2P
+            receive. Inside attention, the QKV projection is a
+            <code>ColumnParallelLinear</code>, so each TP rank computes Q, K,
+            and V for its own subset of heads with no communication. Attention
+            runs locally per head. The output projection is a
+            <code>RowParallelLinear</code>, which produces a partial sum that
+            the <code>g</code> operator all-reduces across the tensor-parallel
+            group to give the true attention output. The MLP repeats the
+            pattern, column-parallel up-projection, element-wise GeLU on the
+            shard with no communication, row-parallel down-projection closed by
+            a second all-reduce. So one block forward fires two all-reduces on
+            the TP group. If sequence parallelism is on, each of those
+            all-reduces is instead an all-gather entering the tensor-parallel
+            region and a reduce-scatter leaving it, which moves the same number
+            of bytes but keeps the layernorm and dropout activations sharded
+            along the sequence dimension to save memory. After the block, the
+            output is sent by P2P to the next stage.
+          </p>
+
+          <h3>Stage 6: the backward pass and the mirror collectives</h3>
+          <p>
+            When the schedule runs a microbatch backward, every collective from
+            the forward pass appears transposed. The <code>f</code> operator,
+            which was identity in the forward, all-reduces the input gradient of
+            each column-parallel layer so that gradient is correct across the
+            TP group. The row-parallel layer's <code>g</code>, which all-reduced
+            in the forward, is identity in the backward. Activation gradients
+            flow upstream between pipeline stages over P2P sends, the reverse of
+            the forward P2P. In the 1F1B schedule these forwards and backwards
+            are interleaved so that a stage does one microbatch forward, then
+            one microbatch backward, keeping at most a pipeline-depth of
+            activations alive at once instead of all of them, which is the
+            memory win over an all-forward-then-all-backward GPipe schedule.
+          </p>
+
+          <h3>Stage 7: finalize_model_grads, the grads nobody sees coming</h3>
+          <p>
+            After the schedule drains, gradients are local to each
+            model-parallel rank and still need three separate reductions,
+            handled together in
+            <code>megatron/core/distributed/finalize_model_grads.py</code>. The
+            big one is the data-parallel reduction, an all-reduce of every
+            gradient across the data-parallel group so every replica agrees, or
+            a reduce-scatter when the distributed optimizer is on. The subtle
+            two are the reason reference implementations exist. First, GPT ties
+            the input embedding and the output projection to the same weight,
+            but those two uses live on the first and last pipeline stages, so
+            their gradients must be all-reduced between just those two stages
+            (unless <code>--untie-embeddings-and-output-weights</code> is set).
+            Second, with sequence parallelism the layernorm parameters are
+            duplicated across the tensor-parallel group, yet each rank computed
+            its gradient from a different sequence shard, so those gradients
+            must be all-reduced across the TP group. <mark>Miss either of these
+            and the model trains, slowly diverging, with no crash to point at,
+            which is exactly the class of bug a battle-tested trainer earns its
+            keep by getting right.</mark>
+          </p>
+
+          <h3>Stage 8: the optimizer step and the distributed optimizer</h3>
+          <p>
+            With gradients finalized, <code>optimizer.step()</code> runs. The
+            gradient norm is computed across every model-parallel dimension and
+            clipped, then AdamW updates the parameters. When
+            <code>--use-distributed-optimizer</code> is set
+            (<code>megatron/core/optimizer/distrib_optimizer.py</code>), the
+            optimizer states and the fp32 master parameters are sharded across
+            the data-parallel group in the style of ZeRO stage one, so each rank
+            updates only its slice, then an all-gather rebuilds the full
+            updated parameters on every rank for the next forward. That trades a
+            plain gradient all-reduce for a reduce-scatter plus an all-gather of
+            equal total volume, in exchange for dividing optimizer memory by the
+            data-parallel degree. Overlap flags like
+            <code>--overlap-grad-reduce</code> and
+            <code>--overlap-param-gather</code> hide that traffic under the
+            backward and the next forward. The learning-rate schedule advances,
+            metrics are logged, and a checkpoint is written on interval into a
+            per-rank sharded format, with a distributed format that supports
+            resharding across a different parallel layout. That closes one step,
+            tokens in, gradients reduced across three groups, updated weights
+            gathered, bytes out.
+          </p>
+
+          <h2>Part V: Internals deep dives</h2>
+
+          <h3>Deep dive: tensor parallelism and the f and g operators</h3>
+          <p>
+            Tensor parallelism is the original Megatron idea, from the 2019
+            paper, and it rests on two conjugate operators that the code calls
+            <code>f</code> and <code>g</code>. They live in
+            <code>megatron/core/tensor_parallel/mappings.py</code> as
+            autograd functions, and in essence they are this:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="c"># conceptual, megatron/core/tensor_parallel/mappings.py</span>
+<span class="k">class</span> <span class="m1">_CopyToModelParallelRegion</span><span class="b0">(</span><span class="m1">torch</span>.<span class="m1">autograd</span>.<span class="m1">Function</span><span class="b0">)</span>:     <span class="c"># f</span>
+    <span class="m1">@staticmethod</span>
+    <span class="k">def</span> <span class="m1">forward</span><span class="b0">(</span><span class="v0">ctx</span>, <span class="v4">x</span><span class="b0">)</span>:
+        <span class="k">return</span> <span class="v4">x</span>                          <span class="c"># identity in the forward</span>
+    <span class="m1">@staticmethod</span>
+    <span class="k">def</span> <span class="m1">backward</span><span class="b0">(</span><span class="v0">ctx</span>, <span class="v4">grad</span><span class="b0">)</span>:
+        <span class="k">return</span> <span class="m1">_all_reduce</span><span class="b0">(</span><span class="v4">grad</span><span class="b0">)</span>          <span class="c"># all-reduce the gradient</span>
+
+<span class="k">class</span> <span class="m1">_ReduceFromModelParallelRegion</span><span class="b0">(</span><span class="m1">torch</span>.<span class="m1">autograd</span>.<span class="m1">Function</span><span class="b0">)</span>: <span class="c"># g</span>
+    <span class="m1">@staticmethod</span>
+    <span class="k">def</span> <span class="m1">forward</span><span class="b0">(</span><span class="v0">ctx</span>, <span class="v4">x</span><span class="b0">)</span>:
+        <span class="k">return</span> <span class="m1">_all_reduce</span><span class="b0">(</span><span class="v4">x</span><span class="b0">)</span>             <span class="c"># all-reduce the activation</span>
+    <span class="m1">@staticmethod</span>
+    <span class="k">def</span> <span class="m1">backward</span><span class="b0">(</span><span class="v0">ctx</span>, <span class="v4">grad</span><span class="b0">)</span>:
+        <span class="k">return</span> <span class="v4">grad</span>                       <span class="c"># identity in the backward</span></code></pre></div>
+          <p>
+            <code>ColumnParallelLinear</code> wraps its input in <code>f</code>
+            and returns a sharded output. <code>RowParallelLinear</code> takes a
+            sharded input and wraps its output in <code>g</code>. Chain a
+            column-parallel layer into a row-parallel layer and you get exactly
+            one all-reduce in the forward, from <code>g</code>, and exactly one
+            in the backward, from <code>f</code>. The ordering is the whole
+            trick. Splitting the first matrix by columns means the nonlinearity
+            between the two matrices acts on independent columns and needs no
+            communication, so the only synchronization is at the block's output.
+            Do it the other way, row-parallel first, and you would have to
+            all-reduce before the nonlinearity, doubling the collectives. The
+            attention block uses the same pairing, the QKV projection is
+            column-parallel and splits the heads, the output projection is
+            row-parallel and closes with the all-reduce.
+          </p>
+          <table>
+            <tr><th>Layer</th><th>Weight split</th><th>Forward collective</th><th>Backward collective</th></tr>
+            <tr><td>ColumnParallelLinear</td><td>by output columns</td><td>none (output stays sharded)</td><td>all-reduce input grad (f)</td></tr>
+            <tr><td>RowParallelLinear</td><td>by input rows</td><td>all-reduce output (g)</td><td>none</td></tr>
+            <tr><td>Attention block</td><td>heads across TP</td><td>1 all-reduce (output proj)</td><td>1 all-reduce (QKV input)</td></tr>
+            <tr><td>MLP block</td><td>ffn dim across TP</td><td>1 all-reduce (fc2)</td><td>1 all-reduce (fc1)</td></tr>
+          </table>
+          <p>
+            So a transformer layer under tensor parallelism performs four
+            all-reduces per step, two in the forward and two in the backward,
+            each on an activation of shape (microbatch, sequence, hidden). Two
+            more details close the loop. The vocabulary embedding is split
+            across TP by <code>VocabParallelEmbedding</code>, each rank owns a
+            slice of the vocabulary and masks tokens outside its range, and the
+            partial embeddings are all-reduced. And the loss uses
+            <code>vocab_parallel_cross_entropy</code> in
+            <code>megatron/core/tensor_parallel/cross_entropy.py</code>, which
+            computes the softmax denominator by all-reducing only the per-row
+            max and sum across the TP group rather than gathering the full
+            logits, so the enormous vocabulary-by-batch logit tensor never has
+            to be materialized on one rank. That is a small idea with a large
+            memory payoff, and it is the kind of thing you only get from a
+            trainer that owns its model.
+          </p>
+
+          <h3>Deep dive: sequence parallelism, memory for free</h3>
+          <p>
+            Plain tensor parallelism shards the linear layers but not the
+            regions between them. The layernorms, the dropouts, and the
+            residual adds run on the full, unsharded activation, replicated
+            identically on every TP rank. For long sequences that replicated
+            activation is a large fraction of the memory budget, and it is
+            pure waste since every rank holds the same bytes. Sequence
+            parallelism, from the 2022 activation-recomputation paper, shards
+            those regions along the sequence dimension instead. Rank zero holds
+            the first slice of sequence positions, rank one the next, and so on,
+            for the parts of the block that act pointwise along the sequence.
+          </p>
+          <p>
+            The elegant part is what happens at the boundary between a
+            sequence-parallel region and a tensor-parallel region.
+            <mark>A ring all-reduce is exactly a reduce-scatter followed by an
+            all-gather, so Megatron replaces the tensor-parallel all-reduce with
+            those two halves and places one at each boundary, moving the same
+            total bytes while keeping the between-layer activations sharded.</mark>
+            Entering the tensor-parallel region you all-gather the
+            sequence-sharded activation into the full activation the linear
+            needs. Leaving it you reduce-scatter back to a sequence shard. The
+            operators for this live alongside <code>f</code> and <code>g</code>
+            in <code>mappings.py</code> as
+            <code>gather_from_sequence_parallel_region</code> and
+            <code>reduce_scatter_to_sequence_parallel_region</code>. The bandwidth
+            bill is identical to tensor parallelism, and the reward is that the
+            layernorm and dropout activations, and the activations you stash for
+            the backward pass, are divided by the tensor-parallel degree. This
+            is why sequence parallelism is almost always on whenever tensor
+            parallelism is, and why the flag is coupled to it.
+          </p>
+          <p>
+            Its companion is selective activation recomputation. Full
+            recomputation reruns an entire layer in the backward pass to avoid
+            storing its activations, trading compute for memory. Megatron
+            observed that the attention softmax and its dropout are cheap in
+            flops but expensive in stored activations, so selective
+            recomputation stores everything except that region and recomputes
+            only the softmax path. You get most of the memory saving for a small
+            fraction of the recompute cost. The flags are
+            <code>--recompute-activations</code> for the selective policy and
+            <code>--recompute-granularity full --recompute-method uniform</code>
+            for the heavier full policy.
+          </p>
+
+          <h3>Deep dive: pipeline parallelism and interleaving</h3>
+          <p>
+            Pipeline parallelism splits the stack of transformer layers into
+            contiguous stages, one group of layers per pipeline rank, and streams
+            microbatches through them like an assembly line. The cost is the
+            bubble, the idle time while the pipeline fills at the start of a step
+            and drains at the end. With <code>p</code> stages and <code>m</code>
+            microbatches the fraction of time spent in the bubble is
+            <code>(p - 1) / m</code>, which is why you want many more microbatches
+            than stages. The naive GPipe schedule runs all forwards then all
+            backwards, which needs enough memory to hold <code>m</code>
+            microbatches of activations. Megatron's default is 1F1B, one forward
+            one backward, in
+            <code>forward_backward_pipelining_without_interleaving</code>, which
+            reaches a steady state where each stage alternates a forward and a
+            backward and keeps only about <code>p</code> microbatches of
+            activations alive. Same bubble, far less memory.
+          </p>
+          <pre class="flow">1F1B on 4 stages, time flows right, F=forward B=backward of a microbatch
+
+stage0  F1 F2 F3 F4 B1 F5 B2 F6 B3 ...        fills, then steady 1F1B, then drains
+stage1     F1 F2 F3 B1 F4 B2 F5 B3 ...
+stage2        F1 F2 B1 F3 B2 F4 B3 ...
+stage3           F1 B1 F2 B2 F3 B3 ...         last stage starts backward first
+              &lt;-- fill bubble --&gt;&lt;-- steady --&gt;</pre>
+          <p>
+            Interleaving attacks the bubble directly. Instead of giving each
+            device one contiguous block of layers, give it several
+            non-contiguous chunks, called virtual pipeline stages or model
+            chunks. With <code>v</code> chunks per device the bubble fraction
+            shrinks to <code>(p - 1) / (v * m)</code>, because the pipeline fills
+            and drains in smaller increments. The price is that pipeline P2P
+            communication grows by a factor of <code>v</code>, since a
+            microbatch now visits each device <code>v</code> times per direction
+            instead of once. That is a good trade when the P2P links have
+            headroom and the bubble is your bottleneck. The interleaved schedule
+            is <code>forward_backward_pipelining_with_interleaving</code>, and it
+            is turned on with <code>--num-layers-per-virtual-pipeline-stage</code>,
+            which sets how many layers each chunk holds and therefore how many
+            chunks there are. Megatron also ships newer low-bubble schedules in
+            the same module, but 1F1B and interleaved 1F1B are the two you must
+            understand first. The point of pipeline parallelism, unlike tensor
+            parallelism, is that stages only exchange the boundary activation
+            once per microbatch over point-to-point sends, so it tolerates the
+            slower links between nodes, which is why it sits on the outer mesh
+            axis.
+          </p>
+
+          <h3>Deep dive: the communication-volume arithmetic</h3>
+          <p>
+            This is the calculation that decides every real configuration. Let
+            <code>b</code> be the microbatch size, <code>s</code> the sequence
+            length, <code>h</code> the hidden size, <code>L</code> the number of
+            layers, <code>P</code> the parameter count, <code>m</code> the number
+            of microbatches, and <code>t</code>, <code>p</code>, <code>d</code>
+            the tensor, pipeline, and data-parallel degrees. A bandwidth-optimal
+            ring all-reduce of a message of <code>M</code> elements moves about
+            <code>2(t - 1)/t * M</code> elements of traffic per GPU, since it is
+            a reduce-scatter of <code>(t-1)/t * M</code> followed by an
+            all-gather of the same. With that, each dimension's per-GPU
+            communication per step is:
+          </p>
+          <table>
+            <tr><th>Dimension</th><th>What crosses</th><th>Volume per GPU</th><th>Fires</th><th>Wire</th></tr>
+            <tr><td>Tensor (TP)</td><td>activations, b·s·h</td><td>~ 8·L·(t−1)/t · b·s·h per microbatch</td><td>every layer, both passes</td><td>NVLink</td></tr>
+            <tr><td>Sequence (SP)</td><td>activations, b·s·h</td><td>same total as TP (all-reduce split in two)</td><td>every layer</td><td>NVLink</td></tr>
+            <tr><td>Pipeline (PP)</td><td>boundary act/grad, b·s·h</td><td>~ 2·m · b·s·h  (× v with interleaving)</td><td>once per microbatch, P2P</td><td>inter-node ok</td></tr>
+            <tr><td>Data (DP)</td><td>gradients, P params</td><td>~ 2(d−1)/d · P</td><td>once per step, all-reduce</td><td>inter-node ok</td></tr>
+          </table>
+          <p>
+            Read the shapes of these formulas, not the constants. Tensor
+            parallelism scales with the activation size <code>b·s·h</code> and
+            fires four all-reduces in every one of <code>L</code> layers, so it
+            is by far the heaviest and most frequent traffic, and it is the only
+            dimension whose volume grows with sequence length. That is the
+            arithmetic reason TP must live on NVLink and stay inside a node,
+            usually at degree eight or less. Sequence parallelism moves the same
+            bytes as TP, so it changes memory, not bandwidth. Pipeline
+            parallelism moves one boundary activation per microbatch and does
+            not scale with <code>L</code> at all, so its volume is smaller by
+            roughly the number of layers per stage and it is point-to-point, which
+            is why it happily crosses node boundaries, and its real cost is the
+            bubble rather than the bytes. Data parallelism moves the parameter
+            count once per step, independent of batch or sequence, so it is
+            cheap per token when microbatches are large and it also tolerates
+            inter-node links. <mark>Stack the dimensions so the heaviest, most
+            frequent traffic sits on the fastest wire, TP innermost on NVLink,
+            then PP and DP across the network, and you have the entire art of
+            configuring Megatron in one sentence.</mark>
+          </p>
+
+          <h3>Deep dive: Megatron-Core as a reusable library</h3>
+          <p>
+            Early Megatron-LM was a monolithic training script. The important
+            structural change over the last few years was carving the reusable
+            primitives out into <code>megatron/core</code>, published as the
+            pip-installable <code>megatron-core</code> package, while the
+            top-level scripts and <code>megatron/training</code> became a
+            reference harness that consumes it. The split matters because
+            Megatron-Core is what NeMo and many other stacks actually depend on,
+            and it is the part worth learning even if you never run
+            <code>pretrain_gpt.py</code>.
+          </p>
+          <p>
+            Its shape is worth memorizing.
+            <code>megatron/core/parallel_state.py</code> owns every process
+            group and is the single source of truth for who talks to whom.
+            <code>megatron/core/tensor_parallel/</code> holds the parallel
+            linear layers, the vocab-parallel embedding and cross entropy, and
+            the <code>f</code> and <code>g</code> mappings.
+            <code>megatron/core/pipeline_parallel/</code> holds the schedules and
+            the P2P communication. <code>megatron/core/transformer/</code> holds
+            the building blocks, the transformer block and layer, attention, and
+            MLP, along with the <code>TransformerConfig</code> dataclass that
+            every one of them reads. <code>megatron/core/models/</code> assembles
+            those blocks into concrete models like <code>GPTModel</code>.
+            <code>megatron/core/distributed/</code> holds the data-parallel
+            wrapper and the gradient finalization, and
+            <code>megatron/core/optimizer/</code> holds the distributed
+            optimizer.
+          </p>
+          <p>
+            The pattern that ties it together is the spec, or
+            <code>ModuleSpec</code>. Rather than hard-coding which attention or
+            norm class a layer uses, Megatron-Core describes a layer as a spec, a
+            small record naming the submodule classes and their arguments, and a
+            <code>build_module</code> helper instantiates it. That is how the
+            same <code>GPTModel</code> can be built from Transformer Engine
+            modules for fused FP8 kernels or from local PyTorch modules for
+            portability, by passing a different spec, without forking the model.
+            <mark>The spec system is Megatron-Core's answer to the tension it
+            lives with, deep coupling between the model and the parallelism, made
+            tolerable by making the coupling declarative and swappable.</mark> If
+            torchtitan's lesson is that layout can be a property of the tensor,
+            Megatron-Core's is that when the model must know about its own
+            parallelism, the least you can do is make that knowledge a small,
+            named, replaceable specification.
+          </p>
+
+          <h2>Part VI: Reading the repository</h2>
+          <p>
+            The repository is large, but the path through it is short if you
+            follow the layers of parallelism rather than the directory listing.
+            Paths are given as they sit on recent main, and the training harness
+            versus core split is the one reorganization to keep in mind.
+          </p>
+          <p>
+            <strong>Stage 0, orientation.</strong> Read the top-level
+            <code>README.md</code>, then <code>pretrain_gpt.py</code>, then one
+            script under <code>examples/</code> with real numbers. Questions to
+            hold. What are the three parts a pretraining script must supply, and
+            which flags set the parallelism degrees, and where does the world
+            size get divided among them.
+          </p>
+          <p>
+            <strong>Stage 1, the process groups.</strong> Read
+            <code>megatron/core/parallel_state.py</code>, specifically
+            <code>initialize_model_parallel</code> and the accessor functions.
+            Questions. How does the rank ordering keep tensor parallelism inside
+            a node, what groups exist, and how does a layer far away in the code
+            get the right group without being handed one.
+          </p>
+          <p>
+            <strong>Stage 2, tensor parallelism.</strong> Read
+            <code>megatron/core/tensor_parallel/layers.py</code> for
+            <code>ColumnParallelLinear</code>, <code>RowParallelLinear</code>,
+            and <code>VocabParallelEmbedding</code>, then
+            <code>mappings.py</code> for <code>f</code> and <code>g</code>, then
+            <code>cross_entropy.py</code>. Questions. Why column then row, where
+            exactly does the all-reduce sit in each layer, and how does the
+            vocab-parallel cross entropy avoid gathering the full logits.
+          </p>
+          <p>
+            <strong>Stage 3, the transformer and the specs.</strong> Read
+            <code>megatron/core/transformer/</code>, the transformer block and
+            layer, <code>attention.py</code>, <code>mlp.py</code>, and
+            <code>transformer_config.py</code>, then the GPT model and its layer
+            specs under <code>megatron/core/models/gpt/</code>. Questions. How is
+            a block assembled from parallel layers, what does a spec name, and
+            how does swapping the spec swap Transformer Engine for local modules.
+          </p>
+          <p>
+            <strong>Stage 4, pipeline parallelism.</strong> Read
+            <code>megatron/core/pipeline_parallel/schedules.py</code>, the three
+            forward-backward functions, and
+            <code>p2p_communication.py</code>. Questions. What does 1F1B keep
+            alive that GPipe does not, how does interleaving change the bubble and
+            the communication, and which ranks compute the loss.
+          </p>
+          <p>
+            <strong>Stage 5, gradients, the optimizer, and the harness.</strong>
+            Read <code>megatron/core/distributed/finalize_model_grads.py</code>,
+            <code>megatron/core/optimizer/distrib_optimizer.py</code>, and then
+            <code>megatron/training/training.py</code> to see
+            <code>train_step</code> tie it together. Questions. What are the three
+            gradient reductions and why does each exist, what does the distributed
+            optimizer shard, and where in the step do the overlap flags hide their
+            traffic.
+          </p>
+          <p>
+            Where not to start. The mixture-of-experts path adds expert
+            parallelism and its own token-routing collectives, a second grid on
+            top of the dense story, and it will only confuse a first read. The
+            Transformer Engine and FP8 internals, the userbuffers-based TP
+            communication overlap, and the multimodal and retrieval models are all
+            worth knowing later and noise at the start. Read the dense GPT path
+            end to end first.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            Lab 1 needs no GPU. Labs 2 through 5 want two or more GPUs on one
+            node, ideally with NVLink. Exact log strings drift with the version,
+            so match on shape, not text.
+          </p>
+          <p><strong>Lab 1: derive a legal configuration on paper.</strong> Concept: the divisibility and volume arithmetic of Part V.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-text">Given: 16 GPUs, 8 per node, a 32-layer model, 32 attention heads.
+Pick tp, pp, dp with tp * pp * dp = 16 such that:
+  - tp divides 32 (heads)          -&gt; tp in {1,2,4,8,16}
+  - pp divides 32 (layers)         -&gt; pp in {1,2,4,8,16,32}
+  - tp stays within one node (&lt;= 8 GPUs) so its all-reduces hit NVLink
+A good answer: tp=8 (one node), pp=2 (across the two nodes), dp=1.
+A bad answer: tp=16, which spans both nodes and puts the per-layer
+all-reduce on the inter-node link.</code></pre></div>
+          <p>
+            Write out, using the Part V table, why <code>tp=16</code> is slow
+            even though it is legal. Then redo the exercise for 64 GPUs and a
+            48-layer, 64-head model, and justify each degree by the wire its
+            traffic lands on.
+          </p>
+          <p><strong>Lab 2: watch tensor parallelism move memory and time.</strong> Concept: the every-layer all-reduce.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="c"># same model, two layouts on 2 GPUs</span>
+<span class="m1">torchrun</span> <span class="s">--nproc_per_node=2</span> <span class="s">pretrain_gpt.py</span> <span class="s">--tensor-model-parallel-size</span> <span class="s">2</span> <span class="s">\</span>
+  <span class="s">--num-layers</span> <span class="s">12</span> <span class="s">--hidden-size</span> <span class="s">1024</span> <span class="s">--num-attention-heads</span> <span class="s">16</span> <span class="s">\</span>
+  <span class="s">--seq-length</span> <span class="s">1024</span> <span class="s">--max-position-embeddings</span> <span class="s">1024</span> <span class="s">\</span>
+  <span class="s">--micro-batch-size</span> <span class="s">8</span> <span class="s">--global-batch-size</span> <span class="s">16</span> <span class="s">--train-iters</span> <span class="s">50</span> <span class="s">\</span>
+  <span class="s">--data-path</span> <span class="s">my-gpt2_text_document</span> <span class="s">\</span>
+  <span class="s">--vocab-file</span> <span class="s">gpt2-vocab.json</span> <span class="s">--merge-file</span> <span class="s">gpt2-merges.txt</span> <span class="s">--bf16</span>
+<span class="c"># compare to --tensor-model-parallel-size 1 (pure data parallel on 2 GPUs)</span></code></pre></div>
+          <p>
+            Compare per-GPU peak memory and step time between the two runs. The
+            tensor-parallel run uses less memory per GPU because the weights and
+            activations are split, and pays for it in the per-layer all-reduces.
+            Now add <code>--sequence-parallel</code> to the TP run and confirm
+            memory drops again while step time barely moves, which is the
+            communication-neutral memory win of Part V made visible.
+          </p>
+          <p><strong>Lab 3: see the pipeline bubble.</strong> Concept: (p−1)/m and why microbatch count matters.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="c"># 4 GPUs, pipeline degree 4, sweep the number of microbatches</span>
+<span class="m1">torchrun</span> <span class="s">--nproc_per_node=4</span> <span class="s">pretrain_gpt.py</span> <span class="s">--pipeline-model-parallel-size</span> <span class="s">4</span> <span class="s">\</span>
+  <span class="s">--num-layers</span> <span class="s">8</span> <span class="s">--hidden-size</span> <span class="s">1024</span> <span class="s">--num-attention-heads</span> <span class="s">16</span> <span class="s">\</span>
+  <span class="s">--seq-length</span> <span class="s">1024</span> <span class="s">--max-position-embeddings</span> <span class="s">1024</span> <span class="s">\</span>
+  <span class="s">--micro-batch-size</span> <span class="s">1</span> <span class="s">--global-batch-size</span> <span class="s">4</span>  <span class="s">--train-iters</span> <span class="s">50</span> <span class="s">...</span>   <span class="c"># m = 4</span>
+<span class="c"># then rerun with --global-batch-size 32                              # m = 32</span></code></pre></div>
+          <p>
+            With four microbatches and four stages the bubble is
+            <code>(4-1)/4</code>, about three quarters idle, and throughput is
+            poor. With thirty-two microbatches it falls to
+            <code>(4-1)/32</code>, under ten percent, and throughput jumps.
+            Predict the ratio before you measure it.
+          </p>
+          <p><strong>Lab 4: interleaving trades communication for bubble.</strong> Concept: (p−1)/(v·m).</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="c"># take the m=4 case above and add virtual pipeline stages</span>
+<span class="m1">torchrun</span> <span class="s">--nproc_per_node=4</span> <span class="s">pretrain_gpt.py</span> <span class="s">--pipeline-model-parallel-size</span> <span class="s">4</span> <span class="s">\</span>
+  <span class="s">--num-layers</span> <span class="s">8</span> <span class="s">--num-layers-per-virtual-pipeline-stage</span> <span class="s">1</span> <span class="s">\</span>
+  <span class="s">--micro-batch-size</span> <span class="s">1</span> <span class="s">--global-batch-size</span> <span class="s">4</span> <span class="s">...</span>   <span class="c"># v = 2 chunks per device</span></code></pre></div>
+          <p>
+            With eight layers over four stages and one layer per virtual stage
+            you get two chunks per device, so the bubble target drops from
+            <code>3/4</code> to <code>3/8</code>. Watch throughput improve on the
+            small-microbatch case, and watch the P2P volume roughly double, which
+            is the trade the schedule is making.
+          </p>
+          <p><strong>Lab 5: compose all three dimensions.</strong> Concept: the full mesh and the safe layout.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="c"># 8 GPUs: tp=2, pp=2, dp=2, with the memory-savers on</span>
+<span class="m1">torchrun</span> <span class="s">--nproc_per_node=8</span> <span class="s">pretrain_gpt.py</span> <span class="s">\</span>
+  <span class="s">--tensor-model-parallel-size</span> <span class="s">2</span> <span class="s">--pipeline-model-parallel-size</span> <span class="s">2</span> <span class="s">\</span>
+  <span class="s">--sequence-parallel</span> <span class="s">--use-distributed-optimizer</span> <span class="s">\</span>
+  <span class="s">--num-layers</span> <span class="s">8</span> <span class="s">--hidden-size</span> <span class="s">2048</span> <span class="s">--num-attention-heads</span> <span class="s">16</span> <span class="s">\</span>
+  <span class="s">--seq-length</span> <span class="s">2048</span> <span class="s">--max-position-embeddings</span> <span class="s">2048</span> <span class="s">\</span>
+  <span class="s">--micro-batch-size</span> <span class="s">2</span> <span class="s">--global-batch-size</span> <span class="s">32</span> <span class="s">--train-iters</span> <span class="s">50</span> <span class="s">--bf16</span> <span class="s">...</span></code></pre></div>
+          <p>
+            Confirm the startup log reports <code>tp=2 pp=2 dp=2</code> and that
+            their product is the world size. Map each of the three collectives
+            from Part IV onto a dimension, the every-layer all-reduce onto TP, the
+            microbatch P2P onto PP, and the once-per-step gradient reduction onto
+            DP, and note that on a single node all three ride NVLink here, which
+            is exactly why single-node debugging hides interconnect problems that
+            only appear at multi-node scale.
+          </p>
+
+          <h2>Part VIII: Questions and model answers</h2>
+          <p>Understanding checks. Answer aloud before reading.</p>
+          <p><strong>1. What is Megatron-LM in one sentence?</strong></p>
+          <p>
+            NVIDIA's reference trainer for large transformers, which shards a
+            model across GPUs by splitting each block's two matrix multiplies
+            column-parallel then row-parallel with one all-reduce to collect the
+            result, and stacks that tensor parallelism with pipeline, sequence,
+            and data parallelism, all provided by the reusable Megatron-Core
+            library.
+          </p>
+          <p><strong>2. Why column-parallel then row-parallel, and not the reverse?</strong></p>
+          <p>
+            Splitting the first matrix by columns lets each rank compute a full
+            slice of the hidden activation and apply the nonlinearity to it
+            with no communication, because the nonlinearity is element-wise and
+            never mixes columns. The row-parallel second matrix then needs a
+            single all-reduce at the block's output. Reversing the order would
+            force an all-reduce before the nonlinearity, doubling the
+            collectives per block.
+          </p>
+          <p><strong>3. What are the f and g operators?</strong></p>
+          <p>
+            Conjugate autograd functions. f is identity in the forward and an
+            all-reduce in the backward, and it wraps the input of a
+            column-parallel layer. g is an all-reduce in the forward and
+            identity in the backward, and it wraps the output of a row-parallel
+            layer. Together they place exactly one all-reduce in each direction
+            per block.
+          </p>
+          <p><strong>4. How many all-reduces does tensor parallelism perform per layer per step?</strong></p>
+          <p>
+            Four. Two in the forward, one closing attention and one closing the
+            MLP, and two in the backward, from the f operators of the two
+            column-parallel layers. Each is on an activation of shape
+            (microbatch, sequence, hidden), which is why the volume scales with
+            the activation and with sequence length.
+          </p>
+          <p><strong>5. What does sequence parallelism change, and what does it not change?</strong></p>
+          <p>
+            It shards the layernorm, dropout, and residual regions along the
+            sequence dimension instead of replicating them, which cuts activation
+            memory by the tensor-parallel degree. It does not change communication
+            volume, because it splits each tensor-parallel all-reduce into a
+            reduce-scatter and an all-gather that together move the same bytes.
+          </p>
+          <p><strong>6. Why must tensor parallelism stay inside a node while pipeline parallelism can cross nodes?</strong></p>
+          <p>
+            Tensor parallelism fires four all-reduces per layer on activation-sized
+            messages that grow with sequence length, so it needs NVLink-class
+            bandwidth and low latency on the critical path. Pipeline parallelism
+            sends one boundary activation per microbatch as a point-to-point
+            message and does not scale with the number of layers, so it tolerates
+            the slower links between nodes.
+          </p>
+          <p><strong>7. What is the pipeline bubble, and how do microbatches and interleaving affect it?</strong></p>
+          <p>
+            The bubble is the idle time while the pipeline fills and drains, a
+            fraction (p−1)/m of the step for p stages and m microbatches. More
+            microbatches shrink it directly. Interleaving gives each device
+            several non-contiguous chunks, cutting the bubble to (p−1)/(v·m) for v
+            chunks, at the cost of multiplying pipeline communication by v.
+          </p>
+          <p><strong>8. What memory advantage does 1F1B have over GPipe?</strong></p>
+          <p>
+            GPipe runs all forwards then all backwards, so it must store roughly m
+            microbatches of activations. 1F1B reaches a steady state of one forward
+            then one backward per stage and keeps only about p microbatches alive at
+            once, giving the same bubble with far less activation memory.
+          </p>
+          <p><strong>9. What three gradient reductions happen after the backward pass, and why?</strong></p>
+          <p>
+            A data-parallel reduction so every replica agrees on the gradient, an
+            all-reduce of the tied input-embedding and output-projection gradient
+            between the first and last pipeline stages because those two uses share
+            one weight, and, under sequence parallelism, an all-reduce of the
+            layernorm gradients across the tensor-parallel group because each rank
+            computed them from a different sequence shard.
+          </p>
+          <p><strong>10. What does the distributed optimizer shard, and what does it trade?</strong></p>
+          <p>
+            It shards the optimizer states and the fp32 master parameters across the
+            data-parallel group, ZeRO-stage-one style, so each rank updates only its
+            slice. It trades a plain gradient all-reduce for a reduce-scatter of
+            gradients plus an all-gather of updated parameters of equal total volume,
+            in exchange for dividing optimizer memory by the data-parallel degree.
+          </p>
+          <p><strong>11. What is Megatron-Core, and who uses it?</strong></p>
+          <p>
+            The reusable library carved out of Megatron-LM, pip-installable as
+            megatron-core, containing the parallel layers, the pipeline schedules,
+            the transformer building blocks, the process-group management, and the
+            distributed optimizer. NVIDIA NeMo and many other training stacks depend
+            on it, while the top-level scripts are a reference harness that consumes
+            it.
+          </p>
+          <p><strong>12. When would you choose torchtitan or DeepSpeed over Megatron-LM?</strong></p>
+          <p>
+            torchtitan when you want a small PyTorch-native codebase that applies
+            every parallelism to a plain model from outside, with portability and
+            readability over peak MFU. DeepSpeed when you are invested in its ZeRO
+            sharding and Hugging Face integration or need CPU and NVMe offload.
+            Megatron when maximum throughput on NVIDIA clusters is worth a framework
+            that owns your model code.
+          </p>
+          <p><strong>13. Why does the vocab-parallel cross entropy matter?</strong></p>
+          <p>
+            The logits are a batch-by-vocabulary tensor that is enormous for a large
+            vocabulary, and gathering it onto one rank would blow the memory budget.
+            The vocab-parallel cross entropy keeps the logits sharded across the
+            tensor-parallel group and computes the softmax denominator by
+            all-reducing only the per-row max and sum, so the full logit tensor is
+            never materialized.
+          </p>
+          <p><strong>14. A multi-node run has good single-node throughput but collapses at scale, with no error. Name the first suspect.</strong></p>
+          <p>
+            A tensor-parallel group that spilled across a node boundary, so the
+            every-layer all-reduce now crosses the inter-node link. It is legal, it
+            trains correctly, and it is catastrophically slow. The fix is to keep the
+            tensor-parallel degree within one node and push pipeline and data
+            parallelism across nodes.
+          </p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Let the math choose the seams.</strong> Tensor parallelism
+            works because the split is placed exactly where a nonlinearity makes it
+            free, column-parallel before the element-wise GeLU, row-parallel after.
+            The best parallel decompositions are not imposed on an algorithm, they
+            are read off its structure. The same instinct shows up in tiling a loop
+            along the axis with no carried dependence and in sharding a database on
+            the key that queries already filter by.
+          </p>
+          <p>
+            <strong>Place communication, do not hide it.</strong> Megatron writes
+            the f and g collectives into the model by hand, at the two points the
+            math demands and nowhere else. Owning that placement is what lets it hit
+            peak utilization, and it is the deliberate opposite of the
+            <a href="/oss/torchtitan">torchtitan</a> philosophy of inferring
+            collectives from tensor layout. Both are defensible, and the trade is
+            explicitness and control against composability and portability.
+          </p>
+          <p>
+            <strong>Know the volume and frequency of every message.</strong> The
+            whole discipline of configuring a large run reduces to one table, which
+            dimension moves how many bytes how often, mapped onto which dimension
+            moves data over which wire. Systems that make their communication costs
+            legible get configured well. Systems that hide them get configured by
+            trial and error at great expense.
+          </p>
+          <p>
+            <strong>Trade memory and compute and bubble on purpose.</strong> Sequence
+            parallelism spends nothing extra to save activation memory, selective
+            recomputation spends a little compute to save more, and interleaving
+            spends communication to shrink the bubble. Each is a knob with a known
+            price, and scaling is choosing the knobs that fit your bottleneck rather
+            than turning all of them up.
+          </p>
+          <p>
+            <strong>When coupling is unavoidable, make it declarative.</strong>
+            Megatron-Core cannot fully decouple the model from its parallelism, so
+            it makes the coupling a swappable spec, a named record of which modules
+            to build. If you must depend on a detail, depend on a small replaceable
+            description of it rather than on a hard-coded class, which is how the
+            same model runs with Transformer Engine or with plain PyTorch.
+          </p>
+          <p>
+            <strong>Extract the library once the patterns are proven.</strong> The
+            move from a monolithic script to Megatron-Core plus a thin harness came
+            after the techniques were battle-tested, not before. Reusable
+            abstractions earned from working code outlast reusable abstractions
+            designed up front, which is why NeMo and others could safely build on
+            the extracted core.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            The one-sentence summary: <mark>Megatron-LM shards each transformer
+            block column-parallel then row-parallel so one all-reduce per block
+            collects the result, splits the between-layer regions along the
+            sequence for memory, streams microbatches through pipeline stages with
+            a 1F1B or interleaved schedule, reduces gradients across data-parallel
+            ranks, and provides all of it as the Megatron-Core library.</mark>
+          </p>
+          <pre class="flow">torchrun -&gt; pretrain_gpt.py -&gt; pretrain() in megatron/training/training.py
+  -&gt; initialize_model_parallel (parallel_state.py): tp innermost, pp outermost
+  -&gt; GPTModel for this stage: ColumnParallelLinear + RowParallelLinear, f/g
+  -&gt; get_forward_backward_func(): no-pipeline / 1F1B / interleaved-1F1B
+  -&gt; per microbatch: 2 TP all-reduces per layer, P2P between stages
+  -&gt; finalize_model_grads: DP all-reduce + shared-embedding + SP layernorm
+  -&gt; optimizer.step(): distributed optimizer all-gathers updated params</pre>
+          <p>The chain mapped to source:</p>
+          <pre class="flow">launch          pretrain_gpt.py, examples/
+harness         megatron/training/ (training.py, arguments.py, initialize.py)
+groups          megatron/core/parallel_state.py
+tensor parallel megatron/core/tensor_parallel/ (layers.py, mappings.py, cross_entropy.py)
+transformer     megatron/core/transformer/ + megatron/core/models/gpt/
+pipeline        megatron/core/pipeline_parallel/ (schedules.py, p2p_communication.py)
+grads + optim   megatron/core/distributed/ + megatron/core/optimizer/</pre>
+          <p>Memorize these blocks:</p>
+          <ul>
+            <li><strong>The pairing:</strong> column-parallel (split by output columns, free nonlinearity) then row-parallel (split by input rows, one all-reduce). Four all-reduces per layer per step.</li>
+            <li><strong>The f/g operators:</strong> f is identity forward and all-reduce backward, g is all-reduce forward and identity backward.</li>
+            <li><strong>Sequence parallelism:</strong> shards the layernorm and dropout regions along the sequence, splits each all-reduce into reduce-scatter plus all-gather, same bytes, less memory.</li>
+            <li><strong>Pipeline bubble:</strong> (p−1)/m without interleaving, (p−1)/(v·m) with v virtual stages, and interleaving multiplies P2P volume by v.</li>
+            <li><strong>Communication volumes:</strong> TP scales with b·s·h every layer (NVLink), PP with one b·s·h per microbatch (inter-node ok), DP with P once per step (inter-node ok).</li>
+            <li><strong>Megatron-Core:</strong> the reusable library under NeMo, split into parallel_state, tensor_parallel, pipeline_parallel, transformer, models, distributed, optimizer.</li>
+          </ul>
+
+          <h2>Part XI: Final takeaway</h2>
+          <p>
+            If the single-GPU transformer that Megatron shards is the piece you
+            want built from scratch, the <a href="/ml">ML implementations section</a>
+            derives it, and the attention-memory story behind sequence parallelism
+            and selective recomputation is worked out in the
+            <a href="/oss/flash-attention">FlashAttention chapter</a> and on the
+            <a href="/ml/softmax">online softmax page</a>. The parallelism arithmetic
+            here is the same arithmetic that governs the
+            <a href="/classes/parallel-computing">parallel computing class</a>, and
+            the inference-time cousin of these ideas lives in the
+            <a href="/oss/vllm">vLLM</a> and <a href="/oss/torchtitan">torchtitan</a>
+            walkthroughs. Read Megatron once with the communication table in hand,
+            and the code stops looking like a wall of collectives and starts looking
+            like a small set of deliberate choices about which wire carries which
+            message.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> Megatron-LM is the reference for
+            large-scale transformer training because it places every collective by
+            hand where the math allows, column-parallel then row-parallel for one
+            all-reduce per block, sequence-sharded regions for memory, pipelined
+            microbatches for depth, and data-parallel gradient reduction for width.
+            Its enduring lesson is the arithmetic, know the volume and frequency of
+            every message and map it onto the interconnect that can carry it, and
+            the same handful of parallel primitives, packaged as Megatron-Core, will
+            scale a model from one node to a supercomputer.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/code-copy.js"></script>
+      <script defer src="/theme.js"></script>
+  </body>
+</html>

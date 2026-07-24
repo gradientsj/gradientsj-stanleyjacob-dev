@@ -1,0 +1,1063 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TRL walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A full chapter on huggingface/trl: the post-training library that sits on transformers.Trainer, covering SFTTrainer, the DPOTrainer and its closed-form reward, GRPOTrainer, PPOTrainer and reward modeling, how each trainer subclasses the HF Trainer, the full life of one DPO step, internals deep dives, a guided reading path, labs, and understanding checks." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+      <script>(function(){try{var t=localStorage.getItem("theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>TRL</h1>
+        <p class="lead">
+          <a href="https://github.com/huggingface/trl" target="_blank" rel="noreferrer">TRL</a>
+          is Hugging Face's transformer reinforcement learning library, the
+          primitive layer that the popular post-training front ends wrap. It
+          is not a framework that owns your model. It is a set of trainers,
+          <code>SFTTrainer</code>, <code>DPOTrainer</code>,
+          <code>GRPOTrainer</code>, <code>RewardTrainer</code>, and the
+          rest, each of which subclasses the ordinary
+          <a href="/oss/transformers">transformers</a> <code>Trainer</code>
+          and swaps in exactly two things, a loss function that encodes an
+          algorithm and a dataset step that prepares the tensors that loss
+          needs. This chapter is three things at once, a practical tutorial
+          for running real fine-tunes, a walkthrough that follows one
+          Direct Preference Optimization step end to end so the closed-form
+          reward stops being magic, and a staged guide to reading the
+          repository. It ends with runnable labs, understanding checks with
+          model answers, and a compact framework for keeping the whole
+          library in your head.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">your data (prompts, preferences, completions)
+      |
+      v
+trl/data_utils.py         apply_chat_template, is_conversational, pack_dataset
+      |
+      v
+one TRL trainer           SFTTrainer | DPOTrainer | GRPOTrainer
+      |                    RewardTrainer | KTOTrainer | RLOOTrainer
+      |                    each = Trainer + {*Config, dataset prep, compute_loss}
+      v
+transformers.Trainer      the loop: accumulate, backward, clip, step, log, save
+      |
+      v
+accelerate                DDP, FSDP, DeepSpeed, mixed precision, device placement
+      |
+      v
+torch                     one or many GPUs
+
+wrapped from above by: Axolotl, LLaMA-Factory, Unsloth, autotrain-advanced</pre>
+          <p>
+            The one-sentence identity, <mark>TRL is a collection of loss
+            functions and dataset adapters bolted onto the Hugging Face
+            <code>Trainer</code>, so that each RLHF and preference-tuning
+            algorithm becomes a small, readable subclass rather than a new
+            training framework.</mark> The Trainer already knows how to run a
+            distributed loop, accumulate gradients, apply mixed precision,
+            clip, step an optimizer and scheduler, log metrics, and write
+            checkpoints. TRL contributes the parts that differ between
+            algorithms and nothing else. A TRL trainer is the base
+            <code>Trainer</code> with three replacements, a
+            <code>Config</code> dataclass that extends
+            <code>TrainingArguments</code> with algorithm knobs like
+            <code>beta</code> or <code>num_generations</code>, a dataset
+            preparation step that turns raw preference or prompt data into
+            model-ready batches, and a <code>compute_loss</code> that
+            encodes the algorithm's objective.
+          </p>
+          <p>
+            Two consequences follow. First, this is why TRL is the layer
+            others build on. Axolotl, LLaMA-Factory, Unsloth, and
+            autotrain-advanced are configuration front ends that call TRL
+            trainers underneath, because TRL already owns the tricky loss
+            math and delegates the boring, well-tested loop to the Trainer.
+            Learn TRL and you have learned the engine inside all of them.
+            Second, reading TRL is the shortest path to understanding what
+            DPO, GRPO, PPO, and reward modeling actually compute, because
+            each algorithm is isolated in one file whose center of gravity
+            is a single loss method. Everything in this chapter is verified
+            against the main branch in July 2026. TRL tracks the fast-moving
+            post-training literature and refactors often, so where a detail
+            is likely to shift I say so and stay at concept level. One such
+            shift already happened, the current main promotes six trainers
+            to first-class status in <code>trl/trainer/</code>, SFT, DPO,
+            GRPO, KTO, RLOO, and Reward, while PPO and a long tail of
+            research methods now live under <code>trl/experimental/</code>.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <p>
+            TRL is a normal Python package. It runs anywhere PyTorch and
+            transformers run, including a laptop for the small models, and
+            it uses whatever GPUs Accelerate finds. Install it with pip,
+            optionally with the extras for parameter-efficient fine-tuning
+            and fast generation:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">pip</span> <span class="s">install</span> <span class="s">trl</span>
+<span class="c"># optional companions used below</span>
+<span class="m1">pip</span> <span class="s">install</span> <span class="s">peft</span>            <span class="c"># LoRA and QLoRA adapters</span>
+<span class="m1">pip</span> <span class="s">install</span> <span class="s">vllm</span>            <span class="c"># fast generation for the online methods (GRPO, PPO, RLOO)</span></code></pre></div>
+          <p>
+            The smallest useful program is supervised fine-tuning. Pass a
+            model by name, a dataset, and let the defaults do the rest. This
+            is the canonical quickstart from the project's own README:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">datasets</span> <span class="k">import</span> <span class="m1">load_dataset</span>
+<span class="k">from</span> <span class="m1">trl</span> <span class="k">import</span> <span class="m1">SFTTrainer</span>
+
+<span class="v6">dataset</span> = <span class="m1">load_dataset</span><span class="b0">(</span><span class="s">"trl-lib/Capybara"</span>, <span class="v0">split</span>=<span class="s">"train"</span><span class="b0">)</span>
+
+<span class="v1">trainer</span> = <span class="m1">SFTTrainer</span><span class="b0">(</span>
+    <span class="v0">model</span>=<span class="s">"Qwen/Qwen2.5-0.5B"</span>,
+    <span class="v4">train_dataset</span>=<span class="v6">dataset</span>,
+<span class="b0">)</span>
+<span class="v1">trainer</span>.<span class="m2">train</span><span class="b0">()</span></code></pre></div>
+          <p>
+            That is the whole thing. <code>SFTTrainer</code> resolves the
+            model string to an <code>AutoModelForCausalLM</code>, loads the
+            matching tokenizer, detects that <code>trl-lib/Capybara</code>
+            is a conversational dataset and applies the model's chat
+            template, tokenizes, and then hands off to the inherited Trainer
+            loop. To control anything, pass an <code>SFTConfig</code>, which
+            is a <code>TrainingArguments</code> with a few extra fields. Note
+            the argument is named <code>processing_class</code>, not
+            <code>tokenizer</code>, because recent transformers renamed it to
+            cover tokenizers and multimodal processors alike:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">trl</span> <span class="k">import</span> <span class="m1">SFTConfig</span>, <span class="m1">SFTTrainer</span>
+
+<span class="v1">trainer</span> = <span class="m1">SFTTrainer</span><span class="b0">(</span>
+    <span class="v0">model</span>=<span class="s">"Qwen/Qwen2.5-0.5B"</span>,
+    <span class="v4">train_dataset</span>=<span class="v6">dataset</span>,
+    <span class="v2">args</span>=<span class="m1">SFTConfig</span><span class="b1">(</span>
+        <span class="v2">output_dir</span>=<span class="s">"Qwen2.5-0.5B-SFT"</span>,
+        <span class="v1">per_device_train_batch_size</span>=<span class="n">8</span>,
+        <span class="v3">gradient_accumulation_steps</span>=<span class="n">2</span>,
+        <span class="v4">learning_rate</span>=<span class="n">2e-5</span>,
+        <span class="v3">num_train_epochs</span>=<span class="n">1</span>,
+        <span class="v1">packing</span>=<span class="k">True</span>,              <span class="c"># concatenate short samples to fill the context</span>
+        <span class="v3">max_length</span>=<span class="n">2048</span>,
+    <span class="b1">)</span>,
+<span class="b0">)</span>
+<span class="v1">trainer</span>.<span class="m2">train</span><span class="b0">()</span></code></pre></div>
+          <p>
+            Preference tuning is the same shape. Direct Preference
+            Optimization needs a dataset of triples, a prompt, a chosen
+            answer, and a rejected answer, and it needs a reference model,
+            which TRL will make for you by freezing a copy of the policy if
+            you do not pass one:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">datasets</span> <span class="k">import</span> <span class="m1">load_dataset</span>
+<span class="k">from</span> <span class="m1">trl</span> <span class="k">import</span> <span class="m1">DPOConfig</span>, <span class="m1">DPOTrainer</span>
+
+<span class="v6">dataset</span> = <span class="m1">load_dataset</span><span class="b0">(</span><span class="s">"trl-lib/ultrafeedback_binarized"</span>, <span class="v0">split</span>=<span class="s">"train"</span><span class="b0">)</span>
+
+<span class="v1">trainer</span> = <span class="m1">DPOTrainer</span><span class="b0">(</span>
+    <span class="v0">model</span>=<span class="s">"Qwen/Qwen3-0.6B"</span>,
+    <span class="v4">train_dataset</span>=<span class="v6">dataset</span>,
+    <span class="v2">args</span>=<span class="m1">DPOConfig</span><span class="b1">(</span><span class="v2">output_dir</span>=<span class="s">"Qwen3-0.6B-DPO"</span>, <span class="v4">beta</span>=<span class="n">0.1</span><span class="b1">)</span>,
+<span class="b0">)</span>
+<span class="v1">trainer</span>.<span class="m2">train</span><span class="b0">()</span></code></pre></div>
+          <p>
+            Online reinforcement learning with a reward comes through
+            <code>GRPOTrainer</code>. Here you do not supply preferences, you
+            supply a reward function, an ordinary Python callable that scores
+            completions. TRL ships some ready made ones in
+            <code>trl.rewards</code>, and writing your own is trivial:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">datasets</span> <span class="k">import</span> <span class="m1">load_dataset</span>
+<span class="k">from</span> <span class="m1">trl</span> <span class="k">import</span> <span class="m1">GRPOConfig</span>, <span class="m1">GRPOTrainer</span>
+
+<span class="v6">dataset</span> = <span class="m1">load_dataset</span><span class="b0">(</span><span class="s">"trl-lib/tldr"</span>, <span class="v0">split</span>=<span class="s">"train"</span><span class="b0">)</span>
+
+<span class="c"># a reward is just: (completions, **kwargs) -&gt; list[float], one score per completion</span>
+<span class="k">def</span> <span class="m1">reward_short_answers</span><span class="b0">(</span><span class="v4">completions</span>, **<span class="v5">kwargs</span><span class="b0">)</span>:
+    <span class="k">return</span> <span class="b0">[</span>-<span class="m1">abs</span><span class="b1">(</span><span class="n">50</span> - <span class="m1">len</span><span class="b2">(</span><span class="v1">c</span><span class="b2">)</span><span class="b1">)</span> <span class="k">for</span> <span class="v1">c</span> <span class="k">in</span> <span class="v4">completions</span><span class="b0">]</span>   <span class="c"># prefer ~50-char answers</span>
+
+<span class="v1">trainer</span> = <span class="m1">GRPOTrainer</span><span class="b0">(</span>
+    <span class="v0">model</span>=<span class="s">"Qwen/Qwen2.5-0.5B-Instruct"</span>,
+    <span class="v6">reward_funcs</span>=<span class="m1">reward_short_answers</span>,
+    <span class="v4">train_dataset</span>=<span class="v6">dataset</span>,
+    <span class="v2">args</span>=<span class="m1">GRPOConfig</span><span class="b1">(</span><span class="v2">output_dir</span>=<span class="s">"Qwen2.5-0.5B-GRPO"</span>, <span class="v1">num_generations</span>=<span class="n">8</span><span class="b1">)</span>,
+<span class="b0">)</span>
+<span class="v1">trainer</span>.<span class="m2">train</span><span class="b0">()</span></code></pre></div>
+          <p>
+            Every trainer also has a command-line front end. The
+            <code>trl</code> CLI reads the same config fields as flags, so a
+            reproducible run needs no Python file at all:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">trl</span> <span class="s">sft</span>  <span class="s">--model_name_or_path</span> <span class="s">Qwen/Qwen2.5-0.5B</span> <span class="s">\</span>
+         <span class="s">--dataset_name</span> <span class="s">trl-lib/Capybara</span> <span class="s">\</span>
+         <span class="s">--output_dir</span> <span class="s">Qwen2.5-0.5B-SFT</span>
+
+<span class="m1">trl</span> <span class="s">dpo</span>  <span class="s">--model_name_or_path</span> <span class="s">Qwen/Qwen2.5-0.5B-Instruct</span> <span class="s">\</span>
+         <span class="s">--dataset_name</span> <span class="s">argilla/Capybara-Preferences</span> <span class="s">\</span>
+         <span class="s">--output_dir</span> <span class="s">Qwen2.5-0.5B-DPO</span>
+
+<span class="m1">trl</span> <span class="s">env</span>                     <span class="c"># dumps versions and hardware for bug reports</span>
+<span class="m1">trl</span> <span class="s">vllm-serve</span> <span class="s">--model</span> <span class="s">...</span>  <span class="c"># stand up a generation server for online methods</span></code></pre></div>
+          <p>
+            Now the mistakes beginners make. First, dataset format. TRL
+            expects one of two shapes, standard (plain text columns like
+            <code>prompt</code>, <code>completion</code>,
+            <code>chosen</code>, <code>rejected</code>) or conversational
+            (those same columns holding lists of <code>{"role", "content"}</code>
+            messages). If a preference method sees the wrong columns it
+            fails early, and if a conversational dataset is fed to a method
+            expecting plain text the chat template is silently not applied.
+            The <code>data_utils.py</code> helpers named later exist to make
+            these conversions explicit. Second, for the online methods,
+            <code>num_generations</code> (the group size) must divide the
+            effective batch size, because a whole group of completions for
+            one prompt has to stay together to be normalized. Third, memory,
+            DPO holds two models on the device, the policy and the
+            reference, so a model that just fit for SFT may not fit for DPO,
+            which is exactly why LoRA is popular here, the reference is the
+            same base weights with the adapter switched off, so there is no
+            second copy. Fourth, and most fundamental, <mark>do not reach for
+            an RL trainer when a preference trainer will do. If you already
+            have preference pairs, DPO trains directly on them with no
+            sampling, no reward model, and no rollouts, and it is almost
+            always the cheaper and more stable first move.</mark>
+          </p>
+
+          <h2>Part III: When it is the right tool</h2>
+          <p>
+            TRL is the right tool when you are post-training a language model
+            on Hugging Face infrastructure and want a small, forkable, honest
+            implementation of a specific algorithm, SFT to teach a format,
+            reward modeling to fit a preference signal, DPO or KTO to align
+            on preferences directly, GRPO or PPO or RLOO to optimize against
+            a reward with on-policy sampling. It is the reference these
+            algorithms are read from, it lands new methods from the
+            literature quickly, and it composes cleanly with the rest of the
+            stack, PEFT for adapters, bitsandbytes for quantization,
+            Accelerate for distribution, and <a href="/oss/vllm">vLLM</a> for
+            the generation-heavy online methods.
+          </p>
+          <p>
+            The honest cases for something else. If your job is plain
+            supervised fine-tuning with no preference or RL component, the
+            bare transformers <code>Trainer</code> already does it and TRL
+            adds little beyond convenience formatting. If you want a
+            configuration-first experience with a hundred recipes and no
+            Python, Axolotl or LLaMA-Factory wrap TRL and give you that,
+            Unsloth does the same with hand-optimized kernels for
+            single-GPU speed, and autotrain-advanced turns it into a hosted
+            job. If you are running large-scale RL across many nodes with
+            heavy rollout throughput, the systems built for that, OpenRLHF
+            and verl, separate generation and training into distinct actor
+            pools with Ray and squeeze more out of a big cluster than TRL's
+            single-controller design targets. TRL deliberately optimizes for
+            legibility and breadth of methods over last-mile cluster
+            throughput. And trlx, the older CarperAI RLHF library, is
+            effectively superseded, its ideas live on here and in the
+            systems above.
+          </p>
+          <p>
+            The domain-shaped warning is about the reward, not the code.
+            Every online method here is a faithful optimizer, and a faithful
+            optimizer of a bad reward produces a confidently bad model. The
+            classic failure is reward hacking, the policy discovers that
+            padding an answer, repeating a keyword, or emitting a fixed
+            format scores high without being better, and GRPO or PPO will
+            find that exploit reliably because finding exploits is precisely
+            what they do. This is the same lesson the
+            <a href="/classes/deep-reinforcement-learning">deep
+            reinforcement learning</a> material returns to again and again,
+            specification is the hard part, and it is the reason DPO's
+            appeal is partly that its reward is pinned to a reference policy
+            rather than to a learned proxy that can be gamed.
+          </p>
+
+          <h2>Part IV: The full life of one DPO training step</h2>
+          <p>
+            The specimen, one step of Direct Preference Optimization, the
+            method whose closed-form reward is the single most load-bearing
+            idea in the library. Follow it once and the shape of every other
+            preference trainer becomes obvious, because they differ only in
+            the loss expression at the end. The trainer is
+            <code>trl/trainer/dpo_trainer.py</code> and the config is
+            <code>dpo_config.py</code>.
+          </p>
+
+          <h3>Stage 1: dataset preparation happens once, up front</h3>
+          <p>
+            <code>DPOTrainer.__init__</code> does the algorithm-specific data
+            work before training starts. For each row of
+            <code>{prompt, chosen, rejected}</code> it applies the chat
+            template when the data is conversational
+            (<code>maybe_apply_chat_template</code>), tokenizes the prompt
+            once and each of the two completions, and records which tokens
+            are prompt (to be masked out of the loss) versus completion. The
+            result is a dataset of tensors that a preference-aware collator
+            can pad into batches. Doing this in <code>__init__</code> rather
+            than inside the loop means the expensive tokenization is paid
+            once, and it is why a TRL trainer can accept a raw Hub dataset
+            and still feed the inherited loop clean tensors.
+          </p>
+
+          <h3>Stage 2: the inherited loop calls compute_loss</h3>
+          <p>
+            <code>trainer.train()</code> is not overridden. It is the stock
+            transformers loop, iterating the dataloader, handling gradient
+            accumulation and mixed precision, and calling
+            <code>compute_loss(model, inputs)</code> for each batch. TRL's
+            entire contribution to the step is what happens inside that one
+            method. <code>DPOTrainer.compute_loss</code> delegates to a
+            helper (historically <code>get_batch_loss_metrics</code>) that
+            produces both the scalar loss and a bundle of metrics to log.
+          </p>
+
+          <h3>Stage 3: one concatenated forward pass</h3>
+          <p>
+            The key efficiency trick lives in <code>concatenated_forward</code>.
+            Rather than run the model twice, once on chosen and once on
+            rejected, it stacks both into a single batch of
+            <code>2N</code> sequences and runs one forward pass. For each
+            sequence it gathers the log-probability the model assigns to each
+            true next token, masks out the prompt positions, and sums over
+            the completion tokens to get a single sequence log-probability.
+            Split back apart, this yields two numbers per example,
+            <code>policy_chosen_logps</code> and
+            <code>policy_rejected_logps</code>, the policy's total
+            log-likelihood of the preferred and dispreferred answers.
+          </p>
+
+          <h3>Stage 4: the reference log-probs</h3>
+          <p>
+            DPO measures the policy against a frozen reference. There are
+            three ways to get <code>reference_chosen_logps</code> and
+            <code>reference_rejected_logps</code>, and TRL supports all
+            three. With a separate reference model, a frozen copy made by
+            <code>create_reference_model</code>, run the same concatenated
+            forward through it under <code>no_grad</code>. With a LoRA
+            adapter, skip the copy entirely, disable the adapter on the
+            policy so the base weights act as the reference, forward, then
+            re-enable, which halves the memory. Or precompute the reference
+            log-probs for the whole dataset once before training
+            (<code>precompute_ref_log_probs</code>) and cache them, trading
+            disk and a preprocessing pass for never holding the reference in
+            memory during the loop.
+          </p>
+
+          <h3>Stage 5: the closed-form reward and the loss</h3>
+          <p>
+            Now the heart of the method. DPO's insight is that you never need
+            to train a reward model at all, because the reward implied by any
+            policy relative to its reference has a closed form, the scaled
+            log-ratio. Define the implicit reward of an answer as
+            <code>r(x, y) = beta * (log pi_theta(y|x) - log pi_ref(y|x))</code>.
+            The loss simply pushes the implicit reward of the chosen answer
+            above that of the rejected one, through a logistic (Bradley-Terry)
+            objective:
+          </p>
+          <pre class="flow">pi_logratios  = policy_chosen_logps    - policy_rejected_logps
+ref_logratios = reference_chosen_logps - reference_rejected_logps
+logits        = pi_logratios - ref_logratios        # difference of implicit rewards / beta
+loss          = -logsigmoid(beta * logits)          # loss_type = "sigmoid" (original DPO)
+
+# logged as metrics, the implicit rewards themselves:
+chosen_reward   = beta * (policy_chosen_logps   - reference_chosen_logps)
+rejected_reward = beta * (policy_rejected_logps - reference_rejected_logps)
+reward_accuracy = mean(chosen_reward &gt; rejected_reward)</pre>
+          <p>
+            <mark>The partition function that would normally make a reward
+            model necessary cancels, because it depends only on the prompt
+            and appears identically in the chosen and rejected terms, so
+            subtracting them makes it vanish. What survives is a loss you can
+            evaluate from four log-probabilities and one hyperparameter,
+            beta, which sets how hard the policy is pulled away from the
+            reference.</mark> That single algebraic cancellation is why DPO
+            needs no reward model, no sampling, and no RL loop. The
+            <code>loss_type</code> field selects variants that keep this
+            structure but change the surrogate, <code>"ipo"</code> replaces
+            the logistic with a squared objective that resists overfitting,
+            <code>"hinge"</code> uses an SVM-style margin, and
+            <code>label_smoothing</code> turns it into the conservative cDPO
+            loss that tolerates noisy preferences. Every one of them is a few
+            lines swapped in at this exact point.
+          </p>
+
+          <h3>Stage 6: backward, step, and logging, all inherited</h3>
+          <p>
+            <code>compute_loss</code> returns the scalar, and from here TRL
+            does nothing special. The stock Trainer backpropagates, clips the
+            gradient norm, steps AdamW and the scheduler, and, on logging
+            steps, emits the metrics DPO stashed, <code>rewards/chosen</code>,
+            <code>rewards/rejected</code>, <code>rewards/accuracies</code>,
+            <code>rewards/margins</code>, and the raw log-probs. Checkpointing
+            and resumption are the Trainer's too. That closes the life of one
+            step, a preference triple in, two forward passes, one log-ratio
+            subtraction, one logistic loss, and a gradient that raises the
+            chosen answer's likelihood and lowers the rejected one's, exactly
+            in proportion to how wrong the implicit reward ordering currently
+            is.
+          </p>
+
+          <h2>Part V: Internals deep dives</h2>
+
+          <h3>Deep dive: how every trainer subclasses transformers.Trainer</h3>
+          <p>
+            The base <code>Trainer</code> is a large, battle-tested class that
+            owns the training loop and, crucially, exposes the right
+            override points. A TRL trainer is that class with three parts
+            replaced, and recognizing the pattern lets you read any trainer
+            in the repo in minutes:
+          </p>
+          <table>
+            <tr><th>Replaced part</th><th>What it is</th><th>Where it lives</th></tr>
+            <tr><td>the config</td><td>a dataclass extending <code>TrainingArguments</code> with algorithm knobs</td><td><code>*_config.py</code></td></tr>
+            <tr><td>the data prep</td><td>tokenizing, templating, packing, or building preference tensors</td><td>trainer <code>__init__</code> and helpers</td></tr>
+            <tr><td>the loss</td><td>the algorithm's objective</td><td>overridden <code>compute_loss</code></td></tr>
+          </table>
+          <p>
+            Everything else is inherited untouched, the distributed loop,
+            gradient accumulation, mixed precision, gradient clipping, the
+            optimizer and LR scheduler, logging to every backend, and
+            checkpoint save and resume. That is a remarkable amount of
+            correctness to get for free, and it is the whole reason TRL can
+            support a dozen algorithms without a dozen training loops.
+          </p>
+          <p>
+            There is a second tier of override for the online methods.
+            SFT, DPO, KTO, and reward modeling are offline, their data is
+            fixed, so replacing <code>compute_loss</code> is enough. GRPO,
+            PPO, and RLOO must generate fresh completions from the current
+            policy every step, so they additionally override the input
+            preparation (a method like <code>_prepare_inputs</code>) or the
+            training step to insert a rollout, sample completions, score them
+            with a reward, compute advantages, and only then hand tensors to
+            the loss. The <code>unwrap_model_for_generation</code> context
+            manager from <code>trl/models/</code> exists precisely for this,
+            it temporarily unwraps the FSDP or DeepSpeed shell so
+            <code>generate</code> can run on a whole model. So the mental
+            taxonomy is, offline methods swap the loss, online methods swap
+            the loss and the sampling, and both inherit the rest.
+          </p>
+
+          <h3>Deep dive: SFTTrainer, formatting is the feature</h3>
+          <p>
+            <code>SFTTrainer</code> looks trivial, its loss is plain causal
+            language-modeling cross-entropy, which the base Trainer would
+            compute anyway. Its real work is turning messy real datasets into
+            clean token tensors, and that data path is worth knowing. It
+            auto-detects conversational data and applies the tokenizer's chat
+            template so the special tokens match what the model saw in
+            pretraining. It supports packing, concatenating multiple short
+            examples into one full-length sequence so no compute is wasted on
+            padding, using a best-fit-decreasing bin-packing pass over the
+            dataset (the <code>pack_dataset</code> utility) rather than naive
+            concatenation. And it supports completion-only loss, masking the
+            prompt tokens so the model is trained only on the response, plus
+            an assistant-only variant for multi-turn chat that masks every
+            turn except the assistant's. Each of these is a switch on
+            <code>SFTConfig</code>. The lesson is that in practice the
+            correctness of a fine-tune lives more in the masking and
+            templating than in the loss, which is why SFTTrainer spends its
+            code there. It also accepts a <code>peft_config</code> to wrap the
+            model in a LoRA adapter before training, the same one-line path to
+            parameter-efficient fine-tuning that the preference trainers use.
+          </p>
+
+          <h3>Deep dive: DPOTrainer and the closed-form reward, in full</h3>
+          <p>
+            Part IV traced the mechanics. Here is why the closed-form reward
+            is true, because it is the idea the whole method rests on. Start
+            from the standard RLHF objective, maximize expected reward while
+            staying close to a reference policy in KL:
+          </p>
+          <pre class="flow">maximize over pi:   E_{x, y~pi}[ r(x,y) ]  -  beta * KL( pi(.|x) || pi_ref(.|x) )</pre>
+          <p>
+            This problem has a known optimal solution, the reference policy
+            reweighted by the exponentiated reward:
+          </p>
+          <pre class="flow">pi*(y|x) = (1 / Z(x)) * pi_ref(y|x) * exp( r(x,y) / beta )</pre>
+          <p>
+            where <code>Z(x)</code> is a normalizing partition function that
+            sums over all possible answers and is hopelessly expensive to
+            compute. Now invert that equation to solve for the reward in terms
+            of the optimal policy:
+          </p>
+          <pre class="flow">r(x,y) = beta * ( log pi*(y|x) - log pi_ref(y|x) ) + beta * log Z(x)</pre>
+          <p>
+            The reward is the scaled log-ratio plus a prompt-only term.
+            Substitute this expression into the Bradley-Terry model of a
+            human preference, which says the probability that
+            <code>y_w</code> beats <code>y_l</code> is the logistic of their
+            reward difference. The <code>beta * log Z(x)</code> term is
+            identical for both answers to the same prompt, so it cancels in
+            the difference and disappears. What remains is a probability
+            written entirely in terms of the policy and the reference, and
+            training the policy to maximize its likelihood on preference data
+            is DPO. <mark>The intractable partition function never has to be
+            computed because it cancels, and the reward model never has to be
+            trained because the policy itself, measured against its
+            reference, is the reward.</mark> That is the entire trick, and it
+            collapses a three-stage RLHF pipeline (fit a reward model, then
+            run PPO against it) into a single supervised-looking loss.
+          </p>
+          <p>
+            The practical corollaries are worth stating. <code>beta</code>
+            is the only real dial and it controls conservatism, small beta
+            lets the policy move far from the reference and risks reward
+            hacking of the preference data itself, large beta keeps it close
+            and safe but slow. The reference model is not optional, it is what
+            makes the reward well-defined, and a DPO run whose reference has
+            drifted from the SFT checkpoint it was trained on will behave
+            oddly. And because there is no sampling, DPO is stable and cheap
+            but it can only express preferences that are already in the
+            dataset, it cannot discover new behaviors the way an online
+            method exploring with a reward can. That trade, offline stability
+            versus online exploration, is the axis the next two deep dives
+            sit on.
+          </p>
+
+          <h3>Deep dive: GRPOTrainer, a critic-free policy gradient</h3>
+          <p>
+            Group Relative Policy Optimization, introduced with DeepSeekMath
+            and made famous by DeepSeek-R1, is the method that trained a
+            generation of reasoning models, and TRL's
+            <code>grpo_trainer.py</code> is a widely read implementation.
+            Its premise is a simplification of PPO, get rid of the value
+            model. PPO needs a learned critic to estimate a baseline for the
+            advantage. GRPO replaces that critic with a statistic computed on
+            the fly, sample a group of <code>num_generations</code>
+            completions for the same prompt, score all of them, and use the
+            group's own mean as the baseline:
+          </p>
+          <pre class="flow">for each prompt x:
+    sample G completions  o_1..o_G ~ pi_theta(.|x)
+    score them            r_1..r_G  = reward_funcs(x, o_i)
+    advantage of o_i:     A_i = (r_i - mean(r)) / (std(r) + eps)   # group-normalized
+
+objective (per token t in completion i), a clipped policy gradient plus a KL leash:
+    ratio  = pi_theta(o_it) / pi_theta_old(o_it)
+    L_i    = min( ratio * A_i, clip(ratio, 1-eps, 1+eps) * A_i )  -  beta * KL(pi_theta || pi_ref)</pre>
+          <p>
+            The advantage is just how much better a completion did than its
+            siblings, so a completion above the group average is reinforced
+            and one below is suppressed, with no critic to train. The KL term
+            (an unbiased, always-positive estimator) leashes the policy to a
+            reference, and <code>beta</code> sets its strength, some recipes
+            set it to zero and drop the reference model entirely. Two subtle
+            knobs on <code>GRPOConfig</code> reward close reading.
+            <code>scale_rewards</code> decides whether to divide by the group
+            standard deviation, dividing normalizes scale but, as the
+            Dr. GRPO analysis pointed out, biases toward easy prompts where
+            variance is low, so leaving it off is sometimes better.
+            <code>importance_sampling_level</code> chooses whether the ratio
+            is computed per token or per sequence, the sequence-level choice
+            is GSPO, which stabilizes long-completion training. And
+            <code>num_iterations</code> controls how many gradient steps reuse
+            one batch of rollouts, at one the ratio is one and the clip never
+            bites so GRPO reduces to REINFORCE with a group baseline, above
+            one it becomes genuinely off-policy PPO-style optimization.
+          </p>
+          <p>
+            The systems reality of GRPO is generation cost. Sampling a group
+            of completions per prompt every step is far more expensive than
+            the gradient update, so TRL integrates <a href="/oss/vllm">vLLM</a>
+            for the rollouts. <code>use_vllm</code> turns it on, and
+            <code>vllm_mode</code> chooses between colocate, running vLLM in
+            the same processes as training and sharing the GPUs, and server,
+            talking to a separate <code>trl vllm-serve</code> process that
+            owns dedicated generation GPUs. Weight synchronization between the
+            training policy and the vLLM engine each step is the fiddly part
+            that mode exists to manage. The reward side is deliberately open,
+            <code>reward_funcs</code> takes any callable, a list of callables
+            combined with <code>reward_weights</code>, or a model name that
+            loads a reward model, so a verifiable reward like a math-answer
+            checker and a learned preference reward can be mixed freely.
+          </p>
+
+          <h3>Deep dive: PPOTrainer, the value head, and reward modeling</h3>
+          <p>
+            PPO is the original RLHF algorithm and it is still here, though on
+            current main it has moved into
+            <code>trl/experimental/ppo/</code> alongside its config and its
+            value-head model, a signal that for language-model post-training
+            GRPO and DPO have become the common defaults while PPO is kept for
+            fidelity to the classic pipeline. PPO is the maximal version of
+            the online loop, it needs four models, a policy being trained, a
+            frozen reference for the KL penalty, a reward model that scores
+            complete responses, and a value model (critic) that estimates
+            expected future reward at every token so advantages can be
+            computed with generalized advantage estimation. The value model
+            is where the <code>AutoModelForCausalLMWithValueHead</code>
+            wrapper (now in <code>experimental/ppo/modeling_value_head.py</code>)
+            comes from, it takes a base transformer and adds a small linear
+            head that reads the hidden states and outputs a scalar value per
+            token. Historically the very first TRL <code>PPOTrainer</code> did
+            not subclass the Trainer at all, it exposed a manual
+            <code>ppo_trainer.step(queries, responses, rewards)</code> loop
+            that you drove yourself. The current rewrite brings it back in
+            line with the rest of the library, it subclasses the Trainer,
+            takes explicit policy, reference, reward, and value models, and
+            runs generation and the PPO update inside the standard loop. The
+            honest summary is that PPO is the most powerful and the most
+            finicky option here, four models to hold and a critic to train
+            well, which is exactly the complexity GRPO set out to remove.
+          </p>
+          <p>
+            Reward modeling is the piece PPO consumes and DPO makes
+            unnecessary, and <code>RewardTrainer</code> is the simplest
+            trainer in the library to read. It fine-tunes an
+            <code>AutoModelForSequenceClassification</code> with a single
+            output (<code>num_labels=1</code>) into a scalar scorer, on the
+            same <code>chosen</code>/<code>rejected</code> preference data DPO
+            uses. Its loss is the Bradley-Terry objective directly,
+            <code>-logsigmoid(reward_chosen - reward_rejected)</code>, pushing
+            the chosen response's score above the rejected one's. An optional
+            per-example <code>margin</code> lets stronger preferences demand a
+            larger gap, and an optional centering term keeps the raw scores
+            from drifting. That is the whole method, one forward pass on each
+            side of the pair and a logistic loss on the difference. Reading
+            <code>RewardTrainer</code> and <code>DPOTrainer</code> back to
+            back is the clearest way to see what DPO bought, the reward
+            trainer fits a scorer you then optimize against with PPO, and DPO
+            folds those two stages into one by making the policy its own
+            reward.
+          </p>
+
+          <h2>Part VI: Reading the repository</h2>
+          <p>
+            The tree is organized by concept and is comfortable to read
+            end to end. All paths verified on main, July 2026.
+          </p>
+          <p>
+            <strong>Stage 0, orientation.</strong> Read the
+            <code>README.md</code> and the top-level
+            <code>trl/__init__.py</code>, which lists the public API, the six
+            first-class trainers and their configs, plus helpers like
+            <code>get_peft_config</code>. Question, which names are exported
+            at the top level, and which have been relegated to
+            <code>trl/experimental/</code>?
+          </p>
+          <p>
+            <strong>Stage 1, the data contract.</strong> Read
+            <code>trl/data_utils.py</code>. The functions there,
+            <code>is_conversational</code>, <code>apply_chat_template</code>
+            and <code>maybe_apply_chat_template</code>,
+            <code>extract_prompt</code>, <code>unpair_preference_dataset</code>,
+            <code>pack_dataset</code>, and <code>maybe_convert_to_chatml</code>,
+            define the standard and conversational dataset formats every
+            trainer assumes. Question, what exactly distinguishes a standard
+            dataset from a conversational one, and where does the chat
+            template get applied?
+          </p>
+          <p>
+            <strong>Stage 2, the simplest trainer.</strong> Read
+            <code>trl/trainer/reward_trainer.py</code> with
+            <code>reward_config.py</code> beside it. It is short and shows the
+            subclass pattern in its purest form, a config extending
+            <code>TrainingArguments</code>, a collator, and a
+            <code>compute_loss</code> that is one logistic on a score
+            difference. Question, what are the three things it replaces on the
+            base Trainer, and what does it inherit?
+          </p>
+          <p>
+            <strong>Stage 3, the preference workhorse.</strong> Read
+            <code>trl/trainer/dpo_trainer.py</code>, aiming for
+            <code>concatenated_forward</code>, the reference-log-prob
+            handling, and the loss block. Then skim
+            <code>kto_trainer.py</code> to see the same skeleton with a
+            different loss (KTO needs only a per-example thumbs-up or
+            thumbs-down, not pairs). Question, how does the trainer get the
+            reference log-probs in the PEFT case without a second model?
+          </p>
+          <p>
+            <strong>Stage 4, the online loop.</strong> Read
+            <code>trl/trainer/grpo_trainer.py</code> and
+            <code>grpo_config.py</code>. This is the longest and richest
+            trainer, follow how a batch of prompts becomes a batch of scored,
+            advantage-weighted completions before the loss, and where vLLM
+            plugs in. Then read <code>rloo_trainer.py</code> for the
+            leave-one-out baseline variant. Question, why must
+            <code>num_generations</code> divide the batch, and what does
+            <code>num_iterations</code> greater than one change?
+          </p>
+          <p>
+            <strong>Stage 5, the classic pipeline and the frontier.</strong>
+            <code>trl/experimental/ppo/</code> for the four-model PPO loop and
+            <code>modeling_value_head.py</code>, then browse
+            <code>trl/experimental/</code> broadly, it holds ORPO, CPO, BCO,
+            Online DPO, Nash-MD, XPO, GKD, PRM, and a stream of research
+            variants. Also read <code>trl/rewards/</code> for the ready-made
+            reward functions and <code>trl/models/utils.py</code> for
+            <code>create_reference_model</code> and
+            <code>unwrap_model_for_generation</code>.
+          </p>
+          <p>
+            Where not to start, the <code>experimental/</code> tree is by
+            definition unstable and its methods move in and out, and the
+            multimodal and vLLM server plumbing is best met after the dense
+            single-modal, single-process story is solid.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            Labs 1 and 2 run on a single small GPU (or slowly on CPU). Labs 3
+            through 5 want a GPU with room for generation. Log formats shift
+            with the fast pace of main.
+          </p>
+          <p><strong>Lab 1: SFT a 0.5B model and read the masks.</strong> Concept: the data path is the feature.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">datasets</span> <span class="k">import</span> <span class="m1">load_dataset</span>
+<span class="k">from</span> <span class="m1">trl</span> <span class="k">import</span> <span class="m1">SFTConfig</span>, <span class="m1">SFTTrainer</span>
+
+<span class="v2">ds</span> = <span class="m1">load_dataset</span><span class="b0">(</span><span class="s">"trl-lib/Capybara"</span>, <span class="v0">split</span>=<span class="s">"train[:2000]"</span><span class="b0">)</span>
+<span class="v1">trainer</span> = <span class="m1">SFTTrainer</span><span class="b0">(</span>
+    <span class="v0">model</span>=<span class="s">"Qwen/Qwen2.5-0.5B"</span>,
+    <span class="v4">train_dataset</span>=<span class="v2">ds</span>,
+    <span class="v2">args</span>=<span class="m1">SFTConfig</span><span class="b1">(</span><span class="v2">output_dir</span>=<span class="s">"sft-lab"</span>, <span class="v3">max_length</span>=<span class="n">1024</span>,
+                   <span class="v5">completion_only_loss</span>=<span class="k">True</span>, <span class="v4">report_to</span>=<span class="s">"none"</span><span class="b1">)</span>,
+<span class="b0">)</span>
+<span class="c"># inspect one prepared batch before training:</span>
+<span class="v6">batch</span> = <span class="m1">next</span><span class="b0">(</span><span class="m1">iter</span><span class="b1">(</span><span class="v1">trainer</span>.<span class="m2">get_train_dataloader</span><span class="b2">()</span><span class="b1">)</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="b1">{</span><span class="v6">k</span>: <span class="v3">v</span>.<span class="m2">shape</span> <span class="k">for</span> <span class="v6">k</span>, <span class="v3">v</span> <span class="k">in</span> <span class="v6">batch</span>.<span class="m2">items</span><span class="b2">()</span><span class="b1">}</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">"masked (prompt) label positions:"</span>, <span class="b1">(</span><span class="v6">batch</span><span class="b2">[</span><span class="s">"labels"</span><span class="b2">]</span> == -<span class="n">100</span><span class="b1">)</span>.<span class="m2">sum</span><span class="b1">()</span>.<span class="m2">item</span><span class="b1">()</span><span class="b0">)</span>
+<span class="v1">trainer</span>.<span class="m2">train</span><span class="b0">()</span></code></pre></div>
+          <p>
+            Observe that the prompt tokens carry a label of
+            <code>-100</code>, the ignore index, so loss is computed only on
+            the completion. Toggle <code>completion_only_loss</code> off and
+            watch that count fall to the padding tokens alone.
+          </p>
+          <p><strong>Lab 2: DPO and the implicit reward.</strong> Concept: the closed-form reward as a logged metric.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">datasets</span> <span class="k">import</span> <span class="m1">load_dataset</span>
+<span class="k">from</span> <span class="m1">trl</span> <span class="k">import</span> <span class="m1">DPOConfig</span>, <span class="m1">DPOTrainer</span>
+
+<span class="v2">ds</span> = <span class="m1">load_dataset</span><span class="b0">(</span><span class="s">"trl-lib/ultrafeedback_binarized"</span>, <span class="v0">split</span>=<span class="s">"train[:2000]"</span><span class="b0">)</span>
+<span class="v1">trainer</span> = <span class="m1">DPOTrainer</span><span class="b0">(</span>
+    <span class="v0">model</span>=<span class="s">"Qwen/Qwen2.5-0.5B-Instruct"</span>,
+    <span class="v4">train_dataset</span>=<span class="v2">ds</span>,
+    <span class="v2">args</span>=<span class="m1">DPOConfig</span><span class="b1">(</span><span class="v2">output_dir</span>=<span class="s">"dpo-lab"</span>, <span class="v4">beta</span>=<span class="n">0.1</span>,
+                   <span class="v0">logging_steps</span>=<span class="n">5</span>, <span class="v4">report_to</span>=<span class="s">"none"</span><span class="b1">)</span>,
+<span class="b0">)</span>
+<span class="v1">trainer</span>.<span class="m2">train</span><span class="b0">()</span></code></pre></div>
+          <p>
+            Watch <code>rewards/chosen</code>, <code>rewards/rejected</code>,
+            and <code>rewards/accuracies</code> in the logs. Early on the
+            accuracy hovers near 0.5, the policy has no preference, and it
+            climbs as the chosen implicit reward pulls above the rejected
+            one. Rerun with <code>beta=0.5</code> and see the rewards move
+            less, the policy is held closer to its reference.
+          </p>
+          <p><strong>Lab 3: GRPO with a reward you can read.</strong> Concept: group-normalized advantage.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">datasets</span> <span class="k">import</span> <span class="m1">load_dataset</span>
+<span class="k">from</span> <span class="m1">trl</span> <span class="k">import</span> <span class="m1">GRPOConfig</span>, <span class="m1">GRPOTrainer</span>
+
+<span class="v2">ds</span> = <span class="m1">load_dataset</span><span class="b0">(</span><span class="s">"trl-lib/tldr"</span>, <span class="v0">split</span>=<span class="s">"train[:1000]"</span><span class="b0">)</span>
+
+<span class="k">def</span> <span class="m1">reward_unique_chars</span><span class="b0">(</span><span class="v4">completions</span>, **<span class="v5">kwargs</span><span class="b0">)</span>:
+    <span class="c"># a transparent, gameable reward: more distinct characters scores higher</span>
+    <span class="k">return</span> <span class="b0">[</span><span class="m1">float</span><span class="b1">(</span><span class="m1">len</span><span class="b2">(</span><span class="m1">set</span><span class="b0">(</span><span class="v1">c</span><span class="b0">)</span><span class="b2">)</span><span class="b1">)</span> <span class="k">for</span> <span class="v1">c</span> <span class="k">in</span> <span class="v4">completions</span><span class="b0">]</span>
+
+<span class="v1">trainer</span> = <span class="m1">GRPOTrainer</span><span class="b0">(</span>
+    <span class="v0">model</span>=<span class="s">"Qwen/Qwen2.5-0.5B-Instruct"</span>,
+    <span class="v6">reward_funcs</span>=<span class="m1">reward_unique_chars</span>,
+    <span class="v4">train_dataset</span>=<span class="v2">ds</span>,
+    <span class="v2">args</span>=<span class="m1">GRPOConfig</span><span class="b1">(</span><span class="v2">output_dir</span>=<span class="s">"grpo-lab"</span>, <span class="v1">num_generations</span>=<span class="n">8</span>,
+                    <span class="v1">per_device_train_batch_size</span>=<span class="n">8</span>, <span class="v0">logging_steps</span>=<span class="n">1</span>,
+                    <span class="v4">report_to</span>=<span class="s">"none"</span><span class="b1">)</span>,
+<span class="b0">)</span>
+<span class="v1">trainer</span>.<span class="m2">train</span><span class="b0">()</span></code></pre></div>
+          <p>
+            Watch the mean reward rise, then read a few completions. Because
+            the reward is gameable, the model will learn to stuff in unusual
+            characters, a live demonstration of reward hacking. Swap in a real
+            reward from <code>trl.rewards</code> and compare.
+          </p>
+          <p><strong>Lab 4: reward model, then see what DPO folded away.</strong> Concept: the two-stage pipeline DPO collapses.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">datasets</span> <span class="k">import</span> <span class="m1">load_dataset</span>
+<span class="k">from</span> <span class="m1">trl</span> <span class="k">import</span> <span class="m1">RewardConfig</span>, <span class="m1">RewardTrainer</span>
+
+<span class="v2">ds</span> = <span class="m1">load_dataset</span><span class="b0">(</span><span class="s">"trl-lib/ultrafeedback_binarized"</span>, <span class="v0">split</span>=<span class="s">"train[:2000]"</span><span class="b0">)</span>
+<span class="v1">trainer</span> = <span class="m1">RewardTrainer</span><span class="b0">(</span>
+    <span class="v0">model</span>=<span class="s">"Qwen/Qwen2.5-0.5B-Instruct"</span>,   <span class="c"># loaded as a 1-logit sequence classifier</span>
+    <span class="v4">train_dataset</span>=<span class="v2">ds</span>,
+    <span class="v2">args</span>=<span class="m1">RewardConfig</span><span class="b1">(</span><span class="v2">output_dir</span>=<span class="s">"rm-lab"</span>, <span class="v4">report_to</span>=<span class="s">"none"</span><span class="b1">)</span>,
+<span class="b0">)</span>
+<span class="v1">trainer</span>.<span class="m2">train</span><span class="b0">()</span></code></pre></div>
+          <p>
+            This trains the scorer that PPO would optimize against. Note it
+            uses the same dataset DPO used, then reflect, DPO's contribution
+            is deleting this entire stage by turning the policy into its own
+            reward.
+          </p>
+          <p><strong>Lab 5: the CLI, no Python.</strong> Concept: config fields are flags.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">trl</span> <span class="s">sft</span> <span class="s">--model_name_or_path</span> <span class="s">Qwen/Qwen2.5-0.5B</span> <span class="s">\</span>
+        <span class="s">--dataset_name</span> <span class="s">trl-lib/Capybara</span> <span class="s">\</span>
+        <span class="s">--output_dir</span> <span class="s">sft-cli</span> <span class="s">--max_length</span> <span class="s">1024</span> <span class="s">--packing</span> <span class="s">\</span>
+        <span class="s">--per_device_train_batch_size</span> <span class="s">8</span> <span class="s">--report_to</span> <span class="s">none</span>
+
+<span class="m1">trl</span> <span class="s">env</span>    <span class="c"># capture the exact versions for a reproducible record</span></code></pre></div>
+          <p>
+            Every flag maps to a field on <code>SFTConfig</code>. Change
+            <code>sft</code> to <code>dpo</code> or <code>grpo</code> and the
+            valid flags change with the config class, which is the CLI's
+            whole design.
+          </p>
+
+          <h2>Part VIII: Questions and model answers</h2>
+          <p>Understanding checks. Answer aloud before reading.</p>
+          <p><strong>1. What is TRL, in one sentence?</strong></p>
+          <p>
+            A library of post-training algorithms implemented as thin
+            subclasses of the transformers <code>Trainer</code>, where each
+            trainer replaces only the config, the dataset preparation, and
+            the loss, and inherits the entire training loop.
+          </p>
+          <p><strong>2. What three things does a TRL trainer replace on the base Trainer, and what does it inherit?</strong></p>
+          <p>
+            It replaces the config (a dataclass extending
+            <code>TrainingArguments</code>), the dataset preparation, and
+            <code>compute_loss</code>. It inherits the distributed loop,
+            gradient accumulation, mixed precision, clipping, the optimizer
+            and scheduler, logging, and checkpointing.
+          </p>
+          <p><strong>3. Why does DPO need no reward model?</strong></p>
+          <p>
+            Because the reward implied by a policy relative to its reference
+            has a closed form, the scaled log-ratio
+            <code>beta * (log pi_theta - log pi_ref)</code>. Substituted into
+            the Bradley-Terry preference model, the intractable partition
+            function cancels between the chosen and rejected terms, leaving a
+            loss computable from four log-probabilities. The policy is its own
+            reward.
+          </p>
+          <p><strong>4. What is the closed-form DPO loss?</strong></p>
+          <p>
+            <code>-logsigmoid( beta * [ (log pi_theta(y_w) - log pi_ref(y_w))
+            - (log pi_theta(y_l) - log pi_ref(y_l)) ] )</code>, the negative
+            log-logistic of beta times the difference between the chosen and
+            rejected implicit rewards.
+          </p>
+          <p><strong>5. What does the concatenated forward pass buy DPO?</strong></p>
+          <p>
+            One forward pass instead of two. Chosen and rejected sequences are
+            stacked into a single batch, run together, then split apart to get
+            the four log-probabilities. It halves the number of forward calls
+            per step for the policy and again for the reference.
+          </p>
+          <p><strong>6. How does GRPO avoid PPO's value model?</strong></p>
+          <p>
+            It samples a group of completions per prompt and uses the group's
+            mean reward as the baseline, so the advantage of a completion is
+            how far its reward sits from the group average, optionally divided
+            by the group standard deviation. No learned critic is needed.
+          </p>
+          <p><strong>7. Why must num_generations divide the batch size?</strong></p>
+          <p>
+            Because the advantage is computed within a group. All completions
+            for one prompt must be present together to compute the group mean
+            and standard deviation, so a group cannot be split across batches.
+          </p>
+          <p><strong>8. Which methods are offline and which are online, and why does it matter for the trainer?</strong></p>
+          <p>
+            SFT, reward modeling, DPO, and KTO are offline, their data is
+            fixed, so they only override the loss. GRPO, PPO, and RLOO are
+            online, they generate completions from the current policy each
+            step, so they additionally override the input or step preparation
+            to sample, score, and compute advantages before the loss runs.
+          </p>
+          <p><strong>9. What four models does PPO hold, and what is each for?</strong></p>
+          <p>
+            A policy being trained, a frozen reference for the KL penalty, a
+            reward model that scores complete responses, and a value model
+            (critic) that estimates expected future reward per token for the
+            advantage estimate. GRPO removes the fourth.
+          </p>
+          <p><strong>10. What is the value head, and where does it live now?</strong></p>
+          <p>
+            A small linear layer added on top of a base transformer's hidden
+            states that outputs a scalar value per token, wrapped by
+            <code>AutoModelForCausalLMWithValueHead</code>. On current main it
+            sits in <code>trl/experimental/ppo/modeling_value_head.py</code>,
+            since PPO is its main consumer and PPO moved to experimental.
+          </p>
+          <p><strong>11. When would you pick GRPO over DPO, or DPO over GRPO?</strong></p>
+          <p>
+            DPO when you already have preference pairs and want a stable,
+            cheap, sampling-free run that cannot easily be gamed. GRPO when
+            you have a reward you can evaluate on fresh generations (a
+            verifier, a scorer) and want the policy to explore and discover
+            behaviors that are not present in any fixed dataset.
+          </p>
+          <p><strong>12. When would you reach past TRL to OpenRLHF or verl?</strong></p>
+          <p>
+            When large-scale online RL throughput is the bottleneck and you
+            want generation and training split into separate actor pools
+            across many nodes, typically orchestrated with Ray. TRL optimizes
+            for legibility and breadth of methods on a single controller
+            rather than last-mile cluster throughput.
+          </p>
+          <p><strong>13. What is reward hacking, and which methods are exposed to it?</strong></p>
+          <p>
+            The policy maximizing the letter of a reward while violating its
+            intent, padding, repetition, format tricks. Every online method
+            that optimizes a reward (GRPO, PPO, RLOO) is exposed, because
+            finding such exploits is exactly what they do. DPO is less
+            exposed because its reward is tied to a reference policy rather
+            than a learned proxy, though it can still overfit its preference
+            data.
+          </p>
+          <p><strong>14. Why is TRL described as the primitive layer others wrap?</strong></p>
+          <p>
+            Because the configuration-first front ends, Axolotl,
+            LLaMA-Factory, Unsloth, autotrain-advanced, call TRL trainers
+            underneath rather than reimplementing the algorithms. TRL owns the
+            loss math and delegates the loop to the transformers Trainer, and
+            the wrappers add recipes and UX on top.
+          </p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Subclass the loop you already trust.</strong> Rather than
+            write a training loop per algorithm, TRL inherits one
+            battle-tested loop and injects only the loss and the data. This is
+            the template-method pattern at library scale, and it is why a
+            dozen algorithms share one set of correctness guarantees for
+            distribution, checkpointing, and mixed precision.
+          </p>
+          <p>
+            <strong>Reparameterize to delete a stage.</strong> DPO's whole
+            value is algebraic, by writing the reward as a function of the
+            policy it deletes the reward-model and RL stages entirely. The
+            general move, whenever a pipeline has a stage whose output is
+            determined by a later stage's parameters, ask whether the later
+            stage can be expressed to make the earlier one vanish.
+          </p>
+          <p>
+            <strong>Replace a learned component with a statistic when you
+            can.</strong> GRPO swaps PPO's trained critic for a group mean
+            computed on the fly. A statistic needs no training, cannot itself
+            be wrong, and removes a whole model from memory. Reach for a
+            cheap empirical baseline before a learned one.
+          </p>
+          <p>
+            <strong>Make the data contract explicit and small.</strong> Two
+            dataset formats, standard and conversational, with named columns
+            and a handful of conversion utilities, mean every trainer agrees
+            on what a dataset is. A small, enforced contract at the boundary
+            is worth more than flexibility that each trainer interprets
+            differently.
+          </p>
+          <p>
+            <strong>Keep the frontier quarantined.</strong> Six trainers are
+            first-class and stable in <code>trl/trainer/</code>, and the
+            stream of research methods lives behind
+            <code>trl/experimental/</code> where instability is expected.
+            Separating the supported core from the moving frontier lets a
+            fast-moving project stay both current and dependable.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            The one-sentence summary, <mark>TRL implements each post-training
+            algorithm as a transformers <code>Trainer</code> subclass that
+            swaps in a config, a dataset step, and a loss, so DPO becomes a
+            log-ratio logistic, GRPO becomes a group-normalized policy
+            gradient, reward modeling becomes a Bradley-Terry score, and the
+            whole training loop is inherited.</mark>
+          </p>
+          <pre class="flow">raw data -&gt; data_utils (template, pack) -&gt; a TRL trainer
+  trainer = transformers.Trainer + {*Config, dataset prep, compute_loss}
+  offline (SFT, DPO, KTO, Reward): swap the loss
+  online  (GRPO, PPO, RLOO): swap the loss AND the sampling (generate, score, advantage)
+  loop, backward, clip, step, log, checkpoint: all inherited</pre>
+          <p>The methods mapped to their one idea:</p>
+          <pre class="flow">SFT     causal-LM cross-entropy; the feature is masking + templating + packing
+Reward  fit a 1-logit scorer; loss = -logsigmoid(r_chosen - r_rejected)
+DPO     policy is its own reward; loss = -logsigmoid(beta * (logratio_w - logratio_l))
+KTO     like DPO but from unpaired thumbs-up / thumbs-down signals
+GRPO    group mean as baseline; advantage = (r - mean)/std; clipped PG + KL
+PPO     4 models (policy, ref, reward, value); GAE advantage; clipped PG + KL
+RLOO    REINFORCE with a leave-one-out baseline over k samples</pre>
+          <p>Memorize these blocks:</p>
+          <ul>
+            <li><strong>The subclass recipe:</strong> config extends <code>TrainingArguments</code>, dataset prep builds the tensors, <code>compute_loss</code> encodes the algorithm, everything else is inherited.</li>
+            <li><strong>DPO reward:</strong> <code>r(x,y) = beta * (log pi_theta(y|x) - log pi_ref(y|x))</code>, the partition function cancels in the difference, so no reward model.</li>
+            <li><strong>GRPO advantage:</strong> <code>A_i = (r_i - mean(r)) / (std(r) + eps)</code> over a group of <code>num_generations</code> completions, no critic.</li>
+            <li><strong>Offline vs online:</strong> offline methods swap only the loss, online methods also generate every step and lean on vLLM.</li>
+            <li><strong>Current layout:</strong> six first-class trainers in <code>trl/trainer/</code> (SFT, DPO, GRPO, KTO, RLOO, Reward), PPO and the research tail in <code>trl/experimental/</code>.</li>
+          </ul>
+
+          <h2>Part XI: Final takeaway</h2>
+          <p>
+            If the algorithms themselves are the gap, the RL foundations
+            behind PPO and GRPO are built up in the
+            <a href="/classes/deep-reinforcement-learning">deep reinforcement
+            learning</a> material, and the place these methods sit in a
+            practical alignment pipeline is the subject of the
+            <a href="/classes/applied-generative-ai">applied generative AI</a>
+            material. The base loop TRL leans on is the ordinary
+            <a href="/oss/transformers">transformers</a> Trainer, and the
+            generation backend behind its online methods is
+            <a href="/oss/vllm">vLLM</a>. Read <code>dpo_trainer.py</code> and
+            <code>reward_trainer.py</code> back to back once, and DPO's whole
+            argument, that a policy measured against its reference is already
+            a reward, will read like the short piece of algebra it is.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> TRL is not a training framework, it
+            is a set of loss functions and dataset adapters on top of the
+            Hugging Face Trainer. Each algorithm is one small subclass that
+            swaps in a config, a data step, and a loss, and inherits the rest.
+            DPO's closed-form reward deletes the reward-model and RL stages by
+            reparameterizing the reward as the policy's log-ratio to its
+            reference, GRPO deletes PPO's critic by using a group mean as the
+            baseline, and reward modeling is a plain Bradley-Terry scorer.
+            Understand this thin layer and you understand the engine inside
+            every post-training front end built on it.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/code-copy.js"></script>
+      <script defer src="/theme.js"></script>
+  </body>
+</html>

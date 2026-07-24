@@ -1,0 +1,1058 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CUTLASS walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A full chapter on NVIDIA/cutlass: the CUDA C++ template library for peak GEMM and the CuTe layout algebra. A practical quickstart, the complete life of one tensor-core GEMM from the host launch through the pipelined mainloop to the fused epilogue, deep dives on the hierarchical tile decomposition, MMA and copy atoms, epilogue fusion, and the arithmetic-intensity story, a guided reading path, labs, and understanding checks." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+      <script>(function(){try{var t=localStorage.getItem("theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>CUTLASS</h1>
+        <p class="lead">
+          <a href="https://github.com/NVIDIA/cutlass" target="_blank" rel="noreferrer">CUTLASS</a>
+          is NVIDIA's open collection of CUDA C++ templates for building
+          matrix multiply and convolution kernels that run at close to the
+          hardware's peak. It is two things stacked together. Underneath sits
+          CuTe, a small algebra of shapes and strides that describes how data
+          is laid out and how threads map onto it. On top sits a library of
+          composable GEMM building blocks that decompose one matrix multiply
+          into a hierarchy of tiles matching the GPU's memory and execution
+          levels, feed the tensor cores through a software-pipelined mainloop,
+          and fuse arbitrary elementwise work into the epilogue. This chapter
+          is three things at once, a practical guide to building and running
+          real kernels, a systems walkthrough that follows one tensor-core
+          GEMM from the host launch down to the <code>wgmma</code> and back up
+          to the stored result, and a staged plan for reading the repository.
+          It ends with hands-on labs, understanding checks with model answers,
+          and the arithmetic-intensity argument that explains why every layer
+          of the design exists.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">one GEMM:  D = alpha * (A @ B) + beta * C        A is MxK, B is KxN, D is MxN
+
+decomposed onto the hardware, level by level:
+
+GLOBAL MEMORY (HBM)         the whole A, B, C, D live here
+      |   tile it
+      v
+THREADBLOCK / CTA tile      one thread block owns an Mt x Nt output tile
+      |                     it streams K in steps, staging A/B tiles in SHARED MEMORY
+      v
+WARP tile                   one warp (or warpgroup) owns an Mw x Nw sub-tile
+      |                     reads operands from SHARED MEMORY into REGISTERS
+      v
+INSTRUCTION / MMA atom      one tensor-core instruction does a small Mi x Ni x Ki
+                            multiply-accumulate straight out of registers/shared
+
+the loop that ties it together:
+
+mainloop over K:   load next A/B tile (cp.async / TMA)  ||  MMA on current tile
+                   double/multi-buffered shared memory keeps loads and math overlapped
+      |
+      v
+epilogue:          accumulators in registers -&gt; alpha/beta, bias, activation,
+                   arbitrary fused elementwise (EVT) -&gt; store D to global memory</pre>
+          <p>
+            The one-sentence identity.
+            <mark>CUTLASS is a template library that expresses one matrix
+            multiply as a nested hierarchy of tiles, one per level of the GPU
+            memory system, so that each level reuses data enough times to keep
+            the next-faster level, and ultimately the tensor cores, busy.</mark>
+            A matrix multiply is almost pure arithmetic sitting on top of a
+            data-movement problem. The tensor cores can do arithmetic far
+            faster than memory can supply operands, so the only way to reach
+            peak is to load each element of A and B once from slow memory and
+            then reuse it many times out of fast memory. Tiling is how you buy
+            that reuse, and doing it at every level, global to shared, shared
+            to register, register to tensor core, is the whole game. Part V
+            makes this quantitative with the arithmetic-intensity story.
+          </p>
+          <p>
+            The second load-bearing idea is CuTe, short for CUDA Tensors. A
+            <code>Layout</code> in CuTe is a pair of a <code>Shape</code> and a
+            <code>Stride</code>, and it is nothing more than a function from a
+            logical coordinate to a linear offset. A <code>Tensor</code> is a
+            pointer plus a <code>Layout</code>. That sounds trivial, but layouts
+            can be hierarchical, they nest, and they support a real algebra of
+            composition, division, and product. With that algebra a single
+            object can describe a tile of a matrix, the partition of that tile
+            across the threads of a warp, or the fragment a tensor-core
+            instruction expects in registers, and all of these compose by the
+            same rules.
+            <mark>Once the mapping from threads to data is itself a value you
+            can compute with, tiling a GEMM stops being index arithmetic
+            scattered through the kernel and becomes a few layout operations
+            you can read, print, and check.</mark>
+            CUTLASS 3.x rebuilt the whole library on CuTe for exactly this
+            reason.
+          </p>
+          <p>
+            Two consequences follow. First, CUTLASS is a toolkit, not a
+            drop-in library. cuBLAS gives you a function to call. CUTLASS gives
+            you the templates to assemble a kernel with the exact data types,
+            tile shapes, pipeline depth, and fused epilogue you want, and then
+            get near cuBLAS-class performance on the newest hardware, often
+            before a tuned closed-source path exists. Second, because the
+            building blocks are open and composable, CUTLASS became the
+            substrate other projects build on. FlashAttention and the fused
+            attention kernels inside inference engines like
+            <a href="/oss/vllm">vLLM</a>,
+            <a href="/oss/sglang">SGLang</a>, and
+            <a href="/oss/tensorrt-llm">TensorRT-LLM</a> lean on CuTe atoms and
+            CUTLASS collectives for their matrix multiplies rather than
+            reinventing them. Everything here is written against the CUTLASS
+            3.x and 4.x line as of mid 2026. The API surface moves quickly
+            between releases, so where an exact template signature is likely
+            to have shifted I say so and stay at the level of the idea.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <p>
+            CUTLASS is a header-only library for the parts you include, plus a
+            CMake project for the examples, tests, and profiler. You need an
+            NVIDIA GPU, a recent CUDA toolkit, and a C++17 compiler. To use the
+            headers in your own code you only have to put <code>include/</code>
+            on the include path. To build the examples and the profiler you
+            clone and run CMake, telling it which GPU architectures to target:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">git</span> <span class="s">clone</span> <span class="s">https://github.com/NVIDIA/cutlass</span>
+<span class="m1">cd</span> <span class="s">cutlass</span>
+<span class="m1">mkdir</span> <span class="s">build</span> &amp;&amp; <span class="m1">cd</span> <span class="s">build</span>
+
+<span class="c"># target one architecture: 80 = Ampere (A100), 90a = Hopper (H100),</span>
+<span class="c"># 100a = Blackwell. The 'a' suffix enables arch-accelerated features.</span>
+<span class="m1">cmake</span> <span class="s">..</span> <span class="s">-DCUTLASS_NVCC_ARCHS=90a</span>
+
+<span class="c"># building every kernel is enormous and slow; scope it down while learning</span>
+<span class="m1">make</span> <span class="s">cutlass_profiler</span> <span class="s">-j</span> <span class="s">16</span></code></pre></div>
+          <p>
+            The first thing to know is that CUTLASS can generate an
+            overwhelming number of kernel instances, one per combination of
+            data type, tile shape, and layout, and building all of them can
+            take hours and many gigabytes. <code>CUTLASS_NVCC_ARCHS</code>
+            restricts the target architectures and
+            <code>CUTLASS_LIBRARY_KERNELS</code> filters which instances get
+            compiled into the instance library. Keep both narrow while you are
+            learning. The single most useful build target is
+            <code>cutlass_profiler</code>, a command-line tool that enumerates
+            the compiled kernels, runs any of them against a problem size, and
+            reports throughput. It is the fastest way to see what the library
+            can do without writing a line of C++:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="c"># run every applicable GEMM instance for a 4096-cube problem and rank them</span>
+<span class="m1">./tools/profiler/cutlass_profiler</span> <span class="s">--operation=Gemm</span> <span class="s">\</span>
+    <span class="s">--m=4096</span> <span class="s">--n=4096</span> <span class="s">--k=4096</span>
+
+<span class="c"># pin the data types and see which tile shapes win</span>
+<span class="m1">./tools/profiler/cutlass_profiler</span> <span class="s">--operation=Gemm</span> <span class="s">\</span>
+    <span class="s">--A=f16:row</span> <span class="s">--B=f16:col</span> <span class="s">--C=f16:row</span> <span class="s">--accum=f32</span> <span class="s">\</span>
+    <span class="s">--m=8192</span> <span class="s">--n=8192</span> <span class="s">--k=8192</span></code></pre></div>
+          <p>
+            Now the smallest amount of C++ that runs a real tensor-core GEMM.
+            The 2.x device API is the gentlest entry point, and it still ships
+            and works. You pick element types and layouts for A, B, and C, an
+            accumulator type, an operator class that says use the tensor cores,
+            and a target architecture, and the template picks sensible tile
+            shapes for you:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-cpp"><span class="k">#include</span> <span class="s">&lt;cutlass/gemm/device/gemm.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;cutlass/numeric_types.h&gt;</span>
+
+<span class="c">// A is row-major fp16, B is column-major fp16, C/D are row-major fp16,</span>
+<span class="c">// accumulation happens in fp32, on Ampere tensor cores.</span>
+<span class="k">using</span> <span class="m1">Gemm</span> = <span class="m1">cutlass</span>::<span class="m2">gemm</span>::<span class="m2">device</span>::<span class="m2">Gemm</span>&lt;
+    <span class="m1">cutlass</span>::<span class="m1">half_t</span>, <span class="m1">cutlass</span>::<span class="m2">layout</span>::<span class="m2">RowMajor</span>,<span class="c">      // A: element, layout</span>
+    <span class="m1">cutlass</span>::<span class="m1">half_t</span>, <span class="m1">cutlass</span>::<span class="m2">layout</span>::<span class="m2">ColumnMajor</span>,<span class="c">   // B</span>
+    <span class="m1">cutlass</span>::<span class="m1">half_t</span>, <span class="m1">cutlass</span>::<span class="m2">layout</span>::<span class="m2">RowMajor</span>,<span class="c">      // C and D</span>
+    <span class="k">float</span>,<span class="c">                                           // accumulator element</span>
+    <span class="m1">cutlass</span>::<span class="m2">arch</span>::<span class="m2">OpClassTensorOp</span>,<span class="c">                  // use tensor cores</span>
+    <span class="m1">cutlass</span>::<span class="m2">arch</span>::<span class="m2">Sm80</span>&gt;;<span class="c">                            // target Ampere</span>
+
+<span class="m1">Gemm</span> <span class="m1">gemm_op</span>;
+<span class="m1">cutlass</span>::<span class="m2">Status</span> <span class="v1">status</span> = <span class="m1">gemm_op</span><span class="b0">(</span><span class="b1">{</span>
+    <span class="b2">{</span><span class="v5">M</span>, <span class="v6">N</span>, <span class="v0">K</span><span class="b2">}</span>,<span class="c">                 // problem size</span>
+    <span class="b2">{</span><span class="v0">ptrA</span>, <span class="v1">lda</span><span class="b2">}</span>, <span class="b2">{</span><span class="v1">ptrB</span>, <span class="v2">ldb</span><span class="b2">}</span>,<span class="c">  // A and B as {pointer, leading dim}</span>
+    <span class="b2">{</span><span class="v3">ptrC</span>, <span class="v4">ldc</span><span class="b2">}</span>, <span class="b2">{</span><span class="v4">ptrD</span>, <span class="v0">ldd</span><span class="b2">}</span>,<span class="c">  // source C and destination D</span>
+    <span class="b2">{</span><span class="v5">alpha</span>, <span class="v4">beta</span><span class="b2">}</span><span class="c">              // epilogue scalars for alpha*AB + beta*C</span>
+<span class="b1">}</span><span class="b0">)</span>;
+<span class="k">if</span> <span class="b0">(</span><span class="v1">status</span> != <span class="m1">cutlass</span>::<span class="m2">Status</span>::<span class="m2">kSuccess</span><span class="b0">)</span> <span class="b0">{</span><span class="c"> /* handle */</span> <span class="b0">}</span></code></pre></div>
+          <p>
+            The default epilogue there is <code>LinearCombination</code>, which
+            computes <code>alpha * accumulator + beta * C</code> and casts to
+            the output type. Swapping it for a fused variant, adding a bias
+            vector or a ReLU, is a matter of naming a different epilogue
+            functor in the template. That is the first taste of the design,
+            the kernel is assembled from parts, and the epilogue is one of the
+            parts you get to choose.
+          </p>
+          <p>
+            On Hopper and Blackwell the recommended path is the 3.x
+            <em>collective builder</em>, which asks you for the problem shape,
+            a threadblock tile, and a cluster shape, then auto-selects the
+            pipeline schedule, stage count, and copy atoms appropriate to the
+            architecture. The signature has changed across releases, so treat
+            this as schematic and cross-check it against the version's
+            <code>examples/</code> directory:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-cpp"><span class="k">#include</span> <span class="s">&lt;cutlass/gemm/collective/collective_builder.hpp&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;cutlass/epilogue/collective/collective_builder.hpp&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;cutlass/gemm/kernel/gemm_universal.hpp&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;cutlass/gemm/device/gemm_universal_adapter.h&gt;</span>
+<span class="k">using</span> <span class="k">namespace</span> <span class="m1">cute</span>;
+
+<span class="k">using</span> <span class="m1">TileShape</span>    = <span class="m1">Shape</span>&lt;<span class="m1">_128</span>, <span class="m1">_256</span>, <span class="m1">_64</span>&gt;;<span class="c">  // CTA tile: M, N, K</span>
+<span class="k">using</span> <span class="m1">ClusterShape</span> = <span class="m1">Shape</span>&lt;<span class="m1">_2</span>,   <span class="m1">_1</span>,   <span class="m1">_1</span>&gt;;<span class="c">    // Hopper thread block cluster</span>
+
+<span class="c">// the mainloop: how A and B are staged and multiplied</span>
+<span class="k">using</span> <span class="m1">Mainloop</span> = <span class="k">typename</span> <span class="m1">cutlass</span>::<span class="m2">gemm</span>::<span class="m2">collective</span>::<span class="m2">CollectiveBuilder</span>&lt;
+    <span class="m1">cutlass</span>::<span class="m2">arch</span>::<span class="m2">Sm90</span>, <span class="m1">cutlass</span>::<span class="m2">arch</span>::<span class="m2">OpClassTensorOp</span>,
+    <span class="m1">cutlass</span>::<span class="m1">half_t</span>, <span class="m1">cutlass</span>::<span class="m2">layout</span>::<span class="m2">RowMajor</span>,    <span class="n">8</span>,<span class="c">   // A + alignment</span>
+    <span class="m1">cutlass</span>::<span class="m1">half_t</span>, <span class="m1">cutlass</span>::<span class="m2">layout</span>::<span class="m2">ColumnMajor</span>, <span class="n">8</span>,<span class="c">   // B + alignment</span>
+    <span class="k">float</span>,<span class="c">                                              // accumulator</span>
+    <span class="m1">TileShape</span>, <span class="m1">ClusterShape</span>,
+    <span class="m1">cutlass</span>::<span class="m2">gemm</span>::<span class="m2">collective</span>::<span class="m2">StageCountAuto</span>,<span class="c">          // pick shared-mem depth</span>
+    <span class="m1">cutlass</span>::<span class="m2">gemm</span>::<span class="m2">collective</span>::<span class="m2">KernelScheduleAuto</span><span class="c">       // pick warp schedule</span>
+&gt;::<span class="m2">CollectiveOp</span>;
+
+<span class="c">// the epilogue: how accumulators become D (fusions plug in here)</span>
+<span class="k">using</span> <span class="m1">Epilogue</span> = <span class="k">typename</span> <span class="m1">cutlass</span>::<span class="m2">epilogue</span>::<span class="m2">collective</span>::<span class="m2">CollectiveBuilder</span>&lt;
+    <span class="m1">cutlass</span>::<span class="m2">arch</span>::<span class="m2">Sm90</span>, <span class="m1">cutlass</span>::<span class="m2">arch</span>::<span class="m2">OpClassTensorOp</span>,
+    <span class="m1">TileShape</span>, <span class="m1">ClusterShape</span>,
+    <span class="m1">cutlass</span>::<span class="m2">epilogue</span>::<span class="m2">collective</span>::<span class="m2">EpilogueTileAuto</span>,
+    <span class="k">float</span>, <span class="k">float</span>,<span class="c">                                       // compute, accumulator</span>
+    <span class="m1">cutlass</span>::<span class="m1">half_t</span>, <span class="m1">cutlass</span>::<span class="m2">layout</span>::<span class="m2">RowMajor</span>, <span class="n">8</span>,<span class="c">      // C</span>
+    <span class="m1">cutlass</span>::<span class="m1">half_t</span>, <span class="m1">cutlass</span>::<span class="m2">layout</span>::<span class="m2">RowMajor</span>, <span class="n">8</span>,<span class="c">      // D</span>
+    <span class="m1">cutlass</span>::<span class="m2">epilogue</span>::<span class="m2">collective</span>::<span class="m2">EpilogueScheduleAuto</span>
+&gt;::<span class="m2">CollectiveOp</span>;
+
+<span class="k">using</span> <span class="m1">GemmKernel</span> = <span class="m1">cutlass</span>::<span class="m2">gemm</span>::<span class="m2">kernel</span>::<span class="m2">GemmUniversal</span>&lt;
+    <span class="m1">Shape</span>&lt;<span class="k">int</span>,<span class="k">int</span>,<span class="k">int</span>,<span class="k">int</span>&gt;, <span class="m1">Mainloop</span>, <span class="m1">Epilogue</span>&gt;;<span class="c">     // problem is M,N,K,L</span>
+<span class="k">using</span> <span class="m1">Gemm</span> = <span class="m1">cutlass</span>::<span class="m2">gemm</span>::<span class="m2">device</span>::<span class="m1">GemmUniversalAdapter</span>&lt;<span class="m1">GemmKernel</span>&gt;;</code></pre></div>
+          <p>
+            The mistakes beginners make. First, trying to build everything.
+            Scope the architectures and the kernel filter, or the first
+            <code>make</code> will run for an hour. Second, confusing element
+            and accumulator types. Tensor-core GEMM typically multiplies fp16
+            or bf16 operands but accumulates in fp32, and getting the
+            accumulator wrong quietly costs accuracy or fails to compile.
+            Third, ignoring alignment. The alignment number in the collective
+            builder, and the vectorized access CUTLASS wants, mean your
+            leading dimensions and pointers usually must be aligned to 8 or 16
+            elements, and a misaligned tensor either falls back to a slow path
+            or refuses to run. Fourth, expecting the newest tile shapes to run
+            on old hardware. A Hopper <code>wgmma</code> schedule needs
+            <code>-DCUTLASS_NVCC_ARCHS=90a</code> and an H100. Compile for the
+            architecture you will actually run on.
+          </p>
+
+          <h2>Part III: When it is the right tool</h2>
+          <p>
+            CUTLASS is the right tool when you need a matrix multiply or
+            convolution that cuBLAS cannot express, and you are willing to work
+            in C++ templates to get it. The common triggers are a fused
+            epilogue cuBLAS does not offer, a quantized or mixed-input GEMM
+            such as fp8 by fp8 or int4 weights by fp16 activations, a grouped
+            or batched GEMM with irregular shapes as in mixture-of-experts, an
+            unusual data layout, or simply wanting an open kernel you can read,
+            modify, and specialize. It is also the place where support for a
+            brand-new architecture lands first, so if you need to use Hopper or
+            Blackwell tensor cores at peak the week the GPU ships, CUTLASS is
+            often the only game in town.
+          </p>
+          <p>
+            The honest cases for alternatives. cuBLAS and cuBLASLt when a plain
+            or lightly-fused GEMM is all you need, since they are a tuned
+            closed-source library you call rather than a toolkit you assemble,
+            and cuBLASLt already fuses common bias and activation epilogues.
+            Triton when you want to write a fused kernel in Python with a
+            block-level programming model and a JIT, trading some peak
+            performance and some control over the exact instruction stream for
+            a much shorter path from idea to working kernel. Plain hand-written
+            CUDA with the <code>mma</code> intrinsics when your kernel is small
+            and you want no abstraction at all. On AMD hardware the closest
+            analogue is Composable Kernel, since CUTLASS is NVIDIA-only. And
+            for the layers below GEMM, the scan, sort, and reduce primitives,
+            reach for CUB and Thrust rather than CUTLASS.
+          </p>
+          <p>
+            There is a real learning-cost warning here. CUTLASS is famous for
+            template error messages that run to hundreds of lines, because the
+            entire kernel configuration lives in the type system and a single
+            mismatched tile shape or unsupported type combination surfaces as a
+            wall of substitution failures. The payoff is that a configuration
+            that compiles is a configuration the library believes is valid, and
+            much of the correctness is checked before the kernel ever runs. But
+            budget time for reading types, not just code. The newer CuTe DSL, a
+            Python front end over the same layout algebra that recent releases
+            ship, exists partly to soften this, letting you author kernels
+            against CuTe abstractions in Python while keeping the semantics of
+            the C++ library.
+          </p>
+          <p>
+            The architecture-shaped caution is about matching the kernel to the
+            problem shape. A GEMM that is large and square is compute-bound and
+            almost any reasonable tiling reaches peak. A GEMM that is tall and
+            skinny, a large K with small M and N as in a single-token decode
+            step, has too few output tiles to fill the GPU, and the arithmetic
+            intensity is low enough that memory bandwidth, not the tensor
+            cores, sets the ceiling. This is the regime where split-K and
+            Stream-K schedules matter, where the choice between them is not
+            cosmetic, and where blindly using the tile shape that won on a
+            square problem gives you a fraction of the achievable throughput.
+            The right tile and the right scheduler depend on the shape, which
+            is exactly why CUTLASS parameterizes both.
+          </p>
+
+          <h2>Part IV: The full life of one GEMM</h2>
+          <p>
+            The specimen is one tensor-core GEMM,
+            <code>D = alpha * A @ B + beta * C</code>, with fp16 operands and
+            fp32 accumulation, running the 3.x collective path on a Hopper GPU.
+            The Ampere path is the same story with <code>cp.async</code> in
+            place of TMA and <code>mma.sync</code> in place of
+            <code>wgmma</code>, and I note the fork where it matters.
+          </p>
+
+          <h3>Stage 1: host setup and launch</h3>
+          <p>
+            On the host you instantiate the <code>Gemm</code> type from Part
+            II, build an <code>Arguments</code> struct holding the problem
+            shape, the device pointers and strides for A, B, C, and D, and the
+            epilogue parameters such as <code>alpha</code> and
+            <code>beta</code>. You then ask the adapter how much scratch it
+            needs with <code>Gemm::get_workspace_size(args)</code>, allocate
+            that workspace, call <code>can_implement(args)</code> to validate
+            the configuration against the problem, then <code>initialize</code>
+            and <code>run</code>. Under the hood <code>run</code> computes a
+            grid shape from the problem and the CTA tile, sets the dynamic
+            shared-memory size, and launches the single kernel. Everything
+            after this is on the device.
+          </p>
+
+          <h3>Stage 2: tile scheduling and the grid</h3>
+          <p>
+            The output matrix is covered by a grid of Mt-by-Nt tiles, and a
+            <em>tile scheduler</em> assigns tiles to thread blocks. The naive
+            scheduler hands block <code>(i, j)</code> the tile at row block
+            <code>i</code>, column block <code>j</code>, but CUTLASS also swizzles
+            this mapping so that blocks running at the same time touch nearby
+            regions of A and B, which improves L2 cache reuse. For skewed
+            shapes the Stream-K scheduler instead splits the K dimension across
+            blocks so every streaming multiprocessor gets a balanced share of
+            work, then reduces the partial results. On Hopper the grid is
+            organized into <em>thread block clusters</em>, small groups of
+            blocks that can read each other's shared memory, which the cluster
+            shape in Part II selects. Each block now knows which output tile it
+            owns.
+          </p>
+
+          <h3>Stage 3: the prologue and CuTe partitioning</h3>
+          <p>
+            Inside the kernel, before any math, the block sets up its view of
+            the data with CuTe. It wraps the global A, B, C, D pointers in
+            tensors with their strides, then uses <code>local_tile</code> to
+            slice out just this block's Mt-by-K slab of A and K-by-Nt slab of
+            B. It allocates the shared-memory staging buffers, which are
+            multi-buffered so several K-tiles can be in flight at once, and it
+            builds a <code>TiledMMA</code> from the architecture's MMA atom and
+            asks it, through <code>partition_C</code>, for this thread's slice
+            of the accumulator, a small register fragment that starts zeroed.
+            All of the ugly index arithmetic that used to fill a GEMM kernel is
+            now a handful of layout operations over these tensors.
+          </p>
+
+          <h3>Stage 4: the mainloop, load and compute overlapped</h3>
+          <p>
+            This is the heart of the kernel and where most of the time is
+            spent. The block walks the K dimension in tile-sized steps, and at
+            every step two things happen concurrently. Loads: a copy atom
+            brings the next A-tile and B-tile from global memory into the next
+            free shared-memory buffer. On Hopper this is a single TMA bulk copy
+            per tile, issued by one thread and driven by the Tensor Memory
+            Accelerator, which knows the tile's shape from a descriptor and
+            signals completion through an <code>mbarrier</code>. On Ampere it is
+            a set of <code>cp.async</code> instructions that copy global to
+            shared without staging through registers. Compute: the tensor cores
+            run MMA instructions over the shared-memory buffer that a previous
+            iteration already filled, accumulating into the register fragment.
+            On Ampere the warp first uses <code>ldmatrix</code> to pull operand
+            fragments from shared memory into registers in the exact layout the
+            <code>mma.sync</code> instruction wants. On Hopper the
+            <code>wgmma</code> instruction is issued by a whole warpgroup of 128
+            threads and reads its operands straight from shared memory through
+            descriptors, so no explicit register load is needed. Because the
+            shared memory is multi-buffered, the loads for tile
+            <code>k+1</code> overlap the math on tile <code>k</code>, and the
+            pipeline barriers make a producer set of warps and a consumer set
+            of warps hand buffers back and forth. This warp specialization,
+            producers doing TMA and consumers doing <code>wgmma</code>, is the
+            defining shape of a Hopper CUTLASS kernel.
+          </p>
+          <pre class="flow">multistage software pipeline over K (shared memory is a ring of buffers):
+
+buffer:   b0     b1     b2     b0     b1  ...
+load:    [k0]-&gt;[k1]-&gt;[k2]-&gt;[k3]-&gt;[k4]           producer warps: TMA / cp.async
+mma:           [k0]-&gt;[k1]-&gt;[k2]-&gt;[k3]-&gt;[k4]     consumer warps: wgmma / mma.sync
+                ^ compute on k0 overlaps load of k2
+result:  register accumulator grows by A[:,k] @ B[k,:] each step</pre>
+
+          <h3>Stage 5: the epilogue and fusion</h3>
+          <p>
+            When the K loop finishes, each thread holds its slice of the raw
+            <code>A @ B</code> accumulator in registers, in whatever scattered
+            layout the tensor-core instruction produced. The epilogue turns
+            that into the stored result. In the simple case it loads the
+            matching piece of C, computes
+            <code>alpha * accumulator + beta * C</code>, casts to the output
+            type, and stores. Because the MMA output layout is not friendly for
+            coalesced global writes, the epilogue usually routes the data
+            through shared memory once to reorganize it into wide, aligned
+            store transactions, and on Hopper the store itself can be a TMA
+            copy back to global. The powerful case is fusion. CUTLASS 3.x
+            expresses the epilogue as an <em>Epilogue Visitor Tree</em>, a small
+            compute graph whose nodes are elementwise ops, broadcasts of a bias
+            vector, activation functions, and reductions. You can fuse a bias
+            add, a GELU, a per-channel scale for dequantization, and a reduction
+            for the next layer's normalization, all into the same kernel, so
+            the accumulator is consumed while it is still hot in registers and
+            never makes an extra trip to memory.
+          </p>
+
+          <h3>Stage 6: the store, and any split-K reduction</h3>
+          <p>
+            The epilogue writes D to global memory and the kernel exits. If the
+            configuration used split-K or Stream-K, several blocks each computed
+            a partial sum over part of K, and a short second phase reduces those
+            partials into the final D, either in a separate reduction kernel or
+            through atomics into the output. That closes the loop of one GEMM,
+            operands streamed in through the memory hierarchy, multiplied on the
+            tensor cores with loads hidden under math, fused in the epilogue,
+            and the result written back once. The same six stages describe a
+            convolution too, because CUTLASS implements convolution as an
+            <em>implicit GEMM</em>, forming the im2col matrix on the fly inside
+            the mainloop rather than materializing it in memory.
+          </p>
+
+          <h2>Part V: Internals deep dives</h2>
+
+          <h3>Deep dive: the arithmetic-intensity story</h3>
+          <p>
+            Everything about CUTLASS follows from one number. Arithmetic
+            intensity is the ratio of floating-point operations performed to
+            bytes moved from memory, in FLOP per byte. The roofline model says
+            the throughput you can attain is
+            <code>min(peak_flops, intensity * peak_bandwidth)</code>. Below a
+            threshold you are memory-bound and bandwidth caps you. Above it you
+            are compute-bound and the tensor cores cap you. That threshold, the
+            <em>ridge point</em>, is <code>peak_flops / peak_bandwidth</code>.
+            For a modern data-center GPU the tensor cores are so fast relative
+            to memory that this ridge point is high. An A100, for instance,
+            delivers roughly 300 TFLOP/s of dense fp16 tensor-core throughput
+            against roughly 2 TB/s of HBM bandwidth, which puts the ridge point
+            near 150 FLOP per byte. To be compute-bound you must do about 150
+            floating-point operations for every byte you read.
+          </p>
+          <p>
+            Now measure a GEMM against that bar. A matrix multiply of shape
+            M-by-N-by-K does <code>2*M*N*K</code> FLOP. The minimal data it must
+            touch is <code>M*K + K*N + M*N</code> elements. A naive kernel that
+            recomputes reads gets nowhere near the minimum and lands far to the
+            memory-bound left of the ridge. Tiling fixes this. Suppose a block
+            holds an Mt-by-Nt output tile in fast storage and streams K. At each
+            K-step it reads <code>Mt + Nt</code> new elements and does
+            <code>2 * Mt * Nt</code> FLOP, so the intensity of the tile is:
+          </p>
+          <pre class="flow">intensity  =  (2 * Mt * Nt FLOP) / ((Mt + Nt) elements * bytes_per_element)
+
+for a square tile Mt = Nt = T, with b bytes per element:
+
+intensity  =  2 * T^2 / (2 * T * b)  =  T / b
+
+so intensity grows LINEARLY with tile size T.
+
+fp16, b = 2 bytes, ridge point ~150 FLOP/byte  =&gt;  need T / 2 &gt; 150  =&gt;  T &gt; 300
+                                                    per level of reuse combined</pre>
+          <p>
+            That single line, intensity equals tile size over bytes per
+            element, is the reason the whole hierarchy exists.
+            <mark>A bigger tile reuses each loaded element more times, which
+            raises arithmetic intensity, which is the only way to cross the
+            ridge point and become compute-bound.</mark>
+            But no single level of storage is both large enough and fast enough
+            to hold a tile big enough on its own. Registers are fastest but tiny,
+            shared memory is bigger but slower, L2 and HBM bigger and slower
+            still. So CUTLASS multiplies the reuse across levels. The
+            threadblock tile, often 128-by-256, gets its reuse against slow
+            global memory by living in shared memory. The warp tile, often
+            64-by-64 or 64-by-128, gets its reuse against shared memory by
+            living in registers. The instruction tile, the 16-by-8-by-16 shape
+            of one Ampere MMA or the 64-wide shape of a Hopper
+            <code>wgmma</code>, gets its reuse right at the tensor-core inputs.
+            Each level's job is to raise the effective intensity seen by the
+            level below it, and the product of the per-level reuse is what lifts
+            a bandwidth-bound problem onto the compute roofline. Read the
+            <code>media/docs/efficient_gemm.md</code> note alongside this
+            section, it walks the same hierarchy from NVIDIA's own framing.
+          </p>
+
+          <h3>Deep dive: CuTe layout algebra</h3>
+          <p>
+            A CuTe <code>Layout</code> is a <code>Shape</code> paired with a
+            <code>Stride</code>, and it is a function from a coordinate to an
+            integer offset. The layout <code>(4,2):(1,4)</code> has shape four
+            by two and strides one and four, so coordinate <code>(i,j)</code>
+            maps to <code>i*1 + j*4</code>. That is a column-major four-by-two
+            tile. Change the strides to <code>(2,1)</code> and the same shape
+            becomes row-major. Shapes and strides can be nested tuples, which is
+            what makes layouts hierarchical, a shape like
+            <code>((2,2),2)</code> describes a tile-of-tiles and the algebra
+            handles the nesting automatically. You build them with
+            <code>make_layout</code> and static integers like
+            <code>_4{}</code>, and you can <code>print_layout</code> them to see
+            the coordinate-to-offset table directly:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-cpp"><span class="k">#include</span> <span class="s">&lt;cute/tensor.hpp&gt;</span>
+<span class="k">using</span> <span class="k">namespace</span> <span class="m1">cute</span>;
+
+<span class="c">// a 4x2 column-major layout: coord (i,j) -&gt; i*1 + j*4</span>
+<span class="k">auto</span> <span class="v2">layout</span> = <span class="m1">make_layout</span><span class="b0">(</span><span class="m1">make_shape</span> <span class="b1">(</span><span class="v5">_4</span><span class="b2">{}</span>, <span class="v1">_2</span><span class="b2">{}</span><span class="b1">)</span>,
+                          <span class="m1">make_stride</span><span class="b1">(</span><span class="v2">_1</span><span class="b2">{}</span>, <span class="v5">_4</span><span class="b2">{}</span><span class="b1">)</span><span class="b0">)</span>;
+<span class="m1">print_layout</span><span class="b0">(</span><span class="v2">layout</span><span class="b0">)</span>;<span class="c">            // prints the 2D index table</span>
+
+<span class="c">// a tensor is just a pointer wearing a layout</span>
+<span class="k">auto</span> <span class="v6">A</span> = <span class="m1">make_tensor</span><span class="b0">(</span><span class="v0">ptrA</span>, <span class="m1">make_layout</span><span class="b1">(</span><span class="m1">make_shape</span><span class="b2">(</span><span class="v5">M</span>, <span class="v0">K</span><span class="b2">)</span>, <span class="m1">make_stride</span><span class="b2">(</span><span class="v0">K</span>, <span class="v2">_1</span><span class="b0">{}</span><span class="b2">)</span><span class="b1">)</span><span class="b0">)</span>;
+
+<span class="c">// slice out one CTA's tile without copying anything</span>
+<span class="k">auto</span> <span class="v0">gA</span> = <span class="m1">local_tile</span><span class="b0">(</span><span class="v6">A</span>, <span class="m1">make_shape</span><span class="b1">(</span><span class="v4">_128</span><span class="b2">{}</span>, <span class="v0">_64</span><span class="b2">{}</span><span class="b1">)</span>, <span class="m1">make_coord</span><span class="b1">(</span><span class="v6">block_m</span>, <span class="v6">k</span><span class="b1">)</span><span class="b0">)</span>;</code></pre></div>
+          <p>
+            The reason this is an algebra and not just a struct is the set of
+            operations that combine layouts. <code>composition</code> feeds one
+            layout's output into another's input, which is how you express
+            slicing and reshaping. <code>complement</code> fills in the strides a
+            layout does not cover. The <em>products</em>,
+            <code>logical_product</code>, <code>blocked_product</code>, and
+            <code>raked_product</code>, tile one layout by another, and the
+            <em>divides</em>, <code>logical_divide</code> and
+            <code>zipped_divide</code>, partition a layout into tiles. The two
+            you meet constantly in kernels are <code>local_tile</code>, which
+            gives a block its tile of a big tensor, and
+            <code>local_partition</code>, which gives a thread its elements of a
+            tile according to a thread layout.
+            <mark>Because the thread-to-data mapping is itself a layout, the
+            same value can describe a matrix tile and the way threads carve it
+            up, and partitioning becomes one algebraic operation instead of a
+            page of index math.</mark>
+            The trap to internalize early is that a layout is bookkeeping, not
+            data. Two very different layouts can point at the same bytes, and a
+            correct-looking kernel with the wrong thread layout produces bank
+            conflicts or wrong answers with no type error, because every layout
+            is a valid layout. The CuTe docs under <code>media/docs/cute/</code>
+            build this up carefully and are worth reading in order.
+          </p>
+
+          <h3>Deep dive: MMA atoms, copy atoms, and tiling them</h3>
+          <p>
+            An <em>atom</em> in CuTe is the smallest indivisible unit of a
+            hardware operation, wrapped so the layout algebra can reason about
+            it. An <code>MMA_Atom</code> corresponds to exactly one tensor-core
+            instruction and carries the thread-value layouts that say which
+            thread holds which element of the operands and the result. The atom
+            names encode the instruction directly. An Ampere fp16 atom reads
+            like <code>SM80_16x8x16_F32F16F16F32_TN</code>, which parses as
+            architecture SM80, MMA shape 16-by-8-by-16, output and operand and
+            accumulator types F32, F16, F16, F32, and the TN operand
+            arrangement the instruction requires. A Hopper warpgroup atom reads
+            like <code>SM90_64x128x16_F32F16F16_SS</code>, a 64-by-N-by-16
+            <code>wgmma</code> that takes both operands from shared memory, which
+            is what the SS suffix means. You rarely name these by hand on the
+            3.x path, the collective builder picks them, but knowing the naming
+            convention lets you read any CUTLASS kernel.
+          </p>
+          <p>
+            A single atom is tiny, one instruction over a handful of threads. A
+            <code>TiledMMA</code> replicates an atom across the warps of a block
+            to cover the whole warp tile, and it exposes
+            <code>partition_A</code>, <code>partition_B</code>, and
+            <code>partition_C</code> so each thread can find its fragments. The
+            mirror image on the data-movement side is the
+            <code>Copy_Atom</code>, one copy instruction such as a
+            <code>cp.async</code> transfer, an <code>ldmatrix</code> shared-to-
+            register load, or a TMA bulk copy, and <code>TiledCopy</code> tiles
+            it across threads the same way. The whole mainloop is then two tiled
+            objects working together, a <code>TiledCopy</code> feeding shared
+            memory and a <code>TiledMMA</code> consuming it, and the actual math
+            is one call to <code>cute::gemm(tiled_mma, fragA, fragB, fragC)</code>.
+            <mark>Expressing both the compute and the data movement as tiled
+            atoms means the same algebra that lays out the matrices also lays
+            out the instructions, so a kernel is a composition of a few
+            well-typed pieces rather than a monolith.</mark>
+            One more layer worth naming is the shared-memory swizzle. Tensor
+            cores read shared memory in patterns that would collide on the
+            memory banks if the layout were naive, so CuTe composes a
+            <code>Swizzle</code> onto the shared-memory layout to scatter
+            addresses across banks and avoid conflicts, and that swizzle is,
+            again, just another layout in the composition.
+          </p>
+
+          <h3>Deep dive: the collective builder and kernel schedules</h3>
+          <p>
+            The 3.x library is organized around <em>collectives</em>. A
+            <code>CollectiveMainloop</code> owns everything about streaming A and
+            B and running the MMAs, and a <code>CollectiveEpilogue</code> owns
+            everything about turning accumulators into output. Above them a
+            <code>GemmUniversal</code> kernel glues a mainloop, an epilogue, and
+            a tile scheduler, and a <code>GemmUniversalAdapter</code> wraps the
+            kernel with the host-side launch machinery. You could assemble a
+            collective by hand, but the <code>CollectiveBuilder</code> exists to
+            choose the hard parts for you. Given the architecture, the types, a
+            tile shape, and a cluster shape, it selects the copy atoms, the MMA
+            atom, the number of pipeline stages that fit in shared memory, and
+            the warp schedule. The schedule is the interesting choice on Hopper.
+            <code>KernelScheduleAuto</code> resolves to a warp-specialized
+            schedule, and the named variants trade off differently. A
+            cooperative schedule has all consumer warps collaborate on one
+            output tile, while a pingpong schedule has two consumer warpgroups
+            alternate on two tiles so one can run the epilogue while the other
+            runs math. Which wins depends on the shape and the epilogue cost,
+            which is why both exist and why the profiler is the way to decide.
+            The exact spelling of these schedule tags and builder parameters has
+            moved between 3.x releases, so learn the roles and check the headers
+            under <code>include/cutlass/gemm/collective/</code> for the version
+            you have.
+          </p>
+
+          <h3>Deep dive: data types and quantization</h3>
+          <p>
+            CUTLASS defines its own numeric types in
+            <code>cutlass/numeric_types.h</code> so the templates can carry
+            precision in the type system. Beyond <code>half_t</code> and
+            <code>bfloat16_t</code> there is <code>tfloat32_t</code>, the
+            reduced-mantissa TF32 format the tensor cores use for fast fp32-ish
+            math, the fp8 formats <code>float_e4m3_t</code> and
+            <code>float_e5m2_t</code>, and narrow integer types down to int4.
+            The point of first-class narrow types is that they raise arithmetic
+            intensity twice over. Fewer bytes per element means the ridge-point
+            math from the first deep dive needs a smaller tile to become
+            compute-bound, and the tensor cores run narrow types at higher
+            FLOP rates, so quantized GEMM is where a great deal of inference
+            speed comes from. This is exactly the machinery inference engines
+            reach for. A vLLM or TensorRT-LLM fp8 or int8 matmul is a CUTLASS
+            GEMM with a narrow input type and an epilogue that fuses the
+            dequantization scale, and a mixture-of-experts layer becomes a
+            grouped GEMM where each expert is one problem in a batch of
+            differently-shaped problems. The newest Blackwell tensor cores push
+            this further with block-scaled four-bit formats, where a small group
+            of elements shares a scale factor, and CUTLASS models those as
+            paired data-and-scale operands in the same collective framework.
+          </p>
+
+          <h2>Part VI: Reading the repository</h2>
+          <p>
+            The repository is large but well-partitioned, and you can read the
+            parts that matter without touching the rest. Paths below reflect the
+            3.x and 4.x layout as of mid 2026, and a few may have shifted.
+          </p>
+          <p>
+            <strong>Stage 0, orientation.</strong> Read the top-level
+            <code>README.md</code> for the feature and architecture matrix, then
+            <code>media/docs/efficient_gemm.md</code> for the hierarchical GEMM
+            picture in NVIDIA's words, then browse
+            <code>media/docs/cute/</code> for the CuTe introduction. Questions to
+            hold, what is the difference between the 2.x and 3.x APIs, what does
+            CuTe replace, and which architectures does your checkout support.
+          </p>
+          <p>
+            <strong>Stage 1, CuTe first.</strong> Everything else rests on it.
+            Read <code>include/cute/layout.hpp</code> and
+            <code>include/cute/tensor.hpp</code> for the core types, then the
+            algorithms in <code>include/cute/algorithm/</code> (notably
+            <code>gemm.hpp</code> and <code>copy.hpp</code>), then the atoms in
+            <code>include/cute/atom/</code> (<code>mma_atom.hpp</code> and
+            <code>copy_atom.hpp</code>). Run the CuTe examples under
+            <code>examples/cute/</code> and print layouts as you go. Questions,
+            what does a layout actually compute, what does
+            <code>local_partition</code> do to a tile, and what is a
+            thread-value layout.
+          </p>
+          <p>
+            <strong>Stage 2, one GEMM end to end.</strong> Start with a basic
+            example such as <code>examples/00_basic_gemm</code> to see the 2.x
+            device API, then a Hopper example such as the warp-specialized GEMM
+            examples in the higher-numbered <code>examples/</code> directories to
+            see the 3.x collective path. Follow the include chain from the
+            example into <code>include/cutlass/gemm/device/</code>, then
+            <code>gemm/kernel/</code>, then <code>gemm/collective/</code>.
+            Questions, where is the mainloop, where is the tile scheduler
+            chosen, and where does the epilogue attach.
+          </p>
+          <p>
+            <strong>Stage 3, the collective internals.</strong> Read the
+            collective mainloop and its pipeline in
+            <code>include/cutlass/gemm/collective/</code>, the epilogue and its
+            fusion nodes in <code>include/cutlass/epilogue/</code> including
+            <code>epilogue/fusion/</code> for the visitor trees, and the
+            architecture-specific instruction wrappers in
+            <code>include/cutlass/arch/</code> and the CuTe
+            <code>include/cute/arch/</code>. Questions, how does the multistage
+            pipeline synchronize producers and consumers, and how does an
+            Epilogue Visitor Tree turn a fusion into code.
+          </p>
+          <p>
+            <strong>Stage 4, the tools.</strong> Read
+            <code>tools/profiler/</code> to understand how kernels are
+            enumerated and benchmarked, <code>tools/library/</code> for how
+            instances are generated and registered, and
+            <code>tools/util/</code> for the host-side reference GEMM and tensor
+            helpers you use when checking your own kernel against a ground truth.
+            Questions, how does the profiler pick which kernels apply to a
+            problem, and how would you add a new instance to the library.
+          </p>
+          <p>
+            <strong>Stage 5, the frontier.</strong> The <code>python/</code>
+            tree holds the Python interface and the CuTe DSL, the
+            <code>include/cutlass/conv/</code> tree holds the implicit-GEMM
+            convolutions, and the grouped and mixture-of-experts GEMM examples
+            show the irregular-shape machinery. Where not to start, the
+            architecture-specific Blackwell paths and the block-scaled
+            narrow-precision types are the most in-flux corner of the codebase
+            and make more sense once the dense Hopper story is solid.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            Labs 1 and 2 need only a checkout and a compiler-visible GPU. Labs 3
+            through 5 want a tensor-core GPU, Ampere or newer. Log and menu
+            formats vary with the release.
+          </p>
+          <p><strong>Lab 1: print a layout.</strong> Concept: CuTe layouts as functions.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-cpp"><span class="c">// layout_lab.cu  -- compile with nvcc -I include, run on host or device</span>
+<span class="k">#include</span> <span class="s">&lt;cute/tensor.hpp&gt;</span>
+<span class="k">using</span> <span class="k">namespace</span> <span class="m1">cute</span>;
+<span class="k">int</span> <span class="m1">main</span><span class="b0">()</span> <span class="b0">{</span>
+  <span class="k">auto</span> <span class="m1">col</span> = <span class="m1">make_layout</span><span class="b1">(</span><span class="m1">make_shape</span><span class="b2">(</span><span class="v5">_4</span><span class="b0">{}</span>, <span class="v1">_2</span><span class="b0">{}</span><span class="b2">)</span>, <span class="m1">make_stride</span><span class="b2">(</span><span class="v2">_1</span><span class="b0">{}</span>, <span class="v5">_4</span><span class="b0">{}</span><span class="b2">)</span><span class="b1">)</span>;
+  <span class="k">auto</span> <span class="m1">row</span> = <span class="m1">make_layout</span><span class="b1">(</span><span class="m1">make_shape</span><span class="b2">(</span><span class="v5">_4</span><span class="b0">{}</span>, <span class="v1">_2</span><span class="b0">{}</span><span class="b2">)</span>, <span class="m1">make_stride</span><span class="b2">(</span><span class="v1">_2</span><span class="b0">{}</span>, <span class="v2">_1</span><span class="b0">{}</span><span class="b2">)</span><span class="b1">)</span>;
+  <span class="m1">print_layout</span><span class="b1">(</span><span class="m1">col</span><span class="b1">)</span>;<span class="c">   // column-major table</span>
+  <span class="m1">print_layout</span><span class="b1">(</span><span class="m1">row</span><span class="b1">)</span>;<span class="c">   // row-major table</span>
+<span class="c">  // predict the offset of coord (2,1) for each BEFORE running</span>
+  <span class="m1">print</span><span class="b1">(</span><span class="m1">col</span><span class="b2">(</span><span class="m1">make_coord</span><span class="b0">(</span><span class="n">2</span>,<span class="n">1</span><span class="b0">)</span><span class="b2">)</span><span class="b1">)</span>; <span class="m1">print</span><span class="b1">(</span><span class="s">"\n"</span><span class="b1">)</span>;
+  <span class="m1">print</span><span class="b1">(</span><span class="m1">row</span><span class="b2">(</span><span class="m1">make_coord</span><span class="b0">(</span><span class="n">2</span>,<span class="n">1</span><span class="b0">)</span><span class="b2">)</span><span class="b1">)</span>; <span class="m1">print</span><span class="b1">(</span><span class="s">"\n"</span><span class="b1">)</span>;
+<span class="b0">}</span></code></pre></div>
+          <p>
+            Predict both offsets from the stride before you run, then confirm.
+            Change one shape to a nested tuple such as
+            <code>make_shape(make_shape(_2{},_2{}), _2{})</code> and read how the
+            hierarchical layout prints.
+          </p>
+          <p><strong>Lab 2: enumerate and benchmark with the profiler.</strong> Concept: the instance library and tile-shape sensitivity.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="c"># after building cutlass_profiler for your arch</span>
+<span class="m1">./tools/profiler/cutlass_profiler</span> <span class="s">--operation=Gemm</span> <span class="s">\</span>
+    <span class="s">--A=f16:row</span> <span class="s">--B=f16:col</span> <span class="s">--C=f16:row</span> <span class="s">--accum=f32</span> <span class="s">\</span>
+    <span class="s">--m=4096</span> <span class="s">--n=4096</span> <span class="s">--k=4096</span>
+
+<span class="c"># now make it skinny and watch the winning kernel change</span>
+<span class="m1">./tools/profiler/cutlass_profiler</span> <span class="s">--operation=Gemm</span> <span class="s">\</span>
+    <span class="s">--A=f16:row</span> <span class="s">--B=f16:col</span> <span class="s">--C=f16:row</span> <span class="s">--accum=f32</span> <span class="s">\</span>
+    <span class="s">--m=16</span> <span class="s">--n=16</span> <span class="s">--k=32768</span></code></pre></div>
+          <p>
+            Note which tile shape and which kernel win the square problem, then
+            note how the winner changes for the tall-skinny K-heavy problem, and
+            connect that to the arithmetic-intensity argument and to split-K.
+          </p>
+          <p><strong>Lab 3: a first device GEMM.</strong> Concept: the 2.x device API and correctness checking.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-cpp"><span class="c">// build the fp16 Gemm from Part II, fill A and B with known values,</span>
+<span class="c">// run it, then compare against the host reference in tools/util:</span>
+<span class="k">#include</span> <span class="s">&lt;cutlass/util/reference/host/gemm.h&gt;</span>
+<span class="c">// compute D_ref on the host, then assert max_abs_error(D, D_ref) is small.</span>
+<span class="c">// deliberately misalign lda by 1 and observe can_implement() reject it.</span></code></pre></div>
+          <p>
+            The lesson is the workflow, instantiate, run, and always validate
+            against <code>tools/util</code>'s reference before trusting a
+            kernel. The alignment failure teaches why leading dimensions matter.
+          </p>
+          <p><strong>Lab 4: fuse an activation into the epilogue.</strong> Concept: epilogue as a swappable part.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-cpp"><span class="c">// swap the default LinearCombination epilogue for a variant that applies</span>
+<span class="c">// a ReLU or GELU after alpha*AB + beta*C, e.g. LinearCombinationRelu, and</span>
+<span class="c">// confirm the fused kernel matches "GEMM then activation" done separately,</span>
+<span class="c">// at lower total time because the accumulator never round-trips memory.</span></code></pre></div>
+          <p>
+            Time the fused kernel against running the GEMM and the activation as
+            two passes. The gap is the extra memory traffic you removed, which
+            is the whole point of epilogue fusion.
+          </p>
+          <p><strong>Lab 5: quantized GEMM.</strong> Concept: narrow types and dequantization fusion.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="c"># find an fp8 or int8 GEMM instance in the profiler and benchmark it</span>
+<span class="m1">./tools/profiler/cutlass_profiler</span> <span class="s">--operation=Gemm</span> <span class="s">\</span>
+    <span class="s">--A=e4m3:row</span> <span class="s">--B=e4m3:col</span> <span class="s">--C=f16:row</span> <span class="s">--accum=f32</span> <span class="s">\</span>
+    <span class="s">--m=8192</span> <span class="s">--n=8192</span> <span class="s">--k=8192</span></code></pre></div>
+          <p>
+            Compare the fp8 throughput against the fp16 result from Lab 2 on the
+            same shape, and reason about why narrower operands move the ridge
+            point and let a smaller tile become compute-bound. This is the exact
+            kernel shape inference engines use for quantized matmuls.
+          </p>
+
+          <h2>Part VIII: Questions and model answers</h2>
+          <p>Understanding checks. Answer aloud before reading.</p>
+          <p><strong>1. What is CUTLASS in one sentence?</strong></p>
+          <p>
+            A header library of CUDA C++ templates, built on the CuTe layout
+            algebra, for assembling matrix-multiply and convolution kernels that
+            decompose one GEMM into a hierarchy of tiles matching the GPU memory
+            levels and run at close to peak tensor-core throughput.
+          </p>
+          <p><strong>2. Why is a GEMM tiled at three levels instead of one?</strong></p>
+          <p>
+            Because no single storage level is both large enough to hold a tile
+            big enough for high arithmetic intensity and fast enough to feed the
+            tensor cores. The threadblock tile buys reuse against global memory
+            by living in shared memory, the warp tile buys reuse against shared
+            memory by living in registers, and the instruction tile sits at the
+            tensor-core inputs. The product of the per-level reuse is what lifts
+            the kernel onto the compute roofline.
+          </p>
+          <p><strong>3. What is a CuTe Layout?</strong></p>
+          <p>
+            A shape paired with a stride, understood as a function from a
+            logical coordinate to a linear offset. Layouts can nest, so one
+            value can describe a tile, a tile-of-tiles, or the mapping of threads
+            onto data, and they compose under a real algebra of composition,
+            product, and division.
+          </p>
+          <p><strong>4. What is an MMA atom and how does a TiledMMA use it?</strong></p>
+          <p>
+            An MMA atom wraps exactly one tensor-core instruction together with
+            the thread-value layouts describing which thread holds which operand
+            and result element. A TiledMMA replicates that atom across the warps
+            of a block to cover the warp tile and exposes partition methods so
+            each thread finds its fragments, so the block-level GEMM is the atom
+            tiled by the algebra.
+          </p>
+          <p><strong>5. What happens in the mainloop, and why is it a pipeline?</strong></p>
+          <p>
+            The block walks K in tile steps, and at each step it loads the next A
+            and B tiles into a free shared-memory buffer while the tensor cores
+            multiply a buffer a previous step already filled. Multi-buffering and
+            pipeline barriers overlap the loads with the math so the tensor cores
+            rarely wait on memory, which is the difference between reaching peak
+            and stalling.
+          </p>
+          <p><strong>6. How does Hopper's mainloop differ from Ampere's?</strong></p>
+          <p>
+            Ampere uses <code>cp.async</code> to copy global to shared without
+            staging through registers, then <code>ldmatrix</code> to load operand
+            fragments into registers for <code>mma.sync</code>. Hopper uses the
+            TMA engine for bulk asynchronous tile copies and the warpgroup-wide
+            <code>wgmma</code> instruction that reads operands directly from
+            shared memory, and it typically warp-specializes producers doing TMA
+            against consumers doing <code>wgmma</code>.
+          </p>
+          <p><strong>7. What is epilogue fusion and why does it help?</strong></p>
+          <p>
+            The epilogue turns the raw accumulator into the stored output, and
+            fusion lets you express a graph of extra elementwise work there, a
+            bias add, an activation, a dequant scale, a reduction, so it runs
+            while the accumulator is still in registers. It helps because it
+            removes the extra global-memory round trips a separate pass would
+            cost, and for memory-bound epilogues that traffic is the dominant
+            cost.
+          </p>
+          <p><strong>8. State the roofline condition for a GEMM to be compute-bound.</strong></p>
+          <p>
+            Its arithmetic intensity, FLOP divided by bytes moved, must exceed
+            the ridge point, which is peak FLOP/s divided by peak bandwidth. For
+            a square tile of side T with b bytes per element the tile intensity
+            is about T over b, so larger tiles and narrower types both push the
+            kernel above the ridge and onto the compute roofline.
+          </p>
+          <p><strong>9. When would you choose Triton or cuBLAS over CUTLASS?</strong></p>
+          <p>
+            cuBLAS or cuBLASLt when a plain or lightly-fused GEMM suffices and
+            you want a tuned function to call rather than a toolkit to assemble.
+            Triton when you want to write a fused kernel in Python quickly and
+            can accept slightly less peak and less control over the exact
+            instructions. CUTLASS when you need an unusual fusion, a quantized or
+            mixed-input type, an irregular grouped shape, or day-one performance
+            on the newest hardware.
+          </p>
+          <p><strong>10. How do FlashAttention and inference engines use CUTLASS?</strong></p>
+          <p>
+            They build their fused kernels on CuTe atoms and CUTLASS collectives
+            rather than reinventing tensor-core plumbing. FlashAttention's Hopper
+            kernels use CuTe MMA and copy atoms, TMA, and warp specialization,
+            and engines like vLLM, SGLang, and TensorRT-LLM use CUTLASS GEMMs for
+            their quantized fp8 and int8 matmuls and for grouped
+            mixture-of-experts layers, with the dequantization fused into the
+            epilogue.
+          </p>
+          <p><strong>11. Why can the same template machinery do convolution?</strong></p>
+          <p>
+            CUTLASS implements convolution as an implicit GEMM. The im2col matrix
+            that a convolution is mathematically equivalent to is never
+            materialized in memory. Instead the mainloop forms the needed tiles
+            on the fly from the input tensor, so the same tiled mainloop and
+            epilogue that serve a GEMM serve a convolution.
+          </p>
+          <p><strong>12. A tall-skinny GEMM, large K with tiny M and N, runs far below peak. Why, and what fixes it?</strong></p>
+          <p>
+            There are too few output tiles to fill the GPU, so most streaming
+            multiprocessors sit idle, and the intensity is low enough that
+            bandwidth caps you regardless. Splitting the K dimension across
+            blocks, split-K or the load-balanced Stream-K scheduler, spreads the
+            work over the machine and then reduces the partial sums, restoring
+            occupancy.
+          </p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Make the layout a value you compute with.</strong> CuTe
+            turns the thread-to-data mapping into a first-class object with an
+            algebra, so tiling and partitioning become operations you can read,
+            print, and compose instead of index arithmetic smeared through the
+            kernel. The same instinct shows up wherever a hard invariant is
+            lifted into data you can manipulate, shapes in an array language,
+            layouts in a database planner, types in a compiler.
+          </p>
+          <p>
+            <strong>Match the abstraction to the memory hierarchy.</strong> The
+            three tile levels are not arbitrary, each one exists to buy reuse
+            against exactly one level of storage. When your abstraction layers
+            mirror the physical cost structure, performance reasoning becomes
+            local, you can look at one level and know what it is responsible for.
+            This is the same discipline as designing cache-oblivious algorithms
+            or blocking a numerical kernel to the L1 and L2 sizes.
+          </p>
+          <p>
+            <strong>Put the configuration in the type system.</strong> CUTLASS
+            encodes tile shapes, data types, and schedules as template
+            parameters, so an invalid kernel usually fails to compile rather
+            than failing at runtime. The cost is famously long error messages,
+            and the benefit is that a kernel that builds is a kernel the library
+            has already largely validated. It is the same trade a strongly-typed
+            builder or a session-typed protocol makes, move errors left, pay in
+            up-front strictness.
+          </p>
+          <p>
+            <strong>Separate the parts of a kernel.</strong> Splitting a GEMM
+            into a collective mainloop, a collective epilogue, and a tile
+            scheduler means you can swap the epilogue for a fused one, swap the
+            scheduler for Stream-K, or retarget the mainloop to a new tensor-core
+            instruction without rewriting the others. Decomposing along the axes
+            that actually vary is what lets one library cover thousands of kernel
+            variants from a handful of composable pieces.
+          </p>
+          <p>
+            <strong>Ship the measurement tool with the library.</strong> The
+            profiler is not an afterthought, it is how you discover that the
+            best tile shape depends on the problem shape, which is a fact the
+            library cannot know for you. Building enumeration and benchmarking
+            into the toolkit makes tuning a first-class activity rather than a
+            bespoke script every user has to write.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            The one-sentence summary.
+            <mark>CUTLASS decomposes one matrix multiply into threadblock, warp,
+            and instruction tiles, streams the operands through shared memory and
+            registers with a pipelined mainloop so loads hide under tensor-core
+            math, and fuses the finishing work into the epilogue, all described
+            by the CuTe layout algebra so the whole kernel is a composition of a
+            few well-typed pieces.</mark>
+          </p>
+          <pre class="flow">D = alpha*A@B + beta*C
+  -&gt; tile scheduler assigns each block an Mt x Nt output tile (swizzle / Stream-K)
+  -&gt; prologue: CuTe local_tile the slabs of A,B, build TiledMMA, zero accumulator
+  -&gt; mainloop over K:  load next tile (TMA / cp.async)  ||  MMA (wgmma / mma.sync)
+                       multi-buffered shared memory overlaps load and compute
+  -&gt; epilogue: accumulators -&gt; alpha/beta, bias, activation, fused EVT -&gt; store D
+  -&gt; optional split-K / Stream-K reduction of partial sums</pre>
+          <p>The pieces mapped to the tree:</p>
+          <pre class="flow">layout algebra    include/cute/            (layout.hpp, tensor.hpp, atom/, algorithm/)
+GEMM building     include/cutlass/gemm/    (device/, kernel/, collective/, warp/, threadblock/)
+epilogue+fusion   include/cutlass/epilogue/ (thread/, collective/, fusion/ for EVT)
+instructions      include/cutlass/arch/ and include/cute/arch/  (mma, cp.async, tma)
+convolution       include/cutlass/conv/    (implicit GEMM)
+tools             tools/profiler/, tools/library/, tools/util/ (reference + benchmark)
+docs              media/docs/ (efficient_gemm.md, cute/, gemm api notes)</pre>
+          <p>Memorize these blocks:</p>
+          <ul>
+            <li><strong>Tile hierarchy:</strong> threadblock tile lives in shared memory, warp tile in registers, instruction tile at the tensor-core inputs. Each level buys reuse against the next-slower memory.</li>
+            <li><strong>Roofline:</strong> attainable = min(peak_flops, intensity * bandwidth). Ridge point = peak_flops / bandwidth. Square-tile intensity is about T/b, so bigger tiles and narrower types both push toward compute-bound.</li>
+            <li><strong>CuTe:</strong> Layout = Shape:Stride is a coord-to-offset function. Atoms wrap one instruction, TiledMMA and TiledCopy tile atoms across threads, the mainloop is a TiledCopy feeding a TiledMMA.</li>
+            <li><strong>Mainloop:</strong> multistage pipeline over K, loads (TMA on Hopper, cp.async on Ampere) overlap MMAs (wgmma on Hopper, mma.sync on Ampere) via multi-buffered shared memory and pipeline barriers.</li>
+            <li><strong>Epilogue:</strong> alpha*AB + beta*C by default, or an Epilogue Visitor Tree fusing bias, activation, dequant, and reduction while the accumulator is still in registers.</li>
+          </ul>
+
+          <h2>Part XI: Final takeaway</h2>
+          <p>
+            If the memory-hierarchy and roofline ideas underneath all of this
+            are the gap, the <a href="/classes/parallel-computing">parallel
+            computing class</a> builds them from the ground up, and the
+            attention-kernel story that leans hardest on CuTe is traced in the
+            <a href="/oss/flash-attention">FlashAttention chapter</a> and the
+            <a href="/ml/softmax">online softmax</a> derivation. Then come back
+            and read one Hopper GEMM example top to bottom. Once the tile
+            hierarchy, the pipelined mainloop, and the layout algebra are in
+            your head, the kernel reads like a direct transcription of the
+            roofline argument, which is the entire point.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> CUTLASS is the arithmetic-intensity
+            argument turned into a library. A matrix multiply is fast only when
+            each loaded element is reused enough times to keep the tensor cores
+            fed, so CUTLASS tiles the problem once per memory level, pipelines
+            the loads under the math, fuses the finishing work into the
+            epilogue, and describes every bit of it with the CuTe layout
+            algebra. Learn the tile hierarchy and the roofline, and the rest of
+            the library, and the kernels that build on it, stop being mysterious.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/code-copy.js"></script>
+      <script defer src="/theme.js"></script>
+  </body>
+</html>

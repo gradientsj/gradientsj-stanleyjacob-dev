@@ -1,0 +1,1000 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Mamba walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A full chapter on state-spaces/mamba: the selective state-space model, why selectivity forbids the convolutional view and forces a hardware-aware CUDA scan kernel, the full life of one forward pass through the Mamba block, deep dives on the S6 selective scan, the scan kernel, and Mamba-2 with state-space duality, a staged reading plan, labs, and understanding checks." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+      <script>(function(){try{var t=localStorage.getItem("theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>Mamba</h1>
+        <p class="lead">
+          <a href="https://github.com/state-spaces/mamba" target="_blank" rel="noreferrer">Mamba</a>
+          is Albert Gu and Tri Dao's reference implementation of the
+          selective state-space model, a sequence architecture that runs in
+          linear time and constant inference memory yet stays competitive
+          with Transformers. Its one load-bearing idea is selectivity, making
+          the state-space parameters functions of the input so the model can
+          choose what to remember. That single change breaks the convolution
+          trick every earlier state-space model relied on, which is why the
+          repository ships a hardware-aware CUDA scan kernel rather than an
+          FFT. This chapter is three things at once, a practical tutorial for
+          running the blocks and pretrained models, a systems walkthrough
+          that follows one forward pass from <code>in_proj</code> down into
+          the selective scan and back out, and a staged guide to reading the
+          code. It ends with runnable labs, understanding checks with model
+          answers, and a compact framework for keeping the whole thing in
+          your head. The theory behind every step is derived on the
+          <a href="/classes/sequence-models-state-spaces">state-space models class page</a>.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">input x : (B, L, d_model)
+      |
+      v
+in_proj            d_model -&gt; 2 * d_inner     (d_inner = expand * d_model)
+      |  split into two branches
+      +--&gt; x branch (B, L, d_inner)      +--&gt; z branch = the gate
+      |
+      v
+causal conv1d (depthwise, width d_conv) + SiLU     short-range mixing
+      |
+      v
+x_proj             d_inner -&gt; dt_rank + 2 * d_state
+      |  split three ways, all input-dependent
+      +--&gt; dt -&gt; dt_proj -&gt; softplus = Delta   (B, L, d_inner)
+      +--&gt; B  (B, L, d_state)
+      +--&gt; C  (B, L, d_state)
+      |
+      v
+selective_scan (S6)    A from A_log, discretize with Delta, scan over L
+      |                custom CUDA kernel, state (B, d_inner, d_state) in SRAM
+      v
+y = y + D * x          per-channel skip
+y = y * SiLU(z)        gated by the z branch
+      |
+      v
+out_proj           d_inner -&gt; d_model
+      |
+      v
+output : (B, L, d_model)</pre>
+          <p>
+            The one-sentence identity: <mark>Mamba is a state-space model
+            made selective, the recurrence parameters that control what the
+            hidden state keeps and forgets are computed from the current
+            token instead of being fixed, and that content-dependence is what
+            lets a linear-time recurrence match attention on language.</mark>
+            A classical state-space model reads an input sequence through a
+            small hidden state with fixed matrices A, B, and C. It is elegant
+            and cheap but it treats every token the same, so it cannot decide
+            that one token matters and another is filler. Mamba lets B, C, and
+            the step size Delta depend on the input, and suddenly the same
+            hidden state can be told to reset, hold, or overwrite based on
+            content. That is the whole architectural bet.
+          </p>
+          <p>
+            The second load-bearing idea is the price of the first.
+            <mark>Once the recurrence is input-dependent it is no longer
+            time-invariant, and a time-varying linear recurrence cannot be
+            written as a single fixed convolution, so the FFT-based training
+            path that made earlier models like S4 fast is gone.</mark> Mamba
+            pays that bill with a hardware-aware parallel scan, a custom CUDA
+            kernel that computes the recurrence directly while keeping the
+            large expanded state in fast on-chip memory and never writing it
+            to HBM. The design instinct is the same one behind
+            <a href="/oss/flash-attention">FlashAttention</a>, fuse the
+            operation, keep the big intermediate on chip, and recompute in the
+            backward pass instead of storing it. Everything below is described
+            against the public repository as it stands in 2026. The project
+            moves, so where a file path is likely to have shifted I name the
+            component by its role and stay at concept level.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <p>
+            Mamba is a Linux-and-NVIDIA-GPU project. The scan and the
+            depthwise convolution are compiled CUDA extensions, so a working
+            install needs a CUDA toolkit whose version matches the one your
+            PyTorch was built against, plus a compiler. The common path is the
+            prebuilt wheel:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">pip</span> <span class="s">install</span> <span class="s">mamba-ssm</span>
+<span class="c"># the fast depthwise causal conv1d lives in a companion package</span>
+<span class="m1">pip</span> <span class="s">install</span> <span class="s">causal-conv1</span><span class="v4">d</span>&gt;<span class="s">=1.4.0</span>
+<span class="c"># or build from source when a matching wheel is not published</span>
+<span class="m1">git</span> <span class="s">clone</span> <span class="s">https://github.com/state-spaces/mamba</span>
+<span class="m1">cd</span> <span class="s">mamba</span>
+<span class="m1">pip</span> <span class="s">install</span> <span class="s">-e</span> <span class="s">.</span></code></pre></div>
+          <p>
+            If the CUDA extensions fail to build, Mamba still runs. The block
+            has a slower pure-PyTorch reference path that is used when the
+            compiled kernels or <code>causal-conv1d</code> are absent, which
+            is enough for correctness checks on a small model though not for
+            serious throughput. On CPU or macOS you can read the code and run
+            the reference path on tiny inputs, but the point of the project is
+            the GPU kernel.
+          </p>
+          <p>
+            The smallest useful program is a single Mamba block. It is a drop
+            in replacement for a Transformer layer, same input and output
+            shape, no attention mask, no positions:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">torch</span>
+<span class="k">from</span> <span class="m1">mamba_ssm</span> <span class="k">import</span> <span class="m1">Mamba</span>
+
+<span class="v6">batch</span>, <span class="v0">length</span>, <span class="v5">dim</span> = <span class="n">2</span>, <span class="n">1024</span>, <span class="n">512</span>
+<span class="v4">x</span> = <span class="m1">torch</span>.<span class="m2">randn</span><span class="b0">(</span><span class="v6">batch</span>, <span class="v0">length</span>, <span class="v5">dim</span>, <span class="v6">device</span>=<span class="s">"cuda"</span><span class="b0">)</span>
+
+<span class="m1">layer</span> = <span class="m1">Mamba</span><span class="b0">(</span>
+    <span class="v6">d_model</span>=<span class="v5">dim</span>,   <span class="c"># the model width, unchanged through the block</span>
+    <span class="v2">d_state</span>=<span class="n">16</span>,    <span class="c"># N, the SSM state expansion per channel</span>
+    <span class="v2">d_conv</span>=<span class="n">4</span>,      <span class="c"># width of the local causal convolution</span>
+    <span class="v2">expand</span>=<span class="n">2</span>,      <span class="c"># inner expansion, d_inner = expand * d_model</span>
+<span class="b0">)</span>.<span class="m2">to</span><span class="b0">(</span><span class="s">"cuda"</span><span class="b0">)</span>
+
+<span class="v6">y</span> = <span class="m1">layer</span><span class="b0">(</span><span class="v4">x</span><span class="b0">)</span>              <span class="c"># (2, 1024, 512), same shape in and out</span>
+<span class="k">assert</span> <span class="v6">y</span>.<span class="m2">shape</span> == <span class="v4">x</span>.<span class="m2">shape</span></code></pre></div>
+          <p>
+            The second thing worth doing is running a real pretrained language
+            model. The <code>state-spaces</code> organization publishes Mamba
+            models trained on the Pile at 130M, 370M, 790M, 1.4B, and 2.8B
+            parameters, plus Mamba-2 checkpoints. They use the GPT-NeoX
+            tokenizer, so pair them with that vocabulary:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">torch</span>
+<span class="k">from</span> <span class="m1">mamba_ssm</span>.<span class="m2">models</span>.<span class="m2">mixer_seq_simple</span> <span class="k">import</span> <span class="m1">MambaLMHeadModel</span>
+<span class="k">from</span> <span class="m1">transformers</span> <span class="k">import</span> <span class="m1">AutoTokenizer</span>
+
+<span class="m1">tok</span> = <span class="m1">AutoTokenizer</span>.<span class="m2">from_pretrained</span><span class="b0">(</span><span class="s">"EleutherAI/gpt-neox-20b"</span><span class="b0">)</span>
+<span class="v0">model</span> = <span class="m1">MambaLMHeadModel</span>.<span class="m2">from_pretrained</span><span class="b0">(</span>
+    <span class="s">"state-spaces/mamba-130m"</span>, <span class="v6">device</span>=<span class="s">"cuda"</span>, <span class="v3">dtype</span>=<span class="m1">torch</span>.<span class="m2">float16</span>
+<span class="b0">)</span>
+
+<span class="v0">ids</span> = <span class="m1">tok</span><span class="b0">(</span><span class="s">"The key idea behind Mamba is"</span>, <span class="v1">return_tensors</span>=<span class="s">"pt"</span><span class="b0">)</span>.<span class="m2">input_ids</span>.<span class="m2">to</span><span class="b0">(</span><span class="s">"cuda"</span><span class="b0">)</span>
+<span class="v2">out</span> = <span class="v0">model</span>.<span class="m2">generate</span><span class="b0">(</span><span class="v5">input_ids</span>=<span class="v0">ids</span>, <span class="v3">max_length</span>=<span class="n">100</span>, <span class="v5">cg</span>=<span class="k">True</span>, <span class="v4">temperature</span>=<span class="n">0.7</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="m1">tok</span>.<span class="m2">decode</span><span class="b1">(</span><span class="v2">out</span><span class="b2">[</span><span class="n">0</span><span class="b2">]</span><span class="b1">)</span><span class="b0">)</span></code></pre></div>
+          <p>
+            The <code>cg=True</code> flag captures the decode step into a CUDA
+            graph, which matters because Mamba generation is a tight loop of
+            tiny per-token launches where kernel launch overhead dominates.
+            Under the hood <code>generate</code> keeps an
+            <code>InferenceParams</code> object, a cache that holds the
+            recurrent SSM state and the small convolution window for every
+            layer. This is the payoff of the recurrent form, decoding token
+            t+1 costs the same as token t regardless of how long the context
+            already is, and memory does not grow with sequence length the way
+            a Transformer KV cache does.
+          </p>
+          <p>
+            Now the mistakes people make. First, forgetting
+            <code>causal-conv1d</code>, which does not error loudly but
+            silently drops onto the slow reference conv and halves your
+            throughput. Second, running in float32 out of habit, the kernels
+            are tuned for bfloat16 and float16 and the SSM state is kept in
+            float32 internally for stability, so passing fp16 or bf16 inputs
+            is both correct and much faster. Third, treating
+            <code>d_state</code> as free, the expanded state is
+            <code>d_inner * d_state</code> per position and the naive path
+            materializes it across the whole sequence, so a large
+            <code>d_state</code> without the fused kernel is where people run
+            out of memory. Fourth, and most conceptual,
+            <mark>reaching for an attention mask. Mamba has no attention and
+            no quadratic score matrix, causality is intrinsic to the
+            left-to-right recurrence and the causal convolution, so there is
+            nothing to mask and nothing that sees the future.</mark>
+          </p>
+
+          <h2>Part III: When it is the right tool</h2>
+          <p>
+            Mamba is the right tool when sequence length is the binding
+            constraint and you want subquadratic cost without giving up too
+            much quality. Long documents, audio and genomics where sequences
+            run to hundreds of thousands of tokens, and high-throughput
+            generation where the constant-memory recurrent decode is a real
+            operational win. It is also the cleanest codebase for learning how
+            a modern state-space model is actually built and made fast, which
+            is a reason to read it even if you deploy something else.
+          </p>
+          <p>
+            The honest competition. Plain Transformers with
+            <a href="/oss/flash-attention">FlashAttention</a> remain the
+            default and beat Mamba on any task that needs precise recall or
+            copying from context, because attention can look directly at every
+            earlier token while a fixed-size state must compress the past and
+            will drop details. Among subquadratic alternatives, S4 and its
+            diagonal simplifications S4D and DSS are the time-invariant
+            predecessors Mamba grew out of, faster to train through the
+            convolutional view but without selectivity. RWKV and RetNet reach
+            similar linear-time recurrent goals from the linear-attention
+            direction. Hyena uses long implicit convolutions rather than a
+            recurrence. Gated linear attention and its relatives sit in the
+            same design space, all honest choices with different tradeoffs.
+          </p>
+          <p>
+            The most important practical finding is that the strongest systems
+            are usually hybrids. Because a pure state-space model struggles
+            with exact in-context retrieval, interleaving a few attention
+            layers among many Mamba layers recovers that ability while keeping
+            most of the efficiency, which is the recipe behind models like
+            Jamba and the gated-recurrence-plus-local-attention family. So the
+            realistic framing is not Mamba versus Transformers but how many
+            attention layers you can remove before recall breaks.
+            <mark>Selectivity buys efficiency by compressing history into a
+            fixed state, and the tasks Mamba is worst at are exactly the ones
+            where that compression throws away the token you needed.</mark>
+            The full comparison, with the linear-attention and RWKV and RetNet
+            branches drawn out, lives on the
+            <a href="/classes/sequence-models-state-spaces">state-space models class page</a>.
+          </p>
+
+          <h2>Part IV: The full life of one forward pass</h2>
+          <p>
+            The specimen is a single training forward pass of one Mamba block
+            over an input of shape <code>(B, L, d_model)</code>. I follow the
+            data down through the block, into the selective scan kernel, and
+            back out, then note what changes in the backward pass and in
+            single-step decoding. The block lives in
+            <code>mamba_ssm/modules/mamba_simple.py</code> and the scan in
+            <code>mamba_ssm/ops/selective_scan_interface.py</code> over a CUDA
+            kernel under <code>csrc/selective_scan/</code>.
+          </p>
+
+          <h3>Stage 1: input projection and the two branches</h3>
+          <p>
+            The block first widens the input. A single linear layer
+            <code>in_proj</code> maps <code>d_model</code> to
+            <code>2 * d_inner</code>, where <code>d_inner = expand * d_model</code>
+            and expand defaults to 2. The result is split into two equal
+            branches. One branch, call it x, is the signal that will actually
+            pass through the state-space model. The other branch, z, is set
+            aside to gate the output at the very end. This split is why a
+            Mamba block folds what would be a separate mixing layer and a
+            separate gated feed-forward into one unit.
+          </p>
+
+          <h3>Stage 2: the causal convolution</h3>
+          <p>
+            The x branch is transposed to channel-first and run through a
+            depthwise causal 1D convolution of width <code>d_conv</code>
+            (default 4), followed by a SiLU activation. Depthwise means each
+            of the <code>d_inner</code> channels has its own tiny filter and
+            channels do not mix here. Causal means the convolution is padded
+            on the left only, so position t sees positions t-3 through t and
+            never the future. This short convolution is doing local token
+            mixing, the kind of neighbor interaction a state-space recurrence
+            is not naturally shaped for, and it is the fast path that
+            <code>causal-conv1d</code> accelerates.
+          </p>
+
+          <h3>Stage 3: producing Delta, B, and C from the input</h3>
+          <p>
+            Here is where the model becomes selective. The convolved x is fed
+            through a linear layer <code>x_proj</code> that produces
+            <code>dt_rank + 2 * d_state</code> numbers per position. Those are
+            split into three input-dependent quantities. The first,
+            <code>dt_rank</code> wide, is passed through a second linear layer
+            <code>dt_proj</code> and a softplus to become Delta, the step
+            size, of shape <code>(B, L, d_inner)</code>, one positive
+            timescale per channel per position. The other two are B and C,
+            each of shape <code>(B, L, d_state)</code>. In a classical
+            state-space model B and C would be fixed weight matrices. Here
+            they are activations, recomputed for every token, and that is
+            precisely the S6 selectivity. The state matrix A is the one piece
+            that stays a learned parameter, stored as <code>A_log</code> and
+            read back as <code>A = -exp(A_log)</code> so it is always negative
+            and the recurrence decays rather than explodes.
+          </p>
+
+          <h3>Stage 4: discretization</h3>
+          <p>
+            The continuous state-space equations are
+            <code>h'(t) = A h(t) + B x(t)</code> and
+            <code>y(t) = C h(t)</code>. To run them on a discrete sequence
+            each step is discretized with the current Delta using a
+            zero-order hold. The A term becomes
+            <code>Abar = exp(Delta * A)</code>, an elementwise exponential
+            because A is diagonal, and the B term is discretized in proportion
+            to Delta, which the code implements with the simplified rule
+            <code>Bbar = Delta * B</code> that the paper notes is a fine Euler
+            approximation because A dominates the dynamics. The upshot is a
+            per-position, per-channel linear recurrence
+            <code>h_t = Abar_t * h_{t-1} + Bbar_t * x_t</code> with a readout
+            <code>y_t = C_t * h_t</code>, where every coefficient carries a
+            time subscript because everything is input-dependent.
+          </p>
+
+          <h3>Stage 5: the selective scan itself</h3>
+          <p>
+            This recurrence is the operation the whole repository exists to
+            make fast. Conceptually it is a loop over the sequence carrying a
+            hidden state of shape <code>(B, d_inner, d_state)</code>, which is
+            <code>d_state</code> times larger than the input. Materializing
+            that expanded state for all L positions is what a naive
+            implementation does and what runs out of memory. The kernel
+            instead fuses discretization, the scan, the C readout, the D skip,
+            and the z gate into one pass, and it never writes the expanded
+            state to HBM. It streams over the sequence keeping the state in
+            registers and shared memory, and it parallelizes across the
+            sequence with a work-efficient parallel scan rather than a literal
+            serial loop, because a linear recurrence is associative. The
+            interface function makes the shapes explicit:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">mamba_ssm</span>.<span class="m2">ops</span>.<span class="m2">selective_scan_interface</span> <span class="k">import</span> <span class="m1">selective_scan_fn</span>
+
+<span class="c"># u:     (B, D, L)   the conv+SiLU output, D = d_inner</span>
+<span class="c"># delta: (B, D, L)   per-channel, per-step timescale</span>
+<span class="c"># A:     (D, N)      diagonal state matrix, negative real, N = d_state</span>
+<span class="c"># B, C:  (B, N, L)   input-dependent, this is what makes it S6 rather than S4</span>
+<span class="c"># D:     (D,)        per-channel skip connection</span>
+<span class="c"># z:     (B, D, L)   gate branch, applies y * silu(z) inside the kernel</span>
+<span class="v6">y</span> = <span class="m1">selective_scan_fn</span><span class="b0">(</span><span class="v2">u</span>, <span class="v1">delta</span>, <span class="v6">A</span>, <span class="v0">B</span>, <span class="v2">C</span>, <span class="v5">D</span>=<span class="v5">D</span>, <span class="v0">z</span>=<span class="v0">z</span>,
+                      <span class="v6">delta_bias</span>=<span class="v2">dt_bias</span>, <span class="v1">delta_softplus</span>=<span class="k">True</span><span class="b0">)</span></code></pre></div>
+          <p>
+            Passing <code>delta_softplus=True</code> lets the kernel apply the
+            softplus internally rather than in Python, and giving it
+            <code>z</code> folds the final gate into the same kernel. In
+            training the block often calls a further fused entry point,
+            <code>mamba_inner_fn</code>, which pulls the input projection, the
+            convolution, the x_proj split, the scan, and the output projection
+            into one fused path so the intermediate tensors between them never
+            hit memory.
+          </p>
+
+          <h3>Stage 6: skip, gate, and output projection</h3>
+          <p>
+            The scan output has a per-channel skip added,
+            <code>y = y + D * u</code>, which lets each channel pass a direct
+            copy of its input around the state, and then it is gated by the
+            branch set aside in stage 1, <code>y = y * SiLU(z)</code>. The
+            gate is what turns the block from a bare sequence mixer into
+            something with the expressive shape of a gated multiplicative
+            unit. Finally <code>out_proj</code> maps <code>d_inner</code> back
+            down to <code>d_model</code>, and the block returns a tensor the
+            same shape as it received. A full model stacks these blocks with
+            RMSNorm and residual connections in
+            <code>mamba_ssm/modules/block.py</code>, wrapped by
+            <code>MixerModel</code> and topped with a tied language-model head
+            in <code>mamba_ssm/models/mixer_seq_simple.py</code>.
+          </p>
+
+          <h3>Stage 7: backward and decoding</h3>
+          <p>
+            The backward pass mirrors FlashAttention's memory trick. Rather
+            than having stored the expanded per-position states during the
+            forward pass, the kernel recomputes them on the way back while it
+            accumulates gradients for u, Delta, A, B, C, D, and z. That
+            recomputation trades a little extra arithmetic for a large memory
+            saving, which is the entire reason the fused kernel exists instead
+            of an autograd graph over primitive ops. Single-step decoding
+            takes a different route entirely. There is no sequence to scan,
+            just one new token, so the block runs a <code>step</code> path
+            that advances the small convolution window and applies one
+            recurrence update through a Triton
+            <code>selective_state_update</code> kernel, reading and writing
+            the cached state in <code>InferenceParams</code>. That closes the
+            loop, one token in, a fixed-size state updated in place, one token
+            out, at a cost independent of context length.
+          </p>
+
+          <h2>Part V: Internals deep dives</h2>
+
+          <h3>Deep dive: S6, and why selectivity forbids the convolution</h3>
+          <p>
+            The clearest way to see Mamba's central idea is to compare the two
+            equivalent views of a time-invariant state-space model and then
+            watch selectivity destroy one of them. When A, B, C, and Delta are
+            fixed for all time, the recurrence
+            <code>h_t = Abar * h_{t-1} + Bbar * x_t</code>,
+            <code>y_t = C * h_t</code> can be unrolled. The output at position
+            t is a weighted sum of all past inputs with weights
+            <code>C * Abar^k * Bbar</code> for the input k steps back. Those
+            weights do not depend on t, only on the gap k, so the whole
+            mapping from x to y is a convolution with one fixed kernel:
+          </p>
+          <pre class="flow">time-invariant (S4):   y = K * x     with kernel
+   K = ( C Bbar,  C Abar Bbar,  C Abar^2 Bbar,  ... )
+
+  two equivalent views of the SAME operation:
+    recurrent   -&gt;  O(1) memory per step, great for inference
+    convolution -&gt;  one big FFT over the sequence, great for training</pre>
+          <p>
+            That equivalence is the engine of S4. Train with the convolution
+            using an FFT so the whole sequence is processed in parallel, then
+            switch to the recurrence for cheap autoregressive inference. It
+            works only because the kernel K is the same at every position.
+          </p>
+          <p>
+            Now make it selective. Mamba computes B, C, and Delta from the
+            input, so they carry a time subscript, and the unrolled weight
+            from position t back to position t-k is
+            <code>C_t * Abar_t * Abar_{t-1} * ... * Bbar_{t-k}</code>, a
+            product of factors that are all different at every t. There is no
+            longer a single kernel K, there is a different effective kernel at
+            every position, so the operation is no longer a convolution and
+            the FFT training path simply does not apply.
+            <mark>Selectivity and the convolutional view are mutually
+            exclusive. You can have fixed parameters and a cheap convolution,
+            or input-dependent parameters and content selection, but not
+            both.</mark> Mamba chooses selection and is left holding a
+            time-varying linear recurrence that it must compute directly. The
+            recurrence is still linear and therefore associative, which is the
+            crack the parallel scan gets its lever into.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="c"># the recurrence is a linear scan:  h_t = a_t * h_{t-1} + b_t</span>
+<span class="c"># it composes with an ASSOCIATIVE operator over (a, b) pairs:</span>
+<span class="k">def</span> <span class="m1">combine</span><span class="b0">(</span><span class="v4">left</span>, <span class="v3">right</span><span class="b0">)</span>:
+    <span class="v0">a_l</span>, <span class="v6">b_l</span> = <span class="v4">left</span>
+    <span class="v5">a_r</span>, <span class="v3">b_r</span> = <span class="v3">right</span>
+    <span class="k">return</span> <span class="b0">(</span><span class="v5">a_r</span> * <span class="v0">a_l</span>, <span class="v5">a_r</span> * <span class="v6">b_l</span> + <span class="v3">b_r</span><span class="b0">)</span>
+<span class="c"># associativity is exactly what a Blelloch prefix scan needs, so all L</span>
+<span class="c"># states can be produced in O(log L) parallel depth instead of a serial loop</span></code></pre></div>
+
+          <h3>Deep dive: the hardware-aware scan kernel</h3>
+          <p>
+            The kernel under <code>csrc/selective_scan/</code> is where the
+            performance lives, and its design is dominated by one number, the
+            size of the expanded state. For each of <code>d_inner</code>
+            channels the model carries a state of width <code>d_state</code>,
+            so the working set per position is <code>d_inner * d_state</code>
+            values, and across a length-L sequence a naive implementation
+            would write a tensor of shape <code>(B, L, d_inner, d_state)</code>
+            to HBM. That tensor is N times larger than the activations
+            themselves and moving it dominates runtime, exactly the
+            memory-bandwidth wall described in the
+            <a href="/oss/flash-attention">FlashAttention chapter</a>. The
+            kernel refuses to create it. A conceptual sketch of what one
+            thread's slice does, with the real kernel doing the across-thread
+            reduction as a parallel scan rather than this serial loop:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-cpp"><span class="c">// one CUDA block owns a (batch, channel) slice and streams over L.</span>
+<span class="c">// the state h[N] lives in registers / shared memory, never in HBM.</span>
+<span class="k">float</span> <span class="v1">h</span><span class="b0">[</span><span class="v6">N</span><span class="b0">]</span> = <span class="b0">{</span><span class="n">0.</span><span class="k">f</span><span class="b0">}</span>;
+<span class="k">for</span> <span class="b0">(</span><span class="k">int</span> <span class="v0">t</span> = <span class="n">0</span>; <span class="v0">t</span> &lt; <span class="v3">L</span>; ++<span class="v0">t</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">float</span> <span class="v2">dt</span> = <span class="m1">softplus</span><span class="b1">(</span><span class="v1">delta</span><span class="b2">[</span><span class="v0">t</span><span class="b2">]</span> + <span class="v2">dt_bias</span><span class="b1">)</span>;<span class="c">   // per-step timescale</span>
+    <span class="k">float</span> <span class="v6">acc</span> = <span class="n">0.</span><span class="k">f</span>;
+    <span class="k">#pragma</span> <span class="m1">unroll</span>
+    <span class="k">for</span> <span class="b1">(</span><span class="k">int</span> <span class="v5">n</span> = <span class="n">0</span>; <span class="v5">n</span> &lt; <span class="v6">N</span>; ++<span class="v5">n</span><span class="b1">)</span> <span class="b1">{</span>
+        <span class="k">float</span> <span class="v0">dA</span> = <span class="m1">expf</span><span class="b2">(</span><span class="v2">dt</span> * <span class="v6">A</span><span class="b0">[</span><span class="v5">n</span><span class="b0">]</span><span class="b2">)</span>;<span class="c">             // Abar = exp(dt * A)</span>
+        <span class="k">float</span> <span class="v2">dB</span> = <span class="v2">dt</span> * <span class="v0">B</span><span class="b2">[</span><span class="v0">t</span><span class="b2">][</span><span class="v5">n</span><span class="b2">]</span>;<span class="c">                // Bbar ~= dt * B  (Euler)</span>
+        <span class="v1">h</span><span class="b2">[</span><span class="v5">n</span><span class="b2">]</span> = <span class="v0">dA</span> * <span class="v1">h</span><span class="b2">[</span><span class="v5">n</span><span class="b2">]</span> + <span class="v2">dB</span> * <span class="v2">u</span><span class="b2">[</span><span class="v0">t</span><span class="b2">]</span>;<span class="c">           // the recurrence</span>
+        <span class="v6">acc</span> += <span class="v2">C</span><span class="b2">[</span><span class="v0">t</span><span class="b2">][</span><span class="v5">n</span><span class="b2">]</span> * <span class="v1">h</span><span class="b2">[</span><span class="v5">n</span><span class="b2">]</span>;<span class="c">                  // readout with C</span>
+    <span class="b1">}</span>
+    <span class="v6">y</span><span class="b1">[</span><span class="v0">t</span><span class="b1">]</span> = <span class="v6">acc</span> + <span class="v5">D</span> * <span class="v2">u</span><span class="b1">[</span><span class="v0">t</span><span class="b1">]</span>;<span class="c">                      // fused skip</span>
+<span class="b0">}</span>
+<span class="c">// backward recomputes h[] rather than reloading a stored (B,L,D,N) tensor</span></code></pre></div>
+          <p>
+            Three ideas make this fast. Kernel fusion, the discretization, the
+            scan, the C readout, the D skip, and the z gate are one launch, so
+            no intermediate leaves the chip. State in fast memory, the
+            expanded state never touches HBM. Recomputation, the backward pass
+            regenerates the states it needs instead of having stored them.
+            <mark>The kernel is not a clever algorithm so much as a disciplined
+            memory schedule, it wins by keeping the one tensor that is too big
+            to move on the chip, and by paying flops to avoid bytes.</mark>
+            This is also why a pure-PyTorch version exists but is only a
+            correctness reference, an eager graph over these primitives would
+            materialize precisely the tensor the kernel is built to avoid.
+          </p>
+
+          <h3>Deep dive: the Mamba block as an architecture</h3>
+          <p>
+            Step back from the kernel and the block itself is a deliberate
+            fusion of two earlier ideas. Prior state-space language models put
+            an SSM mixing layer and a separate gated feed-forward layer in
+            sequence. Mamba collapses them. The <code>in_proj</code> that
+            splits into an x branch and a z gate is the gated-unit half, and
+            the selective scan is the mixing half, so one Mamba block does the
+            work of two conventional layers, which is part of why a Mamba
+            language model can be all identical blocks with no attention and
+            no explicit feed-forward.
+          </p>
+          <p>
+            The small pieces each earn their place. The depthwise causal
+            convolution supplies short-range mixing that a diagonal recurrence
+            handles poorly, so the recurrence can specialize in long-range
+            structure. The SiLU gate gives the block a multiplicative,
+            data-dependent nonlinearity in the spirit of gated linear units.
+            The per-channel D skip lets a channel bypass the state entirely
+            when the state is not helping. And keeping A diagonal, stored as
+            <code>A_log</code> and negated, makes the exponential in
+            discretization an elementwise operation and guarantees stable
+            decay. None of these are incidental, together they turn a bare
+            recurrence into a block that trains stably and stacks deep. The
+            configuration knobs that matter are <code>d_state</code> for how
+            much the state can hold, <code>expand</code> for the inner width,
+            <code>d_conv</code> for the local window, and
+            <code>dt_rank</code>, which defaults to about
+            <code>d_model / 16</code> and controls how expressive the
+            input-dependent Delta is.
+          </p>
+
+          <h3>Deep dive: Mamba-2 and state-space duality</h3>
+          <p>
+            Mamba-2 comes from the paper on structured state-space duality, or
+            SSD, and it starts from an observation. If you restrict the state
+            matrix A even further, from a general diagonal down to a scalar
+            times the identity per head, then the whole selective SSM can be
+            written as a matrix operation that looks like a form of attention
+            with a decay mask. The two views, a linear recurrence and a masked
+            quadratic attention, are dual descriptions of the same structured
+            matrix, one that is semiseparable. That duality is not just theory,
+            it changes how the operation is computed.
+          </p>
+          <pre class="flow">Mamba-1 (S6)      diagonal A,   scan kernel,   state N ~ 16
+Mamba-2 (SSD)     scalar A,     matmul-heavy,  state N ~ 64..128
+
+SSD chunked algorithm over the sequence:
+   split into chunks -&gt; inside a chunk: quadratic attention-like matmul
+                     -&gt; between chunks: pass one recurrent state forward
+   most work is now big matmuls that saturate the tensor cores</pre>
+          <p>
+            The practical consequence is speed. Mamba-1's scan is
+            memory-bound and does not use the tensor cores that GPUs devote
+            most of their flops to. Mamba-2 reformulates the computation as a
+            chunked algorithm, quadratic within each chunk as a dense matmul
+            and recurrent between chunks by passing a single state across
+            chunk boundaries, so the bulk of the work becomes large matrix
+            multiplications that saturate the tensor cores. The paper reports
+            that this makes the core operation several times faster than
+            Mamba-1's scan, and because it is cheaper it can afford a much
+            larger state dimension, which improves quality. Mamba-2 also
+            adopts a multi-head structure with grouped B and C shared across
+            heads, closely echoing multi-query and grouped-query attention.
+            The SSD kernels are written in Triton and live under
+            <code>mamba_ssm/ops/triton/</code>, with the block in
+            <code>mamba_ssm/modules/mamba2.py</code>.
+            <mark>Mamba-2's lesson is that giving up a little expressiveness in
+            A to gain a matmul-shaped algorithm is a good trade on hardware
+            that is built for matmuls, and that the recurrence-attention
+            duality is the bridge that lets you choose the shape you compute.</mark>
+            The theory of that duality, and how it connects to linear
+            attention, is worked through on the
+            <a href="/classes/sequence-models-state-spaces">state-space models class page</a>.
+          </p>
+
+          <h2>Part VI: Reading the repository</h2>
+          <p>
+            The tree is small and readable in an afternoon. Paths below are
+            organized by role, and a few may have moved as the project evolves.
+          </p>
+          <p>
+            <strong>Stage 0, orientation.</strong> Read the
+            <code>README.md</code>, which has the block example, the pretrained
+            models, and a pointer to the two papers. Get the vocabulary
+            straight before touching code, SSM, S4, S6, selective, and SSD.
+            The question to hold, what exactly is input-dependent in Mamba and
+            what is not.
+          </p>
+          <p>
+            <strong>Stage 1, the block.</strong> Read
+            <code>mamba_ssm/modules/mamba_simple.py</code> top to bottom, the
+            <code>Mamba</code> class. Trace the forward from
+            <code>in_proj</code> through the conv, <code>x_proj</code>,
+            <code>dt_proj</code>, the selective scan, the gate, and
+            <code>out_proj</code>, matching each line to a stage of Part IV.
+            Then read the <code>step</code> method and see how single-token
+            decoding avoids the scan entirely. Questions, where does A become
+            <code>-exp(A_log)</code>, why is there both a fused
+            <code>mamba_inner_fn</code> path and an unfused path, and what does
+            the z branch do.
+          </p>
+          <p>
+            <strong>Stage 2, the scan interface.</strong>
+            <code>mamba_ssm/ops/selective_scan_interface.py</code>. This is the
+            autograd boundary, a <code>torch.autograd.Function</code> whose
+            forward calls the CUDA kernel and whose backward calls the CUDA
+            backward. Read the docstrings for the exact shapes of u, delta, A,
+            B, C, D, and z, and notice how the reference PyTorch implementation
+            in the same neighborhood spells out the math the kernel encodes.
+            Questions, which arguments are input-dependent, and why the
+            backward needs to recompute states.
+          </p>
+          <p>
+            <strong>Stage 3, the CUDA kernel.</strong> Under
+            <code>csrc/selective_scan/</code>, the forward and backward kernels
+            and the common header. You do not need to follow every index to
+            get the point, look for where the state array is declared, confirm
+            it stays on chip, and see the discretization and the scan fused in
+            one pass. Read it against the FlashAttention story, the shapes of
+            the wins are the same.
+          </p>
+          <p>
+            <strong>Stage 4, the model.</strong>
+            <code>mamba_ssm/modules/block.py</code> for the norm-and-residual
+            wrapper, then <code>mamba_ssm/models/mixer_seq_simple.py</code> for
+            <code>MixerModel</code>, <code>MambaLMHeadModel</code>, and the
+            config. This is a full language model in remarkably little code,
+            an embedding, a stack of identical blocks, a final norm, and a tied
+            head. Then <code>mamba_ssm/utils/generation.py</code> for the
+            <code>InferenceParams</code> cache and the CUDA-graph decode loop.
+          </p>
+          <p>
+            <strong>Stage 5, Mamba-2 and SSD.</strong>
+            <code>mamba_ssm/modules/mamba2.py</code> and the Triton kernels in
+            <code>mamba_ssm/ops/triton/</code>, especially the combined SSD
+            chunk-scan entry point. This is denser reading, the chunked
+            algorithm and the multi-head bookkeeping, so leave it until the
+            Mamba-1 story is solid. The <code>benchmarks/</code> and
+            <code>tests/</code> directories are the place to confirm your
+            understanding against numbers and against the reference
+            implementations the tests compare the kernels to.
+          </p>
+          <p>
+            Where not to start, the CUDA kernel before the block, and Mamba-2
+            before Mamba-1. Selectivity in <code>mamba_simple.py</code> is the
+            one idea everything else depends on, so read it until it is obvious
+            before descending into either the kernel or the duality.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            Labs 1 through 4 need one GPU, lab 5 is CPU-only reading and
+            arithmetic. Log formats and exact numbers vary with the model and
+            the hardware.
+          </p>
+          <p><strong>Lab 1: a block, forward and backward.</strong> Concept: shapes and the two branches.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">torch</span>
+<span class="k">from</span> <span class="m1">mamba_ssm</span> <span class="k">import</span> <span class="m1">Mamba</span>
+
+<span class="m1">layer</span> = <span class="m1">Mamba</span><span class="b0">(</span><span class="v6">d_model</span>=<span class="n">256</span>, <span class="v2">d_state</span>=<span class="n">16</span>, <span class="v2">d_conv</span>=<span class="n">4</span>, <span class="v2">expand</span>=<span class="n">2</span><span class="b0">)</span>.<span class="m2">cuda</span><span class="b0">()</span>
+<span class="v4">x</span> = <span class="m1">torch</span>.<span class="m2">randn</span><span class="b0">(</span><span class="n">1</span>, <span class="n">64</span>, <span class="n">256</span>, <span class="v6">device</span>=<span class="s">"cuda"</span>, <span class="v5">requires_grad</span>=<span class="k">True</span><span class="b0">)</span>
+<span class="v6">y</span> = <span class="m1">layer</span><span class="b0">(</span><span class="v4">x</span><span class="b0">)</span>
+<span class="v6">y</span>.<span class="m2">sum</span><span class="b0">()</span>.<span class="m2">backward</span><span class="b0">()</span>
+<span class="m1">print</span><span class="b0">(</span><span class="v6">y</span>.<span class="m2">shape</span>, <span class="v4">x</span>.<span class="m2">grad</span>.<span class="m2">shape</span><span class="b0">)</span>          <span class="c"># both (1, 64, 256)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="m1">sum</span><span class="b1">(</span><span class="v6">p</span>.<span class="m2">numel</span><span class="b2">()</span> <span class="k">for</span> <span class="v6">p</span> <span class="k">in</span> <span class="m1">layer</span>.<span class="m2">parameters</span><span class="b2">()</span><span class="b1">)</span><span class="b0">)</span></code></pre></div>
+          <p>
+            Confirm the output matches the input shape and that gradients flow.
+            Then print the shapes inside the block by temporarily logging after
+            <code>in_proj</code> and after <code>x_proj</code>, and match them
+            to <code>2 * d_inner</code> and
+            <code>dt_rank + 2 * d_state</code>.
+          </p>
+          <p><strong>Lab 2: selectivity forbids convolution, empirically.</strong> Concept: time-varying weights.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">torch</span>
+<span class="k">from</span> <span class="m1">mamba_ssm</span>.<span class="m2">ops</span>.<span class="m2">selective_scan_interface</span> <span class="k">import</span> <span class="m1">selective_scan_fn</span>
+
+<span class="v0">B</span>, <span class="v5">D</span>, <span class="v3">L</span>, <span class="v6">N</span> = <span class="n">1</span>, <span class="n">4</span>, <span class="n">8</span>, <span class="n">16</span>
+<span class="v2">u</span> = <span class="m1">torch</span>.<span class="m2">randn</span><span class="b0">(</span><span class="v0">B</span>, <span class="v5">D</span>, <span class="v3">L</span>, <span class="v6">device</span>=<span class="s">"cuda"</span><span class="b0">)</span>
+<span class="v1">delta</span> = <span class="m1">torch</span>.<span class="m2">rand</span><span class="b0">(</span><span class="v0">B</span>, <span class="v5">D</span>, <span class="v3">L</span>, <span class="v6">device</span>=<span class="s">"cuda"</span><span class="b0">)</span>
+<span class="v6">A</span> = -<span class="m1">torch</span>.<span class="m2">rand</span><span class="b0">(</span><span class="v5">D</span>, <span class="v6">N</span>, <span class="v6">device</span>=<span class="s">"cuda"</span><span class="b0">)</span>
+<span class="c"># make B_mat and C the SAME across time -&gt; effectively S4-like, one kernel exists</span>
+<span class="v5">Bt</span> = <span class="m1">torch</span>.<span class="m2">randn</span><span class="b0">(</span><span class="v0">B</span>, <span class="v6">N</span>, <span class="n">1</span>, <span class="v6">device</span>=<span class="s">"cuda"</span><span class="b0">)</span>.<span class="m2">expand</span><span class="b0">(</span><span class="v0">B</span>, <span class="v6">N</span>, <span class="v3">L</span><span class="b0">)</span>.<span class="m2">contiguous</span><span class="b0">()</span>
+<span class="v2">Ct</span> = <span class="m1">torch</span>.<span class="m2">randn</span><span class="b0">(</span><span class="v0">B</span>, <span class="v6">N</span>, <span class="n">1</span>, <span class="v6">device</span>=<span class="s">"cuda"</span><span class="b0">)</span>.<span class="m2">expand</span><span class="b0">(</span><span class="v0">B</span>, <span class="v6">N</span>, <span class="v3">L</span><span class="b0">)</span>.<span class="m2">contiguous</span><span class="b0">()</span>
+<span class="v3">y_ti</span> = <span class="m1">selective_scan_fn</span><span class="b0">(</span><span class="v2">u</span>, <span class="v1">delta</span>, <span class="v6">A</span>, <span class="v5">Bt</span>, <span class="v2">Ct</span><span class="b0">)</span>
+<span class="c"># now let them vary in time -&gt; no single convolution kernel reproduces this</span>
+<span class="v3">Bt2</span> = <span class="m1">torch</span>.<span class="m2">randn</span><span class="b0">(</span><span class="v0">B</span>, <span class="v6">N</span>, <span class="v3">L</span>, <span class="v6">device</span>=<span class="s">"cuda"</span><span class="b0">)</span>
+<span class="v4">Ct2</span> = <span class="m1">torch</span>.<span class="m2">randn</span><span class="b0">(</span><span class="v0">B</span>, <span class="v6">N</span>, <span class="v3">L</span>, <span class="v6">device</span>=<span class="s">"cuda"</span><span class="b0">)</span>
+<span class="v1">y_tv</span> = <span class="m1">selective_scan_fn</span><span class="b0">(</span><span class="v2">u</span>, <span class="v1">delta</span>, <span class="v6">A</span>, <span class="v3">Bt2</span>, <span class="v4">Ct2</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="b1">(</span><span class="v3">y_ti</span><span class="b2">[</span>..., -<span class="n">1</span><span class="b2">]</span> - <span class="v1">y_tv</span><span class="b2">[</span>..., -<span class="n">1</span><span class="b2">]</span><span class="b1">)</span>.<span class="m2">abs</span><span class="b1">()</span>.<span class="m2">mean</span><span class="b1">()</span><span class="b0">)</span></code></pre></div>
+          <p>
+            The point is conceptual, not the number. With B and C constant in
+            time the operation is a fixed-kernel convolution and could be done
+            with an FFT. Once you let them vary per position, as Mamba does,
+            there is no fixed kernel and the scan is the only way. Sit with why
+            the second case cannot be a convolution.
+          </p>
+          <p><strong>Lab 3: constant-memory decoding.</strong> Concept: the recurrent inference cache.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">torch</span>, <span class="m1">time</span>
+<span class="k">from</span> <span class="m1">mamba_ssm</span>.<span class="m2">models</span>.<span class="m2">mixer_seq_simple</span> <span class="k">import</span> <span class="m1">MambaLMHeadModel</span>
+
+<span class="v0">model</span> = <span class="m1">MambaLMHeadModel</span>.<span class="m2">from_pretrained</span><span class="b0">(</span>
+    <span class="s">"state-spaces/mamba-130m"</span>, <span class="v6">device</span>=<span class="s">"cuda"</span>, <span class="v3">dtype</span>=<span class="m1">torch</span>.<span class="m2">float16</span><span class="b0">)</span>
+<span class="v0">ids</span> = <span class="m1">torch</span>.<span class="m2">randint</span><span class="b0">(</span><span class="n">0</span>, <span class="n">50277</span>, <span class="b1">(</span><span class="n">1</span>, <span class="n">16</span><span class="b1">)</span>, <span class="v6">device</span>=<span class="s">"cuda"</span><span class="b0">)</span>
+<span class="k">for</span> <span class="v1">max_len</span> <span class="k">in</span> <span class="b0">(</span><span class="n">64</span>, <span class="n">256</span>, <span class="n">1024</span><span class="b0">)</span>:
+    <span class="m1">torch</span>.<span class="m2">cuda</span>.<span class="m2">synchronize</span><span class="b0">()</span>; <span class="v5">t0</span> = <span class="m1">time</span>.<span class="m2">time</span><span class="b0">()</span>
+    <span class="v0">model</span>.<span class="m2">generate</span><span class="b0">(</span><span class="v5">input_ids</span>=<span class="v0">ids</span>, <span class="v3">max_length</span>=<span class="v1">max_len</span>, <span class="v5">cg</span>=<span class="k">True</span><span class="b0">)</span>
+    <span class="m1">torch</span>.<span class="m2">cuda</span>.<span class="m2">synchronize</span><span class="b0">()</span>
+    <span class="m1">print</span><span class="b0">(</span><span class="v1">max_len</span>, <span class="m1">round</span><span class="b1">(</span><span class="m1">time</span>.<span class="m2">time</span><span class="b2">()</span> - <span class="v5">t0</span>, <span class="n">3</span><span class="b1">)</span>, <span class="s">"s"</span>,
+          <span class="m1">torch</span>.<span class="m2">cuda</span>.<span class="m2">max_memory_allocated</span><span class="b1">()</span> // <span class="n">1024</span>**<span class="n">2</span>, <span class="s">"MB"</span><span class="b0">)</span></code></pre></div>
+          <p>
+            Watch peak memory stay roughly flat as the generated length grows,
+            because the recurrent state is fixed size and there is no KV cache
+            that scales with context. Compare that mentally to a Transformer of
+            the same size, whose cache grows linearly with tokens.
+          </p>
+          <p><strong>Lab 4: Mamba-1 versus Mamba-2 throughput.</strong> Concept: scan versus matmul-shaped SSD.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">torch</span>, <span class="m1">time</span>
+<span class="k">from</span> <span class="m1">mamba_ssm</span> <span class="k">import</span> <span class="m1">Mamba</span>, <span class="m1">Mamba2</span>
+
+<span class="v4">x</span> = <span class="m1">torch</span>.<span class="m2">randn</span><span class="b0">(</span><span class="n">4</span>, <span class="n">4096</span>, <span class="n">1024</span>, <span class="v6">device</span>=<span class="s">"cuda"</span>, <span class="v3">dtype</span>=<span class="m1">torch</span>.<span class="m2">bfloat16</span><span class="b0">)</span>
+<span class="k">for</span> <span class="v2">name</span>, <span class="m1">layer</span> <span class="k">in</span> <span class="b0">[</span><span class="b1">(</span><span class="s">"mamba1"</span>, <span class="m1">Mamba</span><span class="b2">(</span><span class="v6">d_model</span>=<span class="n">1024</span>, <span class="v2">d_state</span>=<span class="n">16</span><span class="b2">)</span><span class="b1">)</span>,
+                    <span class="b1">(</span><span class="s">"mamba2"</span>, <span class="m1">Mamba2</span><span class="b2">(</span><span class="v6">d_model</span>=<span class="n">1024</span>, <span class="v2">d_state</span>=<span class="n">128</span><span class="b2">)</span><span class="b1">)</span><span class="b0">]</span>:
+    <span class="m1">layer</span> = <span class="m1">layer</span>.<span class="m2">to</span><span class="b0">(</span><span class="s">"cuda"</span>, <span class="m1">torch</span>.<span class="m2">bfloat16</span><span class="b0">)</span>
+    <span class="m1">torch</span>.<span class="m2">cuda</span>.<span class="m2">synchronize</span><span class="b0">()</span>; <span class="v5">t0</span> = <span class="m1">time</span>.<span class="m2">time</span><span class="b0">()</span>
+    <span class="k">for</span> <span class="v4">_</span> <span class="k">in</span> <span class="m1">range</span><span class="b0">(</span><span class="n">20</span><span class="b0">)</span>:
+        <span class="m1">layer</span><span class="b0">(</span><span class="v4">x</span><span class="b0">)</span>
+    <span class="m1">torch</span>.<span class="m2">cuda</span>.<span class="m2">synchronize</span><span class="b0">()</span>
+    <span class="m1">print</span><span class="b0">(</span><span class="v2">name</span>, <span class="m1">round</span><span class="b1">(</span><span class="m1">time</span>.<span class="m2">time</span><span class="b2">()</span> - <span class="v5">t0</span>, <span class="n">3</span><span class="b1">)</span>, <span class="s">"s"</span><span class="b0">)</span></code></pre></div>
+          <p>
+            Note that Mamba-2 uses a far larger <code>d_state</code> yet stays
+            competitive or faster, because its work is shaped as tensor-core
+            matmuls rather than a bandwidth-bound scan. Try growing the
+            sequence length and watch both stay linear in L while a
+            same-width attention layer would grow quadratically.
+          </p>
+          <p><strong>Lab 5: derive dt_rank and the projection widths.</strong> Concept: the block's parameter shapes on paper.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="c"># for d_model = 768, expand = 2, d_state = 16, d_conv = 4:</span>
+<span class="c">#   d_inner  = expand * d_model            = 1536</span>
+<span class="c">#   in_proj  : 768 -&gt; 2 * 1536             = 3072 out</span>
+<span class="c">#   dt_rank  = ceil(d_model / 16)          = 48</span>
+<span class="c">#   x_proj   : 1536 -&gt; dt_rank + 2*d_state = 48 + 32 = 80 out</span>
+<span class="c">#   dt_proj  : 48 -&gt; 1536</span>
+<span class="c">#   out_proj : 1536 -&gt; 768</span>
+<span class="c"># check these against a printed layer's named parameters</span></code></pre></div>
+          <p>
+            Instantiate <code>Mamba(d_model=768)</code> and print
+            <code>{n: p.shape for n, p in layer.named_parameters()}</code>,
+            then match every shape to the arithmetic above. When the numbers
+            line up you understand the block.
+          </p>
+
+          <h2>Part VIII: Questions and model answers</h2>
+          <p>Understanding checks. Answer aloud before reading.</p>
+          <p><strong>1. What is Mamba, in one sentence?</strong></p>
+          <p>
+            A selective state-space sequence model that makes the recurrence
+            parameters B, C, and the step size Delta functions of the input,
+            so a fixed-size hidden state can decide what to keep and forget,
+            giving linear-time training and constant-memory inference that
+            rivals attention.
+          </p>
+          <p><strong>2. What does selectivity mean here, concretely?</strong></p>
+          <p>
+            That B, C, and Delta are computed from the current token by linear
+            projections rather than being fixed weights. Because they change
+            per position, the model can gate its state on content, holding
+            information across some tokens and overwriting it at others, which
+            a time-invariant SSM cannot do.
+          </p>
+          <p><strong>3. Why can a selective SSM not be computed as a convolution?</strong></p>
+          <p>
+            A convolutional view exists only when the unrolled input-to-output
+            weights depend just on the gap between positions, which requires
+            fixed A, B, C, and Delta. Once those are input-dependent the
+            effective weight from one position to another differs at every
+            position, so there is no single kernel and no FFT, only a direct
+            time-varying recurrence.
+          </p>
+          <p><strong>4. If the convolution is gone, how is training still efficient?</strong></p>
+          <p>
+            The recurrence is linear and therefore associative, so a parallel
+            prefix scan produces all states in logarithmic parallel depth. A
+            custom CUDA kernel runs that scan while keeping the large expanded
+            state in on-chip memory and fusing discretization, readout, skip,
+            and gate, so it never writes the state to HBM.
+          </p>
+          <p><strong>5. Why is the scan a custom kernel and not plain PyTorch ops?</strong></p>
+          <p>
+            The hidden state is <code>d_state</code> times wider than the
+            activations, so an eager graph over primitive ops would materialize
+            a tensor of shape roughly <code>(B, L, d_inner, d_state)</code> in
+            HBM and be dominated by moving it. The kernel exists precisely to
+            keep that tensor on chip and recompute it in the backward pass.
+          </p>
+          <p><strong>6. Walk through the Mamba block in order.</strong></p>
+          <p>
+            Input projection widens and splits into an x branch and a z gate.
+            The x branch gets a depthwise causal convolution and SiLU. A
+            projection produces input-dependent Delta, B, and C. The selective
+            scan runs the discretized recurrence with A read from A_log. A
+            per-channel D skip is added, the result is gated by SiLU of z, and
+            an output projection returns to the model width.
+          </p>
+          <p><strong>7. Why keep A diagonal and store it as A_log?</strong></p>
+          <p>
+            Diagonal A makes the discretization exponential elementwise and
+            keeps the state channels independent, which is cheap and stable.
+            Storing <code>A_log</code> and using <code>A = -exp(A_log)</code>
+            forces A negative so the recurrence always decays rather than
+            growing without bound.
+          </p>
+          <p><strong>8. What is in the inference cache and why does memory stay flat?</strong></p>
+          <p>
+            An <code>InferenceParams</code> object holds each layer's
+            fixed-size recurrent SSM state plus the short convolution window.
+            Decoding one token updates that state in place, so cost and memory
+            are independent of how long the context already is, unlike a
+            Transformer KV cache that grows with every token.
+          </p>
+          <p><strong>9. How does the backward pass save memory?</strong></p>
+          <p>
+            It does not store the per-position expanded states from the
+            forward pass. Instead it recomputes them while accumulating
+            gradients, trading extra arithmetic for a large reduction in
+            memory traffic, the same recomputation strategy FlashAttention
+            uses for its score matrix.
+          </p>
+          <p><strong>10. What changes in Mamba-2 relative to Mamba-1?</strong></p>
+          <p>
+            A is restricted from a general diagonal to a scalar times the
+            identity per head, which exposes a duality between the SSM and a
+            masked attention over a semiseparable matrix. That lets the
+            computation be reshaped into a chunked, matmul-heavy algorithm that
+            saturates tensor cores, so it is several times faster and can
+            afford a much larger state.
+          </p>
+          <p><strong>11. When should you not use Mamba?</strong></p>
+          <p>
+            When the task needs exact recall or copying from far back in the
+            context, because a fixed-size state compresses history and can drop
+            the specific token you need. Attention looks at every past token
+            directly and wins there, which is why strong systems often
+            interleave a few attention layers among the Mamba layers.
+          </p>
+          <p><strong>12. Why does the block need a convolution at all if it has a recurrence?</strong></p>
+          <p>
+            A diagonal state-space recurrence is good at long-range structure
+            but weak at tight local interactions between neighboring tokens.
+            The short depthwise causal convolution supplies that local mixing
+            cheaply, letting the recurrence specialize in the long range.
+          </p>
+          <p><strong>13. Name three honest alternatives and their tradeoffs.</strong></p>
+          <p>
+            Transformers with FlashAttention, best quality on recall but
+            quadratic in length. S4 and its diagonal variants, time-invariant
+            so they keep the fast convolution but lack selectivity. RWKV,
+            RetNet, and gated linear attention, other linear-time recurrent
+            designs from the linear-attention side with their own tradeoffs.
+          </p>
+          <p><strong>14. What is the single biggest performance mistake a new user makes?</strong></p>
+          <p>
+            Not installing <code>causal-conv1d</code> and running in float32,
+            which silently drops onto slow reference paths. The kernels are
+            built for bf16 or fp16 with the compiled convolution and scan, and
+            without them you are measuring the reference implementation, not
+            Mamba.
+          </p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Make the parameters depend on the data.</strong> The whole
+            leap from S4 to Mamba is letting B, C, and Delta be functions of
+            the input. Content-dependence is the difference between a filter
+            that treats all tokens alike and a model that can select, and it is
+            worth reorganizing an entire training strategy to get. The same
+            instinct shows up wherever a system gains power by conditioning its
+            behavior on its input rather than fixing it in advance.
+          </p>
+          <p>
+            <strong>Know exactly which optimization your change breaks.</strong>
+            Selectivity was not free, it forfeited the convolutional training
+            path that made the predecessor fast. Mamba's authors understood
+            that precisely and had the replacement, a parallel scan, ready.
+            The lesson is to trace which existing efficiency an architectural
+            change invalidates before you make it, because that is where the
+            real engineering cost lands.
+          </p>
+          <p>
+            <strong>Optimize for bytes moved, not flops.</strong> The scan
+            kernel wins by keeping the oversized state on chip and recomputing
+            in the backward pass, spending arithmetic to avoid memory traffic.
+            On modern accelerators the bottleneck is almost always bandwidth,
+            and the same fuse-and-recompute pattern powers
+            <a href="/oss/flash-attention">FlashAttention</a> and most fast
+            kernels. The scan itself is a classic
+            <a href="/classes/parallel-computing">parallel prefix</a>, the
+            oldest trick in the parallel-algorithms book applied to a new
+            recurrence.
+          </p>
+          <p>
+            <strong>Reshape the computation to fit the hardware.</strong>
+            Mamba-2 gives up a little expressiveness in A so the operation
+            becomes matmuls, because GPUs spend most of their silicon on
+            matmul. Choosing an algorithm because the hardware is fast at its
+            shape, rather than choosing the most general algorithm and hoping,
+            is a repeatable source of large speedups.
+          </p>
+          <p>
+            <strong>Ship a slow reference beside the fast kernel.</strong> The
+            repository keeps a pure-PyTorch implementation of the scan that the
+            tests compare against the CUDA kernel. That reference is what makes
+            the fast path trustworthy and readable, and it is the difference
+            between a kernel you believe and one you merely run.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            The one-sentence summary: <mark>Mamba makes a state-space model's
+            B, C, and Delta depend on the input, which forbids the S4
+            convolution and forces a hardware-aware parallel scan, wraps that
+            scan in a block with a causal convolution and a SiLU gate, and in
+            Mamba-2 restricts A to a scalar so the whole thing becomes
+            matmul-shaped through state-space duality.</mark>
+          </p>
+          <pre class="flow">in_proj -&gt; (x branch, z gate)
+  -&gt; causal conv1d + SiLU  (local mixing)
+  -&gt; x_proj -&gt; input-dependent Delta, B, C   (this is S6 selectivity)
+  -&gt; selective_scan: h_t = exp(dt A) h_{t-1} + dt B x_t,  y_t = C h_t
+  -&gt; + D skip, * SiLU(z) gate
+  -&gt; out_proj</pre>
+          <p>The chain mapped to source:</p>
+          <pre class="flow">block          mamba_ssm/modules/mamba_simple.py  (class Mamba)
+scan interface mamba_ssm/ops/selective_scan_interface.py  (selective_scan_fn)
+cuda kernel    csrc/selective_scan/  (fwd + bwd)
+model          mamba_ssm/models/mixer_seq_simple.py  (MambaLMHeadModel)
+inference      mamba_ssm/utils/generation.py  (InferenceParams)
+mamba-2 / ssd  mamba_ssm/modules/mamba2.py + mamba_ssm/ops/triton/</pre>
+          <p>Memorize these blocks:</p>
+          <ul>
+            <li><strong>S4 vs S6:</strong> S4 has fixed A, B, C, Delta and a convolutional view. S6 makes B, C, Delta input-dependent, which kills the convolution and demands a scan.</li>
+            <li><strong>Why a kernel:</strong> the state is d_state times wider than the activations, so it must stay on chip, and the backward recomputes it rather than storing a (B, L, d_inner, d_state) tensor.</li>
+            <li><strong>The block:</strong> in_proj splits into x and z, conv1d plus SiLU, x_proj gives Delta, B, C, selective scan, D skip, SiLU(z) gate, out_proj.</li>
+            <li><strong>Discretization:</strong> A = -exp(A_log), Abar = exp(Delta A), Bbar approximately Delta B, so h_t = Abar h_{t-1} + Bbar x_t and y_t = C h_t.</li>
+            <li><strong>Mamba-2:</strong> scalar A gives a duality with masked attention, a chunked matmul algorithm, tensor-core speed, and a much larger state.</li>
+          </ul>
+
+          <h2>Part XI: Final takeaway</h2>
+          <p>
+            If the continuous state-space equations, the zero-order-hold
+            discretization, HiPPO and S4, the parallel associative scan, and
+            the duality with linear attention are the gaps, the
+            <a href="/classes/sequence-models-state-spaces">state-space models class page</a>
+            derives all of them from first principles, and the memory story
+            behind the fused kernel is worked out in the
+            <a href="/oss/flash-attention">FlashAttention chapter</a>. Then
+            come back and read <code>mamba_simple.py</code> once more. The
+            forward pass will read like an ordinary block with one strange and
+            powerful twist, the parameters of its recurrence are computed from
+            the very sequence it is processing, and everything else is the
+            machinery required to make that twist run fast.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> Mamba shows that a fixed-size
+            recurrent state can rival attention if you let it choose what to
+            remember. Make the state-space parameters depend on the input, pay
+            for the lost convolution with a hardware-aware scan that keeps the
+            oversized state on chip, fold local convolution and gating into one
+            block, and in Mamba-2 reshape the whole computation into matmuls
+            through state-space duality. The result is linear-time training,
+            constant-memory generation, and a codebase small enough to read
+            end to end.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/code-copy.js"></script>
+      <script defer src="/theme.js"></script>
+  </body>
+</html>

@@ -1,0 +1,1111 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DeepSpeed walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A full chapter on microsoft/DeepSpeed: the library that made trillion-parameter training feasible. The ZeRO memory math derived from first principles, stages 1 through 3 partitioning optimizer state, gradients, and parameters, ZeRO-Offload and ZeRO-Infinity to CPU and NVMe, the deepspeed.initialize engine traced through one training step, pipeline parallelism, the fused CUDA kernels and op_builder, and DeepSpeed-Inference, with a reading path, labs, and understanding checks." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+      <script>(function(){try{var t=localStorage.getItem("theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>DeepSpeed</h1>
+        <p class="lead">
+          <a href="https://github.com/microsoft/DeepSpeed" target="_blank" rel="noreferrer">DeepSpeed</a>
+          is the Microsoft library that made trillion-parameter training
+          feasible on hardware that could never hold such a model in one
+          place. Its load-bearing idea is ZeRO, the Zero Redundancy
+          Optimizer, which notices that plain data parallelism keeps a full
+          copy of the optimizer state, the gradients, and the parameters on
+          every single GPU, and then partitions each of those three across
+          the data-parallel group so the redundancy disappears. This chapter
+          derives the ZeRO memory arithmetic from first principles, walks
+          <code>deepspeed.initialize</code> and one training step of a
+          ZeRO-3 model from the config JSON down to the collectives and the
+          CPU-side Adam step, and covers ZeRO-Offload and ZeRO-Infinity, the
+          pipeline engine, the fused CUDA kernels, and DeepSpeed-Inference.
+          It ends with a reading path through the repository, runnable labs,
+          understanding checks with model answers, and a compact framework
+          for keeping the whole system in your head.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">deepspeed launcher        one process per GPU, sets RANK/LOCAL_RANK/WORLD_SIZE
+      |
+      v
+your train.py             plain PyTorch model + a ds_config dict/JSON
+      |
+      v
+deepspeed.initialize()    wraps model -&gt; DeepSpeedEngine (deepspeed/runtime/engine.py)
+      |                    reads zero_optimization.stage, offload, fp16/bf16
+      v
+ZeRO partitioning         optimizer state (st.1), + gradients (st.2), + params (st.3)
+      |                    each shard lives on exactly one data-parallel rank
+      v
+engine(batch)             forward: all-gather each layer's params just in time (st.3)
+      |
+      v
+engine.backward(loss)     backward: reduce-scatter gradients, re-partition params
+      |
+      v
+engine.step()             optimizer step on the local shard (maybe on CPU/NVMe)
+      |                    loss scaling, grad clipping, grad accumulation handled here
+      v
+collectives (NCCL)        all-gather, reduce-scatter; offload copies over PCIe/NVMe</pre>
+          <p>
+            The one-sentence identity: <mark>DeepSpeed is a training engine
+            that wraps an ordinary PyTorch model and removes the redundant
+            memory that data parallelism duplicates on every GPU, by
+            partitioning the optimizer state, the gradients, and the
+            parameters across the group and gathering each piece back only
+            for the moment it is needed.</mark> Ordinary data parallelism
+            replicates everything and communicates only gradients. That is
+            simple and fast, but it caps model size at whatever fits on one
+            device, and for a modern model the optimizer state alone is
+            several times larger than the parameters. ZeRO keeps the
+            single-program simplicity of data parallelism while paying the
+            memory cost of only one Nth of the state per rank, where N is the
+            data-parallel degree.
+          </p>
+          <p>
+            Two consequences follow, and they are the whole reason the
+            library exists. First, memory stops being the wall. A model that
+            needs 120 GB of optimizer, gradient, and parameter state under
+            plain data parallelism needs under 2 GB per GPU under ZeRO-3 on
+            64 devices, and when even that is too much, ZeRO-Offload and
+            ZeRO-Infinity spill the partitions to CPU DRAM and then to NVMe,
+            trading bandwidth for capacity along the memory hierarchy.
+            Second, the model code barely changes. You do not rewrite your
+            transformer into column-parallel and row-parallel layers the way
+            a tensor-parallel framework demands. You hand DeepSpeed a plain
+            model and a JSON config, and the engine applies the partitioning
+            from outside. Everything here is verified against the library as
+            it stands in mid 2026, and the project moves quickly, so where a
+            file path or a config key is likely to have shifted I say so and
+            stay at the level of the concept.
+          </p>
+          <p>
+            One honest orientation before the details. The idea at the center
+            of ZeRO-3, partition the parameters and gather them per layer on
+            the fly, is exactly the idea PyTorch later absorbed as FSDP, and
+            FSDP2 is what
+            <a href="/oss/torchtitan">torchtitan</a> builds on. Reading
+            DeepSpeed is the shortest path to understanding where that whole
+            family of techniques came from and why it works. If you want the
+            single-device transformer these ideas are applied to, the
+            <a href="/classes/language-models-from-scratch">language models
+            from scratch class</a> builds one end to end, and the broader
+            theory of who-shards-what lives in the
+            <a href="/classes/parallel-computing">parallel computing
+            class</a>.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <p>
+            DeepSpeed is a Linux-and-NVIDIA-GPU library first (with ROCm and
+            some CPU and accelerator backends). It installs from PyPI on top
+            of an existing PyTorch, and it wants a CUDA toolkit present
+            because most of its speed comes from custom C++ and CUDA
+            operators it compiles for your machine:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">pip</span> <span class="s">install</span> <span class="s">deepspeed</span>
+
+<span class="c"># sanity check: which ops are compatible with this box, and which are</span>
+<span class="c"># prebuilt vs will be JIT-compiled on first use</span>
+<span class="m1">ds_report</span></code></pre></div>
+          <p>
+            <code>ds_report</code> is the first thing to run and the most
+            useful diagnostic in the project. It prints a table of every
+            operator (fused Adam, CPU Adam, the transformer kernels, the
+            inference kernels, and so on), whether your toolchain can build
+            it, and whether it was precompiled at install time or will be
+            just-in-time compiled the first time you touch it. If CPU Adam
+            shows as incompatible, ZeRO-Offload will fall back or fail, and
+            <code>ds_report</code> tells you before a six-hour run does.
+          </p>
+          <p>
+            The rest of DeepSpeed is driven by two things: a config, and the
+            <code>deepspeed.initialize</code> call that consumes it. The
+            config is a plain dictionary (usually stored as a JSON file, but
+            a Python dict works identically). A minimal ZeRO-3 config with
+            optimizer offload to CPU and parameter offload to NVMe looks like
+            this:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="v0">ds_config</span> = <span class="b0">{</span>
+    <span class="s">"train_micro_batch_size_per_gpu"</span>: <span class="n">4</span>,
+    <span class="s">"gradient_accumulation_steps"</span>: <span class="n">8</span>,
+    <span class="s">"optimizer"</span>: <span class="b1">{</span><span class="s">"type"</span>: <span class="s">"AdamW"</span>, <span class="s">"params"</span>: <span class="b2">{</span><span class="s">"lr"</span>: <span class="n">3e-4</span><span class="b2">}</span><span class="b1">}</span>,
+    <span class="s">"bf16"</span>: <span class="b1">{</span><span class="s">"enabled"</span>: <span class="k">True</span><span class="b1">}</span>,
+    <span class="s">"zero_optimization"</span>: <span class="b1">{</span>
+        <span class="s">"stage"</span>: <span class="n">3</span>,
+        <span class="s">"offload_optimizer"</span>: <span class="b2">{</span><span class="s">"device"</span>: <span class="s">"cpu"</span>, <span class="s">"pin_memory"</span>: <span class="k">True</span><span class="b2">}</span>,
+        <span class="s">"offload_param"</span>: <span class="b2">{</span><span class="s">"device"</span>: <span class="s">"nvme"</span>, <span class="s">"nvme_path"</span>: <span class="s">"/local_nvme"</span><span class="b2">}</span>,
+        <span class="s">"overlap_comm"</span>: <span class="k">True</span>,
+        <span class="s">"contiguous_gradients"</span>: <span class="k">True</span>,
+        <span class="s">"stage3_prefetch_bucket_size"</span>: <span class="n">5e8</span>,
+        <span class="s">"stage3_param_persistence_threshold"</span>: <span class="n">1e6</span>,
+        <span class="s">"stage3_gather_16bit_weights_on_model_save"</span>: <span class="k">True</span>,
+    <span class="b1">}</span>,
+<span class="b0">}</span></code></pre></div>
+          <p>
+            The training code is deliberately close to plain PyTorch, with
+            three method calls replacing the usual four. You do not call
+            <code>loss.backward()</code>, <code>optimizer.step()</code>, and
+            <code>optimizer.zero_grad()</code> yourself. The engine owns
+            those, because it has to interleave gradient reduction, loss
+            scaling, gradient accumulation, and clipping around them:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">deepspeed</span>
+
+<span class="v0">model</span> = <span class="m1">MyTransformer</span><span class="b0">()</span>          <span class="c"># an ordinary nn.Module</span>
+
+<span class="m1">model_engine</span>, <span class="v4">optimizer</span>, <span class="v5">dataloader</span>, <span class="v4">_</span> = <span class="m1">deepspeed</span>.<span class="m2">initialize</span><span class="b0">(</span>
+    <span class="v0">model</span>=<span class="v0">model</span>,
+    <span class="v1">model_parameters</span>=<span class="v0">model</span>.<span class="m2">parameters</span><span class="b1">()</span>,
+    <span class="v6">training_data</span>=<span class="v4">train_dataset</span>,
+    <span class="v4">config</span>=<span class="v0">ds_config</span>,            <span class="c"># dict or path to ds_config.json</span>
+<span class="b0">)</span>
+
+<span class="k">for</span> <span class="v6">batch</span> <span class="k">in</span> <span class="v5">dataloader</span>:
+    <span class="v6">loss</span> = <span class="m1">model_engine</span><span class="b0">(</span><span class="v6">batch</span><span class="b0">)</span>       <span class="c"># forward</span>
+    <span class="m1">model_engine</span>.<span class="m2">backward</span><span class="b0">(</span><span class="v6">loss</span><span class="b0">)</span>      <span class="c"># backward + gradient reduce-scatter</span>
+    <span class="m1">model_engine</span>.<span class="m2">step</span><span class="b0">()</span>              <span class="c"># optimizer step + zero grad (at accum boundary)</span></code></pre></div>
+          <p>
+            <code>deepspeed.initialize</code> returns a four-tuple: the
+            wrapped engine (which is itself an <code>nn.Module</code> you
+            call to run forward), the optimizer it built or adopted, a
+            dataloader if you passed a dataset, and an LR scheduler if the
+            config asked for one. Note that <code>model_engine.step()</code>
+            is called every iteration, but the engine only performs the real
+            optimizer update at gradient-accumulation boundaries. On the
+            intervening micro-steps it just accumulates. That is why
+            <code>train_batch_size</code> in the config equals
+            <code>train_micro_batch_size_per_gpu</code> times
+            <code>gradient_accumulation_steps</code> times the world size,
+            and DeepSpeed will refuse to start if you specify all three and
+            they do not multiply out.
+          </p>
+          <p>
+            You launch with the <code>deepspeed</code> command, which is a
+            process launcher analogous to <code>torchrun</code>. It reads a
+            GPU count or a multi-node hostfile and spawns one rank per GPU:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="c"># single node, 8 GPUs</span>
+<span class="m1">deepspeed</span> <span class="s">--num_gpus=8</span> <span class="s">train.py</span> <span class="s">--deepspeed</span> <span class="s">--deepspeed_config</span> <span class="s">ds_config.json</span>
+
+<span class="c"># multiple nodes: hostfile lists "hostname slots=N" lines</span>
+<span class="m1">deepspeed</span> <span class="s">--hostfile=hostfile</span> <span class="s">train.py</span> <span class="s">--deepspeed_config</span> <span class="s">ds_config.json</span></code></pre></div>
+          <p>
+            Now the mistakes people make. First, the batch-size identity
+            above trips everyone once. If you set
+            <code>train_batch_size</code>,
+            <code>train_micro_batch_size_per_gpu</code>, and
+            <code>gradient_accumulation_steps</code> to values that are
+            inconsistent with the world size, DeepSpeed asserts at init. The
+            fix is to specify at most two of the three and let the engine
+            derive the rest. Second, for very large models under ZeRO-3 you
+            must construct the model under a
+            <code>deepspeed.zero.Init()</code> context, otherwise every rank
+            allocates the full model before partitioning and you are back to
+            the out-of-memory you were trying to avoid:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">deepspeed</span>
+
+<span class="k">with</span> <span class="m1">deepspeed</span>.<span class="m2">zero</span>.<span class="m2">Init</span><span class="b0">(</span><span class="v5">config_dict_or_path</span>=<span class="v0">ds_config</span><span class="b0">)</span>:
+    <span class="v0">model</span> = <span class="m1">VeryLargeTransformer</span><span class="b0">()</span>   <span class="c"># params are sharded as they are created,</span>
+                                     <span class="c"># so the full model never lands on one GPU</span></code></pre></div>
+          <p>
+            Third, saving a ZeRO-3 checkpoint the naive way gives you shards,
+            not a model. Each rank holds a partition, so
+            <code>model_engine.save_checkpoint(dir)</code> writes sharded
+            state that only DeepSpeed can resume. To get a single
+            consolidated file you either set
+            <code>stage3_gather_16bit_weights_on_model_save</code> and call
+            the 16-bit save helper, or run the
+            <code>zero_to_fp32.py</code> conversion script the engine drops
+            next to the checkpoint. Fourth, and most common with offload: NVMe
+            offload needs a real fast local NVMe path and the async I/O
+            operator built, and putting <code>nvme_path</code> on a network
+            filesystem turns a training run into a disk-latency benchmark.
+          </p>
+          <p>
+            Finally, note that you rarely write this loop by hand in practice.
+            <a href="/oss/transformers">Hugging Face Transformers</a> and
+            Accelerate both integrate DeepSpeed, so passing a ZeRO config to
+            the <code>Trainer</code> gets you all of the above without the
+            explicit <code>initialize</code> call. Reading the raw API first
+            is still the right way to understand what that integration is
+            doing under you.
+          </p>
+
+          <h2>Part III: The ZeRO memory math, derived</h2>
+          <p>
+            Everything about ZeRO follows from one accounting exercise, so it
+            is worth doing carefully rather than quoting. Take a model with
+            <code>&#936;</code> parameters trained in mixed precision with the
+            Adam family of optimizers, which is the standard setup. Count the
+            bytes that must live in memory for one optimizer step, per
+            parameter:
+          </p>
+          <table>
+            <tr><th>What</th><th>Precision</th><th>Bytes per param</th></tr>
+            <tr><td>Parameters (for forward/backward)</td><td>fp16 or bf16</td><td>2</td></tr>
+            <tr><td>Gradients</td><td>fp16 or bf16</td><td>2</td></tr>
+            <tr><td>Optimizer: master copy of params</td><td>fp32</td><td>4</td></tr>
+            <tr><td>Optimizer: Adam momentum</td><td>fp32</td><td>4</td></tr>
+            <tr><td>Optimizer: Adam variance</td><td>fp32</td><td>4</td></tr>
+          </table>
+          <p>
+            The three optimizer rows sum to 12 bytes per parameter. The ZeRO
+            paper calls that multiplier <code>K = 12</code>. So the total
+            training memory for the model state, ignoring activations, is
+            <code>(2 + 2 + K)&#936; = 16&#936;</code> bytes. The crucial
+            observation is that the 12 bytes of optimizer state, three
+            quarters of the total, are Adam bookkeeping that is only ever
+            touched during the optimizer step, and under plain data
+            parallelism every GPU holds an identical copy of all of it. That
+            is the redundancy ZeRO removes, in three stages, by partitioning
+            across the <code>N</code> data-parallel ranks:
+          </p>
+          <table>
+            <tr><th>Config</th><th>Params</th><th>Grads</th><th>Optimizer</th><th>Per-GPU bytes</th><th>7.5B on 64 GPUs</th></tr>
+            <tr><td>Data parallel (baseline)</td><td>2&#936;</td><td>2&#936;</td><td>12&#936;</td><td>16&#936;</td><td>120 GB</td></tr>
+            <tr><td>ZeRO-1 (P<sub>os</sub>)</td><td>2&#936;</td><td>2&#936;</td><td>12&#936;/N</td><td>4&#936; + 12&#936;/N</td><td>~31.4 GB</td></tr>
+            <tr><td>ZeRO-2 (P<sub>os+g</sub>)</td><td>2&#936;</td><td>2&#936;/N</td><td>12&#936;/N</td><td>2&#936; + 14&#936;/N</td><td>~16.6 GB</td></tr>
+            <tr><td>ZeRO-3 (P<sub>os+g+p</sub>)</td><td>2&#936;/N</td><td>2&#936;/N</td><td>12&#936;/N</td><td>16&#936;/N</td><td>~1.9 GB</td></tr>
+          </table>
+          <p>
+            The last column is the canonical worked example from the ZeRO
+            paper: a 7.5-billion-parameter model on 64 GPUs. Baseline needs
+            <code>16 &#215; 7.5 = 120</code> GB per GPU, which fits on nothing.
+            ZeRO-1 partitions only the 12 bytes of optimizer state, giving
+            <code>4 &#215; 7.5 + (12 &#215; 7.5)/64 &#8776; 31.4</code> GB.
+            ZeRO-2 also partitions the 2 bytes of gradients, giving
+            <code>2 &#215; 7.5 + (14 &#215; 7.5)/64 &#8776; 16.6</code> GB, a
+            number that now fits on a commodity accelerator. ZeRO-3
+            partitions the parameters too, and the whole 16&#936; divides by
+            N cleanly, giving <code>(16 &#215; 7.5)/64 &#8776; 1.9</code> GB.
+            <mark>As N grows, ZeRO-3 memory goes to zero, so the model you can
+            train is limited by aggregate memory across all GPUs rather than
+            the memory of any one, which is the entire reason
+            trillion-parameter training became possible.</mark>
+          </p>
+          <p>
+            The natural objection is that all this gathering and scattering
+            must cost communication. It costs less than you would guess.
+            Standard data-parallel training does one all-reduce of the
+            gradients per step, which a ring implementation realizes as a
+            reduce-scatter followed by an all-gather, moving
+            <code>2&#936;</code> bytes total. ZeRO-1 and ZeRO-2 keep exactly
+            that <code>2&#936;</code> volume: they reduce-scatter gradients to
+            the rank that owns each shard, that rank updates its slice of
+            parameters, and an all-gather redistributes the updated
+            parameters. Same traffic as ordinary data parallelism, a fraction
+            of the memory. ZeRO-3 is the only stage that costs more.
+            Parameters now have to be all-gathered once in the forward pass
+            and again in the backward pass, and gradients reduce-scattered, so
+            the volume is <code>3&#936;</code>, which is 1.5 times the
+            baseline. <mark>The trade is a 50 percent increase in
+            communication for an N-fold reduction in memory, and on a fast
+            interconnect with good compute overlap that trade is almost always
+            worth taking.</mark>
+          </p>
+          <pre class="flow">communication volume per step, relative to plain data parallel (= 2&#936;)
+
+   data parallel   ZeRO-1   ZeRO-2   ZeRO-3
+        1.0x         1.0x     1.0x     1.5x
+                    &lt;--- same traffic --&gt;   &lt;- 1.5x, all-gather params twice -&gt;</pre>
+          <p>
+            One more subtlety worth stating, because it explains why ZeRO-3
+            is not free even when overlap hides the bandwidth. Gathering a
+            layer's parameters just before it runs means the parameters exist
+            in full for only a brief window, so peak memory depends on how
+            many layers you allow to be live at once
+            (<code>stage3_max_live_parameters</code>) and how far ahead you
+            prefetch (<code>stage3_prefetch_bucket_size</code>). Tune those
+            too aggressively and you recreate the memory pressure you were
+            escaping. Tune them too conservatively and prefetch cannot hide
+            the all-gather latency. That tension is the essence of operating
+            ZeRO-3 well.
+          </p>
+
+          <h2>Part IV: When it is the right tool</h2>
+          <p>
+            DeepSpeed is the right tool when memory is your binding constraint
+            and you want to keep a mostly plain PyTorch model. That covers
+            pretraining or full fine-tuning of a model whose optimizer state
+            will not fit under plain data parallelism, training on a single
+            node (or even a single GPU) a model that is nominally too big for
+            it via offload, and any workflow already sitting inside the Hugging
+            Face ecosystem where a ZeRO config is a few lines in a
+            <code>Trainer</code> argument. It is also the reference
+            implementation of the offload idea. If you want to train a 13B
+            model on one consumer GPU by spilling optimizer state to CPU, this
+            is the library that pioneered that path.
+          </p>
+          <p>
+            The honest alternatives, named plainly. PyTorch FSDP and FSDP2 are
+            the same core idea as ZeRO-3, absorbed into PyTorch itself, and if
+            you want a native, forkable stack that composes sharding with
+            tensor and pipeline parallelism over DTensor, torchtitan built on
+            FSDP2 is cleaner to read and own. Megatron-LM is the tool when you
+            need maximum model-FLOP utilization on large NVIDIA clusters and
+            you accept tensor parallelism that rewrites your model into
+            parallel layers. The two are not even really rivals in practice.
+            The largest public models, Megatron-Turing NLG 530B and BLOOM
+            176B, were trained with Megatron-DeepSpeed, which uses Megatron for
+            tensor parallelism and DeepSpeed for ZeRO data parallelism and
+            pipelining, the so-called 3D parallelism. For inference rather than
+            training, DeepSpeed-Inference exists and is covered below, but the
+            momentum in open-source serving has moved to
+            <a href="/oss/vllm">vLLM</a> and similar engines built around
+            paged KV caches, so reach for those first unless you specifically
+            need ZeRO-Inference to fit a model that will not otherwise load.
+          </p>
+          <p>
+            The architecture-shaped warning is about where the offload
+            bandwidth lands. Every stage of ZeRO trades communication for
+            memory, and every level of offload trades a slower link for more
+            capacity. GPU memory is fed by NVLink, CPU memory by PCIe, and
+            NVMe by PCIe plus a storage controller, each an order of magnitude
+            slower than the last. Offloading optimizer state to CPU is often
+            nearly free because the optimizer step is a small fraction of
+            step time and overlaps with compute. Offloading parameters to
+            NVMe under ZeRO-Infinity can be the difference between running and
+            not running, but it can also dominate step time if the NVMe is
+            slow or the working set does not fit in the CPU cache tier above
+            it:
+          </p>
+          <pre class="flow">memory hierarchy, fastest and smallest at the top
+
+   HBM on GPU        ~TB/s      &lt;- params live here only while a layer runs
+        |  NVLink / PCIe
+   CPU DRAM          ~tens GB/s &lt;- ZeRO-Offload puts optimizer state here
+        |  PCIe + controller
+   local NVMe        ~GB/s      &lt;- ZeRO-Infinity spills params/optimizer here
+
+   rule: push state down only as far as capacity forces you,
+         because each step down costs an order of magnitude of bandwidth</pre>
+          <p>
+            The failure mode is not an error. It is a run that technically
+            works and is ten times slower than it should be because the
+            offload target cannot keep the GPUs fed. As with mapping tensor
+            parallelism across slow links, the symptom is step time, and the
+            profiler is how you find it.
+          </p>
+
+          <h2>Part V: The full life of one ZeRO-3 training step</h2>
+          <p>
+            The specimen is one iteration of a ZeRO-3 model with optimizer
+            offload to CPU, launched with the config from Part II. Most of
+            the machinery below is orchestrated by the DeepSpeedEngine in
+            <code>deepspeed/runtime/engine.py</code> and the stage-3
+            implementation under <code>deepspeed/runtime/zero/</code>. Exact
+            file names in that package have been reorganized more than once,
+            so I name the roles and note where I am confident of a filename.
+          </p>
+
+          <h3>Stage 1: the launcher and initialize</h3>
+          <p>
+            The <code>deepspeed</code> command (its runner lives in
+            <code>deepspeed/launcher/</code>) reads the GPU count or hostfile,
+            sets up the environment, and execs one copy of your
+            <code>train.py</code> per GPU with <code>RANK</code>,
+            <code>LOCAL_RANK</code>, and <code>WORLD_SIZE</code> populated,
+            exactly like <code>torchrun</code>. From there the program is
+            SPMD, the same code on every rank. Your call to
+            <code>deepspeed.initialize</code> parses the config, initializes
+            the distributed backend through DeepSpeed's communication wrapper
+            (<code>deepspeed/comm/</code>, a thin layer over
+            <code>torch.distributed</code> and NCCL), and constructs the
+            engine appropriate to the configured ZeRO stage. For stage 3 that
+            is the stage-3 engine, which immediately partitions the model's
+            parameters so each rank keeps only its slice.
+          </p>
+
+          <h3>Stage 2: parameter partitioning and the hooks</h3>
+          <p>
+            The heart of ZeRO-3 is that every parameter carries a partition.
+            If the model was built under
+            <code>deepspeed.zero.Init()</code>, the parameters were sharded as
+            they were created and the full tensor never existed on one GPU.
+            Otherwise the engine partitions them now. The stage-3 machinery
+            (the parameter partitioning and offload logic, historically in
+            files like <code>partition_parameters.py</code> and a parameter
+            offload coordinator in <code>deepspeed/runtime/zero/</code>) then
+            registers forward and backward hooks on every submodule. Those
+            hooks are the trick that turns a partitioned model into a runnable
+            one. Before a submodule runs, its pre-forward hook all-gathers the
+            full parameters for just that module. After it runs, its
+            post-forward hook releases them back to the partitioned state.
+            Parameters below <code>stage3_param_persistence_threshold</code>
+            in size are left resident permanently, because gathering tiny
+            tensors costs more in latency than it saves in memory.
+          </p>
+
+          <h3>Stage 3: forward with just-in-time all-gather</h3>
+          <p>
+            When you call <code>model_engine(batch)</code>, execution walks
+            the module tree as usual, but each module's pre-forward hook fires
+            an all-gather across the data-parallel group to reconstruct that
+            module's parameters, the module computes, and the post-forward
+            hook frees them again. The engine prefetches. While layer L
+            computes, the all-gather for layer L+1 is already in flight on a
+            separate stream, so the communication hides under the compute of
+            the previous layer. This is the same overlap discipline that makes
+            FSDP fast, and it is why <code>overlap_comm</code> and the
+            prefetch-bucket settings matter so much. The result is a normal
+            forward pass and a normal loss, computed as if the full model were
+            resident, while at no instant is more than a couple of layers'
+            worth of parameters actually materialized.
+          </p>
+
+          <h3>Stage 4: backward with reduce-scatter</h3>
+          <p>
+            <code>model_engine.backward(loss)</code> runs autograd, but with
+            the same hook discipline mirrored. Each module's parameters are
+            re-gathered for its backward, gradients are computed locally, and
+            then, instead of the all-reduce that plain data parallelism would
+            do, ZeRO reduce-scatters the gradients so that each rank ends up
+            holding only the gradient shard for the parameters it owns. The
+            full gradient for a parameter never exists on more than the ranks
+            that momentarily held it. Gradients are accumulated into
+            contiguous buffers when <code>contiguous_gradients</code> is set,
+            which avoids fragmentation and makes the reduce-scatter a single
+            large collective rather than many small ones. If gradient
+            accumulation is configured, backward on the intervening
+            micro-steps simply accumulates locally and skips the reduction
+            until the accumulation boundary, which is why the communication
+            volume is per effective batch, not per micro-batch.
+          </p>
+
+          <h3>Stage 5: the optimizer step, possibly on the CPU</h3>
+          <p>
+            <code>model_engine.step()</code> at an accumulation boundary is
+            where the offload story pays off. Each rank owns a shard of the
+            gradients and a shard of the optimizer state. With
+            <code>offload_optimizer.device = "cpu"</code>, the fp32 master
+            parameters, the Adam momentum, and the variance live in pinned
+            CPU memory, so the gradient shard is copied over PCIe to the host,
+            and the Adam update runs on the CPU using DeepSpeed's hand-written
+            <code>DeepSpeedCPUAdam</code>, a SIMD-vectorized C++ optimizer
+            that keeps the CPU step from becoming the bottleneck. The updated
+            fp32 parameters are cast back to bf16 and copied to the GPU shard.
+            Before the parameters are used again in the next forward, ZeRO-3's
+            all-gather makes the updated values visible to every rank. Loss
+            scaling for fp16, gradient clipping by global norm (which requires
+            reducing partial norms across the shards), and the LR schedule
+            advance all happen inside this one <code>step</code> call. Nothing
+            in your training loop hints at any of it.
+          </p>
+
+          <h3>Stage 6: what actually crossed the wire</h3>
+          <p>
+            Tally the traffic for the step. In the forward pass, one
+            all-gather per module to reconstruct parameters. In the backward
+            pass, one all-gather per module again, plus one reduce-scatter of
+            gradients. That is the <code>3&#936;</code> of Part III, 1.5 times
+            plain data parallelism, spread across many small collectives that
+            the prefetcher overlaps with compute. On top of the NCCL traffic,
+            with CPU offload there are PCIe copies of the gradient and
+            parameter shards in and out of host memory, and with NVMe offload
+            there are asynchronous disk reads and writes staged through the
+            async I/O operator. The reshardable checkpoint, if the interval
+            fires, is written by each rank as its own shard, exactly the way
+            the model is partitioned. That closes the loop of one step, from a
+            plain <code>engine(batch)</code> call down to collectives, PCIe
+            copies, and possibly the NVMe, and back up to an updated model
+            with no rank ever having held it whole.
+          </p>
+
+          <h2>Part VI: Internals deep dives</h2>
+
+          <h3>Deep dive: stages 1 and 2 versus stage 3</h3>
+          <p>
+            The three ZeRO stages are not three variations on one algorithm.
+            They split into two genuinely different implementations, which is
+            why the code base has a combined stage-1-and-2 path and a separate
+            stage-3 path. Stages 1 and 2 leave the parameters replicated. Every
+            rank still holds a full copy of the model weights, so the forward
+            and backward passes are ordinary data-parallel passes with no
+            parameter communication at all. The only cleverness is at the
+            boundaries: gradients are reduce-scattered so each rank keeps one
+            shard (stage 2), and the optimizer state is partitioned so each
+            rank updates only its shard (stages 1 and 2), after which an
+            all-gather republishes the updated parameters. Because parameters
+            are never gathered mid-pass, stages 1 and 2 add zero communication
+            over plain data parallelism and are the safe default whenever the
+            replicated parameters and 2 bytes of gradient still fit. Stage 2
+            is often the sweet spot. It cuts memory to
+            <code>2&#936; + 14&#936;/N</code> with no communication penalty.
+          </p>
+          <p>
+            Stage 3 is the qualitative jump, because it partitions the
+            parameters themselves and therefore has to gather them per layer
+            during both forward and backward, as traced above. That is what
+            costs the extra 0.5x communication, and it is why stage 3 lives in
+            its own file with its own hook machinery, prefetcher, and live-
+            parameter accounting. <mark>The practical decision rule is simple.
+            Use the lowest stage whose memory fits, because each stage upward
+            buys memory with either communication or complexity, and stage 2
+            buys a great deal of memory for free.</mark> Stage 3 is for when
+            even the replicated parameters will not fit, which is exactly the
+            regime of the largest models.
+          </p>
+
+          <h3>Deep dive: ZeRO-Offload and ZeRO-Infinity</h3>
+          <p>
+            ZeRO-Offload extends the partitioning idea down one level of the
+            memory hierarchy. Built originally on ZeRO-2, it moves the
+            optimizer state and the fp32 gradients off the GPU into CPU DRAM
+            and, critically, moves the optimizer computation there too. The
+            insight is a workload-placement argument. The forward and backward
+            passes are compute-heavy and belong on the GPU, but the Adam
+            update is memory-bound and cheap in FLOPs, so running it on the CPU
+            where the state already lives avoids shuttling 12 bytes per
+            parameter back and forth. The reason this is not ruinously slow is
+            <code>DeepSpeedCPUAdam</code>, a fused, AVX-vectorized CPU
+            implementation of Adam that is fast enough to overlap with the
+            next iteration's forward. With ZeRO-Offload a single GPU with a
+            generous host can train models in the low tens of billions of
+            parameters that would otherwise need a small cluster.
+          </p>
+          <p>
+            ZeRO-Infinity goes further and is built on ZeRO-3. It adds NVMe as
+            a third tier below CPU DRAM, so parameters, gradients, and
+            optimizer state can all spill to disk, and it adds the machinery
+            that makes that tolerable: an asynchronous offload engine that
+            prefetches partitions up the hierarchy before they are needed,
+            memory-centric tiling that breaks individual layers too large for
+            GPU memory into pieces processed in sequence, and a
+            bandwidth-aware partitioning that keeps the collectives efficient.
+            <mark>The point of ZeRO-Infinity is that the trainable model size
+            stops being bounded by GPU memory or even by aggregate GPU memory,
+            and becomes bounded by the total capacity of GPU plus CPU plus
+            NVMe across the cluster, which is where the trillion-parameter
+            headline comes from.</mark> The cost is real. NVMe bandwidth is a
+            thousand times below HBM, so ZeRO-Infinity is the tool of last
+            resort when nothing else fits, and its job is to make an
+            impossible run merely slow rather than impossible.
+          </p>
+
+          <h3>Deep dive: the engine and the config system</h3>
+          <p>
+            The <code>DeepSpeedEngine</code> in
+            <code>deepspeed/runtime/engine.py</code> is the object your
+            training loop actually talks to, and it is worth understanding as
+            the coordinator that hides everything else. It subclasses
+            <code>nn.Module</code>, so calling it runs the forward pass, but
+            it also owns the optimizer, the LR scheduler, the loss scaler for
+            fp16, the gradient accumulator, and the checkpoint logic, and it
+            dispatches to whichever ZeRO stage, offload target, and pipeline
+            configuration the config selected. The config itself is the second
+            half of the design, and it is deliberately declarative. A single
+            JSON object with keys like <code>zero_optimization</code>,
+            <code>fp16</code>, <code>bf16</code>, <code>optimizer</code>,
+            <code>scheduler</code>, <code>gradient_clipping</code>, and
+            <code>activation_checkpointing</code> describes the entire training
+            regime, and it is validated against typed config classes in
+            <code>deepspeed/runtime/config.py</code> at init. <mark>The payoff
+            of config-as-data is that the same model code trains under ZeRO-1,
+            ZeRO-2, ZeRO-3, or ZeRO-Infinity by editing a JSON file, with no
+            change to the loop, which is exactly the composability that lets a
+            researcher sweep memory strategies the way they sweep learning
+            rates.</mark>
+          </p>
+          <p>
+            The engine also owns DeepSpeed's activation checkpointing, exposed
+            through <code>deepspeed.checkpointing</code>, which goes beyond the
+            stock PyTorch version by optionally partitioning the saved
+            activations across model-parallel ranks, offloading them to CPU,
+            and packing them into contiguous memory to fight fragmentation.
+            These are the same memory-versus-recompute trade-offs discussed in
+            the <a href="/oss/flash-attention">FlashAttention</a> write-up,
+            applied at the granularity of whole layers rather than the
+            attention kernel.
+          </p>
+
+          <h3>Deep dive: pipeline parallelism</h3>
+          <p>
+            DeepSpeed's pipeline parallelism is a separate axis from ZeRO, and
+            the two compose. You express the model as a sequence of stages by
+            wrapping it in a <code>PipelineModule</code>, which takes either an
+            <code>nn.Sequential</code> or a list of <code>LayerSpec</code>
+            descriptors and splits the layers into contiguous stages placed on
+            the pipeline-parallel ranks:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">deepspeed</span>.<span class="m2">pipe</span> <span class="k">import</span> <span class="m1">PipelineModule</span>, <span class="m1">LayerSpec</span>
+
+<span class="v1">layers</span> = <span class="b0">[</span>
+    <span class="m1">LayerSpec</span><span class="b1">(</span><span class="v5">EmbeddingLayer</span>, <span class="v2">vocab</span>, <span class="v5">dim</span><span class="b1">)</span>,
+    *<span class="b1">[</span><span class="m1">LayerSpec</span><span class="b2">(</span><span class="v0">TransformerBlock</span>, <span class="v5">dim</span>, <span class="v0">heads</span><span class="b2">)</span> <span class="k">for</span> <span class="v4">_</span> <span class="k">in</span> <span class="m1">range</span><span class="b2">(</span><span class="v2">n_layers</span><span class="b2">)</span><span class="b1">]</span>,
+    <span class="m1">LayerSpec</span><span class="b1">(</span><span class="v6">LMHead</span>, <span class="v5">dim</span>, <span class="v2">vocab</span><span class="b1">)</span>,
+<span class="b0">]</span>
+<span class="v3">net</span> = <span class="m1">PipelineModule</span><span class="b0">(</span>
+    <span class="v1">layers</span>=<span class="v1">layers</span>,
+    <span class="v0">num_stages</span>=<span class="n">4</span>,
+    <span class="v4">partition_method</span>=<span class="s">"parameters"</span>,   <span class="c"># balance stages by parameter count</span>
+    <span class="v6">loss_fn</span>=<span class="v0">cross_entropy</span>,
+<span class="b0">)</span>
+<span class="v2">engine</span>, <span class="v4">_</span>, <span class="v4">_</span>, <span class="v4">_</span> = <span class="m1">deepspeed</span>.<span class="m2">initialize</span><span class="b0">(</span><span class="v0">model</span>=<span class="v3">net</span>, <span class="v4">config</span>=<span class="v0">ds_config</span><span class="b0">)</span></code></pre></div>
+          <p>
+            The <code>LayerSpec</code> indirection matters. It records how to
+            build each layer without building it, so a stage constructs only
+            the layers assigned to its rank and the full model is never
+            instantiated anywhere, the same lazy-construction trick as
+            <code>zero.Init</code>. <code>TiedLayerSpec</code> handles weight
+            tying across stages, such as sharing the embedding and the output
+            projection. The pipeline engine runs micro-batches through the
+            stages on a 1F1B-style schedule (one forward, one backward,
+            interleaved) so that the pipeline bubble shrinks as the number of
+            micro-batches grows, and it moves activations and their gradients
+            between adjacent stages with point-to-point sends and receives
+            rather than collectives. Only the last stage computes the loss,
+            which is the honest cost of pipelining: it breaks the illusion
+            that every rank runs the same program. Combined with ZeRO-1 for
+            the optimizer state and Megatron for tensor parallelism, this
+            pipeline forms the third dimension of the 3D parallelism used to
+            train the largest public models.
+          </p>
+
+          <h3>Deep dive: the fused kernels and op_builder</h3>
+          <p>
+            A surprising amount of DeepSpeed is C++ and CUDA, and the way it
+            manages that native code is itself a design worth studying. The
+            kernel sources live under <code>csrc/</code>, their Python bindings
+            under <code>deepspeed/ops/</code>, and the build logic in a
+            top-level <code>op_builder/</code> package. Each operator has a
+            builder class (for example a CPU-Adam builder, a fused-Adam
+            builder, a transformer builder, an inference builder) that knows
+            its sources, its compile flags, and how to check whether the host
+            toolchain can build it. Operators can be precompiled at install
+            time by setting <code>DS_BUILD_OPS=1</code>, or, by default, they
+            are just-in-time compiled the first time your program imports them,
+            which is why the first run after install pauses to build. The
+            headline kernels are <code>FusedAdam</code> and
+            <code>DeepSpeedCPUAdam</code> for the optimizer, a fused
+            transformer layer used to set BERT training-speed records, a
+            block-sparse attention module, and the inference kernels discussed
+            next. <mark>The lesson of <code>op_builder</code> is that a Python
+            library can ship serious hand-written CUDA without forcing every
+            user to precompile it, by treating compilation as a lazy,
+            per-operator, capability-checked step, which is precisely what
+            <code>ds_report</code> exposes.</mark>
+          </p>
+
+          <h3>Deep dive: DeepSpeed-Inference</h3>
+          <p>
+            Training and inference are different problems, and DeepSpeed grew a
+            separate inference path, entered through
+            <code>deepspeed.init_inference</code> rather than
+            <code>deepspeed.initialize</code>. It does three things. It shards
+            the model across GPUs with tensor parallelism for latency, using
+            an injection policy that recognizes known architectures and slices
+            their attention and MLP weights automatically. It replaces the
+            model's transformer modules with fused inference kernels through
+            kernel injection, which is what
+            <code>replace_with_kernel_inject</code> turns on. And it offers
+            INT8 quantization paths for throughput. A minimal call looks like
+            this, with a note that the argument names have changed across
+            versions:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">deepspeed</span>, <span class="m1">torch</span>
+
+<span class="m1">engine</span> = <span class="m1">deepspeed</span>.<span class="m2">init_inference</span><span class="b0">(</span>
+    <span class="v0">model</span>,
+    <span class="v2">tensor_parallel</span>=<span class="b1">{</span><span class="s">"tp_size"</span>: <span class="n">2</span><span class="b1">}</span>,   <span class="c"># older API used mp_size=2</span>
+    <span class="v3">dtype</span>=<span class="m1">torch</span>.<span class="m2">float16</span>,
+    <span class="v4">replace_with_kernel_inject</span>=<span class="k">True</span>,
+<span class="b0">)</span>
+<span class="v6">logits</span> = <span class="m1">engine</span><span class="b0">(</span><span class="v5">input_ids</span><span class="b0">)</span></code></pre></div>
+          <p>
+            Related but distinct is ZeRO-Inference, which applies the offload
+            idea to inference: it streams a huge model's weights layer by layer
+            from CPU or NVMe through a single GPU, trading latency for the
+            ability to run a model far larger than GPU memory when throughput
+            matters more than per-token speed. It is worth being honest about
+            the landscape here. For most interactive serving, the paged-KV-
+            cache engines like <a href="/oss/vllm">vLLM</a> have become the
+            default, and DeepSpeed-Inference is most compelling when you are
+            already in the DeepSpeed ecosystem or when ZeRO-Inference's offload
+            is the only way to fit the model at all. The later DeepSpeed-FastGen
+            work brought continuous-batching ideas into the same family, but
+            the general trajectory of the field has favored the dedicated
+            serving engines.
+          </p>
+
+          <h2>Part VII: Reading the repository</h2>
+          <p>
+            The repository is large, but the load-bearing parts are a small
+            subset. Read in this order. Paths reflect the layout in mid 2026
+            and the <code>runtime/zero</code> internals have been reorganized
+            before, so treat the deeper filenames as roles.
+          </p>
+          <p>
+            <strong>Stage 0, orientation.</strong> Read the top-level
+            <code>README.md</code> and run <code>ds_report</code> against your
+            box. Then open <code>deepspeed/__init__.py</code> to see that the
+            public surface is essentially <code>initialize</code>,
+            <code>init_inference</code>, and the <code>zero</code> submodule.
+            Question: what four things does <code>initialize</code> return,
+            and which of them did you provide versus which did the engine
+            build?
+          </p>
+          <p>
+            <strong>Stage 1, the engine.</strong> Read
+            <code>deepspeed/runtime/engine.py</code>, following one path from
+            <code>forward</code> to <code>backward</code> to
+            <code>step</code>. Questions: where does gradient accumulation
+            decide to skip the reduction, where does loss scaling live, and
+            how does the engine choose which ZeRO stage implementation to
+            construct?
+          </p>
+          <p>
+            <strong>Stage 2, ZeRO stages 1 and 2.</strong> Read the combined
+            stage-1-and-2 optimizer under
+            <code>deepspeed/runtime/zero/</code>. It is the gentler of the two
+            ZeRO paths because parameters stay replicated. Questions: where is
+            the gradient reduce-scatter, and where does the partitioned
+            optimizer state get updated and then all-gathered back?
+          </p>
+          <p>
+            <strong>Stage 3, ZeRO stage 3.</strong> Read the stage-3 code and
+            the parameter-partitioning module. This is the hardest and most
+            rewarding reading in the repo. Questions: which hooks all-gather a
+            module's parameters, where are they freed, what does
+            <code>stage3_param_persistence_threshold</code> control, and how
+            does the prefetcher decide what to gather next?
+          </p>
+          <p>
+            <strong>Stage 4, offload and the CPU optimizer.</strong> Read the
+            parameter and optimizer offload coordinators and the
+            <code>DeepSpeedCPUAdam</code> binding in
+            <code>deepspeed/ops/adam/</code>, then glance at its C++ source
+            under <code>csrc/</code>. Questions: what gets copied over PCIe and
+            when, and why is the CPU Adam SIMD implementation the thing that
+            makes offload viable?
+          </p>
+          <p>
+            <strong>Stage 5, pipeline and kernels.</strong> Read
+            <code>deepspeed/runtime/pipe/</code> for the
+            <code>PipelineModule</code>, the engine, and the schedule, then
+            skim <code>op_builder/</code> to understand how a kernel goes from
+            <code>csrc/</code> source to a callable op. Questions: how does
+            <code>LayerSpec</code> avoid building the whole model, and how does
+            the schedule decide the order of forwards and backwards?
+          </p>
+          <p>
+            Where not to start: the inference and <code>module_inject</code>
+            trees, the MoE code, and the many accelerator backends are all
+            worthwhile later but will overwhelm a first read. Meet the ZeRO
+            stages and the engine first, because everything else in the
+            library orbits them.
+          </p>
+
+          <h2>Part VIII: Hands-on labs</h2>
+          <p>
+            Labs 1 through 3 need a single GPU. Labs 4 and 5 want two or more.
+            Log formats and a few config keys drift with the project's fast
+            pace, so read the current docs alongside these.
+          </p>
+          <p><strong>Lab 1: ds_report and the three method calls.</strong> Concept: the engine replaces backward, step, and zero_grad.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">pip</span> <span class="s">install</span> <span class="s">deepspeed</span>
+<span class="m1">ds_report</span>
+<span class="m1">deepspeed</span> <span class="s">--num_gpus=1</span> <span class="s">train.py</span> <span class="s">--deepspeed</span> <span class="s">--deepspeed_config</span> <span class="s">ds_config.json</span></code></pre></div>
+          <p>
+            Start from any small PyTorch training script (the DeepSpeed
+            examples repo has a CIFAR one). Convert it: replace the model,
+            optimizer, and loop with <code>deepspeed.initialize</code> and the
+            <code>engine(batch)</code>, <code>engine.backward(loss)</code>,
+            <code>engine.step()</code> trio. Confirm it trains, then read
+            <code>ds_report</code> and note which ops were JIT-compiled on the
+            first step.
+          </p>
+          <p><strong>Lab 2: watch memory fall across the stages.</strong> Concept: the Part III table, empirically.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="c"># flip only zero_optimization.stage between runs: 0, 1, 2, 3</span>
+<span class="c"># after a few steps, print peak allocated memory</span>
+<span class="k">import</span> <span class="m1">torch</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">"peak GB:"</span>, <span class="m1">torch</span>.<span class="m2">cuda</span>.<span class="m2">max_memory_allocated</span><span class="b1">()</span> / <span class="n">1e9</span><span class="b0">)</span></code></pre></div>
+          <p>
+            Run the same model at stage 0 (plain data parallel), then 1, 2,
+            and 3, logging peak memory each time. Watch it drop in roughly the
+            proportions the memory table predicts. This is the fastest way to
+            make the ZeRO math stop being abstract.
+          </p>
+          <p><strong>Lab 3: offload a model that does not fit.</strong> Concept: ZeRO-Offload and the CPU optimizer.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="v0">ds_config</span><span class="b0">[</span><span class="s">"zero_optimization"</span><span class="b0">]</span> = <span class="b0">{</span>
+    <span class="s">"stage"</span>: <span class="n">2</span>,
+    <span class="s">"offload_optimizer"</span>: <span class="b1">{</span><span class="s">"device"</span>: <span class="s">"cpu"</span>, <span class="s">"pin_memory"</span>: <span class="k">True</span><span class="b1">}</span>,
+<span class="b0">}</span></code></pre></div>
+          <p>
+            Take a model that just barely OOMs at stage 2 on your GPU, add the
+            optimizer offload above, and watch it fit. Compare step time with
+            and without offload and observe how small the penalty is when the
+            optimizer step overlaps with the next forward. Then try
+            <code>stage: 3</code> with <code>offload_param</code> to
+            <code>cpu</code> and note the larger model you can now hold.
+          </p>
+          <p><strong>Lab 4: construct a large model under zero.Init.</strong> Concept: partitioned construction.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">with</span> <span class="v1">deepspeed</span>.<span class="m2">zero</span>.<span class="m2">Init</span><span class="b0">(</span><span class="v5">config_dict_or_path</span>=<span class="v0">ds_config</span><span class="b0">)</span>:
+    <span class="v0">model</span> = <span class="m1">BigTransformer</span><span class="b0">(</span><span class="v1">layers</span>=<span class="n">48</span>, <span class="v5">dim</span>=<span class="n">8192</span><span class="b0">)</span>   <span class="c"># never fully on one GPU</span>
+<span class="v2">engine</span>, *<span class="v4">_</span> = <span class="v1">deepspeed</span>.<span class="m2">initialize</span><span class="b0">(</span><span class="v0">model</span>=<span class="v0">model</span>, <span class="v4">config</span>=<span class="v0">ds_config</span><span class="b0">)</span></code></pre></div>
+          <p>
+            Build a model whose full parameter set exceeds one GPU's memory,
+            first without the context (observe the OOM at construction), then
+            inside <code>zero.Init</code> (observe that it succeeds because
+            parameters are sharded as they are created). This is the trick
+            that makes stage 3 usable for genuinely huge models.
+          </p>
+          <p><strong>Lab 5: pipeline a Sequential model.</strong> Concept: stages, LayerSpec, and micro-batches.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">deepspeed</span>.<span class="m2">pipe</span> <span class="k">import</span> <span class="m1">PipelineModule</span>
+<span class="v3">net</span> = <span class="m1">PipelineModule</span><span class="b0">(</span><span class="v1">layers</span>=<span class="v4">my_sequential</span>, <span class="v0">num_stages</span>=<span class="n">2</span>, <span class="v6">loss_fn</span>=<span class="v6">loss_fn</span><span class="b0">)</span>
+<span class="v2">engine</span>, *<span class="v4">_</span> = <span class="m1">deepspeed</span>.<span class="m2">initialize</span><span class="b0">(</span><span class="v0">model</span>=<span class="v3">net</span>, <span class="v4">config</span>=<span class="v0">ds_config</span><span class="b0">)</span></code></pre></div>
+          <p>
+            Wrap a plain <code>nn.Sequential</code> in a
+            <code>PipelineModule</code> across two GPUs. Vary
+            <code>gradient_accumulation_steps</code>, which sets the
+            micro-batch count, and watch throughput improve as the pipeline
+            bubble shrinks with more micro-batches. Note that only the last
+            stage reports the loss.
+          </p>
+
+          <h2>Part IX: Questions and model answers</h2>
+          <p>Understanding checks. Answer aloud before reading.</p>
+          <p><strong>1. What is DeepSpeed, in one sentence?</strong></p>
+          <p>
+            A training engine that wraps a plain PyTorch model and removes the
+            memory that data parallelism redundantly replicates on every GPU,
+            by partitioning the optimizer state, gradients, and parameters
+            across the data-parallel group and gathering each piece back only
+            when it is needed.
+          </p>
+          <p><strong>2. Where does the 16&#936; come from, and which part does ZeRO attack first?</strong></p>
+          <p>
+            In mixed-precision Adam training, per parameter, you store 2 bytes
+            of fp16 weights, 2 bytes of fp16 gradient, and 12 bytes of fp32
+            optimizer state (a master copy plus momentum plus variance). That
+            is 16 bytes, so a model with &#936; parameters needs 16&#936;
+            bytes of state. The 12 bytes of optimizer state are the largest and
+            most redundant piece, so ZeRO-1 partitions those first.
+          </p>
+          <p><strong>3. What exactly does each ZeRO stage partition?</strong></p>
+          <p>
+            Stage 1 partitions the optimizer state only. Stage 2 also
+            partitions the gradients. Stage 3 also partitions the parameters.
+            Per-GPU memory goes from 16&#936; at baseline, to 4&#936; + 12&#936;/N,
+            to 2&#936; + 14&#936;/N, to 16&#936;/N.
+          </p>
+          <p><strong>4. Why do stages 1 and 2 add no communication over plain data parallelism, but stage 3 adds 50 percent?</strong></p>
+          <p>
+            Stages 1 and 2 keep parameters replicated, so the forward and
+            backward passes need no parameter communication, and the
+            gradient reduce-scatter plus parameter all-gather move the same
+            2&#936; bytes as a plain all-reduce. Stage 3 partitions parameters,
+            so it must all-gather them once in forward and again in backward,
+            plus reduce-scatter gradients, which is 3&#936;, or 1.5 times the
+            baseline.
+          </p>
+          <p><strong>5. How is a partitioned stage-3 model runnable at all?</strong></p>
+          <p>
+            Forward and backward hooks on every submodule all-gather that
+            module's full parameters just before it computes and free them
+            right after, with the next module's all-gather prefetched to
+            overlap with the current module's compute. Only a couple of
+            layers' worth of parameters are materialized at any instant.
+          </p>
+          <p><strong>6. What does deepspeed.zero.Init do and why is it necessary?</strong></p>
+          <p>
+            It is a context manager that partitions parameters as they are
+            constructed, so a model too large for one GPU is never fully
+            instantiated on any rank. Without it, stage 3 builds the full
+            model first and then partitions, which reintroduces the very
+            out-of-memory you are trying to avoid.
+          </p>
+          <p><strong>7. Why does the training loop call backward and step on the engine instead of on the tensors and optimizer?</strong></p>
+          <p>
+            Because the engine has to interleave gradient reduction, loss
+            scaling, gradient accumulation, and clipping around those
+            operations, and under offload the step may run on the CPU. Handing
+            those responsibilities to the engine is what lets the same loop run
+            unchanged across every ZeRO stage and offload target.
+          </p>
+          <p><strong>8. What is ZeRO-Offload, and why is DeepSpeedCPUAdam central to it?</strong></p>
+          <p>
+            ZeRO-Offload moves the optimizer state and the optimizer
+            computation off the GPU into CPU memory, keeping the compute-heavy
+            forward and backward on the GPU. It works because the Adam update
+            is memory-bound and cheap in FLOPs, but only if the CPU can do it
+            fast enough, which is why DeepSpeed ships a SIMD-vectorized C++
+            Adam so the CPU step overlaps with the next iteration rather than
+            stalling it.
+          </p>
+          <p><strong>9. What does ZeRO-Infinity add, and what does it cost?</strong></p>
+          <p>
+            It extends stage 3 to spill parameters, gradients, and optimizer
+            state to NVMe below CPU memory, with an asynchronous prefetching
+            offload engine and tiling for oversized layers, so trainable model
+            size is bounded by total GPU plus CPU plus NVMe capacity rather
+            than GPU memory. The cost is NVMe bandwidth, orders of magnitude
+            below HBM, so it is the tool of last resort that makes an
+            impossible run merely slow.
+          </p>
+          <p><strong>10. How does DeepSpeed relate to PyTorch FSDP?</strong></p>
+          <p>
+            ZeRO-3 and FSDP are the same core idea, partition the parameters
+            and gather them per layer on the fly. FSDP is that idea absorbed
+            into PyTorch itself, and FSDP2 is what native stacks like
+            torchtitan build on. DeepSpeed is where the idea, and the offload
+            extensions, were pioneered.
+          </p>
+          <p><strong>11. How does pipeline parallelism differ from ZeRO, and do they compose?</strong></p>
+          <p>
+            Pipeline parallelism splits the layer stack across ranks and passes
+            activations stage to stage with point-to-point sends, whereas ZeRO
+            shards the state of a data-parallel replica. They are orthogonal
+            axes and compose, and combined with Megatron tensor parallelism
+            they form the 3D parallelism used for the largest models.
+          </p>
+          <p><strong>12. Why is ds_report the first thing to run?</strong></p>
+          <p>
+            Most of DeepSpeed's speed is in custom C++ and CUDA operators that
+            are compiled for your machine, either at install or just in time.
+            <code>ds_report</code> tells you which ops your toolchain can
+            build and which are already compiled, so you learn that, for
+            example, CPU Adam is unavailable before a long offload run fails
+            instead of after.
+          </p>
+          <p><strong>13. When would you reach for Megatron-LM or vLLM instead of DeepSpeed?</strong></p>
+          <p>
+            Megatron-LM when you need maximum model-FLOP utilization on large
+            NVIDIA clusters and accept tensor parallelism that rewrites your
+            model, though in practice the two are combined as
+            Megatron-DeepSpeed. vLLM and similar engines for interactive
+            inference, where paged KV caches and continuous batching now
+            dominate. DeepSpeed wins when memory is the binding training
+            constraint and you want to keep a mostly plain model.
+          </p>
+          <p><strong>14. A ZeRO-Infinity run technically works but is ten times too slow. What is the first suspect?</strong></p>
+          <p>
+            The NVMe offload target cannot keep the GPUs fed, either because
+            the path is on a slow or network disk rather than fast local NVMe,
+            or because the working set overflows the CPU tier above it so the
+            prefetcher cannot hide the disk latency. The symptom is step time,
+            not an error, and the profiler is how you confirm it.
+          </p>
+
+          <h2>Part X: Design lessons</h2>
+          <p>
+            <strong>Redundancy is the enemy of scale.</strong> The single
+            observation behind the whole library is that data parallelism
+            duplicates identical optimizer state on every GPU. Naming that
+            redundancy and partitioning it away is the entire ZeRO idea.
+            Wherever a system replicates the same large state across nodes for
+            convenience, there is usually a ZeRO-shaped win waiting.
+          </p>
+          <p>
+            <strong>Treat memory as a hierarchy, not a single pool.</strong>
+            ZeRO-Offload and ZeRO-Infinity work because GPU HBM, CPU DRAM, and
+            NVMe are tiers with different bandwidth and capacity, and state can
+            be placed on the slowest tier that still keeps the compute fed.
+            This is the cache hierarchy, virtual memory, and tiered storage
+            insight applied to model training, and the discipline is the same:
+            push data down only as far as capacity forces you.
+          </p>
+          <p>
+            <strong>Put the compute where the data lives.</strong> Running the
+            memory-bound Adam step on the CPU because the optimizer state
+            already sits in CPU memory avoids moving 12 bytes per parameter
+            across PCIe twice. Deciding placement by where the operands live,
+            rather than defaulting everything to the accelerator, is a general
+            heterogeneous-computing lesson.
+          </p>
+          <p>
+            <strong>Configuration as data decouples strategy from code.</strong>
+            A single JSON object selects the ZeRO stage, the offload targets,
+            the precision, and the schedule, so the same model trains under
+            wildly different memory strategies with no code change. Sweeping
+            memory strategy becomes as cheap as sweeping a hyperparameter,
+            which is the same payoff that declarative config buys everywhere.
+          </p>
+          <p>
+            <strong>Ship serious native code without forcing precompilation.</strong>
+            The <code>op_builder</code> and <code>ds_report</code> design lets
+            a Python library carry hand-written CUDA that is compiled lazily,
+            per operator, only where the toolchain supports it. Making the
+            capability check a first-class, inspectable command is why users
+            can diagnose kernel problems before a run rather than during one.
+          </p>
+
+          <h2>Part XI: Final takeaway</h2>
+          <p>
+            If the single-device transformer that all of this partitions is
+            the gap, the <a href="/classes/language-models-from-scratch">language
+            models from scratch class</a> builds one end to end, and the
+            <a href="/classes/parallel-computing">parallel computing class</a>
+            covers the who-shards-what theory in general. When you want the
+            PyTorch-native descendant of ZeRO-3, read the
+            <a href="/oss/torchtitan">torchtitan chapter</a>, and you will
+            recognize the same all-gather-per-layer discipline wearing
+            different names. Then come back and read
+            <code>deepspeed/runtime/engine.py</code> once more, and the
+            three-line training loop will read like plain PyTorch, which is
+            the whole point.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> DeepSpeed made trillion-parameter
+            training feasible by refusing to replicate what data parallelism
+            replicates. Partition the optimizer state, then the gradients,
+            then the parameters across the group, gather each piece back only
+            for the instant a layer needs it, and spill the partitions down
+            through CPU and NVMe when even that will not fit. The memory per
+            GPU falls toward 16&#936;/N while the model code stays a plain
+            PyTorch module and the training loop stays three method calls
+            long.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/code-copy.js"></script>
+      <script defer src="/theme.js"></script>
+  </body>
+</html>

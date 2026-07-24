@@ -1,0 +1,1162 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AutoGen walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A full chapter on microsoft/autogen: the conversable-agent mental model, AgentChat teams and group chat, tool and function calling, the event-driven actor core introduced in the v0.4 rewrite, human-in-the-loop, the complete life of one team.run(task) traced end to end, internals deep dives, a staged reading plan, labs, understanding checks, and design lessons." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+      <script>(function(){try{var t=localStorage.getItem("theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>AutoGen</h1>
+        <p class="lead">
+          <a href="https://github.com/microsoft/autogen" target="_blank" rel="noreferrer">AutoGen</a>
+          is Microsoft's framework for building applications out of
+          multiple conversing LLM agents. Its enduring idea is the
+          <em>conversable agent</em>, an entity that sends messages,
+          receives messages, and generates replies, so that a whole
+          computation becomes a structured conversation between a planner,
+          a coder, a tool executor, a critic, and a human. The v0.4 rewrite,
+          released in January 2025, kept that programming model and rebuilt
+          the machinery underneath it as an event-driven actor runtime that
+          scales from one process to a distributed, cross-language mesh of
+          agents. This chapter is three things at once, a practical tutorial
+          for standing up real teams, a systems walkthrough that follows one
+          <code>team.run(task)</code> from the high-level API down through
+          the runtime's message passing and back up to a result, and a staged
+          guide to reading the repository. It ends with runnable labs,
+          understanding checks with model answers, and a compact framework
+          for holding the whole system in your head.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">a task, in plain English
+      |
+      v
+AgentChat (high-level)     AssistantAgent, UserProxyAgent, teams
+      |                     RoundRobinGroupChat / SelectorGroupChat / Swarm
+      v
+a group chat manager       records a shared message thread, picks the next speaker
+      |
+      v
+each turn: one agent runs  build model context -&gt; call the LLM -&gt; maybe call tools
+      |                     -&gt; produce a Response message
+      v
+broadcast the response     every participant's context is updated
+      |
+      v
+termination check          TextMention / MaxMessage / Handoff / token budget
+      |
+      v
+TaskResult                 the full message list plus a stop_reason
+
+- - - - - - - - - - - -  all of the above rides on:  - - - - - - - - - - - -
+
+autogen-core (low-level)   agents are actors addressed by AgentId(type, key)
+      |                     an AgentRuntime delivers messages
+      |                     direct send_message  (RPC-style, returns a value)
+      |                     publish_message      (broadcast to a TopicId)
+      v
+SingleThreadedAgentRuntime  in one process
+GrpcWorker + gRPC host      across processes and languages (Python and .NET)</pre>
+          <p>
+            The one-sentence identity. <mark>AutoGen treats a message as the
+            universal interface and an agent as an actor, so a task is solved
+            not by one model call but by a conversation among specialized
+            agents whose messages, tool calls, and human interventions are
+            all the same kind of event flowing through a runtime.</mark> A
+            single agent is a function from a prompt to a completion. It
+            cannot run the code it writes, cannot check its own work with
+            fresh eyes, and cannot ask a person for a decision without you
+            wiring that up by hand. AutoGen's answer is to make each of those
+            capabilities a separate agent and let them talk. A coder proposes,
+            an executor runs and reports the traceback, the coder repairs, a
+            reviewer objects, a human approves. The loop grounds the language
+            model in real results instead of leaving it to hallucinate that
+            its code worked.
+          </p>
+          <p>
+            Two layers make this concrete, and it is worth separating them
+            from the first minute. <strong>AgentChat</strong> is the
+            high-level, task-driven API most people use, with pre-built
+            agents and teams that look a lot like the classic AutoGen you may
+            have read about. <strong>autogen-core</strong> is the low-level,
+            event-driven foundation underneath, an actor system where agents
+            are addressed by identity, the runtime routes messages, and
+            communication happens either as direct requests or as broadcasts
+            over named topics. AgentChat is implemented on top of
+            autogen-core. A third package, <strong>autogen-ext</strong>, holds
+            the concrete integrations, model clients for OpenAI and Azure and
+            others, code executors, tool adapters, and the distributed
+            runtime. Everything in this chapter is checked against the v0.4
+            line on the main branch as of mid-2026. The project moves quickly
+            and internal names shift, so where an exact class or path is
+            likely to have moved I describe the component by its role and say
+            so.
+          </p>
+          <p>
+            A note on history, because you will trip over it otherwise.
+            AutoGen v0.2 was the original conversation-first library, and its
+            <code>ConversableAgent</code> abstraction is still the clearest
+            statement of the whole idea. In late 2024 the original creators
+            forked the v0.2 codebase into a separate project, AG2, which
+            inherited the <code>autogen</code> and <code>pyautogen</code> names
+            on PyPI. Microsoft's official continuation is the v0.4 rewrite in
+            this repository, published under the distinct package names
+            <code>autogen-agentchat</code>, <code>autogen-core</code>, and
+            <code>autogen-ext</code>. Install those exact names and you are
+            using Microsoft's AutoGen. This chapter teaches v0.4 as the
+            primary API and uses v0.2 only to explain the conversable-agent
+            model at its source.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <p>
+            AutoGen is a Python package (with a parallel .NET implementation
+            in the same repository). It runs anywhere Python does, including
+            macOS, because the heavy lifting is done by whatever model
+            endpoint you point it at, not on your machine. Install the
+            high-level API together with the OpenAI model client from
+            extensions:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">python</span> <span class="s">-m</span> <span class="s">venv</span> <span class="s">.venv</span> &amp;&amp; <span class="m1">source</span> <span class="s">.venv/bin/activate</span>
+<span class="m1">pip</span> <span class="s">install</span> <span class="s">-U</span> <span class="s">"autogen-agentchat"</span> <span class="s">"autogen-ext[openai]"</span>
+
+<span class="c"># optional low-code GUI for prototyping teams visually</span>
+<span class="m1">pip</span> <span class="s">install</span> <span class="s">-U</span> <span class="s">autogenstudio</span>
+<span class="m1">autogenstudio</span> <span class="s">ui</span> <span class="s">--port</span> <span class="s">8080</span></code></pre></div>
+          <p>
+            The model client is provider-agnostic in shape. Point it at
+            OpenAI, at Azure OpenAI, or at any OpenAI-compatible server you
+            host yourself, for example a local <a href="/oss/vllm">vLLM</a> or
+            <a href="/oss/sglang">SGLang</a> endpoint, or a small model served
+            by <a href="/oss/ollama">Ollama</a>, by setting the
+            <code>base_url</code> and <code>model</code> accordingly. Set your
+            key in the environment, then write the smallest possible program,
+            a single agent that answers a task. Everything in v0.4 is async,
+            so the shape is <code>asyncio.run</code> around an
+            <code>await agent.run(...)</code>:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">asyncio</span>
+<span class="k">from</span> <span class="m1">autogen_agentchat</span>.<span class="m2">agents</span> <span class="k">import</span> <span class="m1">AssistantAgent</span>
+<span class="k">from</span> <span class="m1">autogen_ext</span>.<span class="m2">models</span>.<span class="m2">openai</span> <span class="k">import</span> <span class="m1">OpenAIChatCompletionClient</span>
+
+
+<span class="k">async</span> <span class="k">def</span> <span class="m1">main</span><span class="b0">()</span> -&gt; <span class="k">None</span>:
+    <span class="v0">model_client</span> = <span class="m1">OpenAIChatCompletionClient</span><span class="b0">(</span><span class="v0">model</span>=<span class="s">"gpt-4o"</span><span class="b0">)</span>
+    <span class="v5">agent</span> = <span class="m1">AssistantAgent</span><span class="b0">(</span><span class="s">"assistant"</span>, <span class="v0">model_client</span>=<span class="v0">model_client</span><span class="b0">)</span>
+    <span class="v5">result</span> = <span class="k">await</span> <span class="v5">agent</span>.<span class="m2">run</span><span class="b0">(</span><span class="v4">task</span>=<span class="s">"Name three prime numbers and stop."</span><span class="b0">)</span>
+    <span class="m1">print</span><span class="b0">(</span><span class="v5">result</span>.<span class="m2">messages</span><span class="b1">[</span>-<span class="n">1</span><span class="b1">]</span>.<span class="m2">content</span><span class="b0">)</span>
+    <span class="k">await</span> <span class="v0">model_client</span>.<span class="m2">close</span><span class="b0">()</span>
+
+
+<span class="m1">asyncio</span>.<span class="m2">run</span><span class="b0">(</span><span class="m1">main</span><span class="b1">()</span><span class="b0">)</span></code></pre></div>
+          <p>
+            <code>result</code> is a <code>TaskResult</code>. Its
+            <code>messages</code> field is the full ordered transcript of the
+            run, and the last message is the agent's final answer. That single
+            agent is already useful, but the point of AutoGen is more than one
+            of them. The smallest interesting system is a two-agent team that
+            takes turns until one of them says a stop word. Read this next
+            block as the canonical AutoGen shape, since almost everything
+            larger is a variation on it:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">asyncio</span>
+<span class="k">from</span> <span class="m1">autogen_agentchat</span>.<span class="m2">agents</span> <span class="k">import</span> <span class="m1">AssistantAgent</span>
+<span class="k">from</span> <span class="m1">autogen_agentchat</span>.<span class="m2">teams</span> <span class="k">import</span> <span class="m1">RoundRobinGroupChat</span>
+<span class="k">from</span> <span class="m1">autogen_agentchat</span>.<span class="m2">conditions</span> <span class="k">import</span> <span class="m1">TextMentionTermination</span>
+<span class="k">from</span> <span class="m1">autogen_agentchat</span>.<span class="m2">ui</span> <span class="k">import</span> <span class="m1">Console</span>
+<span class="k">from</span> <span class="m1">autogen_ext</span>.<span class="m2">models</span>.<span class="m2">openai</span> <span class="k">import</span> <span class="m1">OpenAIChatCompletionClient</span>
+
+
+<span class="k">async</span> <span class="k">def</span> <span class="m1">main</span><span class="b0">()</span> -&gt; <span class="k">None</span>:
+    <span class="v0">model_client</span> = <span class="m1">OpenAIChatCompletionClient</span><span class="b0">(</span><span class="v0">model</span>=<span class="s">"gpt-4o"</span><span class="b0">)</span>
+
+    <span class="v3">writer</span> = <span class="m1">AssistantAgent</span><span class="b0">(</span>
+        <span class="s">"writer"</span>,
+        <span class="v0">model_client</span>=<span class="v0">model_client</span>,
+        <span class="v1">system_message</span>=<span class="s">"You draft short poems. Revise when the critic asks."</span>,
+    <span class="b0">)</span>
+    <span class="v0">critic</span> = <span class="m1">AssistantAgent</span><span class="b0">(</span>
+        <span class="s">"critic"</span>,
+        <span class="v0">model_client</span>=<span class="v0">model_client</span>,
+        <span class="v1">system_message</span>=<span class="b1">(</span>
+            <span class="s">"You critique the poem. When it is good enough, "</span>
+            <span class="s">"reply with the single word APPROVE."</span>
+        <span class="b1">)</span>,
+    <span class="b0">)</span>
+
+    <span class="v6">termination</span> = <span class="m1">TextMentionTermination</span><span class="b0">(</span><span class="s">"APPROVE"</span><span class="b0">)</span>
+    <span class="v4">team</span> = <span class="m1">RoundRobinGroupChat</span><span class="b0">(</span><span class="b1">[</span><span class="v3">writer</span>, <span class="v0">critic</span><span class="b1">]</span>, <span class="v5">termination_condition</span>=<span class="v6">termination</span><span class="b0">)</span>
+
+    <span class="k">await</span> <span class="m1">Console</span><span class="b0">(</span><span class="v4">team</span>.<span class="m2">run_stream</span><span class="b1">(</span><span class="v4">task</span>=<span class="s">"Write a two-line poem about the sea."</span><span class="b1">)</span><span class="b0">)</span>
+    <span class="k">await</span> <span class="v0">model_client</span>.<span class="m2">close</span><span class="b0">()</span>
+
+
+<span class="m1">asyncio</span>.<span class="m2">run</span><span class="b0">(</span><span class="m1">main</span><span class="b1">()</span><span class="b0">)</span></code></pre></div>
+          <p>
+            <code>run_stream</code> returns an async iterator of messages as
+            they are produced, and <code>Console</code> pretty-prints that
+            stream to your terminal. You will watch the writer draft, the
+            critic object, the writer revise, and the critic finally emit
+            <code>APPROVE</code>, at which point <code>TextMentionTermination</code>
+            fires and the run ends. If you would rather have the finished
+            transcript than a live stream, call <code>await team.run(task=...)</code>
+            and inspect the returned <code>TaskResult</code> yourself. This is
+            the whole ergonomic bargain, you describe roles with system
+            prompts, choose a team shape, and choose when to stop.
+          </p>
+          <p>
+            Now tools, because an agent that can only talk is limited. In v0.4
+            you give an <code>AssistantAgent</code> ordinary Python functions
+            and it exposes them to the model as callable tools, inferring the
+            JSON schema from the type hints and the docstring:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">async</span> <span class="k">def</span> <span class="m1">get_weather</span><span class="b0">(</span><span class="v0">city</span>: <span class="m1">str</span><span class="b0">)</span> -&gt; <span class="m1">str</span>:
+    <span class="s">"""Return a short weather report for a city."""</span>
+    <span class="k">return</span> <span class="s">f"The weather in {</span><span class="v0">city</span><span class="s">} is 21C and clear."</span>
+
+
+<span class="v5">agent</span> = <span class="m1">AssistantAgent</span><span class="b0">(</span>
+    <span class="s">"weather_agent"</span>,
+    <span class="v0">model_client</span>=<span class="v0">model_client</span>,
+    <span class="v3">tools</span>=<span class="b1">[</span><span class="m1">get_weather</span><span class="b1">]</span>,
+    <span class="v4">reflect_on_tool_use</span>=<span class="k">True</span>,   <span class="c"># after tools run, let the model summarize in prose</span>
+<span class="b0">)</span>
+<span class="v5">result</span> = <span class="k">await</span> <span class="v5">agent</span>.<span class="m2">run</span><span class="b0">(</span><span class="v4">task</span>=<span class="s">"What is the weather in Nairobi?"</span><span class="b0">)</span></code></pre></div>
+          <p>
+            When the model decides to call <code>get_weather</code>, the agent
+            executes the function, feeds the result back, and by default can
+            loop if the model wants to call more tools before answering. With
+            <code>reflect_on_tool_use=True</code> it makes one more model call
+            to turn the raw tool output into a natural-language reply. Behind
+            the scenes the agent emits explicit events for each step, a tool
+            call request and a tool call execution result, which show up in
+            the transcript and are what you inspect when a tool misbehaves.
+          </p>
+          <p>
+            The mistakes beginners make cluster in a few places. First,
+            <strong>forgetting a termination condition</strong>. A team with no
+            stop rule will happily run its agents in circles, burning tokens
+            and money, until it hits a default message cap or you kill it.
+            Every team needs a real condition, and conditions compose with
+            <code>|</code> (or) and <code>&amp;</code> (and), so a common safe
+            default is a task-specific stop word or a hard ceiling on message
+            count:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">autogen_agentchat</span>.<span class="m2">conditions</span> <span class="k">import</span> <span class="m1">TextMentionTermination</span>, <span class="m1">MaxMessageTermination</span>
+
+<span class="v6">termination</span> = <span class="m1">TextMentionTermination</span><span class="b0">(</span><span class="s">"APPROVE"</span><span class="b0">)</span> | <span class="m1">MaxMessageTermination</span><span class="b0">(</span><span class="n">20</span><span class="b0">)</span></code></pre></div>
+          <p>
+            Second, <strong>forgetting that everything is async</strong>.
+            Calling <code>agent.run(...)</code> without <code>await</code>
+            gives you a coroutine object, not a result, and nothing happens.
+            Third, <strong>leaking the model client</strong>. Close it with
+            <code>await model_client.close()</code> or use it as an async
+            context manager, or you leak the underlying HTTP connections.
+            Fourth, and most conceptual, <strong>reaching for a team when one
+            agent would do</strong>. Multi-agent conversation earns its keep
+            when roles genuinely differ or a feedback loop is needed. For a
+            single well-scoped tool-using task, one <code>AssistantAgent</code>
+            is cheaper, faster, and easier to debug.
+          </p>
+
+          <h2>Part III: When it is the right tool</h2>
+          <p>
+            AutoGen is the right tool when your problem is genuinely
+            multi-agent or event-driven, when you want more than one role
+            collaborating, or when you want a runtime that can host agents
+            across processes and even across languages. It shines for
+            research on agent design patterns, for systems where a human is a
+            first-class participant in the loop, and for teams that want the
+            actor-model foundation to grow into a distributed deployment
+            later. The AgentChat layer gets you a working team in a dozen
+            lines, and the core layer is there when you outgrow it. It is also
+            the home of <em>Magentic-One</em>, Microsoft's generalist
+            multi-agent system, whose orchestrator plus web, file, coding, and
+            terminal agents ships as a team you can instantiate directly.
+          </p>
+          <p>
+            The honest cases for alternatives. <strong>LangGraph</strong>
+            models an agent application as an explicit state graph you author
+            node by node, with edges you draw, which gives you tighter control
+            over control flow than AutoGen's conversation-and-broadcast model
+            and suits workflows you want to pin down exactly.
+            <strong>CrewAI</strong> is higher-level and more opinionated around
+            roles and tasks in a "crew", which is pleasant for straightforward
+            role pipelines but gives you less of a runtime underneath.
+            <strong>OpenAI's Agents SDK</strong> (the successor to its Swarm
+            experiment) is a lightweight handoff-based library, and AutoGen's
+            own <code>Swarm</code> team mirrors that same handoff pattern if
+            that is the shape you want. <strong>AG2</strong>, the community
+            fork, continues the v0.2 conversable-agent API, so if you liked
+            that surface and do not want the rewrite it is a reasonable home.
+            <strong>Semantic Kernel</strong> is Microsoft's other agent SDK,
+            plugin-oriented and enterprise-focused with deep .NET heritage.
+          </p>
+          <p>
+            The largest strategic caveat is about that last one. Microsoft has
+            converged AutoGen and Semantic Kernel into a single production line
+            called the Microsoft Agent Framework, previewed in late 2025 and
+            reaching a 1.0 in 2026, which is meant to carry AutoGen's dynamic
+            multi-agent orchestration on top of Semantic Kernel's production
+            foundations. AutoGen itself remains valuable as the research
+            frontier and as the clearest teaching codebase for these ideas,
+            and its abstractions flow directly into the unified framework, but
+            if you are starting a brand-new production system in 2026 you
+            should check the current status of that convergence before
+            committing. Treat this as a moving target and verify against the
+            repository and Microsoft's own guidance, since the details here
+            are exactly the kind that shift.
+          </p>
+          <p>
+            The architecture-shaped warning, the one that bites people in
+            production, is about cost and non-determinism. Every turn in a
+            conversation is at least one LLM call, teams multiply the turns,
+            and tool-calling loops multiply them again. A five-agent group
+            chat that runs twenty rounds is a hundred model calls per task,
+            and if the selector is an LLM too, more. This is the analogue of
+            an accidental fan-out in a distributed system:
+          </p>
+          <pre class="flow">runaway:   no termination + LLM speaker selection + tool loops
+   task -&gt; agentA -&gt; agentB -&gt; agentA -&gt; agentB -&gt; ... forever
+            each arrow = one or more model calls, cost climbs without bound
+
+controlled:  hard MaxMessageTermination + a stop word + a tool-iteration cap
+   task -&gt; ... -&gt; APPROVE (or message #N) -&gt; stop
+            worst-case cost is bounded before you press run</pre>
+          <p>
+            The design gives you the tools to bound it, termination conditions,
+            token-budget conditions, and per-agent tool-iteration limits, but
+            nothing forces you to use them, and the failure mode is a large
+            bill and a wandering transcript rather than a crash. Bound the
+            conversation the way you would bound a retry loop, from the start.
+          </p>
+
+          <h2>Part IV: The full life of one team.run(task)</h2>
+          <p>
+            The specimen is the two-agent writer-and-critic team from Part II,
+            run with <code>RoundRobinGroupChat</code> and a
+            <code>TextMentionTermination("APPROVE")</code>. I follow the task
+            from the high-level call all the way down into autogen-core's
+            message passing and back up to the <code>TaskResult</code>.
+            Internal type names below are the ones on the v0.4 main branch and
+            are the most likely things to have been renamed, so hold them
+            loosely and trust the roles.
+          </p>
+
+          <h3>Stage 1: constructing the team</h3>
+          <p>
+            <code>RoundRobinGroupChat([writer, critic], termination_condition=...)</code>
+            builds a <code>BaseGroupChat</code> subclass. Construction is cheap
+            and does not start anything. It records the list of participant
+            agents, the termination condition, and the round-robin speaker
+            policy, and it prepares (but does not yet run) a
+            <code>SingleThreadedAgentRuntime</code>, the in-process runtime from
+            autogen-core that will actually deliver messages. Nothing has
+            talked to a model yet.
+          </p>
+
+          <h3>Stage 2: run_stream wires up the runtime</h3>
+          <p>
+            The first real work happens inside <code>run</code> or
+            <code>run_stream</code>. The team registers two kinds of actor with
+            the runtime. Each participant agent is wrapped in a container agent
+            (a <code>ChatAgentContainer</code> in the current code) that adapts
+            the AgentChat agent interface to the core actor interface. A
+            separate <code>GroupChatManager</code> actor is registered to run
+            the conversation. All of these subscribe to a shared group topic,
+            so a message published to that topic reaches every participant, and
+            each participant also has its own topic so the manager can address
+            it individually. This subscribe-to-a-shared-topic step is exactly
+            how "everyone hears everyone" is implemented, and it is pure
+            autogen-core pub/sub.
+          </p>
+
+          <h3>Stage 3: the task enters as a message</h3>
+          <p>
+            The team publishes a start message carrying the task text to the
+            group topic and starts the runtime. The manager receives it and
+            appends the task to the shared message thread it maintains, the
+            single source of truth for the conversation. From here the loop is
+            entirely message-driven. There is no central for-loop calling
+            agents, only actors reacting to messages the runtime delivers.
+          </p>
+
+          <h3>Stage 4: the manager selects a speaker</h3>
+          <p>
+            The manager decides who speaks next. For
+            <code>RoundRobinGroupChat</code> that is simply the next agent in
+            the list, the writer on the first turn. For
+            <code>SelectorGroupChat</code> it would instead prompt an LLM with
+            the transcript and the agent descriptions to pick the most relevant
+            next speaker. The manager then publishes a request-to-speak message
+            addressed to the chosen participant's topic. This is the point
+            where the round-robin policy and the selector policy differ, and
+            everything else in the trace is identical between them.
+          </p>
+
+          <h3>Stage 5: one agent takes its turn</h3>
+          <p>
+            The writer's container receives the request. It hands the relevant
+            slice of the shared thread to the wrapped
+            <code>AssistantAgent</code>, whose <code>on_messages</code> logic
+            runs the real work. The agent adds the incoming messages to its
+            model context, calls the model client (one network round trip to
+            the LLM), and if the model returned tool calls it executes them and
+            may loop, otherwise it produces a text response. That response is
+            packaged as a message and published back to the group topic. The
+            LLM call in this stage is where the latency and the token cost of
+            the turn actually live.
+          </p>
+
+          <h3>Stage 6: broadcast, then the termination check</h3>
+          <p>
+            Because the response goes to the group topic, both the manager and
+            the critic's container receive it, so the critic's context is
+            updated even though it has not spoken yet. This broadcast is why a
+            group chat behaves like a shared conversation rather than a set of
+            private channels. The manager appends the response to the thread
+            and evaluates the termination condition against the updated
+            message list. <code>TextMentionTermination("APPROVE")</code> scans
+            the latest message for the token <code>APPROVE</code>. On the
+            writer's first turn it is absent, so the manager loops back to
+            Stage 4 and selects the critic. The critic objects, the writer
+            revises, and eventually the critic replies with
+            <code>APPROVE</code>.
+          </p>
+
+          <h3>Stage 7: stop, drain, and the TaskResult</h3>
+          <p>
+            When the condition matches, the manager publishes a stop signal and
+            the runtime is told to stop once its message queue drains. The team
+            collects the ordered transcript it accumulated and returns a
+            <code>TaskResult</code> whose <code>messages</code> is the full
+            conversation and whose <code>stop_reason</code> explains why it
+            ended, here a text mention of <code>APPROVE</code>. With
+            <code>run_stream</code> the same messages were yielded to you (and
+            to <code>Console</code>) as each was produced, and the
+            <code>TaskResult</code> is the final item in the stream. Critically,
+            the termination condition is stateful across the run and is reset
+            before the next <code>run</code>, and the team retains the thread,
+            so calling <code>run</code> again with a new task continues the
+            same conversation rather than starting fresh. That closes the loop,
+            a task in as English, a bounded multi-agent conversation in the
+            middle, a structured result out.
+          </p>
+
+          <h2>Part V: Internals deep dives</h2>
+
+          <h3>Deep dive: the conversable-agent model</h3>
+          <p>
+            The oldest and most load-bearing idea in AutoGen is that every
+            agent is <em>conversable</em>. In v0.2 this is the
+            <code>ConversableAgent</code> base class, and its interface is only
+            three verbs, <code>send</code> a message to another agent,
+            <code>receive</code> a message, and <code>generate_reply</code> to
+            produce a response to the messages seen so far. Two subclasses do
+            almost all the work in practice. <code>AssistantAgent</code> is
+            backed by an LLM and answers in language and code.
+            <code>UserProxyAgent</code> stands in for the human, executes code,
+            and optionally solicits real human input. The canonical v0.2
+            program is two agents in a loop, an assistant that writes code and
+            a user proxy that runs it and reports back:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="c"># Classic AutoGen v0.2 shape (the conversable-agent model at its source).</span>
+<span class="c"># Note: the PyPI names `autogen` / `pyautogen` now point to the AG2 fork;</span>
+<span class="c"># Microsoft's current package is `autogen-agentchat` (v0.4), shown earlier.</span>
+<span class="k">from</span> <span class="m1">autogen</span> <span class="k">import</span> <span class="m1">AssistantAgent</span>, <span class="m1">UserProxyAgent</span>
+
+<span class="v2">assistant</span> = <span class="m1">AssistantAgent</span><span class="b0">(</span><span class="s">"assistant"</span>, <span class="v6">llm_config</span>=<span class="b1">{</span><span class="s">"model"</span>: <span class="s">"gpt-4"</span><span class="b1">}</span><span class="b0">)</span>
+<span class="v2">user_proxy</span> = <span class="m1">UserProxyAgent</span><span class="b0">(</span>
+    <span class="s">"user_proxy"</span>,
+    <span class="v3">human_input_mode</span>=<span class="s">"NEVER"</span>,
+    <span class="v1">code_execution_config</span>=<span class="b1">{</span><span class="s">"work_dir"</span>: <span class="s">"coding"</span>, <span class="s">"use_docker"</span>: <span class="k">True</span><span class="b1">}</span>,
+<span class="b0">)</span>
+<span class="v2">user_proxy</span>.<span class="m2">initiate_chat</span><span class="b0">(</span>
+    <span class="v2">assistant</span>,
+    <span class="v3">message</span>=<span class="s">"Plot the last year of NVDA stock and save it to chart.png."</span>,
+<span class="b0">)</span></code></pre></div>
+          <p>
+            What makes this more than a chatbot is how <code>generate_reply</code>
+            works. A conversable agent holds an ordered list of registered
+            reply functions and tries them in turn, returning the first one
+            that produces a reply. The default order is meaningful, first check
+            whether the conversation should terminate or the human should be
+            asked, then check for a tool or function call to execute, then check
+            for code to run, and only then call the LLM. <mark>Because reply
+            generation is a pipeline of pluggable handlers rather than a single
+            model call, the same object can be an executor on one turn, a human
+            proxy on another, and a language model on a third, which is what
+            lets a plain conversation carry code execution, tool use, and human
+            approval without any of those being special cases.</mark> The
+            assistant writes a Python block, the user proxy's code-execution
+            reply runs it in a working directory or a Docker container and
+            sends stdout or the traceback back, and the assistant's next
+            LLM reply fixes the bug. A single agent cannot do this, it has no
+            execution environment and no second pair of eyes. The multi-agent
+            loop supplies both, and the grounding it provides, real output fed
+            back into the next prompt, is the entire reason the pattern beats a
+            lone model.
+          </p>
+          <p>
+            v0.4 keeps this model but reshapes the surface. The AgentChat
+            <code>AssistantAgent</code> is async, exposes the tool loop and the
+            reflection step as explicit options, and emits typed events for
+            each internal step instead of hiding them inside
+            <code>generate_reply</code>. The mental model is unchanged, an agent
+            is still something that receives messages and generates replies, but
+            the internals are now events on a runtime rather than callbacks on
+            an object.
+          </p>
+
+          <h3>Deep dive: the event-driven core</h3>
+          <p>
+            autogen-core is an actor system, and reading it that way makes it
+            click. An agent is an actor with an identity, an
+            <code>AgentId</code> that is a pair of a <code>type</code> (which
+            behavior) and a <code>key</code> (which instance), for example
+            <code>AgentId("assistant", "session-42")</code>. Agents do not hold
+            references to each other. They only know identities and topics, and
+            the <code>AgentRuntime</code> is the post office that delivers
+            messages. You do not construct agents directly, you register a
+            factory for a type and the runtime lazily instantiates an instance
+            the first time a message is addressed to it, which is what lets the
+            same code run one agent or ten thousand.
+          </p>
+          <p>
+            There are exactly two communication styles, and knowing which is
+            which explains most of the code you will read. Direct messaging,
+            <code>await runtime.send_message(msg, recipient_id)</code>, is
+            RPC-like, it targets one agent by identity and returns that agent's
+            response value to the caller. Broadcast, <code>publish_message(msg,
+            topic_id)</code>, is fire-and-forget publish/subscribe, it sends to
+            a <code>TopicId</code> and every agent subscribed to that topic
+            receives it, with no return value. A <code>TopicId</code> is itself
+            a <code>type</code> and a <code>source</code>, and subscriptions
+            (for instance <code>TypeSubscription</code>) map topics to the agent
+            types that should hear them. Group chat, as we saw in Part IV, is
+            built almost entirely from broadcast over a shared topic.
+          </p>
+          <p>
+            Agents route incoming messages to handlers by message type. The
+            ergonomic base class is <code>RoutedAgent</code>, and you mark
+            handler methods with the <code>@message_handler</code> decorator,
+            typing the message parameter so the runtime knows which handler
+            gets which message. A minimal custom agent looks like this:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">dataclasses</span> <span class="k">import</span> <span class="m1">dataclass</span>
+<span class="k">from</span> <span class="m1">autogen_core</span> <span class="k">import</span> <span class="m1">RoutedAgent</span>, <span class="m1">message_handler</span>, <span class="m1">MessageContext</span>, <span class="m1">AgentId</span>
+<span class="k">from</span> <span class="m1">autogen_core</span> <span class="k">import</span> <span class="m1">SingleThreadedAgentRuntime</span>
+
+
+<span class="m1">@dataclass</span>
+<span class="k">class</span> <span class="m1">Greeting</span>:
+    <span class="v1">text</span>: <span class="m1">str</span>
+
+
+<span class="k">class</span> <span class="m1">Greeter</span><span class="b0">(</span><span class="m1">RoutedAgent</span><span class="b0">)</span>:
+    <span class="m1">@message_handler</span>
+    <span class="k">async</span> <span class="k">def</span> <span class="m1">on_greeting</span><span class="b0">(</span><span class="k">self</span>, <span class="v3">message</span>: <span class="m1">Greeting</span>, <span class="v0">ctx</span>: <span class="m1">MessageContext</span><span class="b0">)</span> -&gt; <span class="m1">str</span>:
+        <span class="k">return</span> <span class="s">f"heard: {</span><span class="v3">message</span>.<span class="m2">text</span><span class="s">}"</span>
+
+
+<span class="k">async</span> <span class="k">def</span> <span class="m1">main</span><span class="b0">()</span> -&gt; <span class="k">None</span>:
+    <span class="v2">runtime</span> = <span class="m1">SingleThreadedAgentRuntime</span><span class="b0">()</span>
+    <span class="k">await</span> <span class="m1">Greeter</span>.<span class="m2">register</span><span class="b0">(</span><span class="v2">runtime</span>, <span class="s">"greeter"</span>, <span class="k">lambda</span>: <span class="m1">Greeter</span><span class="b1">(</span><span class="s">"a greeter"</span><span class="b1">)</span><span class="b0">)</span>
+    <span class="v2">runtime</span>.<span class="m2">start</span><span class="b0">()</span>
+    <span class="v0">reply</span> = <span class="k">await</span> <span class="v2">runtime</span>.<span class="m2">send_message</span><span class="b0">(</span><span class="m1">Greeting</span><span class="b1">(</span><span class="s">"hello"</span><span class="b1">)</span>, <span class="m1">AgentId</span><span class="b1">(</span><span class="s">"greeter"</span>, <span class="s">"default"</span><span class="b1">)</span><span class="b0">)</span>
+    <span class="m1">print</span><span class="b0">(</span><span class="v0">reply</span><span class="b0">)</span>                    <span class="c"># heard: hello</span>
+    <span class="k">await</span> <span class="v2">runtime</span>.<span class="m2">stop_when_idle</span><span class="b0">()</span></code></pre></div>
+          <p>
+            The <code>MessageContext</code> carries metadata such as the sender,
+            the topic if it was a broadcast, and a cancellation token.
+            <mark>Because delivery, identity, and lifecycle are the runtime's
+            job and not the agent's, the exact same agent code runs unchanged on
+            an in-process runtime or a distributed one, which is the payoff the
+            whole v0.4 rewrite was chasing.</mark> The motivation for the
+            rewrite was precisely this, v0.2's conversation-centric design was
+            hard to observe, hard to scale, and impossible to make
+            cross-language, and rebuilding on an actor core made agents
+            composable, the message flow inspectable, and the runtime
+            swappable. The actor lineage here is the same one behind Erlang and
+            Akka, and the intuition transfers, isolate state per actor,
+            communicate only by messages, and let a supervisor route and
+            restart. If that lineage is unfamiliar, the concurrency and
+            message-passing ideas are developed in
+            <a href="/classes/concurrent-systems-programming">concurrent systems
+            programming</a>.
+          </p>
+
+          <h3>Deep dive: AgentChat teams and group chat</h3>
+          <p>
+            A team is a coordinated set of agents plus a policy for who speaks
+            and when to stop, and AgentChat ships several. <code>RoundRobinGroupChat</code>
+            cycles through participants in order, which is predictable and cheap
+            and perfect when the roles have a natural rotation, like writer then
+            critic. <code>SelectorGroupChat</code> asks a model to choose the
+            next speaker from the transcript and the agents' descriptions, which
+            is more flexible for open-ended tasks but adds a model call per turn
+            and can loop if the descriptions are vague. <code>Swarm</code> uses
+            explicit handoffs, an agent names the next agent to act by emitting a
+            handoff message, which mirrors the OpenAI Agents SDK style and suits
+            workflows with clear stage transitions. <code>MagenticOneGroupChat</code>
+            wraps the Magentic-One orchestrator, which maintains a task ledger
+            and a progress ledger and re-plans when the team gets stuck, aimed at
+            hard open-ended web-and-code tasks.
+          </p>
+          <p>
+            Termination is its own small algebra and deserves respect, since it
+            is the difference between a bounded run and a runaway one. Each
+            condition is a stateful object evaluated against the growing message
+            list, and they compose. <code>TextMentionTermination</code> fires on
+            a keyword, <code>MaxMessageTermination</code> caps the number of
+            messages, <code>TokenUsageTermination</code> caps cumulative token
+            spend, <code>HandoffTermination</code> stops when an agent hands off
+            to a named target (typically the user, for human-in-the-loop), and
+            <code>ExternalTermination</code> lets your code stop a run from
+            outside. You combine them with <code>|</code> and <code>&amp;</code>:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">autogen_agentchat</span>.<span class="m2">conditions</span> <span class="k">import</span> <span class="b0">(</span>
+    <span class="m1">TextMentionTermination</span>,
+    <span class="m1">MaxMessageTermination</span>,
+    <span class="m1">HandoffTermination</span>,
+<span class="b0">)</span>
+
+<span class="c"># stop on success, OR when a human is needed, OR at a hard ceiling</span>
+<span class="v1">condition</span> = <span class="b0">(</span>
+    <span class="m1">TextMentionTermination</span><span class="b1">(</span><span class="s">"TERMINATE"</span><span class="b1">)</span>
+    | <span class="m1">HandoffTermination</span><span class="b1">(</span><span class="v4">target</span>=<span class="s">"user"</span><span class="b1">)</span>
+    | <span class="m1">MaxMessageTermination</span><span class="b1">(</span><span class="n">30</span><span class="b1">)</span>
+<span class="b0">)</span></code></pre></div>
+          <p>
+            Teams are also stateful and resumable. <code>await team.save_state()</code>
+            returns a serializable snapshot of the conversation and each agent's
+            context, and <code>load_state</code> restores it, so you can pause a
+            long-running team, persist it, and resume in another process. This
+            is the same "address durable state by logical content, not by
+            in-memory layout" instinct that good systems reach for everywhere.
+          </p>
+
+          <h3>Deep dive: tool and function calling</h3>
+          <p>
+            A tool is a function the model may ask the agent to call. AutoGen
+            bridges Python functions to the model's tool-calling API so you
+            rarely write a schema by hand. When you pass a plain function in
+            <code>tools=[...]</code>, the agent wraps it as a
+            <code>FunctionTool</code>, reads the parameter type hints and the
+            docstring, and generates the JSON schema the model needs. At run
+            time the flow is a small loop. The agent sends the tools along with
+            the prompt, the model may respond with one or more tool calls
+            instead of a final answer, the agent executes each call (validating
+            arguments against the schema), appends the results to the context as
+            tool-result messages, and calls the model again. That loop can run
+            several iterations if the model chains tool calls, and it is bounded
+            so it cannot spin forever. With <code>reflect_on_tool_use=True</code>
+            the agent makes a final model call to summarize the tool results in
+            prose, otherwise the raw tool result becomes the response.
+          </p>
+          <p>
+            Two things are worth knowing beyond the basics. First, the agent
+            emits distinct events, a tool-call request event and a tool-call
+            execution event, so a transcript shows exactly what was called with
+            what arguments and what came back, which is where you look when a
+            tool returns the wrong thing. Second, tools are not limited to your
+            local functions. autogen-ext provides adapters, including adapters
+            for tools served over the Model Context Protocol, so an AutoGen agent
+            can use the same external tool servers other frameworks do. The
+            uniform treatment, everything is a tool with a schema and a result
+            event, is what keeps the agent's core loop simple no matter where the
+            capability comes from.
+          </p>
+
+          <h3>Deep dive: human-in-the-loop</h3>
+          <p>
+            A human is just another agent, which is the cleanest thing about
+            AutoGen's design here. In v0.2 the human enters through
+            <code>UserProxyAgent</code>'s <code>human_input_mode</code>, set to
+            <code>ALWAYS</code> to prompt the person every turn,
+            <code>TERMINATE</code> to ask only when the conversation would
+            otherwise end, or <code>NEVER</code> to run fully autonomously. In
+            v0.4 the AgentChat <code>UserProxyAgent</code> takes an
+            <code>input_func</code>, which defaults to the console
+            <code>input()</code> but can be any callable, including an async one
+            that awaits a message from a web UI or a chat platform. Drop that
+            agent into a team and, when it is its turn to speak, the team pauses
+            and calls your input function to get the human's message:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">autogen_agentchat</span>.<span class="m2">agents</span> <span class="k">import</span> <span class="m1">UserProxyAgent</span>
+
+<span class="v5">human</span> = <span class="m1">UserProxyAgent</span><span class="b0">(</span><span class="s">"human"</span>, <span class="v2">input_func</span>=<span class="m1">input</span><span class="b0">)</span>   <span class="c"># or an async web callback</span>
+<span class="v4">team</span> = <span class="m1">RoundRobinGroupChat</span><span class="b0">(</span><span class="b1">[</span><span class="v2">assistant</span>, <span class="v5">human</span><span class="b1">]</span>, <span class="v5">termination_condition</span>=<span class="v1">condition</span><span class="b0">)</span>
+<span class="k">await</span> <span class="m1">Console</span><span class="b0">(</span><span class="v4">team</span>.<span class="m2">run_stream</span><span class="b1">(</span><span class="v4">task</span>=<span class="s">"Draft a reply to this email, I will approve it."</span><span class="b1">)</span><span class="b0">)</span></code></pre></div>
+          <p>
+            The more powerful pattern for real applications is
+            <code>HandoffTermination</code> together with the <code>Swarm</code>
+            team. An agent hands off to <code>"user"</code>, the handoff
+            termination stops the run and returns control to your program, you
+            gather the human's input however you like (which may take minutes or
+            days), and then you call <code>team.run(task=...)</code> again with
+            the human's message. Because the team's state persists across those
+            calls, the conversation resumes exactly where it paused. <mark>Making
+            the human a participant with the same message interface as every
+            other agent means approval, correction, and clarification are not
+            bolted-on special cases but ordinary turns in the conversation,</mark>
+            which is why human-in-the-loop in AutoGen feels like the same
+            program rather than a separate approval subsystem.
+          </p>
+
+          <h3>Deep dive: the distributed, cross-language runtime</h3>
+          <p>
+            The single-threaded runtime runs every agent in one process, which
+            is all most applications need. The payoff of the actor design shows
+            up when you swap it for the distributed runtime without touching your
+            agent code. In that mode a central gRPC host acts as a message
+            broker, and each worker process runs a gRPC worker runtime that
+            connects to the host as a client and registers its agents. Messages,
+            both direct and broadcast, are serialized and routed through the host
+            to whichever worker owns the target agent or subscribes to the topic.
+            The wire format follows the CloudEvents convention, which is exactly
+            why the runtime can be cross-language, a message published by a
+            Python agent can be delivered to a .NET agent subscribed to the same
+            topic, since both speak the same event protocol over gRPC. The
+            repository carries a full .NET implementation alongside the Python
+            one for this reason.
+          </p>
+          <p>
+            The honest cost is the usual one for distribution. Everything on the
+            wire must be serializable, the host is a component you now operate,
+            and you inherit the failure modes of a networked system, partial
+            failures, retries, and ordering questions, that the in-process
+            runtime hid. The lesson worth carrying away is the same one that
+            makes the design good, <mark>because agents communicate only by
+            typed messages to identities and topics, moving from one process to a
+            cluster is a runtime swap and a serialization concern, not a rewrite
+            of the agents,</mark> which is the location transparency that the
+            actor model promises and that v0.2 could not offer.
+          </p>
+
+          <h2>Part VI: Reading the repository</h2>
+          <p>
+            The repository is a monorepo with a Python side and a .NET side.
+            Paths below reflect the v0.4 layout on main in 2026. Exact file
+            names inside packages change, so navigate by package and role.
+          </p>
+          <p>
+            <strong>Stage 0, orientation.</strong> Read the top-level
+            <code>README.md</code>, then note the two language trees,
+            <code>python/</code> and <code>dotnet/</code>. The Python packages
+            live under <code>python/packages/</code>, notably
+            <code>autogen-core</code>, <code>autogen-agentchat</code>,
+            <code>autogen-ext</code>, and <code>autogen-studio</code>. Read the
+            AgentChat quickstart and the migration guide from v0.2 in the docs
+            to fix the two-layer picture in your head. Question, which package
+            owns the runtime, and which owns the pre-built agents and teams?
+          </p>
+          <p>
+            <strong>Stage 1, AgentChat surface.</strong> In
+            <code>autogen-agentchat</code>, read the base chat agent, then
+            <code>AssistantAgent</code> and <code>UserProxyAgent</code>, then the
+            teams package (the group-chat base and
+            <code>RoundRobinGroupChat</code> as the simplest concrete team), then
+            the conditions and messages modules. Questions, what exactly does
+            <code>on_messages</code> return, in what order does the assistant do
+            model call, tool loop, and reflection, and how does a termination
+            condition see the message list?
+          </p>
+          <p>
+            <strong>Stage 2, the core.</strong> In <code>autogen-core</code>,
+            read the agent and agent-runtime interfaces, then
+            <code>_single_threaded_agent_runtime.py</code> (the reference
+            runtime, and the best single file for seeing delivery work), then the
+            routed-agent and message-handler machinery, then topics and
+            subscriptions. Questions, how does the runtime turn an
+            <code>AgentId</code> into a delivered message, how does lazy agent
+            instantiation from a registered factory work, and where is the fork
+            between direct send and topic broadcast?
+          </p>
+          <p>
+            <strong>Stage 3, extensions.</strong> In <code>autogen-ext</code>,
+            read the OpenAI model client under the models package, a code
+            executor (the Docker command-line executor is representative), and a
+            tool adapter. This is where the abstract interfaces from core and
+            AgentChat meet real providers. Question, what is the surface a model
+            client must implement, and how does a function become a tool schema?
+          </p>
+          <p>
+            <strong>Stage 4, teams as core programs.</strong> Return to the
+            AgentChat teams package and read how a group chat is assembled out of
+            core primitives, the manager actor, the per-participant container
+            actors, and the shared topic they all subscribe to. This is Part IV
+            in source form and is the moment the two layers fuse in your mind.
+          </p>
+          <p>
+            <strong>Stage 5, the frontier.</strong> The Magentic-One
+            implementation (orchestrator plus specialized agents), the
+            distributed gRPC runtime in <code>autogen-ext</code>, the parallel
+            <code>dotnet/</code> tree for the cross-language story, and
+            <code>autogen-studio</code> for the visual builder. Where not to
+            start, the distributed runtime and the .NET side are fascinating but
+            will confuse the core model if you meet them before the
+            single-threaded runtime is solid, and Magentic-One's ledgers make
+            most sense once plain teams feel obvious.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            All labs need only an API key and a CPU. Set your model endpoint in
+            the environment first. Log and message shapes drift with the fast
+            pace of the project, so match on roles, not exact strings.
+          </p>
+          <p><strong>Lab 1: one agent, then a team.</strong> Concept, the AgentChat surface and the run lifecycle.</p>
+          <p>
+            Run the single-agent program from Part II, print
+            <code>result.messages</code> in full, and notice the transcript
+            already contains more than one message, the task, the model's
+            reasoning, and the answer. Then run the writer-and-critic team and
+            watch the same <code>TaskResult</code> shape grow to a multi-turn
+            conversation. Match each printed message to a stage of Part IV.
+          </p>
+          <p><strong>Lab 2: make it loop, then bound it.</strong> Concept, termination as cost control.</p>
+          <p>
+            Remove the termination condition from the writer-and-critic team and
+            run it (interrupt it quickly). Observe that it does not stop on its
+            own and relies on a default message cap. Now add
+            <code>TextMentionTermination("APPROVE") | MaxMessageTermination(6)</code>
+            and observe which one fires. Lower the cap to 2 and watch it stop
+            before the critic ever approves, then read the
+            <code>stop_reason</code>.
+          </p>
+          <p><strong>Lab 3: a tool and its events.</strong> Concept, the tool-calling loop.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">async</span> <span class="k">def</span> <span class="m1">add</span><span class="b0">(</span><span class="v5">a</span>: <span class="m1">int</span>, <span class="v6">b</span>: <span class="m1">int</span><span class="b0">)</span> -&gt; <span class="m1">int</span>:
+    <span class="s">"""Add two integers."""</span>
+    <span class="k">return</span> <span class="v5">a</span> + <span class="v6">b</span>
+
+<span class="v5">agent</span> = <span class="m1">AssistantAgent</span><span class="b0">(</span><span class="s">"calc"</span>, <span class="v0">model_client</span>=<span class="v0">model_client</span>, <span class="v3">tools</span>=<span class="b1">[</span><span class="m1">add</span><span class="b1">]</span>,
+                       <span class="v4">reflect_on_tool_use</span>=<span class="k">True</span><span class="b0">)</span>
+<span class="v5">result</span> = <span class="k">await</span> <span class="v5">agent</span>.<span class="m2">run</span><span class="b0">(</span><span class="v4">task</span>=<span class="s">"What is 128 plus 273? Use the tool."</span><span class="b0">)</span>
+<span class="k">for</span> <span class="v4">m</span> <span class="k">in</span> <span class="v5">result</span>.<span class="m2">messages</span>:
+    <span class="m1">print</span><span class="b0">(</span><span class="m1">type</span><span class="b1">(</span><span class="v4">m</span><span class="b1">)</span>.<span class="m2">__name__</span>, <span class="m1">getattr</span><span class="b1">(</span><span class="v4">m</span>, <span class="s">"content"</span>, <span class="s">""</span><span class="b1">)</span><span class="b0">)</span></code></pre></div>
+          <p>
+            Observe the tool-call request event and the tool-call execution
+            event in the transcript, the actual arguments the model chose, and
+            the final natural-language answer produced by the reflection step.
+            Toggle <code>reflect_on_tool_use=False</code> and see the raw tool
+            result become the answer instead.
+          </p>
+          <p><strong>Lab 4: raw autogen-core.</strong> Concept, actors, identities, and delivery.</p>
+          <p>
+            Run the <code>Greeter</code> program from Part V. Then add a second
+            agent type that, in its handler, uses <code>ctx</code> and the
+            runtime to <code>publish_message</code> a message to a topic both
+            agents subscribe to, and watch a broadcast reach both. Compare the
+            return-value semantics of <code>send_message</code> with the
+            no-return semantics of <code>publish_message</code>. This is the
+            whole core in miniature.
+          </p>
+          <p><strong>Lab 5: human-in-the-loop.</strong> Concept, the human as a participant.</p>
+          <p>
+            Add a <code>UserProxyAgent("human", input_func=input)</code> to a
+            team with an assistant and run a task that needs your approval.
+            Observe the run pause for your console input on the human's turn, and
+            that your typed message becomes an ordinary message in the same
+            transcript. Then try the handoff pattern, give the assistant a
+            handoff to <code>"user"</code>, use <code>HandoffTermination</code>,
+            run, provide input, and <code>run</code> again to resume.
+          </p>
+          <p><strong>Lab 6: selector versus round robin.</strong> Concept, speaker-selection policy.</p>
+          <p>
+            Build a three-agent team (say a researcher, a coder, and a critic)
+            once as <code>RoundRobinGroupChat</code> and once as
+            <code>SelectorGroupChat</code> on the same task, and compare the
+            transcripts and the number of model calls. The selector version will
+            skip around based on relevance and cost more per turn. Give the
+            agents vague descriptions and watch the selector make worse choices,
+            which teaches why agent descriptions matter.
+          </p>
+
+          <h2>Part VIII: Questions and model answers</h2>
+          <p>Understanding checks. Answer aloud before reading.</p>
+          <p><strong>1. What is a conversable agent?</strong></p>
+          <p>
+            An entity with three verbs, send a message, receive a message, and
+            generate a reply. Because reply generation is a pipeline of
+            handlers, the same agent can execute code, call tools, ask a human,
+            or call an LLM depending on the message, which is what lets a plain
+            conversation carry all of those without special cases.
+          </p>
+          <p><strong>2. Why does multi-agent conversation solve tasks a single agent cannot?</strong></p>
+          <p>
+            A single model call cannot run its own code, cannot review its work
+            with fresh context, and cannot get a human decision. Splitting those
+            into separate agents, a coder, an executor, a critic, a human proxy,
+            creates feedback loops that ground the language model in real
+            results, so errors get caught and corrected instead of hallucinated
+            away.
+          </p>
+          <p><strong>3. Name the three main packages and what each owns.</strong></p>
+          <p>
+            <code>autogen-core</code> is the event-driven actor runtime and the
+            message-passing primitives. <code>autogen-agentchat</code> is the
+            high-level task API with pre-built agents and teams, built on core.
+            <code>autogen-ext</code> holds concrete integrations, model clients,
+            code executors, tool adapters, and the distributed runtime.
+          </p>
+          <p><strong>4. What are the two communication styles in autogen-core?</strong></p>
+          <p>
+            Direct messaging with <code>send_message</code>, which targets one
+            agent by <code>AgentId</code> and returns a response, RPC-style. And
+            broadcast with <code>publish_message</code>, which sends to a
+            <code>TopicId</code> that any number of subscribed agents receive,
+            with no return value. Group chat is built mostly from broadcast over
+            a shared topic.
+          </p>
+          <p><strong>5. Trace one turn of a RoundRobinGroupChat.</strong></p>
+          <p>
+            The manager selects the next agent in the list and publishes a
+            request to that agent's topic, the agent's container runs its
+            <code>on_messages</code> (model call, maybe a tool loop) and
+            publishes a response to the group topic, every participant and the
+            manager receive it so all contexts update, and the manager appends it
+            to the thread and checks the termination condition before selecting
+            again.
+          </p>
+          <p><strong>6. How does a plain Python function become a tool?</strong></p>
+          <p>
+            Passing it in <code>tools=[...]</code> wraps it as a
+            <code>FunctionTool</code>, which reads the type hints and docstring
+            to generate the JSON schema the model needs. At run time the agent
+            offers the tool, the model may emit a tool call, the agent validates
+            arguments, executes, feeds the result back, and loops or answers.
+          </p>
+          <p><strong>7. What does a termination condition do, and why compose them?</strong></p>
+          <p>
+            It is a stateful predicate evaluated against the growing message
+            list that decides when a team stops. You compose with <code>|</code>
+            and <code>&amp;</code> so a run can stop on success (a keyword), on a
+            human handoff, or at a hard ceiling on messages or tokens, whichever
+            comes first, which is how you bound cost before pressing run.
+          </p>
+          <p><strong>8. How is a human integrated, and why does it feel seamless?</strong></p>
+          <p>
+            As an agent. <code>UserProxyAgent</code> takes an
+            <code>input_func</code>, so a human turn is just a message obtained
+            from the console or a web callback. With
+            <code>HandoffTermination</code> plus a persisted team state, a run
+            can pause for arbitrary time and resume on the next
+            <code>run</code>. Because the human shares the message interface,
+            approval and correction are ordinary turns, not a separate subsystem.
+          </p>
+          <p><strong>9. Why was v0.4 rebuilt on an actor runtime?</strong></p>
+          <p>
+            v0.2's conversation-centric design was hard to observe, hard to
+            scale, and could not go cross-language. Making agents actors that
+            communicate only by typed messages to identities and topics made the
+            message flow inspectable, let the runtime be swapped from in-process
+            to distributed without changing agent code, and enabled Python and
+            .NET agents to share one runtime.
+          </p>
+          <p><strong>10. How can the same agent code run distributed?</strong></p>
+          <p>
+            Agents never reference each other, only identities and topics, and
+            the runtime owns delivery and lifecycle. Swapping the single-threaded
+            runtime for the gRPC worker runtime routes messages through a host
+            broker in the CloudEvents format instead of in memory, so
+            distribution is a runtime swap plus a serialization requirement, not
+            an agent rewrite.
+          </p>
+          <p><strong>11. When would you pick LangGraph, CrewAI, or Semantic Kernel over AutoGen?</strong></p>
+          <p>
+            LangGraph when you want an explicit authored state graph with tight
+            control flow. CrewAI when a higher-level role-and-task crew fits and
+            you do not need a runtime underneath. Semantic Kernel when you want
+            Microsoft's plugin-oriented, enterprise, .NET-first SDK. And note
+            that Microsoft is converging AutoGen and Semantic Kernel into a
+            single Agent Framework, so for new production systems check that
+            status first.
+          </p>
+          <p><strong>12. A team quietly costs a fortune and never seems to finish. What happened?</strong></p>
+          <p>
+            No effective termination bound, so the conversation loops, and every
+            turn is at least one LLM call, multiplied by agents and by
+            tool-calling loops, and worse if an LLM selector adds a call per
+            turn. The fix is a hard <code>MaxMessageTermination</code> or token
+            budget combined with a real stop condition, plus a tool-iteration
+            cap, set before the run.
+          </p>
+          <p><strong>13. What is the difference between AssistantAgent and UserProxyAgent?</strong></p>
+          <p>
+            <code>AssistantAgent</code> is LLM-backed, it reasons, writes, and
+            calls tools. <code>UserProxyAgent</code> stands in for the human and,
+            in the classic model, executes code, so the standard two-agent loop
+            is the assistant proposing and the user proxy executing and reporting
+            back, which is the feedback loop that grounds the assistant.
+          </p>
+          <p><strong>14. What is Magentic-One?</strong></p>
+          <p>
+            A generalist multi-agent system built on autogen-core, an
+            orchestrator that keeps a task ledger and a progress ledger and
+            re-plans, coordinating specialized agents for the web, files, coding,
+            and a terminal. It ships as <code>MagenticOneGroupChat</code> and
+            targets hard open-ended tasks that need real tool use.
+          </p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Make the message the universal interface.</strong> Once
+            code output, tool results, human approvals, and model completions
+            are all just messages, one conversation carries every capability and
+            adding a new one means adding an agent, not a new control path. This
+            is the everything-is-a-file instinct applied to agents, a narrow
+            interface that many behaviors flow through.
+          </p>
+          <p>
+            <strong>Separate mechanism from policy across two layers.</strong>
+            autogen-core provides the mechanism, actors, identities, delivery,
+            and AgentChat provides the policy, which agents, which speaker order,
+            when to stop. Beginners live in AgentChat and never touch the core,
+            experts drop to the core when a team shape does not exist yet, and
+            neither layer has to compromise for the other.
+          </p>
+          <p>
+            <strong>Adopt the actor model for isolation and location
+            transparency.</strong> Agents that share no references and
+            communicate only by typed messages to identities and topics can be
+            instantiated lazily, run in one process or many, and even in
+            different languages, because delivery is the runtime's problem. The
+            same discipline underlies Erlang, Akka, and every robust
+            message-passing system.
+          </p>
+          <p>
+            <strong>Ground language models with feedback loops.</strong> The
+            reason a coder-plus-executor pair beats one clever prompt is that the
+            executor returns real output and the coder reacts to it. Whenever a
+            model's output can be checked against reality, wire the check back in
+            as another turn, and let correction be part of the conversation
+            rather than a hope.
+          </p>
+          <p>
+            <strong>Bound the loop at the door.</strong> Multi-agent systems fan
+            out cost the way distributed systems fan out load, so termination
+            conditions, token budgets, and tool-iteration caps are not
+            afterthoughts but the safety envelope, and the design that makes them
+            composable and explicit is what keeps an autonomous system from
+            becoming an unbounded one.
+          </p>
+          <p>
+            <strong>Treat the human as a peer, not a checkpoint.</strong> Giving
+            the human the same message interface as any agent turns approval and
+            correction into ordinary turns and makes pause-and-resume fall out of
+            the same state persistence that everything else uses. Interfaces that
+            include the human as a participant age better than ones that bolt on
+            an approval step.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            The one-sentence summary. <mark>AutoGen solves a task with a
+            conversation among specialized agents, coded in the high-level
+            AgentChat API as a team with a speaker policy and a termination
+            condition, and executed on the low-level autogen-core actor runtime
+            where agents are identities that exchange typed messages by direct
+            send or topic broadcast, in one process or across a distributed,
+            cross-language mesh.</mark>
+          </p>
+          <pre class="flow">task -&gt; AgentChat team (RoundRobin / Selector / Swarm / MagenticOne)
+  -&gt; group chat manager: shared thread, pick speaker, broadcast, check termination
+  -&gt; each turn: model context -&gt; LLM call -&gt; maybe tool loop -&gt; Response
+  -&gt; termination (TextMention | MaxMessage | Handoff | token budget)
+  -&gt; TaskResult (messages + stop_reason)
+
+all riding on autogen-core:
+  AgentId(type, key) actors + AgentRuntime
+  send_message (RPC, returns) | publish_message (broadcast to TopicId)
+  SingleThreadedAgentRuntime (in-process) | gRPC host + workers (distributed, Py/.NET)</pre>
+          <p>The chain mapped to packages:</p>
+          <pre class="flow">high-level agents/teams   autogen-agentchat (AssistantAgent, teams, conditions)
+runtime + primitives      autogen-core (AgentId, RoutedAgent, runtime, topics)
+providers + distributed   autogen-ext (OpenAI client, code executors, gRPC runtime)
+generalist system         Magentic-One (orchestrator + web/file/coder/terminal)
+low-code GUI              autogen-studio</pre>
+          <p>Memorize these blocks:</p>
+          <ul>
+            <li><strong>Two layers:</strong> AgentChat is the task API, autogen-core is the actor runtime under it, autogen-ext holds the integrations.</li>
+            <li><strong>Two message styles:</strong> <code>send_message</code> is direct and returns a value, <code>publish_message</code> is broadcast to a topic and returns nothing.</li>
+            <li><strong>Team shapes:</strong> RoundRobin (ordered), Selector (LLM picks), Swarm (handoffs), MagenticOne (orchestrated), each is a speaker policy plus a shared thread.</li>
+            <li><strong>Termination is cost control:</strong> conditions are stateful, compose with <code>|</code> and <code>&amp;</code>, and every team needs one or it loops.</li>
+            <li><strong>Human as agent:</strong> <code>UserProxyAgent</code> with an <code>input_func</code>, or a Swarm handoff to <code>"user"</code> with <code>HandoffTermination</code> for pause-and-resume.</li>
+            <li><strong>Names caveat:</strong> Microsoft's v0.4 is <code>autogen-agentchat</code>/<code>-core</code>/<code>-ext</code>, while <code>autogen</code>/<code>pyautogen</code> on PyPI now belong to the AG2 fork.</li>
+          </ul>
+
+          <h2>Part XI: Final takeaway</h2>
+          <p>
+            If the single-model pieces underneath these agents are the gap, the
+            <a href="/classes/applied-generative-ai">applied generative AI</a>
+            and <a href="/classes/natural-language-understanding">natural language
+            understanding</a> material builds the language-model side, and the
+            question of how agents ought to plan and improve over time is taken
+            up in <a href="/classes/self-improving-agents">self-improving
+            agents</a> and <a href="/classes/decision-making-under-uncertainty">decision
+            making under uncertainty</a>. Then come back and read
+            <code>_single_threaded_agent_runtime.py</code> once more, and the
+            teams you write in AgentChat will read as what they are, thin
+            policies over a small, honest actor system.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> AutoGen's bet is that hard tasks are
+            solved by a conversation, not a completion. Give each capability its
+            own agent, a coder, an executor, a critic, a human, let them exchange
+            typed messages through a runtime that does not care whether they sit
+            in one process or across a cluster, bound the loop with a termination
+            condition, and a plan-execute-critique-approve cycle that no single
+            model call could perform falls out of a few dozen lines of ordinary,
+            readable Python.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/code-copy.js"></script>
+      <script defer src="/theme.js"></script>
+  </body>
+</html>

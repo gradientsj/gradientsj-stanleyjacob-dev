@@ -1,0 +1,979 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Unsloth walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A full chapter on unslothai/unsloth: how LoRA and QLoRA fine-tuning gets 2x faster in a fraction of the VRAM by rewriting the hot paths (RoPE, RMSNorm, the gated MLP, cross-entropy) as hand-derived autograd.Function classes backed by Triton kernels, plus the model-patching approach, the offloaded gradient checkpointer, a traced training step, internals deep dives, a reading path, labs, and understanding checks." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+      <script>(function(){try{var t=localStorage.getItem("theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>Unsloth</h1>
+        <p class="lead">
+          <a href="https://github.com/unslothai/unsloth" target="_blank" rel="noreferrer">Unsloth</a>
+          makes fine-tuning large language models roughly twice as fast in
+          a fraction of the VRAM, with no change to the math and no new model
+          format to adopt. It does this not by building a new framework but by
+          surgically replacing the four or five operations that dominate a
+          fine-tuning step, rotary embeddings, RMSNorm, the gated MLP, and the
+          cross-entropy loss, with hand-derived <code>torch.autograd.Function</code>
+          classes backed by <a href="/classes/parallel-computing">Triton</a>
+          kernels, then monkey-patching those into a stock Hugging Face model at
+          load time. This chapter is three things at once, a practical guide to
+          running a real QLoRA fine-tune, a systems walkthrough that follows one
+          training step through the patched hot paths and back through their
+          manual backward passes, and a guided read of the kernels and model
+          files. It ends with runnable labs, understanding checks with model
+          answers, and a compact framework for keeping the whole trick in your
+          head.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">your script            model, tok = FastLanguageModel.from_pretrained(...)
+      |
+      v
+loader.py dispatch     model_type -&gt; FastLlamaModel / FastMistralModel / FastQwen3Model ...
+      |
+      v
+pre_patch()            LlamaAttention.forward = LlamaAttention_fast_forward
+      |                RMSNorm, RoPE, gated MLP, and the loss are swapped for Triton-backed versions
+      v
+HF transformers model  ordinary nn.Module, loaded in 4-bit (bitsandbytes NF4) on ONE GPU
+      |
+      |  get_peft_model(...)   inject LoRA adapters, freeze the base, pick "unsloth" checkpointing
+      v
+patched + LoRA model   every hot op is now a custom autograd.Function + Triton kernel
+      |
+      v
+TRL SFTTrainer         a completely ordinary Hugging Face training loop
+      |
+      v
+forward / backward     RoPE, RMSNorm, SwiGLU-MLP, cross-entropy run fused, minimal saved tensors
+      |                activations for each block are offloaded to CPU RAM, streamed back on backward
+      v
+save                   LoRA adapter, merged 16-bit weights, or GGUF for llama.cpp and Ollama</pre>
+          <p>
+            The one-sentence identity: <mark>Unsloth is a drop-in accelerator
+            for LoRA and QLoRA fine-tuning that keeps your model a plain
+            Hugging Face transformer and rewrites only the handful of hot
+            operations as hand-derived autograd functions backed by Triton
+            kernels, so the same fine-tune runs about twice as fast in a
+            fraction of the VRAM with the exact same numerics.</mark> There is
+            no new trainer to learn and no new checkpoint format. You call
+            <code>FastLanguageModel.from_pretrained</code> instead of
+            <code>AutoModelForCausalLM.from_pretrained</code>, wrap the result
+            with <code>get_peft_model</code>, and hand it to the same
+            <a href="/oss/transformers">Transformers</a> or TRL trainer you
+            were already using.
+          </p>
+          <p>
+            Two ideas carry the whole project. The first is that a transformer
+            fine-tuning step spends almost all of its time and memory in a very
+            short list of operations, and PyTorch's generic autograd pays for
+            that generality by materializing and saving an intermediate tensor
+            for nearly every elementwise op. Unsloth collapses each hot path
+            into a single fused kernel and writes the backward by hand, so it
+            saves only the few tensors the gradient actually needs and
+            recomputes the rest. The second idea is that you should not have to
+            fork the model to get this. Rather than ship a modified
+            architecture, Unsloth patches the live classes in the
+            <code>transformers</code> library the moment a model is loaded, so
+            the speedup rides on top of the ecosystem instead of replacing it.
+            Everything below is verified against the repository in July 2026.
+            Unsloth tracks new model families closely and the file layout moves,
+            so where a detail is likely to shift I say so and stay at the level
+            of the idea.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <p>
+            Unsloth is a Linux-and-NVIDIA-GPU project first (recent AMD and
+            Intel support exists and is improving). The open-source library
+            targets a single GPU or a single node, which is exactly why it fits
+            a free Colab T4 or one workstation card. It is not a multi-node
+            distributed trainer, and if that is what you need the right tool is
+            something like <a href="/oss/torchtitan">torchtitan</a>. Install is
+            an ordinary pip install:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">pip</span> <span class="s">install</span> <span class="s">unsloth</span>
+
+<span class="c"># for the newest kernels, install from git, choosing the extra</span>
+<span class="c"># that matches your CUDA and torch (the README prints the exact string):</span>
+<span class="m1">pip</span> <span class="s">install</span> <span class="s">--upgrade</span> <span class="s">--no-cache-dir</span> <span class="s">\</span>
+  <span class="s">"unsloth @ git+https://github.com/unslothai/unsloth.git"</span></code></pre></div>
+          <p>
+            The most reliable path is one of the pinned Colab or Kaggle
+            notebooks the project maintains, because the exact combination of
+            <code>torch</code>, <code>triton</code>, <code>bitsandbytes</code>,
+            and <code>xformers</code> matters and the notebooks track a known
+            good set. On your own machine, install into a fresh environment and
+            let the library autodetect your GPU. A first real session is a QLoRA
+            fine-tune of a small model, which loads in 4-bit and trains in well
+            under a gigabyte of adapter state:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">unsloth</span> <span class="k">import</span> <span class="m1">FastLanguageModel</span>   <span class="c"># import BEFORE transformers/trl so the patches land</span>
+<span class="k">import</span> <span class="m1">torch</span>
+
+<span class="v0">model</span>, <span class="v1">tokenizer</span> = <span class="m1">FastLanguageModel</span>.<span class="m2">from_pretrained</span><span class="b0">(</span>
+    <span class="v4">model_name</span>     = <span class="s">"unsloth/Meta-Llama-3.1-8B-bnb-4bit"</span>,  <span class="c"># a pre-quantized 4-bit repo</span>
+    <span class="v2">max_seq_length</span> = <span class="n">2048</span>,   <span class="c"># RoPE scaling is handled internally</span>
+    <span class="v3">dtype</span>          = <span class="k">None</span>,   <span class="c"># None autodetects bf16 on Ampere+ or fp16 otherwise</span>
+    <span class="v0">load_in_4bit</span>   = <span class="k">True</span>,   <span class="c"># QLoRA. set False for a 16-bit LoRA</span>
+<span class="b0">)</span>
+
+<span class="v0">model</span> = <span class="m1">FastLanguageModel</span>.<span class="m2">get_peft_model</span><span class="b0">(</span>
+    <span class="v0">model</span>,
+    <span class="v2">r</span>              = <span class="n">16</span>,
+    <span class="v4">target_modules</span> = <span class="b1">[</span><span class="s">"q_proj"</span>, <span class="s">"k_proj"</span>, <span class="s">"v_proj"</span>, <span class="s">"o_proj"</span>,
+                      <span class="s">"gate_proj"</span>, <span class="s">"up_proj"</span>, <span class="s">"down_proj"</span><span class="b1">]</span>,
+    <span class="v5">lora_alpha</span>     = <span class="n">16</span>,
+    <span class="v2">lora_dropout</span>   = <span class="n">0</span>,       <span class="c"># 0 lets Unsloth fuse the adapter path</span>
+    <span class="v4">bias</span>           = <span class="s">"none"</span>,  <span class="c"># "none" lets it fuse further</span>
+    <span class="v0">use_gradient_checkpointing</span> = <span class="s">"unsloth"</span>,  <span class="c"># offload activations to CPU RAM</span>
+    <span class="v6">random_state</span>   = <span class="n">3407</span>,
+<span class="b0">)</span></code></pre></div>
+          <p>
+            Two things above are load-bearing. First, the
+            <code>import unsloth</code> must come before you import
+            <code>transformers</code> or <code>trl</code>, because the import is
+            what installs the monkey-patches. Import them in the other order and
+            you silently get the stock, slow paths. Second, the argument
+            defaults are the same ones the library ships, verified from
+            <code>get_peft_model</code> in the model code, so this block is close
+            to what you would write in practice rather than a toy. Setting
+            <code>lora_dropout = 0</code> and <code>bias = "none"</code> is not
+            cosmetic, those are the values that let Unsloth take its fully fused
+            LoRA MLP and attention paths instead of falling back.
+          </p>
+          <p>
+            The model that comes back is a plain Hugging Face model with LoRA
+            adapters, so training is whatever trainer you like. The common
+            choice is TRL's <code>SFTTrainer</code>:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">trl</span> <span class="k">import</span> <span class="m1">SFTTrainer</span>, <span class="m1">SFTConfig</span>
+<span class="k">from</span> <span class="m1">datasets</span> <span class="k">import</span> <span class="m1">load_dataset</span>
+
+<span class="v6">dataset</span> = <span class="m1">load_dataset</span><span class="b0">(</span><span class="s">"yahma/alpaca-cleaned"</span>, <span class="v0">split</span> = <span class="s">"train"</span><span class="b0">)</span>
+
+<span class="v1">trainer</span> = <span class="m1">SFTTrainer</span><span class="b0">(</span>
+    <span class="v0">model</span>         = <span class="v0">model</span>,
+    <span class="v1">tokenizer</span>     = <span class="v1">tokenizer</span>,
+    <span class="v4">train_dataset</span> = <span class="v6">dataset</span>,
+    <span class="v2">args</span> = <span class="m1">SFTConfig</span><span class="b1">(</span>
+        <span class="v1">per_device_train_batch_size</span> = <span class="n">2</span>,
+        <span class="v3">gradient_accumulation_steps</span> = <span class="n">4</span>,   <span class="c"># effective batch 8</span>
+        <span class="v5">warmup_steps</span>    = <span class="n">5</span>,
+        <span class="v0">max_steps</span>       = <span class="n">60</span>,
+        <span class="v4">learning_rate</span>   = <span class="n">2e-4</span>,
+        <span class="v4">optim</span>           = <span class="s">"adamw_8bit"</span>,    <span class="c"># 8-bit optimizer states, more VRAM saved</span>
+        <span class="v0">logging_steps</span>   = <span class="n">1</span>,
+        <span class="v2">output_dir</span>      = <span class="s">"outputs"</span>,
+    <span class="b1">)</span>,
+<span class="b0">)</span>
+<span class="v1">trainer</span>.<span class="m2">train</span><span class="b0">()</span></code></pre></div>
+          <p>
+            TRL has moved several fields (things like
+            <code>dataset_text_field</code> and <code>max_seq_length</code>)
+            between the trainer and <code>SFTConfig</code> across versions, so
+            match the exact placement to your installed TRL. The training loop
+            itself is entirely ordinary. Unsloth is invisible at this layer,
+            which is the point. When training finishes you export in whatever
+            shape you want to serve:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="v0">model</span>.<span class="m2">save_pretrained</span><span class="b0">(</span><span class="s">"lora_model"</span><span class="b0">)</span>   <span class="c"># tiny LoRA adapters only</span>
+<span class="v1">tokenizer</span>.<span class="m2">save_pretrained</span><span class="b0">(</span><span class="s">"lora_model"</span><span class="b0">)</span>
+
+<span class="c"># merge the adapters back into 16-bit weights for a standalone model:</span>
+<span class="v0">model</span>.<span class="m2">save_pretrained_merged</span><span class="b0">(</span><span class="s">"merged_16bit"</span>, <span class="v1">tokenizer</span>, <span class="v4">save_method</span> = <span class="s">"merged_16bit"</span><span class="b0">)</span>
+
+<span class="c"># or export straight to GGUF for llama.cpp and Ollama:</span>
+<span class="v0">model</span>.<span class="m2">save_pretrained_gguf</span><span class="b0">(</span><span class="s">"gguf_model"</span>, <span class="v1">tokenizer</span>, <span class="v3">quantization_method</span> = <span class="s">"q4_k_m"</span><span class="b0">)</span></code></pre></div>
+          <p>
+            The <a href="/oss/llama-cpp">llama.cpp</a> GGUF export is a
+            first-class path, not an afterthought, which is a large part of why
+            Unsloth is popular for the whole train-then-run-locally loop. For
+            fast generation from the fine-tuned model in the same process, flip
+            the model into inference mode:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="v1">FastLanguageModel</span>.<span class="m2">for_inference</span><span class="b0">(</span><span class="v0">model</span><span class="b0">)</span>   <span class="c"># enables the fused inference path</span>
+<span class="v2">out</span> = <span class="v0">model</span>.<span class="m2">generate</span><span class="b0">(</span>**<span class="m1">tokenizer</span><span class="b1">(</span><span class="s">"Hello"</span>, <span class="v1">return_tensors</span> = <span class="s">"pt"</span><span class="b1">)</span>.<span class="m2">to</span><span class="b1">(</span><span class="s">"cuda"</span><span class="b1">)</span><span class="b0">)</span></code></pre></div>
+          <p>
+            Now the mistakes beginners make. First, the import ordering above,
+            which is the single most common cause of a fine-tune that runs but
+            is mysteriously not faster. Second, expecting multi-GPU
+            <code>device_map = "auto"</code> sharding to behave like a
+            distributed trainer, the open-source path is built around one
+            device and picks <code>device_map = "sequential"</code> by default.
+            Third, passing a raw Hugging Face model to
+            <code>get_peft_model</code>, it expects the object returned by
+            <code>FastLanguageModel.from_pretrained</code>, because that object
+            is already patched. Fourth, and most conceptually,
+            <mark>Unsloth changes the implementation of the hot paths, never
+            their result, so if a fine-tune diverges from a stock run the bug is
+            almost always in your data or hyperparameters, not in the
+            kernels.</mark>
+          </p>
+
+          <h2>Part III: When it is the right tool</h2>
+          <p>
+            Unsloth is the right tool when you are fine-tuning (LoRA, QLoRA, or
+            full) a supported open model on a single GPU and you want the run to
+            fit and finish. That covers most of the practical fine-tuning world,
+            adapting Llama, Mistral, Gemma, Qwen, Phi, and their kin on one
+            consumer or datacenter card, teaching in a notebook, and the
+            train-quantize-serve loop that ends in a GGUF running under
+            <a href="/oss/llama-cpp">llama.cpp</a> or Ollama. It supports the
+            usual objectives (supervised fine-tuning, DPO, and GRPO-style RL
+            through TRL) and has grown paths for vision models
+            (<code>FastVisionModel</code>) and for reasoning-style RL with a
+            <a href="/oss/vllm">vLLM</a>-backed rollout for generation.
+          </p>
+          <p>
+            The honest cases for alternatives. Plain Hugging Face
+            <code>peft</code> plus <code>bitsandbytes</code> when you want the
+            most vanilla, most portable stack and do not care about the last 2x,
+            since that is exactly what Unsloth patches on top of. Axolotl or
+            LLaMA-Factory when you want a configuration-driven trainer with many
+            recipes and multi-GPU orchestration handled for you, and are happy to
+            let them own the run. torchtune when you want the PyTorch team's own
+            native fine-tuning library with first-class distributed support.
+            <a href="/oss/torchtitan">torchtitan</a> when the task is
+            pretraining across many nodes rather than adapting a checkpoint on
+            one. And if all you want is the fused kernels as composable pieces to
+            drop into your own model code, the Liger Kernel project offers a
+            similar set of Triton kernels with a more a-la-carte philosophy.
+            Unsloth's distinctive bet is the tight package, patched model plus
+            kernels plus checkpointing plus export, tuned to run on the smallest
+            hardware that could plausibly work.
+          </p>
+          <p>
+            The architecture-shaped warning is about where the speed does and
+            does not come from. Unsloth accelerates the parts of a step it
+            rewrote, and attention itself is not one of them. The attention math
+            is delegated to <a href="/oss/flash-attention">FlashAttention</a> or
+            xformers, whose kernels are already excellent, so on a very
+            attention-bound workload (extremely long sequences, tiny MLPs) the
+            headline multiplier shrinks toward what the attention library alone
+            gives you. The wins concentrate where Unsloth actually lives, the
+            projections and their LoRA adapters, the norms, the rotary
+            embeddings, the SwiGLU MLP, and the loss over a large vocabulary.
+            Knowing that keeps expectations honest, a claimed 2x is a fine-tuning
+            average, not a promise for every shape.
+          </p>
+
+          <h2>Part IV: The full life of one training step</h2>
+          <p>
+            The specimen: one optimizer step of a QLoRA fine-tune of Llama 3.1
+            8B, loaded in 4-bit with LoRA adapters on the seven projection
+            matrices and <code>use_gradient_checkpointing = "unsloth"</code>.
+            The TRL trainer calls the model's forward, computes a loss, calls
+            backward, and steps the optimizer, exactly as it would for a stock
+            model. What follows is what happens inside that call once Unsloth has
+            patched the classes.
+          </p>
+
+          <h3>Stage 1: the forward enters a patched model</h3>
+          <p>
+            At load time <code>pre_patch()</code> in the model module set
+            <code>LlamaAttention.forward = LlamaAttention_fast_forward</code>,
+            replaced the decoder layer and model <code>forward</code> methods,
+            and wrapped the causal-LM head with
+            <code>CausalLM_fast_forward</code>. So when the trainer calls the
+            model, control immediately enters Unsloth's code rather than the
+            stock transformers implementation. The hidden states flow into the
+            first decoder block. Nothing about the module tree changed, the
+            weights are still <code>self.q_proj</code> and friends, only the
+            <code>forward</code> functions were swapped.
+          </p>
+
+          <h3>Stage 2: the input RMSNorm</h3>
+          <p>
+            The block's first operation is the input RMSNorm, which now routes
+            through <code>fast_rms_layernorm</code>. That calls the
+            <code>Fast_RMS_Layernorm</code> autograd function, whose forward
+            launches a Triton kernel that reads the row, computes the mean
+            square, and writes the normalized, scaled output in one pass. Crucially
+            it saves only the input and the per-row reciprocal standard deviation
+            for backward, not the several intermediate tensors a naive graph of
+            square, mean, rsqrt, multiply would each stash. That single decision,
+            repeated at every norm in every block, is a large slice of the memory
+            savings.
+          </p>
+
+          <h3>Stage 3: QKV projection through the fused LoRA path</h3>
+          <p>
+            The normalized hidden state hits the query, key, and value
+            projections. Because the base weights are 4-bit and each has a LoRA
+            adapter, this is where <code>LoRA_QKV</code> earns its keep. Its
+            forward dequantizes each 4-bit weight on the fly with
+            <code>fast_dequantize</code>, computes the base projection, and adds
+            the low-rank adapter contribution through <code>matmul_lora</code>,
+            fusing the three projections and their adapters so the dequantized
+            weights are used and discarded without being written back to memory.
+            The manual backward recomputes what it needs rather than holding the
+            full-precision projections resident across the whole backward pass.
+          </p>
+
+          <h3>Stage 4: rotary embeddings and attention</h3>
+          <p>
+            The query and key tensors are rotated by
+            <code>fast_rope_embedding</code>, which calls
+            <code>Fast_RoPE_Embedding</code>. Its forward reshapes the heads,
+            groups them (an internal <code>ROPE_GROUP_SIZE</code> amortizes the
+            cosine and sine loads across several heads), and applies the rotation
+            in a Triton kernel. It saves only the small cosine and sine tables in
+            the context, and the backward re-runs the same kernel with a
+            backward flag rather than storing the rotated activations. Attention
+            itself is then handed to FlashAttention or xformers. This is the
+            honest seam of the design, Unsloth wraps and feeds the best available
+            attention kernel rather than reimplementing the
+            <a href="/ml/attention">attention</a> tiling story, which is told in
+            the <a href="/oss/flash-attention">FlashAttention chapter</a>.
+          </p>
+
+          <h3>Stage 5: output projection, residual, and the MLP</h3>
+          <p>
+            The attention output passes through the output projection (a
+            <code>LoRA_W</code> single-matrix fused path), adds the residual, and
+            hits the post-attention RMSNorm, another
+            <code>Fast_RMS_Layernorm</code>. Then the gated MLP, which is the
+            single most fused thing in the codebase. <code>LoRA_MLP</code>, via
+            <code>apply_lora_mlp_swiglu</code>, takes the up and gate projections
+            (base plus adapter), applies the SwiGLU activation with the
+            <code>swiglu_fg_kernel</code>, and runs the down projection, all as
+            one autograd function. The intermediate activation, which for an 8B
+            model is large, is never handed to PyTorch's autograd to save.
+            Instead the manual backward recomputes it with
+            <code>swiglu_DWf_DW_dfg_kernel</code> and produces the parameter and
+            input gradients directly. That fusion is where a big share of both
+            the speed and the VRAM headroom comes from.
+          </p>
+
+          <h3>Stage 6: the loss over a large vocabulary</h3>
+          <p>
+            After the final norm, the language-model head projects the last
+            hidden states to logits and <code>CausalLM_fast_forward</code>
+            computes the loss with <code>fast_cross_entropy_loss</code>. Its
+            forward, <code>Fast_CrossEntropyLoss</code>, launches a Triton kernel
+            that computes a numerically stable log-sum-exp per row and the loss,
+            saving only the per-row log-sum-exp (a float32 vector of length
+            <em>rows</em>) rather than the full softmax matrix. For a small
+            vocabulary a single kernel handles a row. For a large vocabulary like
+            Gemma's 256K it splits each row into chunks, takes a log-sum-exp per
+            chunk, and reduces them, using the identity that a log-sum-exp of
+            per-chunk log-sum-exps equals the global one. The backward recomputes
+            the gradient of the logits in place. Saving one scalar per token
+            instead of a full <em>rows</em> by <em>vocab</em> softmax is the same
+            <a href="/ml/softmax">online-softmax</a> idea that powers streaming
+            attention, applied to the loss, and it is why the classifier head
+            stops being the memory bottleneck.
+          </p>
+
+          <h3>Stage 7: backward, offloaded activations, and the step</h3>
+          <p>
+            The trainer calls <code>loss.backward()</code>. Because each block
+            was wrapped by the <code>"unsloth"</code> gradient checkpointer, the
+            block activations were not kept on the GPU during forward, they were
+            offloaded to pinned CPU RAM. As backward reaches each block the
+            checkpointer streams that block's inputs back to the GPU
+            asynchronously, overlapping the copy with the compute of the block
+            after it, recomputes the forward, and lets the manual backward passes
+            above run. Gradients accumulate only into the LoRA adapter tensors,
+            since the 4-bit base weights are frozen, so the gradient and
+            optimizer state footprint is tiny relative to the model. Finally the
+            8-bit AdamW optimizer steps the adapters. That closes one step,
+            tokens in, a handful of small adapter gradients out, and a peak
+            memory dominated by a few resident tensors rather than a full
+            autograd tape.
+          </p>
+
+          <h2>Part V: Internals deep dives</h2>
+
+          <h3>Deep dive: manual autograd, and why it saves memory</h3>
+          <p>
+            PyTorch's autograd is general, so for a chain like
+            <code>rsqrt(mean(x*x)) * x * weight</code> it records every
+            intermediate as a node and saves whatever each node's backward will
+            need. That generality is exactly the cost. Unsloth's answer is to
+            write each hot path as a <code>torch.autograd.Function</code> with a
+            hand-derived <code>backward</code>, which lets it make two moves the
+            generic engine cannot. It fuses the whole chain into one Triton
+            kernel launch, and it chooses to save the minimum and recompute the
+            rest. The verified examples make this concrete. RMSNorm saves the
+            input and the reciprocal standard deviation, nothing else. RoPE saves
+            only the cosine and sine tables and re-applies the rotation backward
+            by flipping a flag. Cross-entropy saves one log-sum-exp scalar per
+            token and reconstructs the gradient in the backward kernel. The MLP
+            saves the projection inputs and recomputes the SwiGLU intermediate.
+            <mark>Custom autograd turns memory from a tax the framework collects
+            automatically into a resource the author spends deliberately, and
+            recomputation is nearly always cheaper than the memory traffic of
+            keeping a large intermediate resident.</mark> This is the recompute
+            side of the same coin as activation checkpointing, pushed down to the
+            granularity of individual operators.
+          </p>
+
+          <h3>Deep dive: the hot kernels</h3>
+          <p>
+            The kernels live in <code>unsloth/kernels/</code>, and the list is
+            short on purpose, because a fine-tuning step really is dominated by a
+            few operations. Each pairs a Triton kernel with a hand-written
+            backward:
+          </p>
+          <table>
+            <tr><th>Op</th><th>Kernel file</th><th>Autograd / entry</th><th>What it saves</th></tr>
+            <tr><td>RMSNorm</td><td>rms_layernorm.py</td><td>Fast_RMS_Layernorm / fast_rms_layernorm</td><td>input + reciprocal std</td></tr>
+            <tr><td>RoPE</td><td>rope_embedding.py</td><td>Fast_RoPE_Embedding / fast_rope_embedding</td><td>cos + sin tables only</td></tr>
+            <tr><td>SwiGLU / GeGLU</td><td>swiglu.py, geglu.py</td><td>swiglu_fg_kernel, swiglu_DWf_DW_dfg_kernel</td><td>projection inputs, MLP intermediate recomputed</td></tr>
+            <tr><td>Cross-entropy</td><td>cross_entropy_loss.py</td><td>Fast_CrossEntropyLoss / fast_cross_entropy_loss</td><td>one log-sum-exp per token</td></tr>
+            <tr><td>LoRA fusion</td><td>fast_lora.py</td><td>LoRA_MLP, LoRA_QKV, LoRA_W</td><td>base + adapter fused, dequant transient</td></tr>
+          </table>
+          <p>
+            A few details reward a close read. The cross-entropy kernel takes
+            <code>logit_softcapping</code> and <code>logit_scaling</code>
+            arguments, because Gemma-2 caps logits and some models scale them,
+            and folding that into the loss kernel avoids a separate pass over the
+            whole logits tensor. The chunked log-sum-exp path only turns on above
+            roughly a 65K vocabulary, so Llama and Mistral use the single-kernel
+            path and Gemma's 256K vocabulary uses the chunked one. The RoPE
+            kernel groups heads so a single load of the cosine and sine tables
+            serves several heads at once. None of these are approximations,
+            which is the repeated theme, the kernels are engineered to produce
+            the same numbers faster, and Unsloth leans hard on that exactness as
+            a correctness guarantee. If you want to understand the Triton
+            programming model these kernels are written in, blocks and program
+            ids and masked loads, the <a href="/classes/parallel-computing">parallel
+            computing class notes</a> build it up from GPU first principles.
+          </p>
+
+          <h3>Deep dive: model patching, the load-time swap</h3>
+          <p>
+            The mechanism that connects those kernels to a real model is
+            monkey-patching. <code>FastLanguageModel.from_pretrained</code> in
+            <code>loader.py</code> inspects the model type and dispatches to a
+            per-family class, <code>FastLlamaModel</code>,
+            <code>FastMistralModel</code>, <code>FastGemma2Model</code>,
+            <code>FastQwen3Model</code>, and so on. Before the weights are
+            loaded, that class runs a <code>pre_patch()</code> that reassigns
+            methods on the live <code>transformers</code> classes, for example
+            <code>LlamaAttention.forward = LlamaAttention_fast_forward</code>,
+            the decoder layer forward, the model forward, and the loss function.
+            The model that gets instantiated is a completely ordinary
+            transformers module, it simply has faster methods. This is why
+            Unsloth composes with the ecosystem instead of replacing it, the
+            object you get back is still something TRL, PEFT, and
+            <code>generate</code> all understand.
+          </p>
+          <p>
+            Two supporting pieces matter. <code>mapper.py</code> maps ordinary
+            model names to Unsloth's pre-quantized 4-bit repositories (the
+            <code>...-bnb-4bit</code> ones), so asking for a base model can
+            transparently pull a 4-bit copy that downloads faster and skips a
+            local quantization step. And <code>_utils.py</code> holds the shared
+            patching helpers and the version and dependency checks, including the
+            gradient-checkpointing patchers imported from the companion
+            <code>unsloth_zoo</code> package. The obvious fragility of this
+            approach is that it binds to the internals of a fast-moving library,
+            transformers changes an attention signature and a patch must follow,
+            which is precisely why Unsloth pins and tests against specific
+            transformers versions and warns loudly on mismatches. The layout of
+            which family lives in which file (<code>llama.py</code>,
+            <code>mistral.py</code>, <code>gemma2.py</code>,
+            <code>qwen3.py</code>, and the newer additions) changes as models are
+            added, so treat the dispatch table in <code>loader.py</code> as the
+            source of truth rather than any fixed list.
+          </p>
+
+          <h3>Deep dive: LoRA fusion and 4-bit dequantization</h3>
+          <p>
+            QLoRA loads the base weights in 4-bit NF4 through
+            <code>bitsandbytes</code> and trains small low-rank adapters on top.
+            The naive way to run that is to dequantize a weight to 16-bit,
+            matmul, then separately add the adapter, which touches memory several
+            times. Unsloth's fused LoRA path collapses it. <code>matmul_lora</code>
+            and <code>fast_dequantize</code> in <code>kernels/utils.py</code> let
+            <code>LoRA_MLP</code>, <code>LoRA_QKV</code>, and <code>LoRA_W</code>
+            dequantize a weight, use it, and drop it without writing the
+            full-precision copy back, while computing the base and adapter
+            contributions together. The autograd functions also arrange the
+            backward so that the adapter gradients, the only trainable ones, are
+            the primary output, and the frozen 4-bit base contributes to the
+            input gradient without accumulating any gradient of its own.
+            <mark>Freezing the base is what makes the optimizer state tiny, and
+            fusing the dequantize-matmul-adapter chain is what keeps the transient
+            16-bit weights from ever becoming resident memory pressure.</mark> The
+            requirement that <code>lora_dropout = 0</code> and
+            <code>bias = "none"</code> to unlock the fastest path comes straight
+            from this, dropout or a bias term breaks the fused expression and
+            forces a more general, slower route.
+          </p>
+
+          <h3>Deep dive: the offloaded gradient checkpointer</h3>
+          <p>
+            Setting <code>use_gradient_checkpointing = "unsloth"</code> selects
+            <code>Unsloth_Offloaded_Gradient_Checkpointer</code>, which lives in
+            the <code>unsloth_zoo.gradient_checkpointing</code> module and is
+            wired in through <code>_utils.py</code>. Ordinary gradient
+            checkpointing trades compute for memory by discarding a block's
+            activations during forward and recomputing them during backward.
+            Unsloth's variant adds a second trade, it moves the small set of
+            tensors it does keep off the GPU entirely, into pinned CPU RAM, and
+            streams them back asynchronously when backward reaches that block, so
+            the copy overlaps with adjacent compute. The effect is that peak GPU
+            memory stops scaling with sequence length the way a resident
+            activation tape would, which is the concrete reason Unsloth
+            advertises much longer context on the same card. The cost is PCIe
+            bandwidth and some added complexity, paid back by the overlap. It is
+            the same recompute-and-move instinct as the manual autograd, lifted
+            from the operator level to the block level.
+          </p>
+
+          <h2>Part VI: Reading the repository</h2>
+          <p>
+            The tree rewards reading kernels-first, because the kernels are the
+            thesis and the model files are the plumbing that installs them. Paths
+            below are from the repository in July 2026 and the newer model files
+            in particular change as families are added.
+          </p>
+          <p>
+            <strong>Stage 0, orientation.</strong> Read the top of
+            <code>unsloth/kernels/__init__.py</code> to see the exported surface,
+            the fast cross-entropy, RMSNorm, layernorm, RoPE, SwiGLU and GeGLU
+            kernels, the fused LoRA entry points, and the dequant utilities. That
+            one file is a map of everything Unsloth actually replaced. Question,
+            which operations are here and, just as telling, which are not
+            (attention is not).
+          </p>
+          <p>
+            <strong>Stage 1, one kernel end to end.</strong>
+            <code>kernels/rope_embedding.py</code> is the friendliest, read
+            <code>Fast_RoPE_Embedding.forward</code> and <code>backward</code>
+            together and notice that the context saves only the cosine and sine
+            tables and the backward re-runs the kernel with a backward flag. Then
+            <code>kernels/rms_layernorm.py</code> for the same pattern with a
+            saved reciprocal standard deviation. Question, what does each
+            <code>forward</code> stash in <code>ctx</code>, and what does that
+            imply for peak memory?
+          </p>
+          <p>
+            <strong>Stage 2, the loss.</strong>
+            <code>kernels/cross_entropy_loss.py</code> is the best single
+            demonstration of the whole philosophy. Read the single-row kernel and
+            then the chunked one, and find the comment deriving that a log-sum-exp
+            over per-chunk log-sum-exps equals the global log-sum-exp. Question,
+            why does saving a per-row log-sum-exp instead of the softmax matrix
+            change the memory class of the LM head, and how do
+            <code>logit_softcapping</code> and <code>logit_scaling</code> fold in?
+          </p>
+          <p>
+            <strong>Stage 3, the fused LoRA MLP.</strong>
+            <code>kernels/swiglu.py</code> for the forward-gate and combined
+            backward kernels, then <code>kernels/fast_lora.py</code> for
+            <code>LoRA_MLP</code>, <code>LoRA_QKV</code>, and <code>LoRA_W</code>,
+            with <code>kernels/utils.py</code> for <code>matmul_lora</code> and
+            <code>fast_dequantize</code>. Question, where is the SwiGLU
+            intermediate recomputed rather than saved, and why do zero dropout and
+            no bias unlock this path?
+          </p>
+          <p>
+            <strong>Stage 4, the patching machinery.</strong>
+            <code>models/loader.py</code> for the dispatch from model type to a
+            per-family class and the <code>from_pretrained</code> signature, then
+            <code>models/llama.py</code> for <code>pre_patch()</code>,
+            <code>LlamaAttention_fast_forward</code>,
+            <code>CausalLM_fast_forward</code>, and the
+            <code>get_peft_model</code> that injects adapters. Then
+            <code>models/mapper.py</code> for the 4-bit name mapping and
+            <code>models/_utils.py</code> for the shared helpers and the gradient
+            checkpointer wiring. Question, at what exact moment does the
+            transformers class get its <code>forward</code> replaced, and why must
+            <code>import unsloth</code> precede importing transformers?
+          </p>
+          <p>
+            <strong>Stage 5, the frontier.</strong> <code>models/rl.py</code> and
+            <code>models/rl_replacements.py</code> for the DPO and GRPO patches
+            over TRL, <code>models/vision.py</code> and the
+            <code>FastVisionModel</code> path, the <code>kernels/moe/</code>
+            subpackage and the MoE model files (<code>qwen3_moe.py</code>,
+            <code>glm4_moe.py</code>) for expert layers, and
+            <code>kernels/fp8.py</code> for the FP8 linear patches. These are the
+            most active and least stable corners, read them last.
+          </p>
+          <p>
+            Where not to start, the per-family model files are long and full of
+            version-specific special cases (softcapping, sliding windows,
+            inference fast paths), and reading them before the kernels makes the
+            kernels look like magic they call. Read the kernels first and the
+            model files read like careful glue.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            Labs 1 through 4 need one GPU (a free Colab T4 is enough for a small
+            model). Lab 5 needs only CPU plus llama.cpp. Log formats and exact
+            numbers vary with hardware and version.
+          </p>
+          <p><strong>Lab 1: a real QLoRA fine-tune.</strong> Concept: the whole loop of Part II and IV.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">unsloth</span> <span class="k">import</span> <span class="m1">FastLanguageModel</span>
+<span class="k">from</span> <span class="m1">trl</span> <span class="k">import</span> <span class="m1">SFTTrainer</span>, <span class="m1">SFTConfig</span>
+<span class="k">from</span> <span class="m1">datasets</span> <span class="k">import</span> <span class="m1">load_dataset</span>
+
+<span class="v0">model</span>, <span class="v1">tok</span> = <span class="m1">FastLanguageModel</span>.<span class="m2">from_pretrained</span><span class="b0">(</span>
+    <span class="s">"unsloth/Llama-3.2-1B-Instruct"</span>, <span class="v2">max_seq_length</span> = <span class="n">2048</span>, <span class="v0">load_in_4bit</span> = <span class="k">True</span><span class="b0">)</span>
+<span class="v0">model</span> = <span class="m1">FastLanguageModel</span>.<span class="m2">get_peft_model</span><span class="b0">(</span>
+    <span class="v0">model</span>, <span class="v2">r</span> = <span class="n">16</span>, <span class="v0">use_gradient_checkpointing</span> = <span class="s">"unsloth"</span>, <span class="v6">random_state</span> = <span class="n">3407</span><span class="b0">)</span>
+
+<span class="v2">ds</span> = <span class="m1">load_dataset</span><span class="b0">(</span><span class="s">"yahma/alpaca-cleaned"</span>, <span class="v0">split</span> = <span class="s">"train[:1000]"</span><span class="b0">)</span>
+<span class="m1">SFTTrainer</span><span class="b0">(</span><span class="v0">model</span> = <span class="v0">model</span>, <span class="v1">tokenizer</span> = <span class="v1">tok</span>, <span class="v4">train_dataset</span> = <span class="v2">ds</span>,
+    <span class="v2">args</span> = <span class="m1">SFTConfig</span><span class="b1">(</span><span class="v0">max_steps</span> = <span class="n">60</span>, <span class="v1">per_device_train_batch_size</span> = <span class="n">2</span>,
+        <span class="v3">gradient_accumulation_steps</span> = <span class="n">4</span>, <span class="v4">learning_rate</span> = <span class="n">2e-4</span>,
+        <span class="v4">optim</span> = <span class="s">"adamw_8bit"</span>, <span class="v0">logging_steps</span> = <span class="n">1</span>, <span class="v2">output_dir</span> = <span class="s">"out"</span><span class="b1">)</span><span class="b0">)</span>.<span class="m2">train</span><span class="b0">()</span></code></pre></div>
+          <p>
+            Watch the loss fall over 60 steps and note the peak memory reported
+            at startup. This is the concrete thing Unsloth exists to make cheap.
+            Save the adapters with <code>model.save_pretrained("lora")</code> and
+            confirm the directory is only a few megabytes, that is the whole
+            point of freezing the 4-bit base.
+          </p>
+          <p><strong>Lab 2: prove the patches landed.</strong> Concept: the load-time monkey-patch.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">transformers</span>.<span class="m2">models</span>.<span class="m2">llama</span>.<span class="m2">modeling_llama</span> <span class="k">as</span> <span class="m1">L</span>
+<span class="m1">print</span><span class="b0">(</span><span class="m1">L</span>.<span class="m2">LlamaAttention</span>.<span class="m2">forward</span>.<span class="m2">__qualname__</span><span class="b0">)</span>   <span class="c"># stock name</span>
+<span class="k">import</span> <span class="m1">unsloth</span>
+<span class="k">from</span> <span class="m1">unsloth</span> <span class="k">import</span> <span class="m1">FastLanguageModel</span>
+<span class="v4">m</span>, <span class="v0">t</span> = <span class="m1">FastLanguageModel</span>.<span class="m2">from_pretrained</span><span class="b0">(</span><span class="s">"unsloth/Llama-3.2-1B-Instruct"</span>, <span class="v0">load_in_4bit</span> = <span class="k">True</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="m1">L</span>.<span class="m2">LlamaAttention</span>.<span class="m2">forward</span>.<span class="m2">__qualname__</span><span class="b0">)</span>   <span class="c"># now an Unsloth fast_forward</span></code></pre></div>
+          <p>
+            Observe that the same class attribute names a different function
+            after the Unsloth import. Then do the experiment that teaches the
+            ordering rule, in a fresh process import <code>transformers</code>
+            and build a model before importing <code>unsloth</code>, and confirm
+            the fast forward is not installed on that pre-existing instance.
+          </p>
+          <p><strong>Lab 3: measure the checkpointer.</strong> Concept: the offloaded gradient checkpointer of Part V.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="c"># run the Lab 1 fine-tune twice, changing only:</span>
+<span class="c">#   get_peft_model(..., use_gradient_checkpointing = True)        # standard</span>
+<span class="c">#   get_peft_model(..., use_gradient_checkpointing = "unsloth")   # offloaded</span>
+<span class="k">import</span> <span class="m1">torch</span>; <span class="m1">print</span><span class="b0">(</span><span class="m1">torch</span>.<span class="m2">cuda</span>.<span class="m2">max_memory_allocated</span><span class="b1">()</span> / <span class="n">1e9</span>, <span class="s">"GB"</span><span class="b0">)</span></code></pre></div>
+          <p>
+            Compare peak memory and step time between the two. The
+            <code>"unsloth"</code> mode should show lower peak memory, more so at
+            longer <code>max_seq_length</code>, and let you push a sequence
+            length or batch size that the standard mode cannot fit. That gap is
+            the CPU offload in Stage 7 made visible.
+          </p>
+          <p><strong>Lab 4: call a kernel directly and check it.</strong> Concept: exactness of the manual autograd.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">torch</span>
+<span class="k">from</span> <span class="m1">unsloth</span>.<span class="m2">kernels</span> <span class="k">import</span> <span class="m1">fast_cross_entropy_loss</span>
+
+<span class="v6">logits</span> = <span class="m1">torch</span>.<span class="m2">randn</span><span class="b0">(</span><span class="n">8</span>, <span class="n">32000</span>, <span class="v6">device</span> = <span class="s">"cuda"</span>, <span class="v3">dtype</span> = <span class="m1">torch</span>.<span class="m2">float32</span>, <span class="v5">requires_grad</span> = <span class="k">True</span><span class="b0">)</span>
+<span class="v3">labels</span> = <span class="m1">torch</span>.<span class="m2">randint</span><span class="b0">(</span><span class="n">0</span>, <span class="n">32000</span>, <span class="b1">(</span><span class="n">8</span>,<span class="b1">)</span>, <span class="v6">device</span> = <span class="s">"cuda"</span><span class="b0">)</span>
+<span class="v6">ref</span> = <span class="m1">torch</span>.<span class="m2">nn</span>.<span class="m2">functional</span>.<span class="m2">cross_entropy</span><span class="b0">(</span><span class="v6">logits</span>, <span class="v3">labels</span><span class="b0">)</span>
+<span class="v5">fast</span> = <span class="m1">fast_cross_entropy_loss</span><span class="b0">(</span><span class="v6">logits</span>, <span class="v3">labels</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="m1">float</span><span class="b1">(</span><span class="v6">ref</span><span class="b1">)</span>, <span class="m1">float</span><span class="b1">(</span><span class="v5">fast</span><span class="b1">)</span>, <span class="m1">abs</span><span class="b1">(</span><span class="m1">float</span><span class="b2">(</span><span class="v6">ref</span><span class="b2">)</span> - <span class="m1">float</span><span class="b2">(</span><span class="v5">fast</span><span class="b2">)</span><span class="b1">)</span><span class="b0">)</span></code></pre></div>
+          <p>
+            Confirm the two losses agree to floating-point tolerance, then
+            backward through each and compare the logit gradients. This is the
+            experiment that turns the exactness claim from marketing into
+            something you have checked with your own hands. Repeat with
+            <code>fast_rope_embedding</code> against a plain PyTorch rotary
+            implementation.
+          </p>
+          <p><strong>Lab 5: export and run locally.</strong> Concept: the train-then-serve loop.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="v0">model</span>.<span class="m2">save_pretrained_gguf</span><span class="b0">(</span><span class="s">"gguf_model"</span>, <span class="v1">tok</span>, <span class="v3">quantization_method</span> = <span class="s">"q4_k_m"</span><span class="b0">)</span></code></pre></div>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="c"># then load the produced .gguf in llama.cpp or Ollama</span>
+<span class="m1">ollama</span> <span class="s">create</span> <span class="s">mymodel</span> <span class="s">-f</span> <span class="s">Modelfile</span>      <span class="c"># Modelfile points at the exported gguf</span>
+<span class="m1">ollama</span> <span class="s">run</span> <span class="s">mymodel</span> <span class="s">"hello"</span></code></pre></div>
+          <p>
+            Confirm the fine-tuned behavior survives the round trip into
+            <a href="/oss/llama-cpp">llama.cpp</a>'s GGUF format and 4-bit
+            quantization. This closing step is why Unsloth is popular for the
+            complete loop rather than just the training minute.
+          </p>
+          <p><strong>Lab 6 (optional, needs more VRAM): GRPO with a vLLM rollout.</strong> Concept: RL fine-tuning reusing the same patched model.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="v0">model</span>, <span class="v1">tok</span> = <span class="v1">FastLanguageModel</span>.<span class="m2">from_pretrained</span><span class="b0">(</span>
+    <span class="s">"unsloth/Llama-3.2-3B-Instruct"</span>, <span class="v2">max_seq_length</span> = <span class="n">1024</span>,
+    <span class="v0">load_in_4bit</span> = <span class="k">True</span>, <span class="v4">fast_inference</span> = <span class="k">True</span><span class="b0">)</span>   <span class="c"># fast_inference uses vLLM for generation</span></code></pre></div>
+          <p>
+            With <code>fast_inference = True</code> the same model generates
+            rollouts through <a href="/oss/vllm">vLLM</a> and trains through the
+            Unsloth kernels, which is how GRPO-style RL fits on a single card.
+            Follow one of the project's GRPO notebooks for the reward and trainer
+            wiring, the point of the lab is to see that the acceleration and the
+            RL loop share one model object.
+          </p>
+
+          <h2>Part VIII: Questions and model answers</h2>
+          <p>Understanding checks. Answer aloud before reading.</p>
+          <p><strong>1. What is Unsloth, in one sentence?</strong></p>
+          <p>
+            A drop-in accelerator for LoRA and QLoRA fine-tuning that keeps the
+            model a plain Hugging Face transformer and rewrites only the hot
+            operations, RoPE, RMSNorm, the gated MLP, and cross-entropy, as
+            hand-derived autograd functions backed by Triton kernels, patched in
+            at load time.
+          </p>
+          <p><strong>2. Where does the speed and memory saving actually come from?</strong></p>
+          <p>
+            From fusing each hot path into one Triton kernel and writing its
+            backward by hand so it saves the minimum and recomputes the rest,
+            from fusing the 4-bit dequantize, base matmul, and LoRA adapter so
+            transient full-precision weights never become resident, from freezing
+            the base so optimizer state is tiny, and from offloading block
+            activations to CPU RAM. Attention itself is delegated to
+            FlashAttention or xformers and is not where the wins come from.
+          </p>
+          <p><strong>3. Why must you import unsloth before transformers and trl?</strong></p>
+          <p>
+            Because the import is what installs the monkey-patches that reassign
+            <code>forward</code> methods on the transformers classes. Import the
+            other libraries first and you build models that still point at the
+            stock, slow methods, so the run works but is not accelerated.
+          </p>
+          <p><strong>4. What does a custom autograd.Function buy over stock autograd here?</strong></p>
+          <p>
+            Two things the generic engine cannot do, fusing a whole operation
+            into one kernel launch, and deciding exactly which tensors to save
+            versus recompute. RMSNorm saves the input and reciprocal std, RoPE
+            saves only cos and sin, cross-entropy saves one log-sum-exp per
+            token, the MLP recomputes its SwiGLU intermediate. Memory becomes
+            something the author spends deliberately rather than a tax the
+            framework collects on every intermediate.
+          </p>
+          <p><strong>5. Why can cross-entropy save just one scalar per token?</strong></p>
+          <p>
+            Because the loss and its gradient can be reconstructed in the backward
+            kernel from the row's log-sum-exp and the stored logits, so the full
+            <em>rows</em> by <em>vocab</em> softmax never needs to be kept. For a
+            256K vocabulary it computes the log-sum-exp in chunks and reduces
+            them, using the identity that a log-sum-exp of per-chunk log-sum-exps
+            is the global one. It is the online-softmax trick applied to the loss.
+          </p>
+          <p><strong>6. How does the model get patched without forking transformers?</strong></p>
+          <p>
+            <code>from_pretrained</code> dispatches on model type to a per-family
+            class whose <code>pre_patch()</code> reassigns methods on the live
+            transformers classes, for example
+            <code>LlamaAttention.forward = LlamaAttention_fast_forward</code>,
+            before the weights load. The instantiated model is an ordinary
+            transformers module with faster methods, so PEFT, TRL, and
+            <code>generate</code> all still understand it.
+          </p>
+          <p><strong>7. What is special about use_gradient_checkpointing = "unsloth"?</strong></p>
+          <p>
+            It selects the offloaded checkpointer, which not only discards and
+            recomputes block activations but moves the tensors it keeps to pinned
+            CPU RAM and streams them back asynchronously during backward,
+            overlapping the copy with compute. That decouples peak GPU memory from
+            sequence length and is why much longer context fits on the same card.
+          </p>
+          <p><strong>8. Why do lora_dropout = 0 and bias = "none" matter for speed?</strong></p>
+          <p>
+            Because the fully fused LoRA MLP and attention paths express the base
+            plus adapter as one computation. A nonzero dropout or an added bias
+            term breaks that fused expression and forces a more general, slower
+            route, so the fastest path is unlocked only at those values.
+          </p>
+          <p><strong>9. Does Unsloth change training results relative to a stock run?</strong></p>
+          <p>
+            No, the kernels are engineered to be exact rather than approximate, so
+            for the same seed, data, and hyperparameters the numerics match to
+            floating-point tolerance. If a fine-tune diverges from a stock run the
+            cause is almost always the data or configuration, not the kernels,
+            which is a claim you can and should verify directly.
+          </p>
+          <p><strong>10. Why is attention not accelerated by an Unsloth kernel?</strong></p>
+          <p>
+            Because FlashAttention and xformers already provide near-optimal
+            attention kernels, so Unsloth wraps and feeds them rather than
+            reimplementing the tiling and online-softmax math. On a strongly
+            attention-bound shape the headline multiplier therefore shrinks toward
+            what the attention library alone delivers.
+          </p>
+          <p><strong>11. When would you reach for Axolotl, torchtune, or torchtitan instead?</strong></p>
+          <p>
+            Axolotl or LLaMA-Factory for a configuration-driven trainer with
+            recipes and multi-GPU orchestration handled for you. torchtune for
+            the PyTorch team's native fine-tuning library with first-class
+            distributed support. torchtitan when the task is multi-node
+            pretraining rather than single-GPU adaptation. Unsloth wins when you
+            want the smallest hardware that could work to fit and finish a
+            fine-tune fast.
+          </p>
+          <p><strong>12. A fine-tune runs but is no faster than a plain PEFT run. First suspect?</strong></p>
+          <p>
+            Import order. If <code>transformers</code> or a model was imported or
+            built before <code>import unsloth</code>, the fast forwards were never
+            installed. Confirm by printing the qualified name of a patched
+            class's <code>forward</code> before and after the Unsloth import.
+          </p>
+          <p><strong>13. What is in a saved adapter, and why is it tiny?</strong></p>
+          <p>
+            Only the low-rank LoRA matrices for the targeted projections, a few
+            megabytes, because the 4-bit base is frozen and untouched. To ship a
+            standalone model you merge the adapters back into 16-bit weights with
+            <code>save_pretrained_merged</code>, or export straight to GGUF for
+            llama.cpp with <code>save_pretrained_gguf</code>.
+          </p>
+          <p><strong>14. Why does Unsloth pin specific transformers versions?</strong></p>
+          <p>
+            Because monkey-patching binds to transformers internals, an attention
+            signature or a forward structure changing upstream can break a patch.
+            Pinning and version checks let Unsloth guarantee the patched paths
+            match the library it is patching, and it warns rather than silently
+            misbehaving on a mismatch.
+          </p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Optimize the short list, not the whole program.</strong>
+            A fine-tuning step spends its time and memory in a handful of
+            operations, so Unsloth rewrites exactly those and leaves everything
+            else alone. Finding the true hot set and going deep on it beats
+            spreading effort evenly, which is the profile-first instinct behind
+            every serious performance win.
+          </p>
+          <p>
+            <strong>Spend memory deliberately with manual backward.</strong>
+            Generic autograd saves an intermediate for every op by default.
+            Writing the backward by hand turns saved memory into an explicit
+            choice, save the reciprocal std, recompute the SwiGLU, keep one
+            log-sum-exp per token. Recomputation is usually cheaper than the
+            memory traffic of keeping a large tensor resident.
+          </p>
+          <p>
+            <strong>Ride the ecosystem, do not replace it.</strong> By patching
+            live transformers classes instead of forking the model, Unsloth stays
+            compatible with PEFT, TRL, and <code>generate</code> for free. The
+            cost is a tight coupling to upstream internals, paid for with version
+            pins. Extending a system from the outside keeps its whole surrounding
+            world usable.
+          </p>
+          <p>
+            <strong>Exactness is a feature, market it.</strong> Because the
+            kernels reproduce the same numbers, Unsloth can promise no accuracy
+            change and invite users to verify it. An optimization you can prove
+            equivalent is far easier to adopt than one that asks for trust, and it
+            makes debugging tractable, any divergence is your bug, not the kernel's.
+          </p>
+          <p>
+            <strong>Normalize by the global token count.</strong> Unsloth's team
+            surfaced and fixed a subtle gradient-accumulation bug where a loss
+            averaged per microbatch, rather than over the total valid tokens,
+            silently mis-weights variable-length sequences across accumulation
+            steps. This is the same correctness point that
+            <a href="/oss/torchtitan">torchtitan</a> makes by all-reducing the
+            valid-token count before computing the loss, whenever you split a
+            batch, normalize by the global count, not the per-shard one.
+          </p>
+          <p>
+            <strong>Make the smallest hardware the target.</strong> Designing so
+            a real fine-tune fits on a free T4 forces every VRAM decision to be
+            honest and puts the tool in far more hands than a design that assumes
+            an eight-GPU box. Constraining to the cheapest plausible machine is a
+            product decision as much as an engineering one.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            The one-sentence summary: <mark>Unsloth patches a stock Hugging Face
+            model at load time so its hot paths, RoPE, RMSNorm, the fused LoRA
+            gated MLP, and cross-entropy, become hand-written Triton kernels with
+            manual backward passes that save the minimum and recompute the rest,
+            and it offloads block activations to CPU RAM, so an ordinary fine-tune
+            runs about twice as fast in a fraction of the VRAM with identical
+            numerics.</mark>
+          </p>
+          <pre class="flow">import unsloth (installs the patches) -&gt; FastLanguageModel.from_pretrained (4-bit, dispatch, pre_patch)
+  -&gt; get_peft_model (LoRA adapters, freeze base, "unsloth" checkpointing)
+  -&gt; SFTTrainer.train (ordinary loop) -&gt; fused RoPE/RMSNorm/SwiGLU-MLP/cross-entropy
+  -&gt; backward with recompute + CPU-offloaded activations -&gt; 8-bit AdamW on adapters
+  -&gt; save adapter / merged 16-bit / GGUF</pre>
+          <p>The chain mapped to source:</p>
+          <pre class="flow">entry            unsloth/models/loader.py (FastLanguageModel, from_pretrained, dispatch)
+patching         models/llama.py (pre_patch, *_fast_forward, get_peft_model), models/mapper.py, models/_utils.py
+kernels          kernels/rope_embedding.py, rms_layernorm.py, swiglu.py, cross_entropy_loss.py
+lora fusion      kernels/fast_lora.py (LoRA_MLP, LoRA_QKV, LoRA_W), kernels/utils.py (matmul_lora, fast_dequantize)
+checkpointing    use_gradient_checkpointing="unsloth" -&gt; unsloth_zoo.gradient_checkpointing (offloaded)
+export           save_pretrained_merged, save_pretrained_gguf -&gt; llama.cpp / Ollama</pre>
+          <p>Memorize these blocks:</p>
+          <ul>
+            <li><strong>The hot set:</strong> RoPE, RMSNorm, SwiGLU/GeGLU MLP, cross-entropy, and the fused LoRA matmuls. Attention is delegated to FlashAttention or xformers, not rewritten.</li>
+            <li><strong>Manual autograd rule:</strong> fuse into one kernel, save the minimum (reciprocal std, cos/sin, one log-sum-exp per token), recompute the rest in backward.</li>
+            <li><strong>Patch, don't fork:</strong> import unsloth first, it reassigns forward methods on live transformers classes so PEFT, TRL, and generate still work.</li>
+            <li><strong>QLoRA math:</strong> 4-bit NF4 base frozen, tiny LoRA adapters trained, dequant-matmul-adapter fused, lora_dropout=0 and bias="none" unlock the fastest path.</li>
+            <li><strong>Offloaded checkpointing:</strong> "unsloth" mode streams block activations to pinned CPU RAM and back, decoupling peak memory from sequence length.</li>
+            <li><strong>Scope:</strong> single GPU or single node, exact numerics, roughly 2x faster and around 70% less VRAM on the open-source path.</li>
+          </ul>
+
+          <h2>Part XI: Final takeaway</h2>
+          <p>
+            If the single-device pieces this project assumes are the gap, the
+            <a href="/ml">ML implementations section</a> builds LoRA, attention,
+            and normalization from scratch, the <a href="/ml/softmax">softmax and
+            cross-entropy</a> notes derive the log-sum-exp trick the loss kernel
+            uses, the <a href="/ml/mixed-precision">mixed-precision</a> notes
+            cover the bf16 and 4-bit numerics, and the
+            <a href="/classes/parallel-computing">parallel computing class</a>
+            teaches the Triton model these kernels are written in. Then read
+            <code>kernels/rope_embedding.py</code> once more, it will read like an
+            ordinary rotary embedding that simply refused to save what it could
+            recompute, which is the entire idea.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> Unsloth shows that most of a
+            fine-tuning bill is paid in a handful of operations, and that you can
+            reclaim it without a new framework. Keep the model a plain Hugging
+            Face transformer, rewrite only the hot paths as fused Triton kernels
+            with hand-derived backward passes that save the minimum, freeze the
+            4-bit base and train tiny adapters, offload activations to CPU RAM,
+            and the same fine-tune fits on the smallest card that could work and
+            finishes in half the time, with numerics you can prove are unchanged.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/code-copy.js"></script>
+      <script defer src="/theme.js"></script>
+  </body>
+</html>

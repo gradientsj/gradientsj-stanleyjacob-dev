@@ -1,0 +1,1186 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ray walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A full chapter on ray-project/ray: the distributed compute substrate under modern ML infra. Tasks and actors, the shared-memory object store and ownership-based reference counting, distributed scheduling through the raylet and GCS, the full life of one remote call, deep dives on Ray Data, Ray Train, Ray Serve, and RLlib, why Ray became the control plane for LLM RLHF where verl and OpenRLHF build on it, a staged reading plan, labs, and understanding checks." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+      <script>(function(){try{var t=localStorage.getItem("theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>Ray</h1>
+        <p class="lead">
+          <a href="https://github.com/ray-project/ray" target="_blank" rel="noreferrer">Ray</a>
+          is the distributed compute substrate that sits under much of modern
+          ML infrastructure. It takes an ordinary Python program and turns it
+          into a cluster program using two primitives, stateless <em>tasks</em>
+          and stateful <em>actors</em>, that communicate through an immutable
+          shared-memory object store of futures. On top of that core sit the
+          libraries most teams actually touch, Ray Data for streaming data and
+          batch inference, Ray Train for distributed training, Ray Serve for
+          model serving, and RLlib for reinforcement learning. This chapter is
+          three things at once. It is a practical tutorial for writing and
+          launching real Ray programs. It is a systems-internals walkthrough
+          that follows one remote call from <code>f.remote(x)</code> down
+          through ownership, the raylet, and the object store and back up to
+          <code>ray.get</code>. And it explains why Ray quietly became the
+          control plane for LLM RLHF, the layer that
+          <a href="https://github.com/volcengine/verl" target="_blank" rel="noreferrer">verl</a>
+          and
+          <a href="https://github.com/OpenRLHF/OpenRLHF" target="_blank" rel="noreferrer">OpenRLHF</a>
+          build on. It ends with runnable labs, understanding checks with
+          model answers, and a compact framework for keeping the whole system
+          in your head.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">your driver          ray.init()   one Python process orchestrates the cluster
+      |
+      |  f.remote(x)  -&gt;  ObjectRef      a distributed future, returns at once
+      v
+core worker          C++ in every process, reached from Python via _raylet.pyx
+      |              owns the returned object, does distributed refcounting
+      |  request a worker lease that fits the task's resources
+      v
+raylet (per node)    node manager (scheduler) + object manager (shared-mem store)
+      |              grants a local lease or spills the request to another raylet
+      v
+worker process       runs f, stores the result in its local object store
+      |
+      v
+ray.get(ref)         blocks, then reads the value (zero-copy for numpy buffers)
+
+GCS (control plane)  nodes, actors, placement groups, runtime envs, a kv store</pre>
+          <p>
+            The one-sentence identity. <mark>Ray is a distributed futures
+            system with two primitives, stateless tasks and stateful actors,
+            whose results live as immutable objects in a shared-memory store,
+            and whose lifetimes are tracked by ownership-based reference
+            counting rather than by a central master.</mark> You write nearly
+            ordinary Python. You add <code>@ray.remote</code> to a function or
+            a class, you call it with <code>.remote(...)</code> instead of
+            calling it directly, and you get back an <code>ObjectRef</code>, a
+            handle to a value that may not exist yet and may be computed on
+            another machine. Nothing blocks until you ask for the value with
+            <code>ray.get</code>. That single shift, from calling to
+            submitting, is the whole programming model.
+          </p>
+          <p>
+            Two load-bearing ideas make it work at scale. The first is the
+            object store. Every result and every large argument lives once per
+            node in a shared-memory segment, so many workers on the same
+            machine read the same bytes with no copy, and moving data between
+            nodes is a deliberate pull rather than a hidden serialization on
+            every call. The second is the single-controller shape. Unlike the
+            SPMD world of <code>torchrun</code> and
+            <a href="/oss/torchtitan">torchtitan</a>, where every rank runs the
+            same script in lockstep, a Ray program has one driver that dispatches
+            heterogeneous work to many workers and actors as plain Python
+            control flow. That is why Ray is comfortable orchestrating a
+            reinforcement-learning loop that juggles several distinct models at
+            once, and it is the reason the RLHF ecosystem landed on it. This
+            chapter is verified against a recent Ray 2.x main branch in July
+            2026. Ray is a large, fast-moving repository, so where an exact API
+            or path is likely to have shifted I say so and stay at the level of
+            role and concept.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <p>
+            Ray runs on Linux, macOS, and Windows, on CPUs and GPUs, from a
+            laptop to a thousand-node cluster with the same API. The install is
+            a wheel, and the extras decide which libraries come along.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="c"># core plus the dashboard, cluster launcher, and Ray Jobs</span>
+<span class="m1">pip</span> <span class="s">install</span> <span class="s">"ray[default]"</span>
+
+<span class="c"># pull in the ML libraries you need</span>
+<span class="m1">pip</span> <span class="s">install</span> <span class="s">"ray[data,train,serve,tune,rllib]"</span></code></pre></div>
+          <p>
+            A first session should be local. <code>ray.init()</code> with no
+            arguments starts a single-node cluster inside your process, and the
+            two primitives are a decorator away. Tasks are stateless remote
+            functions. Actors are remote classes that keep state between calls.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">ray</span>
+<span class="m1">ray</span>.<span class="m2">init</span><span class="b0">()</span>  <span class="c"># start a local cluster; use address="auto" to attach to a running one</span>
+
+<span class="m1">@ray.remote</span>
+<span class="k">def</span> <span class="m1">square</span><span class="b0">(</span><span class="v4">x</span><span class="b0">)</span>:
+    <span class="k">return</span> <span class="v4">x</span> * <span class="v4">x</span>
+
+<span class="c"># submit eight tasks; they run in parallel across your cores</span>
+<span class="v0">refs</span> = <span class="b0">[</span><span class="m1">square</span>.<span class="m2">remote</span><span class="b1">(</span><span class="v3">i</span><span class="b1">)</span> <span class="k">for</span> <span class="v3">i</span> <span class="k">in</span> <span class="m1">range</span><span class="b1">(</span><span class="n">8</span><span class="b1">)</span><span class="b0">]</span>
+<span class="m1">print</span><span class="b0">(</span><span class="m1">ray</span>.<span class="m2">get</span><span class="b1">(</span><span class="v0">refs</span><span class="b1">)</span><span class="b0">)</span>          <span class="c"># [0, 1, 4, 9, 16, 25, 36, 49]</span>
+
+<span class="m1">@ray.remote</span>
+<span class="k">class</span> <span class="m1">Counter</span>:
+    <span class="k">def</span> <span class="m1">__init__</span><span class="b0">(</span><span class="k">self</span><span class="b0">)</span>:
+        <span class="k">self</span>.<span class="m2">n</span> = <span class="n">0</span>
+    <span class="k">def</span> <span class="m1">inc</span><span class="b0">(</span><span class="k">self</span><span class="b0">)</span>:
+        <span class="k">self</span>.<span class="m2">n</span> += <span class="n">1</span>
+        <span class="k">return</span> <span class="k">self</span>.<span class="m2">n</span>
+
+<span class="v1">c</span> = <span class="m1">Counter</span>.<span class="m2">remote</span><span class="b0">()</span>                       <span class="c"># spawn a long-lived actor process</span>
+<span class="m1">print</span><span class="b0">(</span><span class="m1">ray</span>.<span class="m2">get</span><span class="b1">(</span><span class="b2">[</span><span class="v1">c</span>.<span class="m2">inc</span>.<span class="m2">remote</span><span class="b0">()</span> <span class="k">for</span> <span class="v4">_</span> <span class="k">in</span> <span class="m1">range</span><span class="b0">(</span><span class="n">3</span><span class="b0">)</span><span class="b2">]</span><span class="b1">)</span><span class="b0">)</span>   <span class="c"># [1, 2, 3]</span></code></pre></div>
+          <p>
+            Resources are requested declaratively, and Ray schedules around
+            them. <code>@ray.remote(num_gpus=1)</code> asks for a whole GPU and
+            sets <code>CUDA_VISIBLE_DEVICES</code> so the worker sees only its
+            assigned device. <code>num_gpus=0.5</code> packs two actors onto one
+            GPU, which matters a great deal for RLHF colocation later.
+            <code>num_cpus</code>, memory, and arbitrary custom resources
+            (<code>resources={"accelerator_type:H100": 1}</code>) work the same
+            way. One thing to internalize early is that these numbers are
+            logical accounting for the scheduler, not enforced isolation. Ray
+            will not stop a task that claimed one CPU from using four. The
+            reservation is a promise you make to the bin-packer.
+          </p>
+          <p>
+            Passing large data around is where <code>ray.put</code> earns its
+            keep. Putting an object into the store once and passing its
+            <code>ObjectRef</code> to many tasks means the bytes are shared, not
+            re-sent per call.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">numpy</span> <span class="k">as</span> <span class="m1">np</span>
+<span class="v1">big</span> = <span class="m1">np</span>.<span class="m2">zeros</span><span class="b0">(</span><span class="b1">(</span><span class="n">10_000</span>, <span class="n">10_000</span><span class="b1">)</span><span class="b0">)</span>     <span class="c"># ~800 MB</span>
+<span class="v6">ref</span> = <span class="m1">ray</span>.<span class="m2">put</span><span class="b0">(</span><span class="v1">big</span><span class="b0">)</span>                   <span class="c"># into the object store once, zero-copy reads</span>
+
+<span class="m1">@ray.remote</span>
+<span class="k">def</span> <span class="m1">col_sum</span><span class="b0">(</span><span class="v5">a</span>, <span class="v4">j</span><span class="b0">)</span>:
+    <span class="k">return</span> <span class="v5">a</span><span class="b0">[</span>:, <span class="v4">j</span><span class="b0">]</span>.<span class="m2">sum</span><span class="b0">()</span>
+
+<span class="c"># each task reads the same shared-memory buffer; big is not re-serialized</span>
+<span class="v4">totals</span> = <span class="m1">ray</span>.<span class="m2">get</span><span class="b0">(</span><span class="b1">[</span><span class="m1">col_sum</span>.<span class="m2">remote</span><span class="b2">(</span><span class="v6">ref</span>, <span class="v4">j</span><span class="b2">)</span> <span class="k">for</span> <span class="v4">j</span> <span class="k">in</span> <span class="m1">range</span><span class="b2">(</span><span class="n">100</span><span class="b2">)</span><span class="b1">]</span><span class="b0">)</span></code></pre></div>
+          <p>
+            To go multi-node, start a head node and attach workers, then point
+            a driver at the cluster.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="c"># on the head node (GCS listens on 6379 by default, a nod to its Redis past)</span>
+<span class="m1">ray</span> <span class="s">start</span> <span class="s">--head</span> <span class="s">--port=6379</span>
+
+<span class="c"># on each worker node</span>
+<span class="m1">ray</span> <span class="s">start</span> <span class="s">--address='HEAD_IP:6379'</span>
+
+<span class="c"># inspect the cluster</span>
+<span class="m1">ray</span> <span class="s">status</span>
+<span class="m1">ray</span> <span class="s">list</span> <span class="s">actors</span>
+<span class="m1">ray</span> <span class="s">summary</span> <span class="s">tasks</span>
+<span class="c"># the dashboard is at http://HEAD_IP:8265</span></code></pre></div>
+          <p>
+            You rarely hand-roll clusters in production. The autoscaler brings
+            nodes up and down from a YAML file with <code>ray up cluster.yaml</code>,
+            and on <a href="/oss/kubernetes">Kubernetes</a> the KubeRay operator
+            manages <code>RayCluster</code>, <code>RayJob</code>, and
+            <code>RayService</code> custom resources. Dependencies travel with
+            the job through a <code>runtime_env</code> that can specify pip
+            packages, a working directory, or environment variables per task or
+            per job, so a driver on your laptop can ship code and requirements
+            to a remote cluster with <code>ray job submit</code>.
+          </p>
+          <p>
+            Now the mistakes everyone makes once. First, calling
+            <code>ray.get</code> immediately after each <code>.remote</code>
+            call inside a loop, which serializes the whole program because each
+            get blocks before the next task is even submitted. Submit
+            everything first, then get.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="c"># wrong: this runs one task at a time, no parallelism at all</span>
+<span class="v2">results</span> = <span class="b0">[]</span>
+<span class="k">for</span> <span class="v3">i</span> <span class="k">in</span> <span class="m1">range</span><span class="b0">(</span><span class="n">8</span><span class="b0">)</span>:
+    <span class="v2">results</span>.<span class="m2">append</span><span class="b0">(</span><span class="v6">ray</span>.<span class="m2">get</span><span class="b1">(</span><span class="v0">square</span>.<span class="m2">remote</span><span class="b2">(</span><span class="v3">i</span><span class="b2">)</span><span class="b1">)</span><span class="b0">)</span>   <span class="c"># blocks every iteration</span>
+
+<span class="c"># right: submit all, then gather</span>
+<span class="v0">refs</span> = <span class="b0">[</span><span class="v0">square</span>.<span class="m2">remote</span><span class="b1">(</span><span class="v3">i</span><span class="b1">)</span> <span class="k">for</span> <span class="v3">i</span> <span class="k">in</span> <span class="m1">range</span><span class="b1">(</span><span class="n">8</span><span class="b1">)</span><span class="b0">]</span>
+<span class="v2">results</span> = <span class="v6">ray</span>.<span class="m2">get</span><span class="b0">(</span><span class="v0">refs</span><span class="b0">)</span></code></pre></div>
+          <p>
+            Second, an actor is single-threaded by default, so a long method
+            call blocks every other call queued on that actor. Reach for an
+            <code>async</code> actor or <code>max_concurrency</code> only when
+            you actually need concurrency inside one actor. Third, objects in
+            the store are immutable. You cannot mutate a value another task is
+            reading. You produce a new object instead. Fourth, tiny tasks are a
+            trap. Every remote call pays for serialization with cloudpickle, a
+            scheduling round trip, and gRPC. Wrapping a function that runs in
+            microseconds in <code>@ray.remote</code> makes it slower, not
+            faster. Ray pays off when a task does real work, a handful of
+            milliseconds or more, and when the data is large enough that the
+            shared-memory store saves a copy.
+          </p>
+
+          <h2>Part III: When it is the right tool</h2>
+          <p>
+            Ray Core is the right tool when your problem is genuinely
+            distributed and irregular, a pipeline of Python tasks and stateful
+            services that a rigid framework would fight. It shines at
+            heterogeneous ML workloads, hyperparameter sweeps, distributed
+            simulation and RL, large-scale batch inference, and any place you
+            want to compose CPU preprocessing and GPU compute in one program.
+            It is deliberately general, two primitives and a scheduler, so the
+            same substrate carries very different libraries.
+          </p>
+          <p>
+            The honest comparisons at the core level. Dask covers similar
+            ground for distributed Python and is stronger if your world is
+            dataframes and arrays, while Ray's actor model and serving story
+            make it the better fit for stateful services and RL. Spark remains
+            the right answer for massive structured ETL and SQL on the JVM.
+            Ray Data overlaps it for ML ingestion and inference but is not a
+            general data warehouse. Celery is a task queue for web backends
+            with no shared object store and no first-class actors. Slurm and
+            <a href="/oss/kubernetes">Kubernetes</a> are cluster resource
+            managers, and Ray runs on top of them rather than replacing them.
+            MPI and <code>torchrun</code> own the tightly-coupled SPMD training
+            world, where every rank runs identical code and communicates through
+            collectives, and that is exactly the world of
+            <a href="/oss/torchtitan">torchtitan</a> and Megatron. Ray is looser
+            coupling by design, and when it does run tight training it wraps a
+            PyTorch job rather than replacing the collectives.
+          </p>
+          <p>
+            At the library level the comparisons matter just as much. Ray Serve
+            competes with Triton Inference Server, KServe, BentoML, and
+            TorchServe, and it wins on Python-native multi-model composition and
+            autoscaling while a dedicated engine like
+            <a href="/oss/tensorrt-llm">TensorRT-LLM</a> or a
+            <a href="/oss/vllm">vLLM</a> server wins on raw single-model
+            throughput. Ray Train sits alongside raw <code>torchrun</code>,
+            DeepSpeed, Lightning, and Accelerate, and it is not another
+            parallelism strategy. It is the orchestration and fault-tolerance
+            layer that launches your DDP or FSDP job as actors and keeps it
+            alive. Ray Data competes with Spark, the PyTorch
+            <code>DataLoader</code>, <code>tf.data</code>, and Petastorm, and it
+            wins where a streaming pipeline must overlap CPU and GPU stages and
+            feed distributed training. RLlib competes with Stable-Baselines3,
+            CleanRL, TorchRL, and Tianshou, and it trades their single-machine
+            readability for multi-node scale and a catalog of production
+            algorithms. There is more on the algorithms themselves in the
+            <a href="/rl">RL section</a> and in
+            <a href="/classes/deep-reinforcement-learning">deep reinforcement
+            learning</a>.
+          </p>
+          <p>
+            The architecture-shaped warning is about task granularity and data
+            placement, which is the distributed-systems cousin of the parallel
+            computing lessons in
+            <a href="/classes/parallel-computing">parallel computing</a>. Ray's
+            overheads are small but not zero, and they are fixed per task.
+          </p>
+          <pre class="flow">dangerous:  a million microsecond tasks
+   driver --submit--&gt; scheduler --lease--&gt; worker --gRPC--&gt; result
+            &lt;--- per-task overhead dwarfs the work; the cluster idles on plumbing ---&gt;
+
+safe:       coarse tasks over shared data
+   ray.put(big) once, then tasks that each do real work on a slice
+            &lt;--- overhead amortized, shared-memory reads are free ---&gt;</pre>
+          <p>
+            The fix is almost always to make tasks coarser, to batch the unit of
+            work, and to put large inputs into the store once instead of passing
+            them as arguments repeatedly. The symptom of getting this wrong is a
+            program that is technically parallel and yet slower than a serial
+            loop, with the dashboard showing workers spending their time in
+            scheduling and deserialization rather than in your code.
+          </p>
+
+          <h2>Part IV: The full life of one remote call</h2>
+          <p>
+            The specimen is the smallest interesting thing Ray does, one task
+            call and one get, on a multi-node cluster. Follow
+            <code>y = square.remote(x)</code> then <code>ray.get(y)</code>.
+            Every library in Part V is ultimately this path repeated, so it is
+            worth tracing carefully.
+          </p>
+
+          <h3>Stage 1: the decorator and the call</h3>
+          <p>
+            <code>@ray.remote</code> wraps <code>square</code> into a
+            <code>RemoteFunction</code> (in <code>python/ray/remote_function.py</code>).
+            The plain function is preserved, but the wrapper adds
+            <code>.remote()</code>. Calling <code>square.remote(x)</code> does
+            not run anything. It builds a task specification, a description of
+            the function to run, its arguments, and its resource requirements,
+            and hands it to the process's core worker. Actors are the parallel
+            case, wrapping a class into an <code>ActorClass</code> (in
+            <code>python/ray/actor.py</code>) whose <code>.remote()</code>
+            creates a long-lived worker instead of a one-shot task.
+          </p>
+
+          <h3>Stage 2: ownership and the returned ObjectRef</h3>
+          <p>
+            Before anything schedules, the driver's core worker allocates an
+            <code>ObjectRef</code> for the future return value and records that
+            the driver is its <em>owner</em>. Ownership is the quiet center of
+            Ray's design. The owner is the worker that created the ref, and it
+            alone is responsible for that object's reference count and its
+            locations in the cluster. There is no central table of every
+            object. This decentralization is what lets Ray schedule millions of
+            fine-grained tasks without a metadata bottleneck, and it is
+            described in the ownership paper (NSDI 2021) that followed the
+            original Ray paper (OSDI 2018).
+          </p>
+
+          <h3>Stage 3: arguments, inline or by reference</h3>
+          <p>
+            The core worker resolves the task's arguments. Small values are
+            inlined directly into the task spec, so a task that takes an integer
+            carries the integer with it. Large values are put into the local
+            object store and passed by reference, so they are transferred at
+            most once and shared. If an argument is itself an
+            <code>ObjectRef</code>, the task gains a dependency and will not be
+            scheduled until that object exists, which is how Ray builds implicit
+            dataflow graphs out of ordinary function composition.
+          </p>
+
+          <h3>Stage 4: the lease request and distributed scheduling</h3>
+          <p>
+            The core worker asks its local raylet for a <em>worker lease</em>
+            that satisfies the task's resources. The raylet is the per-node C++
+            daemon that owns local scheduling. If the local node has the
+            resources and an idle worker, the raylet grants a lease. If it does
+            not, it replies with a spillback, the address of another raylet that
+            does, using a cluster-wide resource view that the GCS keeps roughly
+            synchronized. This is two-level scheduling. The owner drives task
+            placement, and the raylets arbitrate the physical resources. Leases
+            are the efficiency trick. Once a worker is leased, the owner may
+            reuse it for many tasks, amortizing the scheduling round trip over a
+            batch of work rather than paying it per call.
+          </p>
+
+          <h3>Stage 5: direct dispatch and execution</h3>
+          <p>
+            With a lease in hand, the owner pushes the task spec directly to the
+            leased worker over gRPC. The raylet is out of the hot path now,
+            which keeps the scheduler from becoming a funnel. The worker resolves
+            the arguments, fetching any remote objects it needs by asking its
+            local object manager to pull them from the node that holds them,
+            then runs <code>square</code>. The return value is stored in the
+            worker's local object store, or inlined back to the owner if it is
+            small.
+          </p>
+
+          <h3>Stage 6: reference counting and eviction</h3>
+          <p>
+            The worker reports the value's location back to the owner, which
+            updates the <code>ObjectRef</code>. From here the object lives as
+            long as some reference to it exists. The owner counts references,
+            including ones it handed to other tasks, which then become
+            borrowers that report back when they are done. When the count
+            reaches zero the object becomes evictable, and when the store fills
+            up, cold objects are spilled to local disk or cloud storage rather
+            than lost, with their refs still valid. If a node dies and takes a
+            task-produced object with it, Ray can often reconstruct it by
+            re-executing the lineage of tasks that produced it, which is
+            fault tolerance without checkpointing every intermediate value.
+          </p>
+
+          <h3>Stage 7: ray.get and zero-copy reads</h3>
+          <p>
+            <code>ray.get(y)</code> blocks until the value is ready. If the
+            object is on another node, the object manager pulls it into the
+            local store first. Then the value is read. For numpy arrays and
+            Arrow buffers the read is zero-copy. The consumer maps the same
+            shared-memory pages the producer wrote, with no deserialization at
+            all. Other Python objects are deserialized with cloudpickle. That
+            closes the loop of one call. A future created on submit, a lease and
+            a direct dispatch, an immutable result in shared memory, and a
+            reference count that decides when the bytes can go. <code>ray.wait</code>
+            is the same story for many refs at once, returning whichever are
+            ready so you can process results as they complete.
+          </p>
+
+          <h2>Part V: Internals deep dives</h2>
+
+          <h3>Deep dive: the object store and ownership</h3>
+          <p>
+            The object store is a shared-memory segment on every node,
+            historically built on Plasma from the Arrow project and now
+            integrated into the raylet's object manager. Objects are immutable
+            and stored once per node. Every local worker that reads an object
+            maps the same pages, so N readers on a machine cost one copy, not N.
+            For numpy and Arrow data the read is truly zero-copy, which is why
+            Ray Data and Ray Train can move batches between CPU preprocessing and
+            GPU consumers cheaply. When the store fills, objects spill to disk or
+            to a configured cloud bucket, and inter-node access is a pull
+            initiated by the object manager on the node that needs the bytes.
+          </p>
+          <p>
+            The subtle part is who keeps the books. A naive design has a central
+            master track every object's location and reference count, which
+            becomes a bottleneck the instant tasks get small and numerous. Ray's
+            answer is ownership.
+          </p>
+          <pre class="flow">object X produced by task T, submitted by worker W
+
+owner of X          = W (the submitter of T), and only W
+W tracks            reference count of X, borrowers of X, node locations of X
+no global table     of all objects; metadata is sharded across owners
+
+if W dies           X is lost, but Ray may re-run T's lineage to rebuild X
+if a holder dies    W notices via the borrower protocol and adjusts the count</pre>
+          <p>
+            <mark>By making the creator of a reference its owner, Ray scales
+            object metadata with the number of workers instead of funneling it
+            through one master, which is what lets it schedule millions of tiny
+            tasks.</mark> The cost is a sharp failure rule worth memorizing. An
+            object's fate is tied to its owner. If the owner process dies, the
+            object cannot be fetched even if a copy physically exists somewhere,
+            because the bookkeeping that finds and validates it is gone.
+            Lineage-based reconstruction covers task outputs, whose producing
+            task can be replayed, but not values placed with <code>ray.put</code>
+            by a since-dead owner, which have no lineage to replay.
+          </p>
+
+          <h3>Deep dive: distributed scheduling, the raylet, and placement groups</h3>
+          <p>
+            The raylet is the workhorse daemon, one per node, written in C++. It
+            has two halves. The node manager is the local scheduler and worker
+            pool. It grants and reclaims worker leases, bin-packs the node's
+            logical resources, and spills requests it cannot satisfy. The object
+            manager is the store and its transfers. Scheduling in Ray is thus
+            local first. An owner asks the nearest raylet, which either serves
+            the request or forwards it, and the global resource picture that
+            informs spillback is kept in the GCS and refreshed periodically
+            rather than consulted on every decision.
+          </p>
+          <p>
+            Resources deserve their own note because they are logical, not
+            enforced. A declared <code>num_cpus</code> is a reservation the
+            scheduler honors when packing, not a cgroup. The exception is GPUs.
+            When Ray assigns <code>num_gpus</code> to a worker it sets
+            <code>CUDA_VISIBLE_DEVICES</code> so the process sees only its share,
+            and fractional GPU requests let several workers share one device,
+            with memory isolation left to you. Custom resources are arbitrary
+            labels you attach to nodes and request on tasks, which is how teams
+            route work to specific accelerator types or data-local nodes.
+          </p>
+          <p>
+            Placement groups are the primitive that makes training and RLHF
+            possible, and they are easy to overlook. A placement group reserves
+            a set of resource <em>bundles</em> atomically across the cluster,
+            with a strategy that controls how they are laid out.
+          </p>
+          <table>
+            <tr><th>Strategy</th><th>Meaning</th><th>Typical use</th></tr>
+            <tr><td>PACK</td><td>bundles on as few nodes as possible</td><td>keep a training group on one node for fast links</td></tr>
+            <tr><td>SPREAD</td><td>bundles across as many nodes as possible</td><td>fault tolerance, spread inference replicas</td></tr>
+            <tr><td>STRICT_PACK</td><td>all bundles on one node, or fail</td><td>a group that must share NVLink</td></tr>
+            <tr><td>STRICT_SPREAD</td><td>each bundle on a distinct node, or fail</td><td>one replica per node exactly</td></tr>
+          </table>
+          <p>
+            The point of a placement group is gang scheduling. A distributed
+            training job needs all N of its GPUs reserved together or none of
+            them, because a job holding half its GPUs while waiting for the rest
+            is a deadlock in the making. <mark>Placement groups turn all-or-nothing
+            resource acquisition into a first-class operation, which is exactly
+            what an RLHF pipeline needs to colocate a policy trainer and a
+            generation engine on the same GPUs.</mark> verl and OpenRLHF both
+            lean on this heavily.
+          </p>
+          <p>
+            The GCS, the Global Control Store, is the cluster's control plane. It
+            holds node membership, the actor registry, placement group tables,
+            runtime environments, job metadata, and a general key-value store
+            that libraries use for coordination. It was originally backed by
+            <a href="/oss/redis">Redis</a>, which is why the default GCS port is
+            6379, and it is now a dedicated in-memory service that can optionally
+            persist to Redis for high availability so the head node can restart
+            without tearing down the cluster. The GCS is on the control path, not
+            the data path. It decides where actors live and which nodes exist,
+            while the bulk data flows worker to worker through the object
+            managers.
+          </p>
+
+          <h3>Deep dive: Ray Data, streaming blocks that overlap CPU and GPU</h3>
+          <p>
+            A Ray Data <code>Dataset</code> is a sequence of <em>blocks</em>,
+            each an Arrow table living in the object store. Operations are lazy.
+            <code>read_parquet</code>, <code>map_batches</code>, <code>filter</code>,
+            and the rest build a logical plan that is optimized into a physical
+            plan of operators and then run by a streaming executor. Streaming is
+            the load-bearing word. Rather than materializing the whole dataset
+            at each stage, the executor pipelines blocks through the operators,
+            keeping only a bounded window resident and applying backpressure so a
+            slow GPU stage does not let a fast reader flood memory.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">ray</span>, <span class="m1">numpy</span> <span class="k">as</span> <span class="m1">np</span>
+
+<span class="v2">ds</span> = <span class="m1">ray</span>.<span class="m2">data</span>.<span class="m2">read_parquet</span><span class="b0">(</span><span class="s">"s3://bucket/images/"</span><span class="b0">)</span>
+
+<span class="k">class</span> <span class="m1">Classifier</span>:
+    <span class="k">def</span> <span class="m1">__init__</span><span class="b0">(</span><span class="k">self</span><span class="b0">)</span>:
+        <span class="k">self</span>.<span class="m2">model</span> = <span class="m1">load_model</span><span class="b0">()</span>          <span class="c"># loaded once per actor, not per batch</span>
+    <span class="k">def</span> <span class="m1">__call__</span><span class="b0">(</span><span class="k">self</span>, <span class="v6">batch</span><span class="b0">)</span>:
+        <span class="v6">batch</span><span class="b0">[</span><span class="s">"pred"</span><span class="b0">]</span> = <span class="k">self</span>.<span class="m2">model</span><span class="b0">(</span><span class="v6">batch</span><span class="b1">[</span><span class="s">"image"</span><span class="b1">]</span><span class="b0">)</span>
+        <span class="k">return</span> <span class="v6">batch</span>
+
+<span class="c"># an actor pool of GPU workers, each holding the model, streamed over the data</span>
+<span class="v4">preds</span> = <span class="v2">ds</span>.<span class="m2">map_batches</span><span class="b0">(</span>
+    <span class="m1">Classifier</span>,
+    <span class="v4">concurrency</span>=<span class="n">4</span>,          <span class="c"># four model-holding actors</span>
+    <span class="v0">num_gpus</span>=<span class="n">1</span>,             <span class="c"># one GPU each</span>
+    <span class="v3">batch_size</span>=<span class="n">256</span>,
+<span class="b0">)</span>
+<span class="v4">preds</span>.<span class="m2">write_parquet</span><span class="b0">(</span><span class="s">"s3://bucket/preds/"</span><span class="b0">)</span></code></pre></div>
+          <p>
+            The pattern above is the canonical large-scale batch inference job.
+            A stateless <code>map_batches</code> spins up short tasks. Passing a
+            class with <code>concurrency</code> spins up an actor pool so an
+            expensive model loads once per actor and is reused across batches,
+            while the reader, any CPU preprocessing, and the GPU model all run
+            as concurrent stages of one pipeline. The same machinery is how Ray
+            Train gets fed. Each training worker asks for its shard of a
+            <code>Dataset</code> and pulls batches that were prepared on CPU
+            workers in parallel, overlapping data prep with the backward pass.
+          </p>
+
+          <h3>Deep dive: Ray Train, orchestration around your PyTorch loop</h3>
+          <p>
+            Ray Train does not implement a new parallelism strategy. It launches
+            your existing distributed training as a set of worker actors and
+            takes care of everything around the edges. A
+            <code>TorchTrainer</code> takes a training function and a
+            <code>ScalingConfig</code>, starts that many workers, and sets up the
+            torch process group so your function can use DDP or FSDP normally.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">ray</span>.<span class="m2">train</span>
+<span class="k">from</span> <span class="m1">ray</span>.<span class="m2">train</span> <span class="k">import</span> <span class="m1">ScalingConfig</span>
+<span class="k">from</span> <span class="m1">ray</span>.<span class="m2">train</span>.<span class="m2">torch</span> <span class="k">import</span> <span class="m1">TorchTrainer</span>
+
+<span class="k">def</span> <span class="m1">train_fn</span><span class="b0">(</span><span class="v4">config</span><span class="b0">)</span>:
+    <span class="v0">model</span> = <span class="m1">ray</span>.<span class="m2">train</span>.<span class="m2">torch</span>.<span class="m2">prepare_model</span><span class="b0">(</span><span class="m1">build_model</span><span class="b1">()</span><span class="b0">)</span>   <span class="c"># wraps in DDP</span>
+    <span class="v2">shard</span> = <span class="m1">ray</span>.<span class="m2">train</span>.<span class="m2">get_dataset_shard</span><span class="b0">(</span><span class="s">"train"</span><span class="b0">)</span>           <span class="c"># this worker's data</span>
+    <span class="k">for</span> <span class="v4">epoch</span> <span class="k">in</span> <span class="m1">range</span><span class="b0">(</span><span class="v4">config</span><span class="b1">[</span><span class="s">"epochs"</span><span class="b1">]</span><span class="b0">)</span>:
+        <span class="k">for</span> <span class="v6">batch</span> <span class="k">in</span> <span class="v2">shard</span>.<span class="m2">iter_torch_batches</span><span class="b0">(</span><span class="v3">batch_size</span>=<span class="n">32</span><span class="b0">)</span>:
+            <span class="v6">loss</span> = <span class="m1">step</span><span class="b0">(</span><span class="v0">model</span>, <span class="v6">batch</span><span class="b0">)</span>
+        <span class="m1">ray</span>.<span class="m2">train</span>.<span class="m2">report</span><span class="b0">(</span><span class="b1">{</span><span class="s">"loss"</span>: <span class="m1">float</span><span class="b2">(</span><span class="v6">loss</span><span class="b2">)</span><span class="b1">}</span><span class="b0">)</span>            <span class="c"># metrics + checkpoint</span>
+
+<span class="v1">trainer</span> = <span class="m1">TorchTrainer</span><span class="b0">(</span>
+    <span class="m1">train_fn</span>,
+    <span class="v3">train_loop_config</span>=<span class="b1">{</span><span class="s">"epochs"</span>: <span class="n">10</span><span class="b1">}</span>,
+    <span class="v6">scaling_config</span>=<span class="m1">ScalingConfig</span><span class="b1">(</span><span class="v2">num_workers</span>=<span class="n">8</span>, <span class="v0">use_gpu</span>=<span class="k">True</span><span class="b1">)</span>,
+    <span class="v2">datasets</span>=<span class="b1">{</span><span class="s">"train"</span>: <span class="m1">ray</span>.<span class="m2">data</span>.<span class="m2">read_parquet</span><span class="b2">(</span><span class="s">"s3://bucket/train/"</span><span class="b2">)</span><span class="b1">}</span>,
+<span class="b0">)</span>
+<span class="v5">result</span> = <span class="v1">trainer</span>.<span class="m2">fit</span><span class="b0">()</span></code></pre></div>
+          <p>
+            What Ray Train adds is the operational layer. It gang-schedules the
+            workers with a placement group, wires each one to a Ray Data shard,
+            collects <code>ray.train.report</code> calls into metrics and
+            checkpoints persisted to shared or cloud storage, and restarts the
+            worker group from the last checkpoint when a node fails. The actual
+            sharding of parameters and gradients is still PyTorch's, which means
+            a torchtitan-style FSDP job or a DeepSpeed job can run underneath Ray
+            Train, gaining fault tolerance and streaming ingestion without giving
+            up its collectives. That division of labor, Ray owns placement and
+            recovery while the framework owns the math, is the whole point.
+          </p>
+
+          <h3>Deep dive: Ray Serve, deployments as composable actors</h3>
+          <p>
+            Ray Serve turns model serving into a graph of Python classes. A
+            <code>@serve.deployment</code> becomes a group of replica actors. You
+            bind deployments together to compose them, and <code>serve.run</code>
+            brings the graph up.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">ray</span> <span class="k">import</span> <span class="m1">serve</span>
+<span class="k">from</span> <span class="m1">ray</span>.<span class="m2">serve</span>.<span class="m2">handle</span> <span class="k">import</span> <span class="m1">DeploymentHandle</span>
+
+<span class="m1">@serve.deployment</span><span class="b0">(</span><span class="v2">num_replicas</span>=<span class="n">2</span><span class="b0">)</span>
+<span class="k">class</span> <span class="m1">Embedder</span>:
+    <span class="k">def</span> <span class="m1">embed</span><span class="b0">(</span><span class="k">self</span>, <span class="v1">text</span>: <span class="m1">str</span><span class="b0">)</span>:
+        <span class="k">return</span> <span class="m1">model_embed</span><span class="b0">(</span><span class="v1">text</span><span class="b0">)</span>
+
+<span class="m1">@serve.deployment</span>
+<span class="k">class</span> <span class="m1">Router</span>:
+    <span class="k">def</span> <span class="m1">__init__</span><span class="b0">(</span><span class="k">self</span>, <span class="v3">embedder</span>: <span class="m1">DeploymentHandle</span><span class="b0">)</span>:
+        <span class="k">self</span>.<span class="m2">embedder</span> = <span class="v3">embedder</span>
+    <span class="k">async</span> <span class="k">def</span> <span class="m1">__call__</span><span class="b0">(</span><span class="k">self</span>, <span class="v0">request</span><span class="b0">)</span>:
+        <span class="v1">text</span> = <span class="b0">(</span><span class="k">await</span> <span class="v0">request</span>.<span class="m2">json</span><span class="b1">()</span><span class="b0">)[</span><span class="s">"text"</span><span class="b0">]</span>
+        <span class="v4">vec</span> = <span class="k">await</span> <span class="k">self</span>.<span class="m2">embedder</span>.<span class="m2">embed</span>.<span class="m2">remote</span><span class="b0">(</span><span class="v1">text</span><span class="b0">)</span>   <span class="c"># call another deployment</span>
+        <span class="k">return</span> <span class="b0">{</span><span class="s">"vector"</span>: <span class="v4">vec</span>.<span class="m2">tolist</span><span class="b1">()</span><span class="b0">}</span>
+
+<span class="v6">app</span> = <span class="m1">Router</span>.<span class="m2">bind</span><span class="b0">(</span><span class="m1">Embedder</span>.<span class="m2">bind</span><span class="b1">()</span><span class="b0">)</span>
+<span class="m1">serve</span>.<span class="m2">run</span><span class="b0">(</span><span class="v6">app</span><span class="b0">)</span>   <span class="c"># now serving on http://localhost:8000</span></code></pre></div>
+          <p>
+            Behind the API, a controller actor holds the desired state of every
+            deployment, a proxy actor on each node terminates HTTP or gRPC and
+            routes requests to replicas, and the replicas are ordinary Ray actors
+            that Serve can autoscale by watching queue depth, adding replicas
+            under load and removing them when idle. The composition story is what
+            sets it apart. A <code>DeploymentHandle</code> lets one deployment
+            call another as if it were a local method, so a preprocessor, a
+            model, and a postprocessor, or an ensemble, or a router in front of
+            several models, is just Python objects calling each other, each
+            scaled independently. Ray Serve LLM builds on this to host
+            <a href="/oss/vllm">vLLM</a> engines with an OpenAI-compatible API,
+            which is a natural fit because the engine is itself a Ray actor.
+          </p>
+
+          <h3>Deep dive: RLlib, the sampling-then-learning loop as actors</h3>
+          <p>
+            RLlib is Ray Core applied to reinforcement learning, and its shape
+            mirrors the RL loop directly. An <code>Algorithm</code> such as PPO,
+            configured through a config object and then built, orchestrates two
+            kinds of actor. <em>EnvRunner</em> actors (the older stack called
+            them RolloutWorkers) each hold copies of the environment and the
+            current policy and step them to collect experience in parallel. A
+            <em>Learner</em>, or a <code>LearnerGroup</code> of learner actors
+            for multi-GPU, takes the collected batch and computes gradient
+            updates, with the neural network defined by an <code>RLModule</code>.
+            Each iteration samples from the env runners, learns on the batch,
+            and broadcasts the updated weights back to the runners.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">ray</span>.<span class="m2">rllib</span>.<span class="m2">algorithms</span>.<span class="m2">ppo</span> <span class="k">import</span> <span class="m1">PPOConfig</span>
+
+<span class="v4">config</span> = <span class="b0">(</span>
+    <span class="m1">PPOConfig</span><span class="b1">()</span>
+    .<span class="m2">environment</span><span class="b1">(</span><span class="s">"CartPole-v1"</span><span class="b1">)</span>
+    .<span class="m2">env_runners</span><span class="b1">(</span><span class="v0">num_env_runners</span>=<span class="n">4</span><span class="b1">)</span>     <span class="c"># four parallel experience collectors</span>
+    .<span class="m2">learners</span><span class="b1">(</span><span class="v1">num_learners</span>=<span class="n">1</span><span class="b1">)</span>
+<span class="b0">)</span>
+<span class="v3">algo</span> = <span class="v4">config</span>.<span class="m2">build</span><span class="b0">()</span>                   <span class="c"># exact builder method has evolved across versions</span>
+<span class="k">for</span> <span class="v3">i</span> <span class="k">in</span> <span class="m1">range</span><span class="b0">(</span><span class="n">10</span><span class="b0">)</span>:
+    <span class="v5">result</span> = <span class="v3">algo</span>.<span class="m2">train</span><span class="b0">()</span>               <span class="c"># sample, learn, sync weights</span>
+    <span class="m1">print</span><span class="b0">(</span><span class="v3">i</span>, <span class="v5">result</span><span class="b1">[</span><span class="s">"env_runners"</span><span class="b1">][</span><span class="s">"episode_return_mean"</span><span class="b1">]</span><span class="b0">)</span></code></pre></div>
+          <p>
+            The new API stack (RLModule, Learner, EnvRunner, ConnectorV2) is a
+            cleaner separation of the network, the update, the sampling, and the
+            data transforms than the old stack (Policy, RolloutWorker, Trainer),
+            and the exact spellings have moved more than once, so learn the four
+            roles rather than the current method names. What matters for this
+            chapter is the structural insight. RLlib is a distributed dance of
+            many samplers and a few learners exchanging weights and batches
+            through actors, and that same structure, scaled up and specialized to
+            language models, is precisely what RLHF needs.
+          </p>
+
+          <h3>Deep dive: why Ray became the control plane for LLM RLHF</h3>
+          <p>
+            RLHF for large language models is not one model training. It is a
+            small society of models that must run together. A policy (the actor
+            being trained), often a separate critic, a frozen reference model for
+            the KL penalty, one or more reward models, and a fast generation
+            engine that produces rollouts. These pieces use different frameworks,
+            FSDP or Megatron for the training models and
+            <a href="/oss/vllm">vLLM</a> or <a href="/oss/sglang">SGLang</a> for
+            generation, they want different parallelism layouts, and each PPO
+            step has to route data between them and synchronize the policy's new
+            weights into the generation engine.
+          </p>
+          <pre class="flow">one PPO step of LLM RLHF
+
+  prompts -&gt; [generation engine: vLLM / SGLang]  -&gt; responses
+                       |
+                       v
+             [reward model]      score responses
+             [reference model]   log-probs for the KL term
+                       |
+                       v
+             [critic]            value estimates, advantages
+                       |
+                       v
+             [policy trainer: FSDP / Megatron]  update weights
+                       |
+                       v
+             weight sync  -----------------&gt;  reshard into the generation engine</pre>
+          <p>
+            Pure SPMD cannot express this cleanly. A <code>torchrun</code> world
+            where every rank runs the same script has no natural place to say
+            "generate with these engines, then score with that model, then update
+            this other model, then push the new weights over there." That is
+            branching, heterogeneous control flow, and it wants a single
+            controller. <mark>Ray provides exactly that, one driver that treats
+            each model group as a set of actors, placement groups that gang-reserve
+            and colocate their GPUs, an object store to pass rollout batches, and
+            named actors plus collectives to reshard weights between the training
+            layout and the inference layout.</mark>
+          </p>
+          <p>
+            This is why the ecosystem converged on it.
+            <a href="https://github.com/volcengine/verl" target="_blank" rel="noreferrer">verl</a>
+            (the HybridFlow framework from ByteDance) uses Ray for the
+            single-controller RLHF dataflow while keeping efficient multi-controller
+            SPMD inside each model, colocating the actor, rollout, reference, and
+            critic roles with placement groups, supporting FSDP and Megatron
+            training backends with vLLM or SGLang rollout, and resharding weights
+            between the train and generate layouts each step.
+            <a href="https://github.com/OpenRLHF/OpenRLHF" target="_blank" rel="noreferrer">OpenRLHF</a>
+            uses Ray to place vLLM generation engines and DeepSpeed ZeRO-3
+            training actors across GPU groups, coordinating the PPO pipeline and
+            the weight sync from trainer to engine. Others, including
+            NeMo-Aligner and various TRL-based stacks, adopt Ray for the same
+            reason. The generation engine, the trainer, and the reward model are
+            all just actors, and the loop that connects them is plain Python on a
+            single controller. The RLHF background itself lives in the
+            <a href="/rl">RL section</a>.
+          </p>
+
+          <h2>Part VI: Reading the repository</h2>
+          <p>
+            The Ray repository is large and bilingual, a Python surface over a
+            C++ core, built with Bazel. Paths below are the stable landmarks and
+            are described by role where fine detail is likely to have shifted.
+          </p>
+          <p>
+            <strong>Stage 0, orientation.</strong> Run the Part II quickstart and
+            open the dashboard at port 8265, then read the Ray Core docs, then
+            <code>python/ray/remote_function.py</code> and
+            <code>python/ray/actor.py</code>. Questions. What does
+            <code>.remote()</code> actually build, how does an
+            <code>ObjectRef</code> differ from the value it points to, and what
+            is the difference between how a task and an actor acquire a worker?
+          </p>
+          <p>
+            <strong>Stage 1, the Python to C++ bridge.</strong> Skim
+            <code>python/ray/_raylet.pyx</code>, the Cython layer where Python
+            calls cross into the C++ core worker to submit tasks and get objects.
+            Do not try to master it. The goal is to see the seam, that the driver
+            you write is a thin Python skin over a core worker library embedded in
+            every process.
+          </p>
+          <p>
+            <strong>Stage 2, the core worker.</strong> Read
+            <code>src/ray/core_worker/</code>, which is the intellectual center of
+            the whole system. This is where task submission, the ownership and
+            reference-counting tables, and the object-store interface live. Read
+            it with the Part IV trace open beside you. Questions. Where does the
+            owner record a new object, how does a borrower report back, and how
+            does the worker-lease reuse actually amortize scheduling?
+          </p>
+          <p>
+            <strong>Stage 3, the node and the cluster.</strong> Read
+            <code>src/ray/raylet/</code> for the node manager's scheduling loop,
+            worker pool, and spillback, then <code>src/ray/object_manager/</code>
+            for the shared-memory store, spilling, and inter-node pulls, then
+            <code>src/ray/gcs/</code> for the control plane. Questions. When does
+            a local raylet decide to spill a request, what does the GCS know that
+            a raylet does not, and how does a placement group reserve bundles
+            atomically?
+          </p>
+          <p>
+            <strong>Stage 4, one library end to end.</strong> Pick a single
+            library and read only its Python top layer.
+            <code>python/ray/data/</code> for the <code>Dataset</code>, the plan
+            optimizer, and the streaming executor.
+            <code>python/ray/serve/</code> for the controller, proxy, and replica.
+            <code>python/ray/train/</code> for the trainers and the backend that
+            sets up the process group. <code>python/ray/rllib/</code> for the
+            <code>Algorithm</code>, the EnvRunner, and the Learner. Each is a Ray
+            program, so you will recognize tasks, actors, and object refs
+            underneath the domain API.
+          </p>
+          <p>
+            <strong>Where not to start.</strong> RLlib's full catalog of
+            algorithms is breadth you do not need on a first pass. The autoscaler
+            node-provider plugins in <code>python/ray/autoscaler/</code> are
+            cloud-specific glue. The dashboard frontend is a separate world.
+            Meet these only after tasks, actors, ownership, and the raylet are
+            solid.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            Labs 1 through 4 need only a laptop. Labs 5 and 6 are happier with a
+            GPU but degrade gracefully to CPU. Log and dashboard details drift
+            with Ray's release cadence.
+          </p>
+          <p><strong>Lab 1: parallel speedup and the get-in-a-loop trap.</strong> Concept: submit then gather, Part II.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">ray</span>, <span class="m1">time</span>
+<span class="m1">ray</span>.<span class="m2">init</span><span class="b0">()</span>
+
+<span class="m1">@ray.remote</span>
+<span class="k">def</span> <span class="m1">slow</span><span class="b0">(</span><span class="v3">i</span><span class="b0">)</span>:
+    <span class="m1">time</span>.<span class="m2">sleep</span><span class="b0">(</span><span class="n">1</span><span class="b0">)</span>
+    <span class="k">return</span> <span class="v3">i</span>
+
+<span class="v0">t</span> = <span class="m1">time</span>.<span class="m2">time</span><span class="b0">()</span>; <span class="b0">[</span><span class="m1">ray</span>.<span class="m2">get</span><span class="b1">(</span><span class="m1">slow</span>.<span class="m2">remote</span><span class="b2">(</span><span class="v3">i</span><span class="b2">)</span><span class="b1">)</span> <span class="k">for</span> <span class="v3">i</span> <span class="k">in</span> <span class="m1">range</span><span class="b1">(</span><span class="n">8</span><span class="b1">)</span><span class="b0">]</span>   <span class="c"># get inside loop</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">"serial-ish:"</span>, <span class="m1">time</span>.<span class="m2">time</span><span class="b1">()</span> - <span class="v0">t</span><span class="b0">)</span>                          <span class="c"># ~8 s</span>
+
+<span class="v0">t</span> = <span class="m1">time</span>.<span class="m2">time</span><span class="b0">()</span>; <span class="m1">ray</span>.<span class="m2">get</span><span class="b0">(</span><span class="b1">[</span><span class="m1">slow</span>.<span class="m2">remote</span><span class="b2">(</span><span class="v3">i</span><span class="b2">)</span> <span class="k">for</span> <span class="v3">i</span> <span class="k">in</span> <span class="m1">range</span><span class="b2">(</span><span class="n">8</span><span class="b2">)</span><span class="b1">]</span><span class="b0">)</span>   <span class="c"># submit then gather</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">"parallel:"</span>, <span class="m1">time</span>.<span class="m2">time</span><span class="b1">()</span> - <span class="v0">t</span><span class="b0">)</span>                            <span class="c"># ~1 s</span></code></pre></div>
+          <p>
+            Watch the two timings and explain the gap. Then open the dashboard
+            and see eight tasks running at once in the parallel case versus one
+            at a time in the first.
+          </p>
+          <p><strong>Lab 2: actor state and single-threaded ordering.</strong> Concept: actors keep state and serialize their calls.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="m1">@ray.remote</span>
+<span class="k">class</span> <span class="m1">Bank</span>:
+    <span class="k">def</span> <span class="m1">__init__</span><span class="b0">(</span><span class="k">self</span><span class="b0">)</span>:
+        <span class="k">self</span>.<span class="m2">balance</span> = <span class="n">0</span>
+    <span class="k">def</span> <span class="m1">deposit</span><span class="b0">(</span><span class="k">self</span>, <span class="v4">x</span><span class="b0">)</span>:
+        <span class="k">self</span>.<span class="m2">balance</span> += <span class="v4">x</span>
+        <span class="k">return</span> <span class="k">self</span>.<span class="m2">balance</span>
+
+<span class="v3">acct</span> = <span class="m1">Bank</span>.<span class="m2">remote</span><span class="b0">()</span>
+<span class="m1">print</span><span class="b0">(</span><span class="m1">ray</span>.<span class="m2">get</span><span class="b1">(</span><span class="b2">[</span><span class="v3">acct</span>.<span class="m2">deposit</span>.<span class="m2">remote</span><span class="b0">(</span><span class="n">1</span><span class="b0">)</span> <span class="k">for</span> <span class="v4">_</span> <span class="k">in</span> <span class="m1">range</span><span class="b0">(</span><span class="n">5</span><span class="b0">)</span><span class="b2">]</span><span class="b1">)</span><span class="b0">)</span>   <span class="c"># [1,2,3,4,5], in order</span></code></pre></div>
+          <p>
+            Observe that the results are exactly ordered because one actor runs
+            one method at a time. Now add <code>@ray.remote(max_concurrency=4)</code>
+            and a <code>time.sleep</code> inside the method, and watch the
+            behavior change. The lesson is that an actor is a single-threaded
+            service unless you ask otherwise.
+          </p>
+          <p><strong>Lab 3: ray.put and zero-copy sharing.</strong> Concept: the object store, Part V.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">numpy</span> <span class="k">as</span> <span class="m1">np</span>
+<span class="v1">big</span> = <span class="m1">np</span>.<span class="m2">random</span>.<span class="m2">rand</span><span class="b0">(</span><span class="n">5000</span>, <span class="n">5000</span><span class="b0">)</span>      <span class="c"># ~200 MB</span>
+<span class="v6">ref</span> = <span class="m1">ray</span>.<span class="m2">put</span><span class="b0">(</span><span class="v1">big</span><span class="b0">)</span>
+
+<span class="m1">@ray.remote</span>
+<span class="k">def</span> <span class="m1">rowmean</span><span class="b0">(</span><span class="v5">a</span>, <span class="v3">i</span><span class="b0">)</span>:
+    <span class="k">return</span> <span class="m1">float</span><span class="b0">(</span><span class="v5">a</span><span class="b1">[</span><span class="v3">i</span><span class="b1">]</span>.<span class="m2">mean</span><span class="b1">()</span><span class="b0">)</span>
+
+<span class="v5">means</span> = <span class="m1">ray</span>.<span class="m2">get</span><span class="b0">(</span><span class="b1">[</span><span class="m1">rowmean</span>.<span class="m2">remote</span><span class="b2">(</span><span class="v6">ref</span>, <span class="v3">i</span><span class="b2">)</span> <span class="k">for</span> <span class="v3">i</span> <span class="k">in</span> <span class="m1">range</span><span class="b2">(</span><span class="n">50</span><span class="b2">)</span><span class="b1">]</span><span class="b0">)</span></code></pre></div>
+          <p>
+            Run <code>ray memory</code> or watch the dashboard's cluster memory
+            while this runs and confirm the array is stored once, not fifty
+            times. Then pass <code>big</code> directly instead of
+            <code>ref</code> and observe the difference in object-store traffic.
+          </p>
+          <p><strong>Lab 4: a placement group and gang scheduling.</strong> Concept: bundles reserved atomically, Part V.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">ray</span>.<span class="m2">util</span>.<span class="m2">placement_group</span> <span class="k">import</span> <span class="m1">placement_group</span>
+<span class="k">from</span> <span class="m1">ray</span>.<span class="m2">util</span>.<span class="m2">scheduling_strategies</span> <span class="k">import</span> <span class="m1">PlacementGroupSchedulingStrategy</span>
+
+<span class="v3">pg</span> = <span class="m1">placement_group</span><span class="b0">(</span><span class="b1">[</span><span class="b2">{</span><span class="s">"CPU"</span>: <span class="n">1</span><span class="b2">}</span>, <span class="b2">{</span><span class="s">"CPU"</span>: <span class="n">1</span><span class="b2">}</span><span class="b1">]</span>, <span class="v2">strategy</span>=<span class="s">"STRICT_PACK"</span><span class="b0">)</span>
+<span class="m1">ray</span>.<span class="m2">get</span><span class="b0">(</span><span class="v3">pg</span>.<span class="m2">ready</span><span class="b1">()</span><span class="b0">)</span>     <span class="c"># blocks until all bundles are reserved together</span>
+
+<span class="m1">@ray.remote</span><span class="b0">(</span><span class="v3">num_cpus</span>=<span class="n">1</span><span class="b0">)</span>
+<span class="k">class</span> <span class="m1">Worker</span>:
+    <span class="k">def</span> <span class="m1">whoami</span><span class="b0">(</span><span class="k">self</span><span class="b0">)</span>:
+        <span class="k">return</span> <span class="m1">ray</span>.<span class="m2">get_runtime_context</span><span class="b0">()</span>.<span class="m2">get_node_id</span><span class="b0">()</span>
+
+<span class="v4">ws</span> = <span class="b0">[</span><span class="m1">Worker</span>.<span class="m2">options</span><span class="b1">(</span>
+        <span class="v5">scheduling_strategy</span>=<span class="m1">PlacementGroupSchedulingStrategy</span><span class="b2">(</span><span class="v3">pg</span>, <span class="v0">bundle_index</span>=<span class="v3">i</span><span class="b2">)</span>
+      <span class="b1">)</span>.<span class="m2">remote</span><span class="b1">()</span> <span class="k">for</span> <span class="v3">i</span> <span class="k">in</span> <span class="m1">range</span><span class="b1">(</span><span class="n">2</span><span class="b1">)</span><span class="b0">]</span>
+<span class="m1">print</span><span class="b0">(</span><span class="m1">ray</span>.<span class="m2">get</span><span class="b1">(</span><span class="b2">[</span><span class="v5">w</span>.<span class="m2">whoami</span>.<span class="m2">remote</span><span class="b0">()</span> <span class="k">for</span> <span class="v5">w</span> <span class="k">in</span> <span class="v4">ws</span><span class="b2">]</span><span class="b1">)</span><span class="b0">)</span>   <span class="c"># same node under STRICT_PACK</span></code></pre></div>
+          <p>
+            Confirm both actors land on one node under <code>STRICT_PACK</code>.
+            Switch to <code>STRICT_SPREAD</code> on a single-node cluster and
+            watch the group fail to become ready, which is the gang guarantee
+            working as intended.
+          </p>
+          <p><strong>Lab 5: batch inference with Ray Data.</strong> Concept: streaming actor pool, Part V.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">ray</span>
+<span class="v2">ds</span> = <span class="m1">ray</span>.<span class="m2">data</span>.<span class="m2">range</span><span class="b0">(</span><span class="n">10_000</span><span class="b0">)</span>
+
+<span class="k">class</span> <span class="m1">Squarer</span>:
+    <span class="k">def</span> <span class="m1">__call__</span><span class="b0">(</span><span class="k">self</span>, <span class="v6">batch</span><span class="b0">)</span>:
+        <span class="v6">batch</span><span class="b0">[</span><span class="s">"out"</span><span class="b0">]</span> = <span class="v6">batch</span><span class="b0">[</span><span class="s">"id"</span><span class="b0">]</span> ** <span class="n">2</span>
+        <span class="k">return</span> <span class="v6">batch</span>
+
+<span class="v2">out</span> = <span class="v2">ds</span>.<span class="m2">map_batches</span><span class="b0">(</span><span class="m1">Squarer</span>, <span class="v4">concurrency</span>=<span class="n">4</span>, <span class="v3">batch_size</span>=<span class="n">512</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="v2">out</span>.<span class="m2">take_batch</span><span class="b1">(</span><span class="n">4</span><span class="b1">)</span><span class="b0">)</span></code></pre></div>
+          <p>
+            Note that passing a class rather than a function makes each of the
+            four workers an actor. Now give <code>Squarer.__init__</code> an
+            expensive setup and confirm from the logs that it runs four times,
+            once per actor, not once per batch. That reuse is the whole reason
+            batch inference uses an actor pool.
+          </p>
+          <p><strong>Lab 6: compose two Ray Serve deployments.</strong> Concept: deployment handles and independent scaling, Part V.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">ray</span> <span class="k">import</span> <span class="m1">serve</span>
+<span class="k">from</span> <span class="m1">ray</span>.<span class="m2">serve</span>.<span class="m2">handle</span> <span class="k">import</span> <span class="m1">DeploymentHandle</span>
+
+<span class="m1">@serve.deployment</span><span class="b0">(</span><span class="v2">num_replicas</span>=<span class="n">2</span><span class="b0">)</span>
+<span class="k">class</span> <span class="m1">Upper</span>:
+    <span class="k">def</span> <span class="m1">do</span><span class="b0">(</span><span class="k">self</span>, <span class="v4">s</span>: <span class="m1">str</span><span class="b0">)</span>:
+        <span class="k">return</span> <span class="v4">s</span>.<span class="m2">upper</span><span class="b0">()</span>
+
+<span class="m1">@serve.deployment</span>
+<span class="k">class</span> <span class="m1">Front</span>:
+    <span class="k">def</span> <span class="m1">__init__</span><span class="b0">(</span><span class="k">self</span>, <span class="v4">up</span>: <span class="m1">DeploymentHandle</span><span class="b0">)</span>:
+        <span class="k">self</span>.<span class="m2">up</span> = <span class="v4">up</span>
+    <span class="k">async</span> <span class="k">def</span> <span class="m1">__call__</span><span class="b0">(</span><span class="k">self</span>, <span class="v6">req</span><span class="b0">)</span>:
+        <span class="v4">s</span> = <span class="b0">(</span><span class="k">await</span> <span class="v6">req</span>.<span class="m2">json</span><span class="b1">()</span><span class="b0">)[</span><span class="s">"s"</span><span class="b0">]</span>
+        <span class="k">return</span> <span class="b0">{</span><span class="s">"result"</span>: <span class="k">await</span> <span class="k">self</span>.<span class="m2">up</span>.<span class="m2">do</span>.<span class="m2">remote</span><span class="b1">(</span><span class="v4">s</span><span class="b1">)</span><span class="b0">}</span>
+
+<span class="m1">serve</span>.<span class="m2">run</span><span class="b0">(</span><span class="m1">Front</span>.<span class="m2">bind</span><span class="b1">(</span><span class="m1">Upper</span>.<span class="m2">bind</span><span class="b2">()</span><span class="b1">)</span><span class="b0">)</span>
+<span class="c"># curl -X POST http://localhost:8000/ -H 'content-type: application/json' -d '{"s":"hi"}'</span></code></pre></div>
+          <p>
+            Call it over HTTP, then bump <code>Upper</code> to
+            <code>num_replicas=4</code> and redeploy, confirming the two
+            deployments scale independently. Open the Serve dashboard and watch
+            requests fan out across the <code>Upper</code> replicas.
+          </p>
+
+          <h2>Part VIII: Questions and model answers</h2>
+          <p>Understanding checks. Answer aloud before reading.</p>
+          <p><strong>1. What is Ray, in one sentence?</strong></p>
+          <p>
+            A distributed futures system with two primitives, stateless tasks
+            and stateful actors, whose results live as immutable objects in a
+            shared-memory store and whose lifetimes are managed by
+            ownership-based reference counting, with a stack of ML libraries
+            (Data, Train, Serve, RLlib) built on that core.
+          </p>
+          <p><strong>2. What is an ObjectRef and how does it differ from a Future in plain Python?</strong></p>
+          <p>
+            An <code>ObjectRef</code> is a reference to a value that may live on
+            another node in the shared object store. Like a future it is returned
+            immediately from an async call and resolved with <code>ray.get</code>,
+            but unlike a local future it is a distributed, first-class value. You
+            can pass it to other tasks to build dataflow dependencies, and it is
+            reference-counted across the cluster by its owner.
+          </p>
+          <p><strong>3. What is the difference between a task and an actor?</strong></p>
+          <p>
+            A task is a stateless remote function that runs once on any available
+            worker. An actor is a remote class instance bound to a dedicated
+            long-lived worker that keeps state between calls and, by default,
+            executes its methods one at a time in submission order.
+          </p>
+          <p><strong>4. Explain ownership and why Ray uses it.</strong></p>
+          <p>
+            Every object has exactly one owner, the worker that created its
+            reference. The owner alone tracks that object's reference count,
+            borrowers, and locations. This shards object metadata across all
+            workers instead of funneling it through a central master, which is
+            what lets Ray schedule millions of fine-grained tasks without a
+            bottleneck. The cost is that if the owner dies, the object is lost.
+          </p>
+          <p><strong>5. Trace one remote call from .remote to ray.get.</strong></p>
+          <p>
+            <code>.remote</code> builds a task spec, the owner allocates the
+            return <code>ObjectRef</code> and records itself as owner, arguments
+            are inlined or put by reference, the core worker asks its raylet for a
+            worker lease, the raylet grants locally or spills to another node, the
+            owner dispatches the task directly to the leased worker over gRPC, the
+            worker resolves args, runs the function, and stores the result, then
+            reports its location back so reference counting can manage it, and
+            <code>ray.get</code> blocks and reads the value, zero-copy for numpy.
+          </p>
+          <p><strong>6. Why can wrapping a tiny function in @ray.remote make a program slower?</strong></p>
+          <p>
+            Every remote call has fixed overhead, cloudpickle serialization, a
+            scheduling round trip for a lease, and gRPC. If the function runs in
+            microseconds, that overhead dominates and the cluster spends its time
+            on plumbing. Tasks should be coarse enough that real work dwarfs the
+            per-task cost.
+          </p>
+          <p><strong>7. What is a placement group and what problem does it solve?</strong></p>
+          <p>
+            A placement group reserves a set of resource bundles atomically across
+            the cluster with a layout strategy. It solves gang scheduling, the
+            need to acquire all of a job's resources together or none, which
+            avoids deadlock in distributed training and lets an RLHF pipeline
+            colocate its trainer and generation engine on the same GPUs.
+          </p>
+          <p><strong>8. What does the GCS store, and what is it not on the path for?</strong></p>
+          <p>
+            The GCS holds cluster control state, node membership, the actor
+            registry, placement groups, runtime environments, jobs, and a
+            key-value store. It is on the control path only. Bulk data flows
+            worker to worker through the object managers, not through the GCS.
+          </p>
+          <p><strong>9. How does Ray Data overlap CPU and GPU work?</strong></p>
+          <p>
+            A dataset is a stream of blocks, and the streaming executor pipelines
+            them through operators, keeping only a bounded window resident with
+            backpressure. Reading, CPU preprocessing, and GPU inference run as
+            concurrent stages, so the GPU is fed by CPU workers preparing the next
+            batches while it consumes the current one.
+          </p>
+          <p><strong>10. What does Ray Train add over just running torchrun?</strong></p>
+          <p>
+            Ray Train does not replace the parallelism, which is still PyTorch's
+            DDP or FSDP. It launches the workers as a gang-scheduled actor group,
+            wires each to a Ray Data shard, collects metrics and checkpoints to
+            durable storage, and restarts the group from a checkpoint on failure.
+            It is the orchestration and fault-tolerance layer around your loop.
+          </p>
+          <p><strong>11. How does Ray Serve compose multiple models?</strong></p>
+          <p>
+            Each <code>@serve.deployment</code> is a group of replica actors. You
+            bind deployments together and pass <code>DeploymentHandle</code>s, so
+            one deployment calls another like a local method. A preprocessor, a
+            model, a postprocessor, an ensemble, or a router are just Python
+            objects calling each other, each autoscaled independently on queue
+            depth.
+          </p>
+          <p><strong>12. Why is SPMD a poor fit for LLM RLHF, and why is Ray a good one?</strong></p>
+          <p>
+            RLHF coordinates several distinct models, a policy, a critic, a
+            reference model, a reward model, and a generation engine, with
+            branching control flow and weight syncing between training and
+            inference layouts. SPMD assumes every rank runs the same program,
+            which cannot express that heterogeneity. Ray's single controller
+            treats each model as actors, uses placement groups to colocate their
+            GPUs, and passes data through the object store, so the loop is plain
+            Python.
+          </p>
+          <p><strong>13. Name two frameworks that build RLHF on Ray and what Ray gives them.</strong></p>
+          <p>
+            verl (HybridFlow) uses Ray for single-controller RLHF dataflow with
+            SPMD inside each model, placement-group colocation, and FSDP or
+            Megatron plus vLLM or SGLang. OpenRLHF uses Ray to place vLLM
+            generation engines and DeepSpeed training actors and to coordinate the
+            weight sync from trainer to engine. Ray gives both the actor
+            orchestration, gang scheduling, and data passing.
+          </p>
+          <p><strong>14. A Ray job dies when one node fails and cannot recover an object. What happened?</strong></p>
+          <p>
+            The lost object's owner most likely lived on the failed node, so its
+            reference-counting and location metadata went with it and the object
+            became unfetchable even if a copy existed. Lineage reconstruction can
+            replay task-produced objects, but a <code>ray.put</code> value from a
+            dead owner has no lineage to replay.
+          </p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Two primitives, then build everything on them.</strong> Ray
+            commits to just tasks and actors over an object store, and every
+            library, Data, Train, Serve, RLlib, is an ordinary Ray program on
+            that substrate. A small, sharp core that many domains reuse beats a
+            pile of special-purpose systems, the same instinct as a good kernel
+            interface or a minimal instruction set.
+          </p>
+          <p>
+            <strong>Make data movement implicit and dedupe with shared
+            memory.</strong> Results are immutable objects read zero-copy by every
+            local worker, and inter-node transfer is an explicit pull. Turning
+            data placement into first-class references, rather than hidden
+            serialization on every call, is the same win as content-addressed
+            storage or copy-on-write pages.
+          </p>
+          <p>
+            <strong>Shard the metadata, not just the data.</strong> Ownership
+            pushes reference counting and object location to the creator of each
+            reference, so the control state scales with the number of workers
+            instead of through one master. Whenever a central table becomes a
+            bottleneck, the move is to partition responsibility by who created
+            what, which is how scalable filesystems and databases avoid a single
+            hot coordinator.
+          </p>
+          <p>
+            <strong>A single controller between SPMD and a workflow engine.</strong>
+            Ray sits deliberately between rigid lockstep parallelism and a heavy
+            DAG scheduler. One driver expressing distributed work as plain Python
+            control flow is expressive enough for RLHF yet light enough for tight
+            loops, and that middle ground is exactly the gap the RLHF ecosystem
+            needed filled.
+          </p>
+          <p>
+            <strong>Gang scheduling deserves to be a primitive.</strong> Placement
+            groups make all-or-nothing resource acquisition a first-class
+            operation rather than something each application reinvents badly.
+            Wherever partial acquisition means deadlock, training GPUs, database
+            locks, distributed transactions, the atomic reservation belongs in the
+            substrate.
+          </p>
+          <p>
+            <strong>Recover by replay, not only by checkpoint.</strong> Because
+            tasks are deterministic functions with recorded lineage, Ray can
+            rebuild a lost object by re-executing the tasks that produced it,
+            paying for fault tolerance only when something actually fails. Lineage
+            and idempotence turn recovery into recomputation, the same idea behind
+            resilient distributed datasets and event-sourced systems.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            The one-sentence summary. <mark>Ray turns a Python program into a
+            cluster program with stateless tasks and stateful actors, stores
+            their immutable results in a shared-memory object store tracked by
+            ownership-based reference counting, schedules them through per-node
+            raylets with a GCS control plane and placement groups for gang
+            scheduling, and layers Data, Train, Serve, and RLlib on top, which is
+            why it became the single-controller substrate under LLM RLHF.</mark>
+          </p>
+          <pre class="flow">.remote() -&gt; ObjectRef (owner allocates it, starts refcount)
+  -&gt; core worker asks raylet for a worker lease (resources)
+  -&gt; raylet grants locally or spills to another node (GCS resource view)
+  -&gt; owner dispatches directly to the leased worker over gRPC
+  -&gt; worker runs, stores result in shared-memory object store
+  -&gt; ray.get reads it (zero-copy for numpy); refcount to 0 -&gt; evict/spill</pre>
+          <p>The system mapped to source:</p>
+          <pre class="flow">python api        python/ray/remote_function.py, actor.py, _private/worker.py
+py-&gt;c++ bridge     python/ray/_raylet.pyx
+core worker       src/ray/core_worker/   (submission, ownership, refcount)
+node scheduler    src/ray/raylet/        (leases, spillback, worker pool)
+object store      src/ray/object_manager/  (shared memory, transfer, spill)
+control plane     src/ray/gcs/           (nodes, actors, placement groups, kv)
+libraries         python/ray/{data,train,serve,rllib,tune}/</pre>
+          <p>Memorize these blocks:</p>
+          <ul>
+            <li><strong>Primitives:</strong> tasks are stateless functions, actors are stateful classes, both requested with <code>@ray.remote</code> and called with <code>.remote()</code> returning an <code>ObjectRef</code>.</li>
+            <li><strong>Object store:</strong> immutable objects, one copy per node in shared memory, zero-copy numpy reads, spill to disk or cloud when full.</li>
+            <li><strong>Ownership:</strong> the creator of a reference owns the object and does its reference counting and location tracking, no central table, and if the owner dies the object is lost.</li>
+            <li><strong>Scheduling:</strong> owner requests a worker lease from a raylet, which grants locally or spills, then the owner dispatches directly and reuses the lease; placement groups gang-reserve bundles (PACK, SPREAD, STRICT_PACK, STRICT_SPREAD).</li>
+            <li><strong>Libraries:</strong> Ray Data streams blocks over CPU and GPU stages, Ray Train orchestrates a PyTorch DDP/FSDP job as actors, Ray Serve composes deployment actors behind a proxy, RLlib runs EnvRunner samplers and Learner updaters.</li>
+            <li><strong>RLHF:</strong> a single controller with actors for policy, critic, reference, reward, and a vLLM or SGLang generation engine, colocated by placement groups, is why verl and OpenRLHF build on Ray.</li>
+          </ul>
+
+          <h2>Part XI: Final takeaway</h2>
+          <p>
+            If the tightly-coupled training these libraries wrap is the part you
+            want to understand from the inside, the
+            <a href="/oss/torchtitan">torchtitan chapter</a> follows one FSDP
+            training step down to the collectives, and the generation engines Ray
+            colocates for RLHF are dissected in the
+            <a href="/oss/vllm">vLLM</a> and <a href="/oss/sglang">SGLang</a>
+            chapters. The scheduling and data-placement instincts underneath Ray
+            are the distributed cousins of the ideas in
+            <a href="/classes/parallel-computing">parallel computing</a>. Then
+            come back and read <code>src/ray/core_worker/</code> once more with
+            the one-call trace in hand, and the object store, the leases, and the
+            reference counts will read like the plain mechanics they are.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> Ray shows that a distributed ML stack
+            does not need a new framework per problem. Give programmers two
+            primitives, stateless tasks and stateful actors, back them with an
+            immutable shared-memory object store and ownership-based reference
+            counting, schedule them through per-node raylets with placement groups
+            for gang scheduling, and the same substrate carries streaming data,
+            distributed training, model serving, reinforcement learning, and the
+            single-controller orchestration that made it the control plane under
+            modern LLM RLHF.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/code-copy.js"></script>
+      <script defer src="/theme.js"></script>
+  </body>
+</html>
