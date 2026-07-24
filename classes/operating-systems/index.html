@@ -1,0 +1,2377 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Operating Systems &middot; Stanley Jacob</title>
+    <meta name="description" content="Processes, system calls, and context switches measured on a real Xeon; CFS and EEVDF scheduling worked numerically; futexes built from atomics; the 4-level x86-64 page walk done address-by-address; TLB and huge-page effects benchmarked; journaling, LFS, io_uring, namespaces, cgroups, and hardware virtualization." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes" class="active">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/classes">Classes</a></div>
+        <h1>Operating systems: processes, virtual memory, file systems, and the kernel boundary</h1>
+        <p class="lead">
+          An operating system is a resource multiplexer built on three
+          abstractions: the process, which virtualizes the CPU; the address
+          space, which virtualizes memory; and the file, which virtualizes
+          storage. This page works through all three with the arithmetic
+          shown: the cost of crossing the user/kernel boundary measured on
+          this site's build machine, CFS vruntime and EEVDF deadlines
+          computed by hand and then verified against the live scheduler, a
+          mutex built up from a single atomic instruction to the futex
+          system call, a 4-level x86-64 page walk decomposed
+          address-by-address, a measured 1.9x penalty for translating 32
+          GiB through 4 KiB pages instead of huge pages, inode pointer
+          arithmetic, the crash-consistency argument behind journaling,
+          and the ring buffers of io_uring driven through raw system
+          calls. It closes where the kernel's own boundaries are drawn
+          today: namespaces and cgroups below, hypervisors beneath.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Why this subject matters now</h2>
+          <p>
+            Operating systems knowledge went through a strange decade. The
+            textbook material, processes, paging, file systems, stabilized
+            in the 1990s, and for a while it was fashionable to treat the
+            kernel as a solved layer one merely sits on. Three shifts ended
+            that. First, the cloud made the kernel's isolation machinery
+            into product surface: containers are nothing but namespaces
+            plus cgroups, serverless platforms boot a hardware virtual
+            machine per function, and the difference between a 130 ns
+            system call and a 4 &micro;s trap into a hypervisor is a line
+            item on someone's bill. Second, hardware outran the kernel's
+            old interfaces: NVMe devices that sustain millions of I/O
+            operations per second made the one-syscall-per-operation model
+            a bottleneck, which is why io_uring exists, and terabyte-scale
+            memory made 4 KiB pages a measurable tax, which is why huge
+            pages and multi-level TLB design are now application-level
+            concerns. Third, the schedulers changed under everyone's feet:
+            Linux replaced the O(1) scheduler with CFS in 2007, replaced
+            CFS's heuristics with EEVDF in 2023, and since 6.12 lets
+            operators load entire scheduling policies as BPF programs. An
+            engineer who last looked at scheduling in the CFS era is two
+            generations behind the kernel their service runs on.
+          </p>
+          <p>
+            The practitioner bar has risen accordingly. Debugging a tail
+            latency regression today routinely bottoms out in kernel
+            territory: a transparent-huge-page compaction stall, a cgroup
+            CPU quota throttling a container at exactly the wrong moment, a
+            journal commit serializing behind an fsync, a page cache that
+            looks like a memory leak to a naive dashboard. The material on
+            this page is the vocabulary those investigations are conducted
+            in. It is anchored on Arpaci-Dusseau and Arpaci-Dusseau's
+            <em>Operating Systems: Three Easy Pieces</em>, Tanenbaum and
+            Bos's <em>Modern Operating Systems</em>, and Love's
+            <em>Linux Kernel Development</em>, with the original papers,
+            Ritchie and Thompson on UNIX, McKusick on FFS, Rosenblum and
+            Ousterhout on LFS, Denning on working sets, cited where the
+            ideas were born.
+          </p>
+          <p>
+            Every number presented as a measurement below was taken on this
+            site's build machine: an Intel Xeon Platinum 8480+ (Sapphire
+            Rapids, 52 logical CPUs), Ubuntu 22.04 on Linux 6.8, gcc 11.4
+            at -O2, recorded in <code>classes/data/os.json</code>. The
+            host is itself a KVM guest on shared multi-tenant hardware, a
+            fact worth keeping in view twice over: absolute numbers carry
+            guest-exit and neighbor noise, so they are order-of-magnitude
+            engineering data rather than microarchitectural truth, and the
+            machine is a living example of the virtualization stack the
+            last section describes. Context-switch and lock-contention
+            numbers measured in the same environment live in
+            <code>classes/data/concurrency.json</code> and are dissected
+            at length on the
+            <a href="/classes/concurrent-systems-programming/">concurrency
+            page</a>; cache and TLB hardware internals are covered on the
+            <a href="/classes/computer-architecture/">architecture
+            page</a>. This page owns the kernel's side of both stories.
+          </p>
+
+          <h2>The process: the kernel's unit of accounting</h2>
+          <p>
+            A process is a running program: one or more threads of
+            execution bound to an address space, a table of open file
+            descriptors, credentials, signal state, and, on a modern
+            Linux, a set of namespaces and a cgroup membership. The
+            definition matters because every one of those components is a
+            kernel data structure with a cost and a sharing rule. In
+            Linux the whole bundle hangs off <code>struct task_struct</code>
+            in <code>include/linux/sched.h</code>, one per thread, several
+            kilobytes each: the pid, the run state, a pointer to
+            <code>mm_struct</code> (the address space: page-table root,
+            VMA tree, RSS counters), a pointer to <code>files_struct</code>
+            (the fd table), <code>cred</code> (uid, gid, capabilities),
+            the scheduling entity that CFS/EEVDF sorts, and the namespace
+            proxy. The teaching kernel xv6-riscv (MIT's modern rewrite of
+            v6 UNIX) collapses this to a 64-line <code>struct proc</code>
+            in <code>kernel/proc.h</code>, pid, state, page-table pointer,
+            kernel stack, open files, and reading it first makes the
+            production structure legible: everything Linux adds is
+            accounting, not concept.
+          </p>
+          <pre class="flow">process = address space + threads + kernel state
+
+  ┌──────────────── task_struct (per thread) ────────────────┐
+  │ pid, state (R/S/D/Z), sched_entity {vruntime, deadline}  │
+  │   │                                                      │
+  │   ├─→ mm_struct     page-table root (CR3 value), VMAs,   │
+  │   │                 rss; SHARED by threads, COPIED by    │
+  │   │                 fork (lazily, via COW)               │
+  │   ├─→ files_struct  fd table: fd 0,1,2,... → struct file │
+  │   ├─→ cred          uid, gid, capabilities               │
+  │   ├─→ nsproxy       pid/mnt/net/uts/ipc/time namespaces  │
+  │   └─→ css_set       cgroup membership (cpu, memory, io)  │
+  └───────────────────────────────────────────────────────────┘</pre>
+          <p>
+            The state machine is small. A task is created, becomes
+            runnable, runs when the scheduler picks it, blocks when it
+            waits for I/O or a lock, and on exit becomes a zombie: dead
+            but still occupying a process-table slot so its parent can
+            read the exit status with <code>wait</code>. Only after the
+            parent reaps it does the kernel free the slot; a parent that
+            never waits leaks zombies, which is why long-running daemons
+            either catch <code>SIGCHLD</code> or double-fork so init
+            inherits and reaps. Linux's <code>D</code> state,
+            uninterruptible sleep, is the operationally famous one: a task
+            blocked in the kernel, usually on disk I/O, that not even
+            <code>kill -9</code> can touch until the I/O completes,
+            because the kernel cannot safely unwind a half-finished
+            operation on its stack.
+          </p>
+          <pre class="flow">        fork/clone           scheduler picks
+  NEW ────────────→ READY ⇄──────────────────⇄ RUNNING
+                      ↑         preempted        │    │
+                      │ I/O done / lock freed    │    │ exit()
+                    BLOCKED ←────────────────────┘    ↓
+                      (S: interruptible,           ZOMBIE ── wait() ──→ gone
+                       D: uninterruptible)         (exit status held
+                                                    for the parent)</pre>
+          <p>
+            The UNIX creation interface splits creation into two calls,
+            and the split is a design decision worth defending because it
+            looks wasteful at first sight. <code>fork()</code> duplicates
+            the calling process, same code, same (copy-on-write) memory,
+            same open files; <code>exec()</code> replaces the program
+            image within the existing process. Ritchie and Thompson's 1974
+            paper shows what the gap between them buys: the shell
+            implements redirection by forking, then, <em>in the child,
+            between fork and exec</em>, closing fd 1 and opening the
+            output file in its place, then exec-ing the command. No
+            special kernel support for redirection, pipes, or environment
+            setup is needed; the child rearranges its own inheritance
+            using ordinary calls before it becomes the new program. The
+            alternative, a single spawn call, needs a parameter block
+            describing every possible rearrangement, which is exactly what
+            <code>posix_spawn</code>'s file-actions API looks like. The
+            cost side, measured on this machine and recorded in
+            <code>concurrency.json</code>: fork plus wait for an exiting
+            child is 118.9 &micro;s, fork plus exec of
+            <code>/bin/true</code> is 499.7 &micro;s, posix_spawn of the
+            same 432.6 &micro;s, and a pthread create/join, which shares
+            the address space instead of copying page tables, is 33.9
+            &micro;s. The copy-on-write machinery that makes fork cheap
+            enough to survive is measured in the virtual memory section
+            below.
+          </p>
+          <p>
+            Linux implements all of these over one primitive:
+            <code>clone()</code>, whose flag bits decide what the child
+            shares. <code>fork</code> is clone sharing almost nothing;
+            <code>pthread_create</code> is clone with
+            <code>CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+            CLONE_THREAD</code>, sharing the address space, fd table, and
+            signal handlers; a container runtime's first act is clone with
+            <code>CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET</code>,
+            sharing nothing and additionally unsharing the kernel's own
+            naming. Process, thread, and container are not three kernel
+            concepts; they are three settings of one bitmask.
+          </p>
+
+          <h2>System calls: what the boundary costs</h2>
+          <p>
+            User code runs at privilege level 3, the kernel at level 0,
+            and the only sanctioned way across is a trap. On x86-64 the
+            <code>syscall</code> instruction does the crossing in
+            hardware: it copies the return address into <code>rcx</code>
+            and the flags into <code>r11</code>, loads the instruction
+            pointer from the <code>LSTAR</code> machine-specific register,
+            which the kernel set at boot to point at its entry stub, and
+            raises the privilege level, all without touching memory. The
+            kernel stub then does the work the instruction skipped:
+            <code>swapgs</code> to find the per-CPU area, a switch to the
+            task's kernel stack, a spill of user registers into a
+            <code>struct pt_regs</code>, and an indirect call through the
+            system-call table indexed by <code>rax</code>. The return path
+            (<code>sysret</code>) mirrors it. Two things are worth
+            separating immediately. This is a <em>mode switch</em>, not a
+            context switch: the address space does not change, no
+            scheduler runs, and the same task continues in kernel clothes.
+            And the cost is not the instruction, which is tens of cycles,
+            but the round trip: entry bookkeeping, the work itself,
+            exit checks (pending signals, need-resched), and the indirect
+            cache and branch-predictor damage on both sides.
+          </p>
+          <p>
+            Some "system calls" never cross at all. The kernel maps a
+            shared page of code and data, the vDSO, into every process,
+            and calls whose answer the kernel can precompute,
+            <code>clock_gettime</code>, <code>gettimeofday</code>,
+            <code>getcpu</code>, are satisfied there: the vDSO reads the
+            timekeeping variables the kernel publishes under a sequence
+            lock, scales the CPU's timestamp counter, and returns without
+            a trap. The measured gap below is the whole argument for the
+            mechanism.
+          </p>
+          <p>
+            The benchmark: tight loops over each primitive, pinned to one
+            logical CPU, 3-10 million iterations, medians of repeated
+            runs. This kernel reports <code>meltdown: Not affected</code>,
+            so no KPTI page-table split inflates the numbers; the host is
+            a shared KVM guest, the standing caveat for every figure on
+            this page.
+          </p>
+          <div class="tbl-wrap"><table class="data">
+            <thead><tr><th>Primitive</th><th>ns/call</th><th>What it is</th></tr></thead>
+            <tbody>
+              <tr><td>plain function call</td><td>1.4</td><td>baseline: call through a volatile pointer, no boundary</td></tr>
+              <tr><td><code>clock_gettime</code> (vDSO)</td><td>32.2</td><td>userspace read of kernel-published time; no trap</td></tr>
+              <tr><td><code>getpid()</code></td><td>133.8</td><td>the cheapest real system call: trap, return a cached integer</td></tr>
+              <tr><td><code>read()</code> of 8 B from /dev/zero</td><td>183.7</td><td>a real call with fd lookup and a copy_to_user</td></tr>
+              <tr><td><code>clock_gettime</code> (forced trap)</td><td>188.6</td><td>the same call as row 2, denied the vDSO</td></tr>
+              <tr><td>Python <code>time.clock_gettime</code></td><td>133</td><td>vDSO plus interpreter dispatch: overhead moves up the stack</td></tr>
+              <tr><td>Python <code>os.getpid()</code></td><td>216</td><td>real trap plus interpreter dispatch</td></tr>
+            </tbody>
+          </table></div>
+          <p>
+            Three readings of this table. The boundary multiplier is about
+            96x: 133.8 ns for the cheapest possible trap against 1.4 ns
+            for a call, which at this machine's clock is on the order of
+            300 cycles of entry/exit machinery wrapped around a few cycles
+            of work. The vDSO recovers a factor of 5.9 for time queries
+            (188.6 versus 32.2 ns), which is why profilers and tracing
+            frameworks can afford to timestamp everything. And the Python
+            rows show the boundary from higher altitude: the interpreter
+            adds roughly 100 ns of dispatch to either path, so from Python
+            the trap versus vDSO distinction shrinks from 5.9x to 1.6x,
+            a general lesson in where optimization effort should go.
+            Adding a seccomp filter, the mechanism containers use to
+            restrict which calls may cross, was also measured: one
+            BPF filter adds about 11 ns to every getpid, and a second
+            filter adds nothing measurable on top.
+          </p>
+          <p>
+            The benchmark source, C and Python side by side. The C loop is
+            the one whose numbers are quoted; the Python version exists to
+            show the same experiment is a ten-line afternoon tool in any
+            language.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="c" class="active">C</button>
+              <button data-lang="python">Python</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="c" class="shl lang active"><code class="language-cpp"><span class="c">/* syscall_cost.c: gcc -O2 syscall_cost.c &amp;&amp; taskset -c 2 ./a.out</span>
+<span class="c"> * Measures the user/kernel boundary four ways. Numbers quoted on this</span>
+<span class="c"> * page: 1.4 / 32.2 / 133.8 / 188.6 ns on a Xeon 8480+ guest, Linux 6.8. */</span>
+<span class="k">#define</span> <span class="m1">_GNU_SOURCE</span>
+<span class="k">#include</span> <span class="s">&lt;stdio.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;stdint.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;time.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;unistd.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;sys/syscall.h&gt;</span>
+
+<span class="k">static</span> <span class="k">inline</span> <span class="k">uint64_t</span> <span class="m1">now_ns</span><span class="b0">(</span><span class="k">void</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">struct</span> <span class="m1">timespec</span> <span class="v2">ts</span>;
+    <span class="m1">clock_gettime</span><span class="b1">(</span><span class="v4">CLOCK_MONOTONIC</span>, &amp;<span class="v2">ts</span><span class="b1">)</span>;<span class="c">          /* itself vDSO */</span>
+    <span class="k">return</span> <span class="b1">(</span><span class="k">uint64_t</span><span class="b1">)</span><span class="v2">ts</span>.<span class="m2">tv_sec</span> * <span class="n">1000000000</span><span class="k">ull</span> + <span class="v2">ts</span>.<span class="m2">tv_nsec</span>;
+<span class="b0">}</span>
+
+__attribute__<span class="b0">(</span><span class="b1">(</span><span class="m1">noinline</span><span class="b1">)</span><span class="b0">)</span> <span class="k">long</span> <span class="m1">plain_call</span><span class="b0">(</span><span class="k">long</span> <span class="v4">x</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">__asm__</span> <span class="k">volatile</span><span class="b1">(</span><span class="s">""</span> : <span class="s">"</span>+<span class="v2">r</span><span class="s">"</span><span class="b2">(</span><span class="v4">x</span><span class="b2">)</span><span class="b1">)</span>;<span class="c">               /* defeat inlining */</span>
+    <span class="k">return</span> <span class="v4">x</span> + <span class="n">1</span>;
+<span class="b0">}</span>
+
+<span class="k">int</span> <span class="m1">main</span><span class="b0">(</span><span class="k">void</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">const</span> <span class="k">long</span> <span class="v6">N</span> = <span class="n">10</span> * <span class="n">1000</span> * <span class="n">1000</span>;
+    <span class="k">volatile</span> <span class="k">long</span> <span class="v2">sink</span> = <span class="n">0</span>;
+    <span class="k">struct</span> <span class="m1">timespec</span> <span class="v2">ts</span>;
+    <span class="k">uint64_t</span> <span class="v5">t0</span>;
+
+    <span class="k">for</span> <span class="b1">(</span><span class="k">long</span> <span class="v3">i</span> = <span class="n">0</span>; <span class="v3">i</span> &lt; <span class="n">200000</span>; <span class="v3">i</span>++<span class="b1">)</span> <span class="v2">sink</span> += <span class="m1">getpid</span><span class="b1">()</span>;<span class="c">   /* warmup */</span>
+
+    <span class="v5">t0</span> = <span class="m1">now_ns</span><span class="b1">()</span>;
+    <span class="k">for</span> <span class="b1">(</span><span class="k">long</span> <span class="v3">i</span> = <span class="n">0</span>; <span class="v3">i</span> &lt; <span class="v6">N</span>; <span class="v3">i</span>++<span class="b1">)</span> <span class="v2">sink</span> += <span class="m1">plain_call</span><span class="b1">(</span><span class="v3">i</span><span class="b1">)</span>;
+    <span class="m1">printf</span><span class="b1">(</span><span class="s">"plain call:          %6.2f ns\n"</span>, <span class="b2">(</span><span class="k">double</span><span class="b2">)(</span><span class="m1">now_ns</span><span class="b0">()</span>-<span class="v5">t0</span><span class="b2">)</span>/<span class="v6">N</span><span class="b1">)</span>;
+
+    <span class="v5">t0</span> = <span class="m1">now_ns</span><span class="b1">()</span>;
+    <span class="k">for</span> <span class="b1">(</span><span class="k">long</span> <span class="v3">i</span> = <span class="n">0</span>; <span class="v3">i</span> &lt; <span class="v6">N</span>; <span class="v3">i</span>++<span class="b1">)</span> <span class="b1">{</span> <span class="m1">clock_gettime</span><span class="b2">(</span><span class="v4">CLOCK_MONOTONIC</span>, &amp;<span class="v2">ts</span><span class="b2">)</span>; <span class="v2">sink</span> += <span class="v2">ts</span>.<span class="m2">tv_nsec</span>; <span class="b1">}</span>
+    <span class="m1">printf</span><span class="b1">(</span><span class="s">"clock_gettime vDSO:  %6.2f ns\n"</span>, <span class="b2">(</span><span class="k">double</span><span class="b2">)(</span><span class="m1">now_ns</span><span class="b0">()</span>-<span class="v5">t0</span><span class="b2">)</span>/<span class="v6">N</span><span class="b1">)</span>;
+
+    <span class="v5">t0</span> = <span class="m1">now_ns</span><span class="b1">()</span>;
+    <span class="k">for</span> <span class="b1">(</span><span class="k">long</span> <span class="v3">i</span> = <span class="n">0</span>; <span class="v3">i</span> &lt; <span class="v6">N</span>; <span class="v3">i</span>++<span class="b1">)</span> <span class="v2">sink</span> += <span class="m1">syscall</span><span class="b1">(</span><span class="v1">SYS_getpid</span><span class="b1">)</span>;
+    <span class="m1">printf</span><span class="b1">(</span><span class="s">"raw getpid trap:     %6.2f ns\n"</span>, <span class="b2">(</span><span class="k">double</span><span class="b2">)(</span><span class="m1">now_ns</span><span class="b0">()</span>-<span class="v5">t0</span><span class="b2">)</span>/<span class="v6">N</span><span class="b1">)</span>;
+
+    <span class="v5">t0</span> = <span class="m1">now_ns</span><span class="b1">()</span>;<span class="c">                                /* deny the vDSO */</span>
+    <span class="k">for</span> <span class="b1">(</span><span class="k">long</span> <span class="v3">i</span> = <span class="n">0</span>; <span class="v3">i</span> &lt; <span class="v6">N</span>; <span class="v3">i</span>++<span class="b1">)</span> <span class="b1">{</span> <span class="m1">syscall</span><span class="b2">(</span><span class="v4">SYS_clock_gettime</span>, <span class="v4">CLOCK_MONOTONIC</span>, &amp;<span class="v2">ts</span><span class="b2">)</span>; <span class="v2">sink</span> += <span class="v2">ts</span>.<span class="m2">tv_nsec</span>; <span class="b1">}</span>
+    <span class="m1">printf</span><span class="b1">(</span><span class="s">"clock_gettime trap:  %6.2f ns\n"</span>, <span class="b2">(</span><span class="k">double</span><span class="b2">)(</span><span class="m1">now_ns</span><span class="b0">()</span>-<span class="v5">t0</span><span class="b2">)</span>/<span class="v6">N</span><span class="b1">)</span>;
+    <span class="k">return</span> <span class="b1">(</span><span class="k">int</span><span class="b1">)(</span><span class="v2">sink</span> &amp; <span class="n">1</span><span class="b1">)</span>;
+<span class="b0">}</span>
+</code></pre>
+            <pre data-lang="python" class="shl lang"><code class="language-python"><span class="c"># Same experiment from Python. On this machine: os.getpid() 216 ns,</span>
+<span class="c"># time.clock_gettime 133 ns. The ~100 ns interpreter dispatch dwarfs</span>
+<span class="c"># the vDSO's 32 ns, so the trap/no-trap gap shrinks from 5.9x to 1.6x.</span>
+<span class="k">import</span> <span class="m1">os</span>, <span class="m1">time</span>
+
+<span class="k">def</span> <span class="m1">bench</span><span class="b0">(</span><span class="m1">fn</span>, <span class="v5">n</span>=<span class="n">2_000_000</span><span class="b0">)</span>:
+    <span class="v5">t0</span> = <span class="m1">time</span>.<span class="m2">perf_counter</span><span class="b0">()</span>
+    <span class="k">for</span> <span class="v4">_</span> <span class="k">in</span> <span class="m1">range</span><span class="b0">(</span><span class="v5">n</span><span class="b0">)</span>:
+        <span class="m1">fn</span><span class="b0">()</span>
+    <span class="k">return</span> <span class="b0">(</span><span class="m1">time</span>.<span class="m2">perf_counter</span><span class="b1">()</span> - <span class="v5">t0</span><span class="b0">)</span> / <span class="v5">n</span> * <span class="n">1e9</span>
+
+<span class="m1">print</span><span class="b0">(</span><span class="s">f"os.getpid:            {</span><span class="m1">bench</span><span class="b1">(</span><span class="m1">os</span>.<span class="m2">getpid</span><span class="b1">)</span><span class="s">:6.0f} ns/call"</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">f"clock_gettime (vDSO): {</span><span class="m1">bench</span><span class="b1">(</span><span class="k">lambda</span>: <span class="m1">time</span>.<span class="m2">clock_gettime</span><span class="b2">(</span><span class="m1">time</span>.<span class="m2">CLOCK_MONOTONIC</span><span class="b2">)</span><span class="b1">)</span><span class="s">:6.0f} ns/call"</span><span class="b0">)</span>
+</code></pre>
+          </div>
+
+          <div class="problem">
+            <span class="plabel">Problem 1</span>
+            <p>
+              A tracing framework timestamps function entry and exit, two
+              clock reads per traced call, and the traced service executes
+              2,000,000 traced calls per second per core. Using this
+              machine's measurements (32.2 ns vDSO, 188.6 ns forced trap),
+              compute the fraction of a core consumed by timestamping in
+              each configuration, and the break-even call rate at which
+              trap-based timestamps alone would consume an entire core.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> Clock reads per second:
+                \( 2 \times 2{,}000{,}000 = 4{,}000{,}000 \). Via the
+                vDSO: \( 4 \times 10^6 \times 32.2\,\text{ns} =
+                0.1288\,\text{s} \) of CPU per second, i.e. 12.9% of a
+                core. Via forced traps:
+                \( 4 \times 10^6 \times 188.6\,\text{ns} =
+                0.754\,\text{s} \), i.e. 75.4% of a core, and the service
+                has lost three quarters of its capacity to observability.
+                Break-even for a full core with traps:
+                \( 1 / 188.6\,\text{ns} = 5.30 \times 10^6 \) reads/s,
+                or 2.65 million traced calls per second. The design
+                conclusion: high-frequency instrumentation is only viable
+                because the vDSO exists, and even then 12.9% is a price
+                one states in a design review rather than discovers in
+                production. This is why serious tracers read the TSC
+                directly (about 7 ns) and defer conversion to wall time.
+              </p>
+            </div>
+          </div>
+
+          <h2>Context switches, measured</h2>
+          <p>
+            A context switch is the scheduler's act of replacing the
+            running task: save the outgoing task's registers into its
+            kernel stack, switch stacks, switch <code>mm_struct</code> if
+            the incoming task lives in a different address space (a CR3
+            write, which on this hardware does not flush the TLB thanks to
+            PCID tags, but does invalidate the cheap fiction that the TLB
+            content is yours), restore the incoming registers, and return
+            into a different program. The direct cost is small; the
+            indirect cost, refilling caches, TLB entries, and branch
+            predictors that the other task evicted, is the part that
+            scales with the workload and dominates in practice.
+          </p>
+          <p>
+            Both were measured here. The direct cost: a 1-byte ping-pong
+            between two processes over a pair of pipes, both pinned to the
+            same logical CPU so every round trip forces two switches,
+            199,000 round trips. Result: 3,770 ns per round trip, so about
+            1,885 ns per process switch; the same experiment with threads
+            (shared address space, no CR3 write) gives 1,749 ns, and a
+            <code>sched_yield</code> handoff pair costs 1,583 ns. The
+            concurrency page's independent run of the same experiment
+            (<code>concurrency.json</code>) got 3,730 ns per round trip,
+            agreement well within this host's noise. Cross-core, where
+            each wakeup needs an inter-processor interrupt instead of a
+            local schedule, the round trip balloons to about 15.9
+            &micro;s on this virtualized box. The indirect cost: the same
+            ping-pong, but each peer touches 512 random cache lines of a
+            private working set before yielding. As the working set grows
+            from 32 KiB to 64 MiB, the measured overhead per turn versus
+            running alone grows from 5.1 &micro;s to 11.3 &micro;s: the
+            switch itself did not change, but every turn now begins by
+            reloading state the peer evicted. "How much does a context
+            switch cost" has no single answer; it has a cache footprint
+            parameter.
+          </p>
+          <div class="tbl-wrap"><table class="data">
+            <thead><tr><th>Experiment (same core unless noted)</th><th>Measured</th></tr></thead>
+            <tbody>
+              <tr><td>pipe round trip, processes (2 switches)</td><td>3,770 ns</td></tr>
+              <tr><td>&rarr; implied per-switch cost</td><td>~1,885 ns</td></tr>
+              <tr><td>pipe round trip, threads</td><td>3,497 ns</td></tr>
+              <tr><td>sched_yield handoff pair</td><td>1,583 ns</td></tr>
+              <tr><td>pipe round trip, cross-core</td><td>~15,900 ns</td></tr>
+              <tr><td>socketpair round trip, blocking read</td><td>5,885 ns</td></tr>
+              <tr><td>socketpair round trip, epoll_wait + read</td><td>6,342 ns</td></tr>
+              <tr><td>switch overhead, 32 KiB working set</td><td>5.1 &micro;s/turn</td></tr>
+              <tr><td>switch overhead, 64 MiB working set</td><td>11.3 &micro;s/turn</td></tr>
+            </tbody>
+          </table></div>
+          <p>
+            Two details in that table earn their keep later. The AF_UNIX
+            socketpair round trip costs 2.1 &micro;s more than the pipe
+            (5,885 versus 3,770 ns), the price of the socket layer's
+            generality, and adding an <code>epoll_wait</code> before each
+            read costs a further ~460 ns, one extra system call per turn,
+            which is the baseline against which the I/O section's
+            readiness-versus-completion argument is conducted. And the
+            1,885 ns switch cost sets the floor for every blocking
+            primitive: a mutex that parks its waiter cannot hand off in
+            less than two switches, which is why the futex design below
+            spends so much effort never entering the kernel at all.
+          </p>
+
+          <h2>Scheduling: from round-robin to EEVDF</h2>
+          <h3>Metrics, and the quantum trade-off</h3>
+          <p>
+            A scheduler optimizes under a conflict. Turnaround time,
+            \( T_{\text{turnaround}} = T_{\text{completion}} -
+            T_{\text{arrival}} \), rewards running each job to completion;
+            response time, \( T_{\text{response}} = T_{\text{first run}} -
+            T_{\text{arrival}} \), rewards slicing finely. Shortest Job
+            First minimizes mean turnaround among non-preemptive policies,
+            and the proof is a one-line exchange argument: if a longer job
+            runs immediately before a shorter one, swapping them reduces
+            the shorter job's completion time by the longer job's length
+            and increases the longer job's by the shorter one's, a net
+            decrease in the sum; repeat until sorted. But SJF needs future
+            knowledge and starves long jobs, so interactive systems slice:
+            round-robin with quantum \( q \) bounds response time by
+            \( (n-1)q \) for \( n \) runnable tasks at the cost of paying
+            one context switch per quantum.
+          </p>
+          <p>
+            The quantum trade-off becomes concrete with this machine's
+            1,885 ns switch cost. Overhead fraction is
+            \( s/(q+s) \): at \( q = 10 \) ms it is
+            \( 1.885/10001.885 = 0.019\% \), irrelevant; at
+            \( q = 1 \) ms, 0.186%; at \( q = 100 \) &micro;s, 1.83%,
+            and that still ignores the cache-refill tax measured above,
+            which at a 64 MiB working set adds several microseconds per
+            switch. Solving \( s/(q+s) \le 1\% \) gives
+            \( q \ge 99s = 186.6 \) &micro;s. This bracket, a few hundred
+            microseconds to a few milliseconds, is where every production
+            scheduler's slice lands, and now the reader knows why.
+          </p>
+
+          <h3>MLFQ: learning priority from behavior</h3>
+          <p>
+            The multi-level feedback queue, descended from Corbat&oacute;'s
+            CTSS (1962), the first system that had to timeshare
+            interactive users, approximates SJF without future knowledge
+            by using the past. The rules: maintain a stack of queues by
+            priority; always run from the highest non-empty queue,
+            round-robin within it; new jobs enter on top; a job that
+            exhausts its allotment at a level drops one level; and
+            periodically every job is boosted back to the top. The scheme
+            learns: an interactive job that sleeps before its allotment
+            expires keeps its priority, a CPU-bound job sinks to the
+            bottom queues where quanta are long and switches rare. Each
+            rule patches a real failure mode. The periodic boost fixes
+            both starvation (a bottom-queue job under a stream of
+            interactive arrivals would otherwise never run) and behavior
+            change (a compile that becomes a REPL is re-observed). The
+            "allotment across the level, not per burst" accounting fixes
+            gaming: without it a job could sleep for a millisecond just
+            before each quantum expired and camp on the top queue forever.
+            Windows and the BSDs run recognizable MLFQ descendants;
+            Linux went a different way.
+          </p>
+
+          <h3>Lottery and stride: sharing by arithmetic</h3>
+          <p>
+            Waldspurger and Weihl's lottery scheduling (OSDI 1994, MIT)
+            reframed the goal: not priority, but <em>proportional
+            share</em>. Give each task tickets; each quantum, draw a
+            uniform ticket and run the holder. A task holding
+            \( t_i \) of \( T \) tickets gets each quantum with
+            probability \( p_i = t_i / T \), so over \( n \) quanta its
+            allocation is binomial with mean \( n p_i \) and standard
+            deviation \( \sqrt{n p_i (1-p_i)} \): the <em>relative</em>
+            error decays as \( 1/\sqrt{n} \), fairness that is only
+            asymptotic. Stride scheduling, Waldspurger's deterministic
+            follow-up, removes the variance. Each task gets
+            \( \text{stride}_i = L / t_i \) for a large constant \( L \),
+            and a pass counter; always run the task with the smallest
+            pass, then advance it by its stride. With tickets 250, 100,
+            50 and \( L = 10{,}000 \): strides 40, 100, 200. Simulating
+            from zero (ties broken by name) gives the schedule A B C, A,
+            A, B, A, A, A, B: in ten quanta A ran 6 times, B 3, C 1,
+            against exact entitlements 6.25, 2.5, 1.25, and the error is
+            provably bounded by one quantum forever, never
+            \( \sqrt{n} \). These two papers are the direct ancestors of
+            everything below: CFS's vruntime is a pass counter with
+            weights, and cgroup CPU shares are tickets under another name.
+          </p>
+
+          <h3>CFS: the vruntime invariant, worked and then verified</h3>
+          <p>
+            Linux's Completely Fair Scheduler (2007-2023) implements
+            weighted proportional share by bookkeeping a single quantity
+            per task, virtual runtime. While a task runs for
+            \( \Delta t \) of wall time, its vruntime advances by
+            $$ \Delta v_i \;=\; \Delta t \cdot \frac{w_0}{w_i}, \qquad
+               w_0 = 1024, $$
+            where \( w_i \) is the task's weight from the kernel's nice
+            table (<code>sched_prio_to_weight</code> in
+            <code>kernel/sched/core.c</code>): nice 0 is 1024, and each
+            nice step multiplies the weight by about 1.25, so nice -5 is
+            3121, nice 5 is 335, nice 19 is 15, nice -20 is 88761. The
+            scheduler keeps runnable tasks in a red-black tree ordered by
+            vruntime and always runs the leftmost, the task that has
+            received the least weighted service. Heavy tasks accumulate
+            vruntime slowly, so they hold the CPU longer before the tree
+            rotates them out.
+          </p>
+          <p>
+            Worked numerically: tasks A at nice 0 (\( w_A = 1024 \)) and
+            B at nice -5 (\( w_B = 3121 \)) share one CPU for 100 ms. In
+            equilibrium CFS equalizes vruntime advance, so CPU time
+            divides in weight proportion:
+            \( 1024 + 3121 = 4145 \), A gets
+            \( 100 \times 1024/4145 = 24.70 \) ms and B gets
+            \( 100 \times 3121/4145 = 75.30 \) ms. Check the invariant:
+            A's vruntime advances \( 24.70 \times 1024/1024 = 24.70 \)
+            ms; B's advances \( 75.30 \times 1024/3121 = 24.70 \) ms.
+            Equal, as required, and that equality is not an assumption
+            but the fixed point the leftmost-first rule drives the system
+            toward: any task whose vruntime lags gets picked until it
+            catches up (Problem 2 makes this a derivation).
+          </p>
+          <p>
+            The prediction was then tested against the live scheduler:
+            pairs of spin loops pinned to one logical CPU of this machine
+            for 4 seconds, CPU time read from <code>getrusage</code>.
+            Nice 0 versus nice 5 predicts a share of
+            \( 1024/(1024+335) = 0.753 \) for the nice-0 task; measured,
+            0.753. Nice 0 versus nice 3: predicted 0.661, measured 0.660.
+            Nice 0 versus nice 10: predicted 0.903, measured 0.902. The
+            weight table is not a suggestion; the kernel hits it to three
+            digits.
+          </p>
+          <div class="tbl-wrap"><table class="data">
+            <thead><tr><th>Pair (pinned, 4 s spin)</th><th>Weight ratio</th><th>Predicted share</th><th>Measured share</th></tr></thead>
+            <tbody>
+              <tr><td>nice 0 vs nice 0</td><td>1.000</td><td>0.500</td><td>0.500</td></tr>
+              <tr><td>nice 0 vs nice 3</td><td>1.947</td><td>0.661</td><td>0.660</td></tr>
+              <tr><td>nice 0 vs nice 5</td><td>3.057</td><td>0.753</td><td>0.753</td></tr>
+              <tr><td>nice 0 vs nice 10</td><td>9.309</td><td>0.903</td><td>0.902</td></tr>
+            </tbody>
+          </table></div>
+
+          <h3>EEVDF: adding deadlines to fairness</h3>
+          <p>
+            CFS answered "who is owed CPU" but had no principled answer to
+            "who needs it soon": interactivity came from a pile of
+            heuristics (sleeper credits, wakeup preemption tunables) that
+            were a constant source of regressions. The replacement, merged
+            as the default in Linux 6.6 and running on this machine's 6.8
+            kernel, is Stoica and Abdel-Wahab's Earliest Eligible Virtual
+            Deadline First (1995-96), a scheduler with a fairness
+            <em>and</em> a latency variable. Define system virtual time
+            \( V(t) \) as the weighted average of all runnable tasks'
+            virtual runtimes; task \( i \)'s lag is
+            \( \ell_i = w_i\,(V - v_i) \), the service it is owed (positive)
+            or has over-received (negative). Two rules:
+          </p>
+          <p>
+            First, <em>eligibility</em>: only tasks with
+            \( \ell_i \ge 0 \), i.e. \( v_i \le V \), may run. A task that
+            has already over-consumed cannot be picked again merely
+            because it holds a large weight. Second, among eligible tasks,
+            run the one with the earliest <em>virtual deadline</em>
+            $$ d_i \;=\; v_{e,i} + \frac{r_i}{w_i}, $$
+            where \( v_{e,i} \) is the virtual time at which the task's
+            current request became eligible and \( r_i \) is its slice,
+            the amount it asks for before rescheduling. The consequence,
+            worked with numbers: two equal-weight tasks become eligible at
+            \( v_e = 0 \), one a latency-sensitive task with a 2 ms slice,
+            one a batch task with a 10 ms slice. Deadlines: 2 versus 10.
+            The interactive task runs first, not because it holds more
+            weight, over any window both still get 50%, but because it
+            asked for less at a time. Latency and share have been
+            decoupled: nice adjusts \( w_i \) (how much you get), slice
+            adjusts \( r_i \) (how urgently you get it), and the old
+            heuristics are simply deleted. Stoica and Abdel-Wahab prove
+            lag stays bounded by one maximal request in their 1996
+            technical report; the proof is out of scope here but the
+            bounded-lag claim is the whole warranty. The implementation is
+            readable in <code>kernel/sched/fair.c</code>, where
+            <code>entity_eligible</code> and
+            <code>pick_eevdf</code> are near-literal transcriptions of the
+            two rules.
+          </p>
+          <p>
+            One machine-level footnote: all of the above is per-CPU. Linux
+            runs one runqueue per logical CPU and migrates tasks between
+            them under a separate load-balancing regime that respects
+            cache and NUMA domains, because a globally fair queue would
+            serialize 52 CPUs on one lock. Fairness is therefore local and
+            approximate across cores, a deliberate trade the
+            <a href="/classes/parallel-computing/">parallel computing
+            page</a> revisits from the application side.
+          </p>
+
+          <div class="problem">
+            <span class="plabel">Problem 2</span>
+            <p>
+              (a) Prove that under CFS's rule
+              \( \Delta v_i = \Delta t \cdot w_0 / w_i \), equal vruntime
+              advance across runnable tasks over a window implies each
+              task \( i \) received CPU time proportional to \( w_i \),
+              and conversely. (b) Three tasks at nice 0, nice 5, and nice
+              10 (weights 1024, 335, 110) share one CPU for 3 seconds
+              with no blocking. Compute each task's CPU time to the
+              millisecond and each task's common vruntime advance.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> (a) Let task \( i \) receive
+                wall time \( c_i \) in the window. Its vruntime advance is
+                \( \Delta v_i = c_i w_0 / w_i \). Suppose all advances are
+                equal to a common \( \Delta v \). Then
+                \( c_i = \Delta v \cdot w_i / w_0 \), which is
+                proportionality \( c_i \propto w_i \) with constant
+                \( \Delta v / w_0 \). Conversely if
+                \( c_i = K w_i \) for all \( i \), then
+                \( \Delta v_i = K w_i \cdot w_0 / w_i = K w_0 \),
+                independent of \( i \), hence equal. So the leftmost-first
+                rule, which by always advancing the minimum vruntime
+                forces all vruntimes to track each other to within one
+                slice, is exactly weighted fair sharing, up to
+                one-slice granularity.
+              </p>
+              <p>
+                (b) Total weight \( 1024 + 335 + 110 = 1469 \). Shares of
+                3,000 ms: nice 0 gets
+                \( 3000 \times 1024/1469 = 2091.2 \) ms; nice 5 gets
+                \( 3000 \times 335/1469 = 684.1 \) ms; nice 10 gets
+                \( 3000 \times 110/1469 = 224.6 \) ms. (Sum: 2999.9 ms,
+                rounding.) Common vruntime advance, using any task:
+                \( 2091.2 \times 1024/1024 = 2091.2 \) ms; check with
+                nice 10: \( 224.6 \times 1024/110 = 2090.9 \) ms, equal
+                to rounding. Note the compounding: two tasks five nice
+                levels apart differ by 3.06x, ten levels
+                9.3x, consistent with the measured table above.
+              </p>
+            </div>
+          </div>
+
+          <h2>Locks from atomics, and the futex</h2>
+          <h3>Spinning: correct in three lines, wrong for user space</h3>
+          <p>
+            Every mutual-exclusion primitive bottoms out in one hardware
+            capability: an atomic read-modify-write on a shared word. With
+            <code>xchg</code> or compare-and-swap, a spinlock is three
+            lines: loop exchanging 1 into the lock word until the old
+            value comes back 0; store 0 to release. Add the
+            test-and-test-and-set refinement, spin on a plain load and
+            only attempt the exchange when the lock looks free, so that
+            waiters spin in their own caches instead of stampeding the
+            line, plus a <code>pause</code> hint; the cache-coherence
+            mechanics of why this matters are traced on the
+            <a href="/classes/computer-architecture/">architecture
+            page</a>, and the memory-ordering contract (acquire on lock,
+            release on unlock) is derived on the
+            <a href="/classes/concurrent-systems-programming/">concurrency
+            page</a>. The kernel uses spinlocks pervasively, and may:
+            it disables preemption while holding one, so the holder cannot
+            be descheduled and hold-time is bounded by code inspection.
+          </p>
+          <p>
+            User space has no such guarantee, and that changes the
+            verdict entirely. If a thread is preempted while holding a
+            spinlock, every other thread spins through its whole quantum
+            accomplishing nothing; with the measured numbers, waiters burn
+            milliseconds of CPU to wait out a 1,885 ns switch. On a
+            single core it is strictly worse: spinning <em>prevents</em>
+            the holder from running. What user space needs is a lock that
+            costs nothing when uncontended and sleeps when contended, and
+            that is precisely the futex design.
+          </p>
+
+          <h3>The futex: kernel help, only on the slow path</h3>
+          <p>
+            The futex system call (Franke, Russell, and Kirkwood, Ottawa
+            Linux Symposium 2002; the definitive user guide is Drepper's
+            "Futexes Are Tricky") provides exactly two things over a
+            user-space 32-bit word. <code>FUTEX_WAIT(addr, val)</code>:
+            the kernel locks the hash bucket for <code>addr</code>,
+            re-reads <code>*addr</code>, and <em>only if it still equals
+            <code>val</code></em> enqueues the caller and sleeps;
+            otherwise it returns <code>EAGAIN</code> immediately.
+            <code>FUTEX_WAKE(addr, n)</code>: wake up to \( n \) sleepers
+            queued on <code>addr</code>. The compare inside WAIT is the
+            entire intellectual content: it makes "check the lock word
+            and go to sleep" atomic against a concurrent unlocker, which
+            closes the lost-wakeup window that would exist if user space
+            checked and then slept in two steps. The kernel keeps no
+            state for an uncontended futex; there is no registration, no
+            per-lock kernel object, nothing until someone actually waits.
+          </p>
+          <p>
+            A production-shaped mutex needs three states, not two:
+            0 unlocked, 1 locked with no waiters, 2 locked with possible
+            waiters. The third state is what lets the unlock fast path
+            skip the <code>FUTEX_WAKE</code> syscall when nobody is
+            sleeping, and its maintenance, waiters must re-lock to state
+            2, not 1, because after one wakeup other sleepers may remain,
+            is where hand-rolled futex code classically goes wrong.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="c" class="active">C</button>
+              <button data-lang="rust">Rust</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="c" class="shl lang active"><code class="language-cpp"><span class="c">/* futex_mutex.c: a three-state futex mutex, after Drepper's analysis.</span>
+<span class="c"> * states: 0 = unlocked, 1 = locked, 2 = locked with (possible) waiters.</span>
+<span class="c"> * Fast paths are one CAS / one XCHG; the kernel is entered only under</span>
+<span class="c"> * contention. gcc -O2 -pthread futex_mutex.c */</span>
+<span class="k">#define</span> <span class="m1">_GNU_SOURCE</span>
+<span class="k">#include</span> <span class="s">&lt;stdatomic.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;linux/futex.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;sys/syscall.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;unistd.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;limits.h&gt;</span>
+
+<span class="k">typedef</span> <span class="k">struct</span> <span class="b0">{</span> <span class="m1">_Atomic</span> <span class="k">unsigned</span> <span class="v3">v</span>; <span class="b0">}</span> <span class="m1">mutex_t</span>;<span class="c">   /* 32-bit word */</span>
+
+<span class="k">static</span> <span class="k">long</span> <span class="m1">futex</span><span class="b0">(</span><span class="m1">_Atomic</span> <span class="k">unsigned</span> <span class="k">*</span><span class="v1">addr</span>, <span class="k">int</span> <span class="v6">op</span>, <span class="k">unsigned</span> <span class="v4">val</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">return</span> <span class="m1">syscall</span><span class="b1">(</span><span class="v3">SYS_futex</span>, <span class="v1">addr</span>, <span class="v6">op</span>, <span class="v4">val</span>, <span class="k">NULL</span>, <span class="k">NULL</span>, <span class="n">0</span><span class="b1">)</span>;
+<span class="b0">}</span>
+
+<span class="k">void</span> <span class="m1">mutex_lock</span><span class="b0">(</span><span class="m1">mutex_t</span> <span class="k">*</span><span class="v4">m</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">unsigned</span> <span class="v1">c</span> = <span class="n">0</span>;
+<span class="c">    /* fast path: 0 -&gt; 1, one CAS, ~6 ns uncontended on this machine */</span>
+    <span class="k">if</span> <span class="b1">(</span><span class="m1">atomic_compare_exchange_strong</span><span class="b2">(</span>&amp;<span class="v4">m</span>-&gt;<span class="m2">v</span>, &amp;<span class="v1">c</span>, <span class="n">1</span><span class="b2">)</span><span class="b1">)</span> <span class="k">return</span>;
+<span class="c">    /* slow path: force state to 2 so unlock knows waiters may exist.</span>
+<span class="c">     * If the xchg returns 0 the lock was just released and we own it</span>
+<span class="c">     * (as 2, conservatively: other sleepers may remain). */</span>
+    <span class="k">if</span> <span class="b1">(</span><span class="v1">c</span> != <span class="n">2</span><span class="b1">)</span> <span class="v1">c</span> = <span class="m1">atomic_exchange</span><span class="b1">(</span>&amp;<span class="v4">m</span>-&gt;<span class="m2">v</span>, <span class="n">2</span><span class="b1">)</span>;
+    <span class="k">while</span> <span class="b1">(</span><span class="v1">c</span> != <span class="n">0</span><span class="b1">)</span> <span class="b1">{</span>
+<span class="c">        /* sleep iff the word is STILL 2: the kernel re-checks under</span>
+<span class="c">         * its own lock, closing the lost-wakeup race */</span>
+        <span class="m1">futex</span><span class="b2">(</span>&amp;<span class="v4">m</span>-&gt;<span class="m2">v</span>, <span class="v3">FUTEX_WAIT_PRIVATE</span>, <span class="n">2</span><span class="b2">)</span>;
+<span class="c">        /* on wakeup, re-acquire as 2, NOT 1: see comment above.</span>
+<span class="c">         * This mirrors Drepper's third, correct mutex exactly. */</span>
+        <span class="v1">c</span> = <span class="m1">atomic_exchange</span><span class="b2">(</span>&amp;<span class="v4">m</span>-&gt;<span class="m2">v</span>, <span class="n">2</span><span class="b2">)</span>;
+    <span class="b1">}</span>
+<span class="b0">}</span>
+
+<span class="k">void</span> <span class="m1">mutex_unlock</span><span class="b0">(</span><span class="m1">mutex_t</span> <span class="k">*</span><span class="v4">m</span><span class="b0">)</span> <span class="b0">{</span>
+<span class="c">    /* fast path: if we were in state 1, nobody waits; just store 0 */</span>
+    <span class="k">if</span> <span class="b1">(</span><span class="m1">atomic_exchange</span><span class="b2">(</span>&amp;<span class="v4">m</span>-&gt;<span class="m2">v</span>, <span class="n">0</span><span class="b2">)</span> == <span class="n">2</span><span class="b1">)</span>
+        <span class="m1">futex</span><span class="b1">(</span>&amp;<span class="v4">m</span>-&gt;<span class="m2">v</span>, <span class="v0">FUTEX_WAKE_PRIVATE</span>, <span class="n">1</span><span class="b1">)</span>;<span class="c">   /* wake one waiter */</span>
+<span class="b0">}</span>
+</code></pre>
+            <pre data-lang="rust" class="shl lang"><code class="language-rust"><span class="c">// Same three-state futex mutex in Rust. std::sync::Mutex has been</span>
+<span class="c">// futex-based on Linux since Rust 1.62 and follows this exact shape;</span>
+<span class="c">// this version exposes the mechanics. cargo add libc</span>
+<span class="k">use</span> <span class="m1">std</span>::<span class="m1">sync</span>::<span class="m1">atomic</span>::<span class="b0">{</span><span class="m1">AtomicU32</span>, <span class="m1">Ordering</span>::<span class="b1">{</span><span class="m1">Acquire</span>, <span class="m1">Release</span>, <span class="m1">Relaxed</span><span class="b1">}</span><span class="b0">}</span>;
+
+<span class="k">pub</span> <span class="k">struct</span> <span class="m1">FutexMutex</span> <span class="b0">{</span> <span class="v3">v</span>: <span class="m1">AtomicU32</span> <span class="b0">}</span>   <span class="c">// 0 free, 1 locked, 2 contended</span>
+
+<span class="k">fn</span> <span class="m1">futex</span><span class="b0">(</span><span class="v1">addr</span>: &amp;<span class="m1">AtomicU32</span>, <span class="v6">op</span>: <span class="m1">i32</span>, <span class="v4">val</span>: <span class="m1">u32</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">unsafe</span> <span class="b1">{</span>
+        <span class="m1">libc</span>::<span class="m1">syscall</span><span class="b2">(</span><span class="m1">libc</span>::<span class="m1">SYS_futex</span>, <span class="v1">addr</span> <span class="k">as</span> *<span class="k">const</span> <span class="m1">AtomicU32</span>,
+                      <span class="v6">op</span>, <span class="v4">val</span>, <span class="n">0usize</span>, <span class="n">0usize</span>, <span class="n">0u32</span><span class="b2">)</span>;
+    <span class="b1">}</span>
+<span class="b0">}</span>
+
+<span class="k">impl</span> <span class="m1">FutexMutex</span> <span class="b0">{</span>
+    <span class="k">pub</span> <span class="k">const</span> <span class="k">fn</span> <span class="m1">new</span><span class="b1">()</span> -&gt; <span class="k">Self</span> <span class="b1">{</span> <span class="k">Self</span> <span class="b2">{</span> <span class="v3">v</span>: <span class="m1">AtomicU32</span>::<span class="m1">new</span><span class="b0">(</span><span class="n">0</span><span class="b0">)</span> <span class="b2">}</span> <span class="b1">}</span>
+
+    <span class="k">pub</span> <span class="k">fn</span> <span class="m1">lock</span><span class="b1">(</span>&amp;<span class="k">self</span><span class="b1">)</span> <span class="b1">{</span>
+        <span class="k">if</span> <span class="k">self</span>.<span class="m2">v</span>.<span class="m1">compare_exchange</span><span class="b2">(</span><span class="n">0</span>, <span class="n">1</span>, <span class="m1">Acquire</span>, <span class="m1">Relaxed</span><span class="b2">)</span>.<span class="m1">is_ok</span><span class="b2">()</span> <span class="b2">{</span>
+            <span class="k">return</span>;                                   <span class="c">// fast path</span>
+        <span class="b2">}</span>
+        <span class="k">loop</span> <span class="b2">{</span>
+            <span class="k">let</span> <span class="v0">prev</span> = <span class="k">self</span>.<span class="m2">v</span>.<span class="m1">swap</span><span class="b0">(</span><span class="n">2</span>, <span class="m1">Acquire</span><span class="b0">)</span>;       <span class="c">// mark contended</span>
+            <span class="k">if</span> <span class="v0">prev</span> == <span class="n">0</span> <span class="b0">{</span> <span class="k">return</span>; <span class="b0">}</span>                  <span class="c">// got it (as 2)</span>
+            <span class="m1">futex</span><span class="b0">(</span>&amp;<span class="k">self</span>.<span class="m2">v</span>, <span class="m1">libc</span>::<span class="m2">FUTEX_WAIT</span> | <span class="m1">libc</span>::<span class="m2">FUTEX_PRIVATE_FLAG</span>, <span class="n">2</span><span class="b0">)</span>;
+            <span class="c">// loop: re-attempt as contended; spurious wakeups are fine</span>
+        <span class="b2">}</span>
+    <span class="b1">}</span>
+
+    <span class="k">pub</span> <span class="k">fn</span> <span class="m1">unlock</span><span class="b1">(</span>&amp;<span class="k">self</span><span class="b1">)</span> <span class="b1">{</span>
+        <span class="k">if</span> <span class="k">self</span>.<span class="m2">v</span>.<span class="m1">swap</span><span class="b2">(</span><span class="n">0</span>, <span class="m1">Release</span><span class="b2">)</span> == <span class="n">2</span> <span class="b2">{</span>             <span class="c">// waiters exist</span>
+            <span class="m1">futex</span><span class="b0">(</span>&amp;<span class="k">self</span>.<span class="m2">v</span>, <span class="m1">libc</span>::<span class="m2">FUTEX_WAKE</span> | <span class="m1">libc</span>::<span class="m2">FUTEX_PRIVATE_FLAG</span>, <span class="n">1</span><span class="b0">)</span>;
+        <span class="b2">}</span>
+    <span class="b1">}</span>
+<span class="b0">}</span>
+</code></pre>
+          </div>
+          <p>
+            The cost model, entirely from this machine's measurements: the
+            uncontended fast path is one CAS, 5.5 ns
+            (<code>concurrency.json</code> measures an uncontended mutex
+            lock/unlock at 5.53 ns per operation, 180.8 M ops/s). The
+            contended slow path pays one futex syscall in the waiter
+            (~134 ns of boundary plus queueing), a context switch out
+            (~1,885 ns), a switch back in on wake, and the cache refill
+            tax. The ratio between the paths is three orders of
+            magnitude, which is the quantitative case for the golden rule
+            of lock design: make critical sections short enough that
+            contention stays rare, because the primitive's cost is
+            bimodal, not average. Under real contention on this machine an
+            8-thread mutex-protected counter collapses to 11.5 M ops/s
+            aggregate, 255x worse than uncontended arithmetic; that
+            cliff, and the sharded designs that avoid it, are the
+            concurrency page's subject.
+          </p>
+
+          <h3>Deadlock: the Coffman conditions and the banker</h3>
+          <p>
+            Coffman, Elphick, and Shoshani (1971) reduced deadlock to
+            four simultaneously necessary conditions: mutual exclusion
+            (resources are held exclusively), hold-and-wait (holders can
+            request more), no preemption (resources cannot be revoked),
+            and circular wait (a cycle in the who-waits-for-whom graph).
+            The taxonomy is useful because it is a menu: break any one
+            condition and deadlock is impossible. Practice almost always
+            breaks circular wait with a global lock ordering, acquire in
+            a fixed order, and the concurrency page demonstrates both the
+            hang (two transfers locking accounts in argument order,
+            killed by timeout on this machine) and the fix
+            (<code>std::scoped_lock</code>'s all-or-nothing acquisition).
+            The kernel's own lockdep validator does the same thing
+            dynamically: it records the acquisition order classes
+            observed and reports the first cycle-creating acquisition,
+            deadlock detection at development time.
+          </p>
+          <p>
+            Deadlock <em>avoidance</em>, deciding at request time whether
+            a grant could lead to deadlock, is Dijkstra's banker's
+            algorithm: grant a request only if the resulting state is
+            <em>safe</em>, meaning there exists some order in which all
+            processes can run to their declared maximum and finish. The
+            test is a simulation: repeatedly find a process whose
+            remaining need fits in the currently available pool, pretend
+            it finishes and returns its holdings, and see whether
+            everyone eventually finishes. Its production footprint is
+            small, it needs declared maxima and a closed world, but it is
+            the canonical safety-versus-liveness computation, and worth
+            doing by hand once.
+          </p>
+          <div class="problem">
+            <span class="plabel">Problem 3</span>
+            <p>
+              A system has three resource types with totals
+              \( (9, 6, 4) \). Current allocation and declared maxima:
+              A holds \( (1,1,0) \) of max \( (4,2,1) \);
+              B holds \( (2,1,1) \) of max \( (5,2,2) \);
+              C holds \( (2,0,1) \) of max \( (3,1,3) \);
+              D holds \( (1,1,0) \) of max \( (2,3,1) \).
+              (a) Show the state is safe. (b) B requests \( (1,0,1) \):
+              grant or defer? (c) Separately, in a one-resource system
+              with 12 units, A holds 5 of max 10, B holds 2 of max 4, C
+              holds 2 of max 9. C requests 1 unit while 3 are free.
+              Grant or defer?
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> (a) Held total is
+                \( (6,3,2) \), so available is
+                \( (9,6,4) - (6,3,2) = (3,3,2) \). Needs (max minus held):
+                A \( (3,1,1) \), B \( (3,1,1) \), C \( (1,1,2) \),
+                D \( (1,2,1) \). C's need fits in \( (3,3,2) \): run C,
+                reclaim its \( (2,0,1) \), available becomes
+                \( (5,3,3) \). D fits: available
+                \( (5,3,3)+(1,1,0) = (6,4,3) \). A fits:
+                \( (7,5,3) \). B fits: \( (9,6,4) \), the full pool.
+                Safe sequence C, D, A, B exists, so the state is safe.
+              </p>
+              <p>
+                (b) Pretend-grant: available
+                \( (3,3,2)-(1,0,1) = (2,3,1) \); B now holds
+                \( (3,1,2) \), need \( (2,1,0) \). Search for a safe
+                sequence: A needs \( (3,1,1) \), but only 2 units of the
+                first resource are free, blocked. B's new need
+                \( (2,1,0) \le (2,3,1) \): run B, reclaim
+                \( (3,1,2) \), available \( (5,4,3) \). Then A:
+                \( (6,5,3) \); then C \( (1,1,2) \le (6,5,3) \):
+                \( (8,5,4) \); then D: \( (9,6,4) \). Sequence B, A, C,
+                D finishes everyone: the post-grant state is safe, so
+                <em>grant</em>.
+              </p>
+              <p>
+                (c) Pretend-grant: available \( 3 - 1 = 2 \); C holds 3,
+                needs \( 9 - 3 = 6 \). Who can finish with 2 free? A
+                needs \( 10-5 = 5 \): no. B needs \( 4-2 = 2 \): yes;
+                run B, reclaim its 4 held (2 original plus... B held 2,
+                so available \( 2 + 2 = 4 \)). Now A needs 5: no. C
+                needs 6: no. No process can finish: the state after the
+                grant is unsafe, so <em>defer</em>, even though a unit
+                is physically free. This is the algorithm's whole point:
+                it refuses states from which an unlucky but legal future
+                cannot be survived, trading utilization for a guarantee.
+              </p>
+            </div>
+          </div>
+
+          <h2>Virtual memory: paging and the 4-level walk</h2>
+          <h3>Why paging won</h3>
+          <p>
+            The address-space abstraction promises each process a private,
+            contiguous, zero-based memory while the kernel packs everyone
+            into shared physical DRAM. Translation at some granularity is
+            forced by that promise; the granularity choices were
+            segments (variable-size, matching program structure) or pages
+            (fixed-size, matching nothing). Paging won because external
+            fragmentation is the killer: with variable-size segments,
+            free physical memory shatters into unusable slivers and
+            compaction means copying, while fixed 4 KiB pages make every
+            free frame interchangeable, allocation a bitmap operation,
+            and eviction a per-page decision. The costs paging accepts in
+            exchange, internal fragmentation of at most one page per
+            region, and a translation structure that must map a 48-bit
+            space without occupying it, define the rest of this section.
+          </p>
+          <p>
+            The naive structure fails arithmetic immediately: a flat
+            array of 8-byte entries for every 4 KiB page of a 48-bit
+            space is \( 2^{48-12} \times 8 = 2^{39} \) bytes, 512 GiB,
+            <em>per process</em>. The fix is to make the table a radix
+            tree and allocate only the paths actually used. x86-64 splits
+            the 48-bit virtual address into four 9-bit indices plus a
+            12-bit page offset, giving a 4-level tree in which each node
+            is itself exactly one 4 KiB page holding 512 8-byte entries;
+            a page of a process that maps almost nothing costs four
+            pages of table, not 512 GiB. (Ice Lake and later, including
+            this machine's Sapphire Rapids, optionally extend to 5
+            levels and 57 bits when the kernel enables LA57.)
+          </p>
+          <pre class="flow">virtual address (48 bits used, canonical):
+  47        39 38        30 29        21 20        12 11         0
+ ┌────────────┬────────────┬────────────┬────────────┬────────────┐
+ │ PML4 index │ PDPT index │  PD index  │  PT index  │ page offset│
+ │   9 bits   │   9 bits   │   9 bits   │   9 bits   │  12 bits   │
+ └────────────┴────────────┴────────────┴────────────┴────────────┘
+       │             │            │            │
+ CR3 ──→ PML4 page ──→ PDPT page ──→ PD page ──→ PT page ──→ data
+        512 entries  512 entries  512 entries  512 entries
+                     (PS=1 here:  (PS=1 here:
+                      1 GiB page)  2 MiB page)</pre>
+          <div class="problem">
+            <span class="plabel">Problem 4</span>
+            <p>
+              Decompose the user virtual address
+              <code>0x00007f3bd1c04a20</code> into its x86-64 4-level
+              indices, give the byte offset the hardware reads within
+              each table page, count the memory references the full
+              translation costs, and state where the split would occur if
+              the mapping used a 2 MiB huge page.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> Write the address as bits and
+                peel fields from the top.
+                \( \text{PML4} = (\text{addr} \gg 39) \,\&amp;\, 511 =
+                254 \);
+                \( \text{PDPT} = (\text{addr} \gg 30) \,\&amp;\, 511 =
+                239 \);
+                \( \text{PD} = (\text{addr} \gg 21) \,\&amp;\, 511 =
+                142 \);
+                \( \text{PT} = (\text{addr} \gg 12) \,\&amp;\, 511 = 4 \);
+                offset \( = \text{addr} \,\&amp;\, 4095 = 0\text{xa20} =
+                2592 \). Reassembling
+                \( (254 \ll 39) + (239 \ll 30) + (142 \ll 21) +
+                (4 \ll 12) + 2592 \) reproduces
+                <code>0x7f3bd1c04a20</code> exactly, confirming the
+                split. Since each entry is 8 bytes, the hardware reads
+                the PML4 page at byte offset \( 254 \times 8 = 2032 \),
+                the PDPT at \( 239 \times 8 = 1912 \), the PD at
+                \( 142 \times 8 = 1136 \), and the PT at
+                \( 4 \times 8 = 32 \): four dependent memory reads
+                before the data byte itself, five total for one load. On
+                a 2 MiB huge page the PD entry has the PS bit set and
+                <em>is</em> the leaf: translation stops after three
+                reads, and the low \( 21 \) bits,
+                \( \text{addr} \,\&amp;\, 0\text{x1FFFFF} =
+                0\text{x4a20} = 18{,}976 \), become the in-page offset.
+                One fewer level, and, far more importantly, 512x more
+                reach per TLB entry.
+              </p>
+            </div>
+          </div>
+          <p>
+            Each entry carries control bits beside the frame number:
+            Present (clear means any access faults, the hook demand
+            paging hangs on), Writable and User (checked at every level;
+            a supervisor-only bit anywhere on the path protects the
+            kernel half of the space), Accessed and Dirty (set by
+            hardware, harvested by replacement), NX (no instruction
+            fetch, the cheap end of exploit mitigation), and PS (this
+            entry is a 2 MiB or 1 GiB leaf). A page fault delivers the
+            faulting address in CR2 plus an error code, and the kernel's
+            fault handler (<code>mm/memory.c</code> on Linux,
+            <code>handle_mm_fault</code>) decides among: allocate and
+            zero a page (first touch of anonymous memory), read from the
+            page cache (file mapping), copy a shared page
+            (copy-on-write), grow the stack, or deliver SIGSEGV. The
+            measured cost of the benign minor fault on this machine:
+            1,509 ns per first-touch of a 4 KiB anonymous page,
+            against 21.5 ns for a store to an already-mapped page,
+            a 70x gap that explains why allocators recycle memory
+            rather than returning it to the kernel.
+          </p>
+
+          <h3>TLBs and huge pages: the 1.9x measurement</h3>
+          <p>
+            The four dependent reads of Problem 4 would make every load
+            five loads, so the translation lookaside buffer caches final
+            translations, and hardware page-walk caches hold the upper
+            levels; the microarchitecture is on the
+            <a href="/classes/computer-architecture/">architecture
+            page</a>. What the kernel controls is <em>reach</em>. A
+            typical two-level TLB of order a few thousand entries covers
+            only a few MiB at 4 KiB per entry: this is tiny against a
+            multi-GiB heap, and once the working set of translations
+            exceeds it, every access pays a walk. At 2 MiB per entry the
+            same TLB covers hundreds of times more, which is the entire
+            case for huge pages.
+          </p>
+          <p>
+            Measured here, with a benchmark built to isolate translation:
+            an anonymous region is faulted in, then a random Hamiltonian
+            cycle visiting one cache line per 4 KiB page is chased with
+            fully dependent loads, so neither the prefetcher nor
+            out-of-order overlap can hide anything. Over 32 GiB with 4
+            KiB pages: 255 ns per access. Same region backed by 2 MiB
+            transparent huge pages: 134.6 ns, a 1.9x difference with
+            identical DRAM traffic, pure translation overhead. Over a 4
+            GiB region the gap narrows (178.7 versus 122.8 ns, 1.45x)
+            because 4 GiB of PTEs is 8 MiB, which mostly fits in this
+            machine's caches, while 32 GiB of PTEs is 64 MiB, which does
+            not: the walk itself starts missing cache. Sequential
+            controls confirm the mechanism: a 64 B stride costs 4.5
+            ns/access regardless of page size (prefetch hides
+            everything), and a 4,096 B sequential stride costs ~19 ns,
+            cheap because 512 consecutive PTEs share one table page and
+            eight of them share one cache line.
+          </p>
+          <div class="tbl-wrap"><table class="data">
+            <thead><tr><th>Access pattern</th><th>4 KiB pages</th><th>2 MiB THP</th><th>ratio</th></tr></thead>
+            <tbody>
+              <tr><td>sequential, 64 B stride, 32 GiB</td><td>4.5 ns</td><td>4.5 ns</td><td>1.0</td></tr>
+              <tr><td>sequential, 4 KiB stride, 32 GiB</td><td>18.8 ns</td><td>17.7 ns</td><td>1.06</td></tr>
+              <tr><td>random page chase, 4 GiB</td><td>178.7 ns</td><td>122.8 ns</td><td>1.46</td></tr>
+              <tr><td>random page chase, 32 GiB</td><td>255.0 ns</td><td>134.6 ns</td><td>1.90</td></tr>
+            </tbody>
+          </table></div>
+          <p>
+            The experiment carried an operational lesson worth recording.
+            The first THP run showed zero effect, and
+            <code>smaps_rollup</code> showed <code>AnonHugePages: 0
+            kB</code> despite <code>madvise(MADV_HUGEPAGE)</code>
+            succeeding: this host starts processes with the
+            per-process <code>PR_SET_THP_DISABLE</code> prctl flag set
+            (visible as <code>THP_enabled: 0</code> in
+            <code>/proc/self/status</code>), and the flag silently
+            overrides madvise. Clearing it with
+            <code>prctl(PR_SET_THP_DISABLE, 0, ...)</code> made the
+            kernel back the full 32 GiB with huge pages on first touch,
+            confirmed by <code>AnonHugePages: 33554432 kB</code>. Huge
+            pages are a three-party negotiation, sysfs policy, process
+            flags, madvise, and any party can veto silently; measuring,
+            not assuming, is the only reliable way to know which pages
+            you actually got.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="c" class="active">C</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="c" class="shl lang active"><code class="language-cpp"><span class="c">/* tlb_stride.c (core): one line per page, visited in a random single</span>
+<span class="c"> * cycle (Sattolo), chased with dependent loads. gcc -O2, pinned.</span>
+<span class="c"> * On this machine over 32 GiB: 255 ns/access at 4 KiB pages,</span>
+<span class="c"> * 134.6 ns with MADV_HUGEPAGE, a 1.9x translation tax. */</span>
+<span class="k">#include</span> <span class="s">&lt;sys/mman.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;sys/prctl.h&gt;</span>
+
+<span class="m1">prctl</span><span class="b0">(</span><span class="v4">PR_SET_THP_DISABLE</span>, <span class="n">0</span>, <span class="n">0</span>, <span class="n">0</span>, <span class="n">0</span><span class="b0">)</span>;<span class="c">   /* this host sets it! */</span>
+<span class="k">uint8_t</span> *<span class="v6">buf</span> = <span class="m1">mmap</span><span class="b0">(</span><span class="k">NULL</span>, <span class="v0">span</span>, <span class="v0">PROT_READ</span> | <span class="v0">PROT_WRITE</span>,
+                    <span class="v0">MAP_PRIVATE</span> | <span class="v1">MAP_ANONYMOUS</span>, -<span class="n">1</span>, <span class="n">0</span><span class="b0">)</span>;
+<span class="c">/* align to 2 MiB, then choose the experiment's page size: */</span>
+<span class="m1">madvise</span><span class="b0">(</span><span class="v6">buf</span>, <span class="v3">bytes</span>, <span class="v5">huge</span> ? <span class="v2">MADV_HUGEPAGE</span> : <span class="v5">MADV_NOHUGEPAGE</span><span class="b0">)</span>;
+<span class="m1">memset</span><span class="b0">(</span><span class="v6">buf</span>, <span class="n">1</span>, <span class="v3">bytes</span><span class="b0">)</span>;<span class="c">                    /* fault everything in */</span>
+
+<span class="c">/* Sattolo's algorithm: a uniform random permutation with ONE cycle,</span>
+<span class="c"> * so the chase visits every page exactly once per lap */</span>
+<span class="k">for</span> <span class="b0">(</span><span class="k">size_t</span> <span class="v3">i</span> = <span class="v1">npages</span> - <span class="n">1</span>; <span class="v3">i</span> &gt; <span class="n">0</span>; <span class="v3">i</span>--<span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">size_t</span> <span class="v4">j</span> = <span class="m1">rnd</span><span class="b1">()</span> % <span class="v3">i</span>;<span class="c">                 /* j &lt; i: single cycle */</span>
+    <span class="k">size_t</span> <span class="v0">t</span> = <span class="v1">perm</span><span class="b1">[</span><span class="v3">i</span><span class="b1">]</span>; <span class="v1">perm</span><span class="b1">[</span><span class="v3">i</span><span class="b1">]</span> = <span class="v1">perm</span><span class="b1">[</span><span class="v4">j</span><span class="b1">]</span>; <span class="v1">perm</span><span class="b1">[</span><span class="v4">j</span><span class="b1">]</span> = <span class="v0">t</span>;
+<span class="b0">}</span>
+<span class="k">for</span> <span class="b0">(</span><span class="k">size_t</span> <span class="v3">i</span> = <span class="n">0</span>; <span class="v3">i</span> &lt; <span class="v1">npages</span>; <span class="v3">i</span>++<span class="b0">)</span><span class="c">       /* pointer at page start */</span>
+    *<span class="b0">(</span><span class="k">uint64_t</span> *<span class="b0">)(</span><span class="v6">buf</span> + <span class="v1">perm</span><span class="b1">[</span><span class="v3">i</span><span class="b1">]</span> * <span class="n">4096</span><span class="b0">)</span> =
+        <span class="b0">(</span><span class="k">uint64_t</span><span class="b0">)(</span><span class="v6">buf</span> + <span class="v1">perm</span><span class="b1">[</span><span class="b2">(</span><span class="v3">i</span> + <span class="n">1</span><span class="b2">)</span> % <span class="v1">npages</span><span class="b1">]</span> * <span class="n">4096</span><span class="b0">)</span>;
+
+<span class="k">volatile</span> <span class="k">uint64_t</span> *<span class="v6">p</span> = <span class="b0">(</span><span class="k">uint64_t</span> *<span class="b0">)</span><span class="v6">buf</span>;<span class="c">   /* the measured loop: */</span>
+<span class="k">for</span> <span class="b0">(</span><span class="k">long</span> <span class="v3">i</span> = <span class="n">0</span>; <span class="v3">i</span> &lt; <span class="v0">steps</span>; <span class="v3">i</span>++<span class="b0">)</span>
+    <span class="v6">p</span> = <span class="b0">(</span><span class="k">uint64_t</span> *<span class="b0">)</span>*<span class="v6">p</span>;<span class="c">                   /* dependent: no overlap */</span>
+</code></pre>
+          </div>
+          <p>
+            The costs of huge pages are real too, and they are why the
+            kernel default here is <code>madvise</code> rather than
+            <code>always</code>: a 2 MiB allocation for a region that
+            uses 8 KiB wastes 255x the memory (huge-page bloat), first
+            touch is more expensive (72.6 ms measured to fault 512 MiB
+            as THP, about 554 ns per 4 KiB equivalent, versus 1,509 ns
+            per page individually, cheaper per byte but a larger
+            single stall), and when physical memory fragments, the
+            kernel's compaction runs to manufacture contiguous 2 MiB
+            blocks can produce latency spikes famous enough that
+            database vendors ship "disable THP" in their install
+            checklists. The research line on automatic huge-page
+            management, Ingens (UT Austin, OSDI 2016) and HawkEye (IISc,
+            ASPLOS 2019) among others, is an attempt to get the 1.9x
+            without the bloat and the spikes.
+          </p>
+
+          <h3>Copy-on-write, fork, and mmap</h3>
+          <p>
+            fork's survival depends on not copying memory. The child gets
+            a copy of the page <em>tables</em> with both copies' PTEs
+            marked read-only; the first write on either side faults, and
+            the handler copies just that page. Measured on this machine,
+            the scaling law is visible: forking a process with 1 MiB
+            resident costs 39.2 &micro;s, 16 MiB costs 122.2 &micro;s,
+            128 MiB costs 798.6 &micro;s, 512 MiB costs 3.27 ms, and 2
+            GiB costs 14.27 ms, an asymptotic ~25-27 ns per resident
+            page of pure page-table duplication and refcounting. The
+            deferred price also measured: the first write to an
+            inherited page costs about 2.0 &micro;s (fault, allocate,
+            copy 4 KiB, remap), roughly the same as a minor fault plus a
+            page copy, paid only for pages actually written. The design
+            consequence: fork-then-exec from a large process wastes the
+            whole table copy, 14 ms for a 2 GiB parent, which is why
+            <code>posix_spawn</code> (measured 432.6 &micro;s versus
+            499.7 for fork+exec of a small parent, and unboundedly
+            better for large ones) exists, and why Redis-style
+            fork-for-snapshot pays a known COW tax proportional to the
+            write rate during the snapshot.
+          </p>
+          <p>
+            <code>mmap</code> generalizes the same machinery to files:
+            a mapping is a VMA whose faults are satisfied from the page
+            cache instead of by zero pages, giving file I/O with load
+            instructions. It is not automatically faster than
+            <code>read()</code>: measured here on a warm 2 GiB file,
+            <code>read()</code> streams at 9.02 GB/s while touching the
+            same data through a mapping runs at 7.35 GB/s and takes
+            32,768 minor faults, one per 64 KiB faultahead cluster;
+            the copy that mmap avoids costs less than the faults it
+            adds at this access pattern. mmap wins for random access to
+            large files (no syscall per access, no double buffering)
+            and for sharing (two processes mapping one file share
+            physical pages), not as a universal read replacement.
+          </p>
+
+          <h3>Page replacement: Belady, clock, and the working set</h3>
+          <p>
+            When memory is scarce the kernel must choose a page to
+            evict, and the theory has one exact result: Belady's OPT
+            (1966, IBM), evict the page whose next use is farthest in
+            the future, is optimal and unimplementable, existing to
+            calibrate everything else. LRU approximates OPT by using the
+            past as the future's proxy and inherits a valuable
+            structural property: it is a <em>stack algorithm</em>, the
+            set of pages LRU holds with \( k \) frames is always a
+            subset of what it holds with \( k+1 \), so more memory can
+            never cause more faults. FIFO is not a stack algorithm, and
+            Belady, Nelson, and Shedler (1969) showed the consequence,
+            an anomaly worth verifying by hand once in a lifetime.
+          </p>
+          <div class="problem">
+            <span class="plabel">Problem 5</span>
+            <p>
+              Run FIFO on the reference string
+              1, 2, 3, 4, 1, 2, 5, 1, 2, 3, 4, 5 with 3 frames and with
+              4 frames, counting faults. Then state what LRU gives on
+              both sizes and why the FIFO behavior cannot happen to LRU.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> Three frames (queue order,
+                oldest first; F = fault, H = hit):
+                1&rarr;F [1]; 2&rarr;F [1 2]; 3&rarr;F [1 2 3];
+                4&rarr;F [2 3 4]; 1&rarr;F [3 4 1]; 2&rarr;F [4 1 2];
+                5&rarr;F [1 2 5]; 1&rarr;H; 2&rarr;H; 3&rarr;F [2 5 3];
+                4&rarr;F [5 3 4]; 5&rarr;H. Total: <strong>9
+                faults</strong>. Four frames: 1, 2, 3, 4 all fault
+                [1 2 3 4]; 1&rarr;H; 2&rarr;H; 5&rarr;F [2 3 4 5];
+                1&rarr;F [3 4 5 1]; 2&rarr;F [4 5 1 2];
+                3&rarr;F [5 1 2 3]; 4&rarr;F [1 2 3 4];
+                5&rarr;F [2 3 4 5]. Total: <strong>10 faults</strong>.
+                Adding a frame made FIFO worse, because the early hits
+                on 1 and 2 left them ancient in the queue exactly when
+                the string returned to them. LRU gives 10 faults at 3
+                frames and 8 at 4, monotone as the stack property
+                requires: with LRU the \( k \)-frame content is the
+                \( k \) most recently used pages, which is by
+                construction a subset of the \( k+1 \) most recent, so
+                a hit at \( k \) frames is a hit at \( k+1 \). The same
+                simulation run in this repository
+                (<code>os.json</code>) also checked clock on this
+                string: 9 and 10 faults, inheriting FIFO's anomaly, and
+                OPT: 7 and 6.
+              </p>
+            </div>
+          </div>
+          <p>
+            True LRU is too expensive to maintain per-access in
+            hardware-assisted paging, so real kernels run clock: pages
+            in a circular list, one reference bit each, set by hardware
+            on access; the hand clears set bits and evicts the first
+            clear one, giving each page one lap of grace. Simulated on a
+            20,000-reference trace with a moving 8-page hot set (85% of
+            references) over 64 pages, this repository's runs rank the
+            policies as theory predicts: at 16 frames, OPT 1,553 faults,
+            LRU 2,303, clock 2,550, FIFO 3,818; and on a uniformly
+            random trace all three practical policies collapse together
+            (15,080-15,096 faults at 16 frames) because without
+            locality there is nothing to learn. That collapse is the
+            important negative result: replacement policy is a bet on
+            locality, not a free win.
+          </p>
+          <p>
+            Denning's working set model (1968) supplies the vocabulary
+            for when paging works at all: \( W(t, \theta) \), the set of
+            pages referenced in the last \( \theta \) references, and
+            its size on the simulated trace grows from 6.7 pages at
+            \( \theta = 10 \) to 19.5 at \( \theta = 100 \) to only 54.5
+            at \( \theta = 1000 \), the flattening curve that defines a
+            working set. The policy consequence: give each process
+            frames for its working set or do not run it, because a
+            process below that threshold faults continuously, and a
+            system of such processes spends its time paging instead of
+            computing, thrashing, the failure mode where throughput
+            falls as load rises. Modern Linux descendants of these
+            ideas: the split active/inactive LRU lists, and since 6.1
+            the multi-generational LRU contributed by Google, which
+            tracks page age in generations precisely because two lists
+            quantize recency too coarsely.
+          </p>
+
+          <h2>File systems: from inodes to journals</h2>
+          <h3>The VFS layer and the inode</h3>
+          <p>
+            Linux interposes a virtual file system layer between the
+            syscall interface and any concrete file system: four object
+            types, superblock (one per mount: block size, root,
+            operations), inode (one per file: metadata and the map from
+            file offsets to blocks, but no name), dentry (a name
+            component mapping to an inode, cached aggressively because
+            path lookup is the hottest metadata operation in the
+            system), and file (an open instance: position, mode, a
+            pointer into the dentry cache). The separation of name from
+            file is load-bearing: hard links are just multiple dentries
+            for one inode, and unlinking while a process holds the file
+            open works because the inode's life is governed by link
+            count plus open count, not by any name. Every concrete file
+            system, ext4, XFS, Btrfs, tmpfs, FUSE, supplies operation
+            tables for these objects, which is why <code>cat</code>
+            works identically over all of them.
+          </p>
+          <p>
+            The classic UNIX inode maps offsets to blocks with a small
+            fixed array biased toward small files: 12 direct block
+            pointers, then one single-indirect (a block full of
+            pointers), one double-indirect, one triple-indirect. With 4
+            KiB blocks and 4-byte pointers, one indirect block holds
+            1,024 pointers, and the tiers cover: direct
+            \( 12 \times 4\,\text{KiB} = 48 \) KiB; single
+            \( 1024 \times 4\,\text{KiB} = 4 \) MiB; double
+            \( 1024^2 \times 4\,\text{KiB} = 4 \) GiB; triple
+            \( 1024^3 \times 4\,\text{KiB} = 4 \) TiB; total maximum
+            file size \( 48\,\text{KiB} + 4\,\text{MiB} + 4\,\text{GiB}
+            + 4\,\text{TiB} = 4{,}402{,}345{,}721{,}856 \) bytes. The
+            asymmetry is deliberate: measurement has always shown most
+            files are small (so 12 direct pointers usually suffice and
+            metadata stays one block), while the tree depth grows only
+            logarithmically for the rare huge file.
+          </p>
+          <div class="problem">
+            <span class="plabel">Problem 6</span>
+            <p>
+              In such a file system (4 KiB blocks, 4-byte pointers, 12
+              direct), a process reads one byte at offset 1,300,000,000
+              of a cold file. Which pointer chain resolves it, with
+              exact indices at each level, and how many disk reads does
+              the byte cost, assuming the inode itself is cached but no
+              data or indirect blocks are?
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> The file block index is
+                \( \lfloor 1{,}300{,}000{,}000 / 4096 \rfloor =
+                317{,}382 \), with in-block offset
+                \( 1{,}300{,}000{,}000 - 317{,}382 \times 4096 =
+                3{,}328 \). Subtract the direct tier:
+                \( 317{,}382 - 12 = 317{,}370 \). Subtract the single
+                indirect tier's 1,024 blocks:
+                \( 317{,}370 - 1024 = 316{,}346 \), which is less than
+                the double tier's \( 1024^2 = 1{,}048{,}576 \), so the
+                double-indirect pointer resolves it. Outer index:
+                \( \lfloor 316{,}346 / 1024 \rfloor = 308 \); inner
+                index: \( 316{,}346 - 308 \times 1024 = 954 \). The
+                chain: inode's double-indirect pointer &rarr; outer
+                indirect block, entry 308 &rarr; inner indirect block,
+                entry 954 &rarr; data block, byte 3,328. Three disk
+                reads (outer, inner, data). The general lesson: offset
+                arithmetic is pure integer division, no search, which
+                is what makes the inode's map O(depth) rather than
+                O(file size), and why a byte at offset 1.3 GB costs
+                two more reads than a byte at offset 0.
+              </p>
+            </div>
+          </div>
+          <p>
+            Modern file systems replaced per-block pointers with
+            <em>extents</em>, ext4's being a representative design
+            (Mathur et al., Ottawa Linux Symposium 2007): an extent is
+            (logical block, length up to 32,768 blocks, physical start),
+            so a contiguous 128 MiB file is described by one 12-byte
+            record instead of 32,768 pointers, with a B-tree of extents
+            for fragmented files. Extents win threefold: metadata
+            shrinks by orders of magnitude, contiguity is encoded
+            rather than incidental (enabling large sequential I/O
+            requests), and allocation can be delayed until writeback so
+            the allocator sees whole files, not single blocks.
+          </p>
+
+          <h3>FFS: putting layout near the arm</h3>
+          <p>
+            McKusick, Joy, Leffler, and Fabry's Fast File System
+            (Berkeley, 1984) is the paper that made file-system design
+            an empirical performance discipline. The original UNIX file
+            system put all inodes at the start of the disk and treated
+            blocks as interchangeable, so reading any file seeked
+            across the whole platter between metadata and data, and the
+            paper reports it delivering only a few percent of disk
+            bandwidth. FFS's move was structural: divide the disk into
+            cylinder groups, each with its own inode table, bitmap, and
+            data blocks; place a file's inode and data in the same
+            group, files of a directory together, and spread
+            directories across groups; plus the pragmatic changes,
+            larger blocks with fragments for the tails of small files,
+            and a ~10% free-space reserve because allocation quality
+            collapses on a full disk (the paper measured up to 47% of
+            disk bandwidth after these changes). Every rotating-disk
+            file system since is recognizably FFS-shaped, and the ideas
+            survive SSDs in modified form: locality still matters, but
+            for erase blocks and mapping-table pressure rather than
+            seek arms.
+          </p>
+
+          <h3>Crash consistency: the argument for the journal</h3>
+          <p>
+            Appending one block to a file updates three on-disk
+            structures: the data block itself, the inode (new size, new
+            pointer), and the block bitmap. A crash can strike between
+            any pair of writes, and enumerating the six orderings gives
+            the whole problem. Data alone: harmless, an orphaned write.
+            Bitmap alone: a space leak. Inode alone: the file now
+            points at a block containing whatever was there before,
+            <em>someone else's old data</em>, both a corruption and a
+            security hole. Inode+bitmap without data: the file
+            durably contains garbage. The old answer, fsck, scans the
+            entire disk at boot reconciling structures; it repairs
+            invariants but cannot restore data, and its cost scales
+            with disk size, hours on modern volumes.
+          </p>
+          <p>
+            Journaling imports write-ahead logging from databases:
+            before touching home locations, write a description of the
+            whole update into a log, ending with a commit record; only
+            after the commit is durable, checkpoint the changes to
+            their home locations; after a crash, replay committed
+            transactions and discard uncommitted ones. The invariant is
+            atomicity at the transaction level: the append either
+            happens entirely or not at all, and recovery time is
+            proportional to the journal, not the disk. ext4's jbd2
+            makes the trade-offs selectable. <code>data=journal</code>
+            logs data and metadata both: full atomicity, everything
+            written twice. <code>data=ordered</code> (the default) logs
+            only metadata but enforces one ordering rule, <em>data
+            blocks reach disk before the metadata transaction that
+            references them commits</em>: the inode can never durably
+            point at garbage, at half the write cost; what remains
+            possible is a file whose data landed but whose metadata
+            did not (the append vanishes, harmlessly).
+            <code>data=writeback</code> drops the ordering rule and
+            re-admits the stale-data window in exchange for scheduling
+            freedom. The rule of thumb this generates: ordered mode
+            protects the file system's integrity and metadata's
+            atomicity, but an application that needs <em>its own
+            data</em> durable must still call fsync, and the price was
+            measured here: a 4 KiB append plus fsync costs 608.7
+            &micro;s on this machine's virtio disk, against 1.15
+            &micro;s without, a 530x durability tax that batching
+            (group commit) exists to amortize.
+          </p>
+          <p>
+            Ganger, McKusick, Soules, and Patt's soft updates (Michigan
+            and Berkeley, published in full in TOCS 2000) is the
+            competing line: instead of a log, track fine-grained
+            dependencies between in-memory metadata blocks and order
+            writeback so that the disk only ever transitions between
+            consistent states (initialize an inode before the directory
+            entry that names it; clear the entry before freeing the
+            inode). No double-write, near-fsck-free recovery; the cost
+            is fearsome implementation complexity, dependency cycles
+            must be broken by rolling back parts of blocks at write
+            time, and journaling's comparative simplicity is why it
+            won everywhere but FreeBSD's FFS.
+          </p>
+
+          <h3>LFS: the log becomes the file system</h3>
+          <p>
+            Rosenblum and Ousterhout (Berkeley, 1992) pushed the logic
+            to its limit: if the journal must be written anyway, make
+            it the only structure. LFS buffers all writes, data,
+            inodes, indirect blocks, into memory and writes them as
+            one large sequential <em>segment</em>; nothing is ever
+            overwritten in place. Finding things back requires one
+            level of indirection, the inode map (inode number &rarr;
+            latest inode location), itself written into the log and
+            rooted in a periodically-updated checkpoint region. Every
+            write is sequential, so write bandwidth approaches disk
+            bandwidth by construction; the price is that old segments
+            fill with dead versions and a cleaner must compact live
+            data to reclaim space. The cleaning cost is derivable in
+            three lines. To reclaim a segment whose live fraction is
+            \( u \): read the whole segment (1 segment of I/O), write
+            back the live \( u \), netting \( 1 - u \) of fresh space;
+            new data then fills that space, another \( 1 - u \) of
+            writes. Total I/O per unit of new data:
+            $$ \text{write cost} \;=\;
+               \frac{1 + u + (1-u)}{1-u} \;=\; \frac{2}{1-u}. $$
+            At \( u = 0.5 \) every byte costs 4 bytes of I/O; at
+            \( u = 0.8 \), 10; at \( u = 0.9 \), 20. The design
+            consequence is bimodality: LFS must clean cold segments
+            when they are nearly empty and avoid touching hot ones,
+            and the paper's cost-benefit cleaner does exactly that.
+            The idea outlived the file system spectacularly: every SSD
+            firmware is an LFS (the FTL remaps writes into erase
+            blocks and garbage-collects, with \( 2/(1-u) \) reappearing
+            as write amplification), as are F2FS, most key-value
+            store compaction schemes, and every copy-on-write file
+            system's allocation strategy.
+          </p>
+
+          <h2>I/O: the page cache, epoll, and io_uring</h2>
+          <h3>The path of a read, measured layer by layer</h3>
+          <p>
+            A buffered read traverses: syscall &rarr; VFS &rarr; page
+            cache (hit ends here) &rarr; file system &rarr; block layer
+            (bio assembly, per-queue scheduling, request merging)
+            &rarr; driver &rarr; device, with blk-mq providing one
+            submission queue per CPU so 52 cores do not serialize on
+            one lock. The page cache dominates the economics, measured
+            on this machine's virtio disk with a 2 GiB file: cold
+            sequential read 2.28 GB/s, warm 9.02 GB/s; cold random 4
+            KiB reads 47.0 &micro;s each, warm 1.0 &micro;s, a 47x
+            gap. <code>O_DIRECT</code>, which bypasses the cache
+            entirely, reads at 2.11 GB/s, the device's own speed;
+            databases that maintain their own buffer pools choose it
+            precisely to stop paying for two caches holding the same
+            bytes.
+          </p>
+          <p>
+            For many concurrent I/O sources the question becomes how to
+            wait. Blocking a thread per fd costs a stack and two
+            context switches per operation (3.7-5.9 &micro;s measured
+            round trips above). Readiness models multiplex:
+            <code>select</code> and <code>poll</code> hand the kernel
+            the whole fd list every call, O(n) each time, while
+            <code>epoll</code> registers interest once and each wait
+            returns only ready fds. The per-event price measured here:
+            a socketpair ping-pong costs 5,885 ns blocking versus
+            6,342 with an <code>epoll_wait</code> before each read,
+            about 460 ns for the extra syscall; epoll's win is not per
+            event but per idle fd, it makes 100,000 mostly-idle
+            connections cost nothing per wait, which readiness models
+            with per-call registration cannot.
+          </p>
+
+          <h3>io_uring: completion, batched, on shared rings</h3>
+          <p>
+            Readiness has two structural residues: one syscall per
+            actual I/O remains, and regular files are always "ready,"
+            so epoll cannot express asynchronous disk reads at all.
+            Axboe's io_uring (2019, "Efficient IO with io_uring") is
+            the completion-model answer: two ring buffers shared
+            between user space and kernel via mmap, a submission queue
+            of 64-byte SQEs describing operations and a completion
+            queue of CQEs carrying results. User space writes SQEs and
+            advances the tail with a release store; one
+            <code>io_uring_enter</code> submits any number of them;
+            completions appear in the CQ readable with acquire loads
+            and no syscall whatsoever. Optional flags remove even the
+            submit call (SQPOLL: a kernel thread polls the ring) and
+            per-op overheads (registered buffers and files). The
+            memory-ordering discipline on the ring indices is the
+            acquire/release pattern derived on the
+            <a href="/classes/concurrent-systems-programming/">concurrency
+            page</a>, deployed at the kernel boundary.
+          </p>
+          <pre class="flow">              shared memory (mmap'd from the ring fd)
+   user space                                        kernel
+  ──────────────  SQ ring: [ SQE | SQE | SQE | ... ] ──────────────
+  write SQEs,  ─→ tail (release store)      head ─→  consume SQEs,
+  bump tail                                          start I/O
+                  CQ ring: [ CQE | CQE | ... ]
+  read CQEs,   ←─ head (acquire load)       tail ←─  post results
+  bump head
+  one io_uring_enter() submits N and/or waits for M completions;
+  with SQPOLL, steady state needs zero syscalls</pre>
+          <p>
+            Measured here, driving the rings through raw
+            <code>io_uring_setup</code>/<code>io_uring_enter</code>
+            syscalls (this machine has no liburing headers, which
+            forced the instructive path): random 4 KiB reads from a
+            512 MiB file, cold cache, queue depth 64 versus a pread
+            loop: 151.4 kIOPS versus 37.4 kIOPS, 4.0x, because the
+            device finally sees a queue instead of one request at a
+            time. Warm cache, where there is no device to overlap:
+            pread 851 ns, io_uring 790 ns, and a separate
+            queue-depth sweep on a 1 GiB warm file measured 1,078 ns
+            for pread, 1,069 at depth 1, 956 at depth 32, batching
+            recovers only the ~130 ns syscall share of an operation
+            dominated by the 4 KiB copy itself. The honest summary:
+            io_uring is transformative when there is real device
+            parallelism or syscall count is the bottleneck, and
+            near-neutral for cached reads, which is exactly what the
+            mechanism predicts.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="c" class="active">C</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="c" class="shl lang active"><code class="language-cpp"><span class="c">/* uring_read.c (core): io_uring with no liburing, so the actual ABI</span>
+<span class="c"> * is visible. Error handling elided here; full source compiled and</span>
+<span class="c"> * run for the numbers quoted on this page. */</span>
+<span class="k">#include</span> <span class="s">&lt;linux/io_uring.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;sys/syscall.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;sys/mman.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;stdatomic.h&gt;</span>
+
+<span class="k">struct</span> <span class="m1">io_uring_params</span> <span class="v6">p</span> = <span class="b0">{</span><span class="n">0</span><span class="b0">}</span>;
+<span class="k">int</span> <span class="v5">ring</span> = <span class="m1">syscall</span><span class="b0">(</span><span class="v6">__NR_io_uring_setup</span>, <span class="n">64</span>, &amp;<span class="v6">p</span><span class="b0">)</span>;
+
+<span class="c">/* map the SQ ring (indices + array), CQ ring (indices + CQEs), and</span>
+<span class="c"> * the SQE array; FEAT_SINGLE_MMAP lets SQ and CQ share one mapping */</span>
+<span class="k">size_t</span> <span class="v5">sq_sz</span> = <span class="v6">p</span>.<span class="m2">sq_off</span>.<span class="m2">array</span> + <span class="v6">p</span>.<span class="m2">sq_entries</span> * <span class="k">sizeof</span><span class="b0">(</span><span class="k">unsigned</span><span class="b0">)</span>;
+<span class="k">size_t</span> <span class="v2">cq_sz</span> = <span class="v6">p</span>.<span class="m2">cq_off</span>.<span class="m2">cqes</span>  + <span class="v6">p</span>.<span class="m2">cq_entries</span> * <span class="k">sizeof</span><span class="b0">(</span><span class="v3">struct</span> <span class="v3">io_uring_cqe</span><span class="b0">)</span>;
+<span class="k">char</span> *<span class="v6">sq</span> = <span class="m1">mmap</span><span class="b0">(</span><span class="k">NULL</span>, <span class="v5">sq_sz</span>, <span class="v0">PROT_READ</span>|<span class="v0">PROT_WRITE</span>,
+                <span class="v3">MAP_SHARED</span>|<span class="v5">MAP_POPULATE</span>, <span class="v5">ring</span>, <span class="v0">IORING_OFF_SQ_RING</span><span class="b0">)</span>;
+<span class="k">char</span> *<span class="v6">cq</span> = <span class="b0">(</span><span class="v6">p</span>.<span class="m2">features</span> &amp; <span class="v4">IORING_FEAT_SINGLE_MMAP</span><span class="b0">)</span> ? <span class="v6">sq</span>
+         : <span class="m1">mmap</span><span class="b0">(</span><span class="k">NULL</span>, <span class="v2">cq_sz</span>, <span class="v0">PROT_READ</span>|<span class="v0">PROT_WRITE</span>,
+                <span class="v3">MAP_SHARED</span>|<span class="v5">MAP_POPULATE</span>, <span class="v5">ring</span>, <span class="v5">IORING_OFF_CQ_RING</span><span class="b0">)</span>;
+<span class="k">struct</span> <span class="m1">io_uring_sqe</span> <span class="k">*</span><span class="v4">sqes</span> =
+    <span class="m1">mmap</span><span class="b0">(</span><span class="k">NULL</span>, <span class="v6">p</span>.<span class="m2">sq_entries</span> * <span class="k">sizeof</span><span class="b1">(</span>*<span class="v4">sqes</span><span class="b1">)</span>, <span class="v0">PROT_READ</span>|<span class="v0">PROT_WRITE</span>,
+         <span class="v3">MAP_SHARED</span>|<span class="v5">MAP_POPULATE</span>, <span class="v5">ring</span>, <span class="v0">IORING_OFF_SQES</span><span class="b0">)</span>;
+<span class="k">unsigned</span> *<span class="v0">sq_tail</span> = <span class="b0">(</span><span class="k">unsigned</span> *<span class="b0">)(</span><span class="v6">sq</span> + <span class="v6">p</span>.<span class="m2">sq_off</span>.<span class="m2">tail</span><span class="b0">)</span>;
+<span class="k">unsigned</span> *<span class="v3">sq_mask</span> = <span class="b0">(</span><span class="k">unsigned</span> *<span class="b0">)(</span><span class="v6">sq</span> + <span class="v6">p</span>.<span class="m2">sq_off</span>.<span class="m2">ring_mask</span><span class="b0">)</span>;
+<span class="k">unsigned</span> *<span class="v4">sq_arr</span>  = <span class="b0">(</span><span class="k">unsigned</span> *<span class="b0">)(</span><span class="v6">sq</span> + <span class="v6">p</span>.<span class="m2">sq_off</span>.<span class="m2">array</span><span class="b0">)</span>;
+
+<span class="c">/* submit a batch of `depth` reads, then wait for all of them */</span>
+<span class="k">unsigned</span> <span class="v4">tail</span> = *<span class="v0">sq_tail</span>;
+<span class="k">for</span> <span class="b0">(</span><span class="k">unsigned</span> <span class="v3">i</span> = <span class="n">0</span>; <span class="v3">i</span> &lt; <span class="v3">depth</span>; <span class="v3">i</span>++<span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">unsigned</span> <span class="v4">idx</span> = <span class="v4">tail</span> &amp; *<span class="v3">sq_mask</span>;
+    <span class="k">struct</span> <span class="m1">io_uring_sqe</span> <span class="k">*</span><span class="v4">s</span> = &amp;<span class="v4">sqes</span><span class="b1">[</span><span class="v4">idx</span><span class="b1">]</span>;
+    <span class="m1">memset</span><span class="b1">(</span><span class="v4">s</span>, <span class="n">0</span>, <span class="v2">sizeof</span> *<span class="v4">s</span><span class="b1">)</span>;
+    <span class="v4">s</span>-&gt;<span class="m2">opcode</span> = <span class="v4">IORING_OP_READ</span>;
+    <span class="v4">s</span>-&gt;<span class="m2">fd</span>     = <span class="v3">file</span>;
+    <span class="v4">s</span>-&gt;<span class="m2">addr</span>   = <span class="b1">(</span><span class="k">uint64_t</span><span class="b1">)</span><span class="v3">bufs</span><span class="b1">[</span><span class="v3">i</span><span class="b1">]</span>;
+    <span class="v4">s</span>-&gt;<span class="m2">len</span>    = <span class="n">4096</span>;
+    <span class="v4">s</span>-&gt;<span class="m2">off</span>    = <span class="m1">random_page_offset</span><span class="b1">()</span>;
+    <span class="v4">sq_arr</span><span class="b1">[</span><span class="v4">idx</span><span class="b1">]</span> = <span class="v4">idx</span>;
+    <span class="v4">tail</span>++;
+<span class="b0">}</span>
+<span class="c">/* publish: the kernel's acquire load must see completed SQEs */</span>
+<span class="m1">atomic_store_explicit</span><span class="b0">(</span><span class="b1">(</span><span class="v3">_Atomic</span> <span class="k">unsigned</span> *<span class="b1">)</span><span class="v0">sq_tail</span>, <span class="v4">tail</span>,
+                      <span class="v1">memory_order_release</span><span class="b0">)</span>;
+<span class="m1">syscall</span><span class="b0">(</span><span class="v5">__NR_io_uring_enter</span>, <span class="v5">ring</span>, <span class="v3">depth</span>, <span class="v3">depth</span>,
+        <span class="v5">IORING_ENTER_GETEVENTS</span>, <span class="k">NULL</span>, <span class="n">0</span><span class="b0">)</span>;
+<span class="c">/* CQEs are now readable between cq head (ours) and tail (kernel's,</span>
+<span class="c"> * loaded with memory_order_acquire) */</span>
+</code></pre>
+          </div>
+
+          <h2>Containers: namespaces plus cgroups</h2>
+          <p>
+            A container is not a kernel object. It is a process created
+            with an unusual set of clone/unshare flags (namespaces:
+            what the process can <em>see</em>) and placed in a cgroup
+            (what it can <em>consume</em>), usually with a changed root
+            (pivot_root), dropped capabilities, and a seccomp filter
+            (measured above: ~11 ns per syscall). The namespaces
+            virtualize the kernel's naming: pid (process 1 inside is a
+            normal pid outside), mnt (private mount table), net (own
+            interfaces, ports, routing), uts (hostname), ipc, user
+            (uid 0 inside maps to an unprivileged uid outside, the flag
+            that made rootless containers possible), cgroup, and time.
+            All of it is demonstrable with stock tools, run here as an
+            unprivileged user:
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="bash" class="active">Bash</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="bash" class="shl lang active"><code class="language-bash"><span class="c"># run on this machine, unprivileged. New user+pid+mount namespaces:</span>
+<span class="m1">$</span> <span class="s">unshare</span> <span class="s">--user</span> <span class="s">--pid</span> <span class="s">--mount</span> <span class="s">--fork</span> <span class="s">--map-root-user</span> <span class="s">\</span>
+    <span class="s">sh</span> <span class="s">-c</span> <span class="s">'echo "pid in new ns: $$"; id -u'</span>
+<span class="m1">pid</span> <span class="s">in</span> <span class="s">new</span> <span class="s">ns:</span> <span class="s">1</span>        <span class="c"># first process in a fresh pid namespace</span>
+<span class="m1">0</span>                       <span class="c"># uid 0 inside; unprivileged outside</span>
+
+<span class="c"># a UTS namespace: hostname changes are invisible to the host</span>
+<span class="m1">$</span> <span class="s">unshare</span> <span class="s">--user</span> <span class="s">--map-root-user</span> <span class="s">--uts</span> <span class="s">--fork</span> <span class="s">\</span>
+    <span class="s">sh</span> <span class="s">-c</span> <span class="s">'hostname box-in-a-box; hostname'</span>
+<span class="m1">box-in-a-box</span>
+<span class="m1">$</span> <span class="s">hostname</span>              <span class="c"># host unchanged</span>
+
+<span class="c"># the other half: cgroup v2, one unified hierarchy</span>
+<span class="m1">$</span> <span class="s">cat</span> <span class="s">/sys/fs/cgroup/cgroup.controllers</span>
+<span class="m1">cpuset</span> <span class="s">cpu</span> <span class="s">io</span> <span class="s">memory</span> <span class="s">hugetlb</span> <span class="s">pids</span> <span class="s">rdma</span> <span class="s">misc</span>
+
+<span class="c"># real limits on the cgroup this very shell runs in:</span>
+<span class="m1">$</span> <span class="s">d=/sys/fs/cgroup/system.slice/lambda-jupyter.service</span>
+<span class="m1">$</span> <span class="s">cat</span> $<span class="v4">d</span><span class="s">/cpu.max</span>        <span class="c"># quota / period (us): "max" = unthrottled</span>
+<span class="m1">max</span> <span class="s">100000</span>
+<span class="m1">$</span> <span class="s">cat</span> $<span class="v4">d</span><span class="s">/memory.current</span> <span class="c"># bytes charged to this cgroup right now</span>
+<span class="m1">18747445248</span>
+<span class="m1">$</span> <span class="s">cat</span> $<span class="v4">d</span><span class="s">/pids.current</span>   <span class="c"># tasks: fork bombs hit pids.max, not the box</span>
+<span class="m1">439</span>
+
+<span class="c"># writes need delegation; this box grants none to this user:</span>
+<span class="m1">$</span> <span class="s">mkdir</span> $<span class="v4">d</span><span class="s">/demo</span>
+<span class="m1">mkdir:</span> <span class="s">cannot</span> <span class="s">create</span> <span class="s">directory:</span> <span class="s">Permission</span> <span class="s">denied</span></code></pre>
+          <p>
+            Reading a container runtime confirms there is no other
+            magic: runc's <code>libcontainer</code> issues exactly
+            these unshares, writes uid_map, mounts a new /proc (so
+            <code>ps</code> inside sees the pid namespace),
+            pivot_roots into the image, writes the cgroup files, and
+            execs the entrypoint. The economic consequence of
+            "container = process" is the entire density story: starting
+            one is a fork+exec (measured ~500 &micro;s) plus namespace
+            setup, not a kernel boot, and a thousand containers share
+            one page cache and one scheduler. The security consequence
+            cuts the other way: every container shares the host
+            kernel's ~350-syscall attack surface, one kernel exploit
+            is a full escape, which is precisely the gap gVisor (a
+            user-space kernel intercepting syscalls) and
+            firecracker-style microVMs exist to close.
+          </p>
+          <p>
+            The cgroup side deserves one mechanical note: cpu.max is a
+            quota, not a share. A container with
+            <code>cpu.max = 50000 100000</code> gets 50 ms of CPU per
+            100 ms period <em>and is throttled for the remainder</em>
+            even if the machine is idle, a famous source of tail
+            latency for multithreaded services whose N threads burn
+            the quota in period/N wall time. cpu.weight is the
+            work-conserving alternative, EEVDF weights (the same 1024
+            arithmetic worked above) applied to groups; the pressure
+            stall information files (<code>cpu.pressure</code>,
+            <code>memory.pressure</code>) are the modern signal for
+            "this cgroup is starving," and Kubernetes' CPU-limit
+            debates are this paragraph with a larger cast.
+          </p>
+
+          <h2>Virtualization: one more level of the same idea</h2>
+          <p>
+            A hypervisor applies the process abstraction one level
+            down: to a guest kernel, the "hardware" is virtual, and
+            the host multiplexes real hardware among guests. Popek and
+            Goldberg (1974) gave the criterion under which naive
+            trap-and-emulate works: every <em>sensitive</em>
+            instruction (one that reads or changes privileged machine
+            state) must be <em>privileged</em> (trap when executed
+            without privilege). Run the guest kernel deprivileged;
+            sensitive instructions trap; the hypervisor emulates them
+            against a virtual machine state block. Classic x86 fails
+            the criterion, instructions like <code>popf</code>
+            silently do less instead of trapping when deprivileged,
+            so the first x86 hypervisors could not trap-and-emulate.
+            VMware's answer was binary translation, rewriting guest
+            kernel code on the fly (Adams and Agesen's 2006 paper is
+            the definitive account); Xen's was paravirtualization
+            (Barham et al., SOSP 2003, Cambridge), modifying the guest
+            to call the hypervisor explicitly, with reported overheads
+            of a few percent. Intel VT-x and AMD-V then fixed the
+            architecture: a new root/non-root mode distinction, a
+            hardware-defined control structure (VMCS) holding guest
+            state, and defined exits, restoring Popek-Goldberg by
+            construction and enabling KVM, a kernel module that turns
+            Linux itself into the hypervisor, with QEMU or a minimal
+            VMM supplying device models from user space.
+          </p>
+          <p>
+            The memory story composes with everything above: the guest
+            translates virtual to guest-physical through its own
+            4-level tree, and hardware then translates each
+            guest-physical address to host-physical through a second
+            4-level tree (EPT/NPT). The composition is quadratic in
+            the worst case: each of the guest walk's 4 loads is itself
+            a guest-physical address needing a 4-level EPT walk, plus
+            EPT translation of the final data address, so a fully cold
+            translation costs up to \( 5 \times 5 - 1 = 24 \) memory
+            references against 4 native. TLBs cache the composed
+            translation so the steady state is native-speed, but
+            TLB-miss-heavy workloads, exactly the 32 GiB random chase
+            measured above, are the ones that hurt most inside VMs,
+            and huge pages on <em>both</em> levels are the standard
+            remedy. I/O composes similarly: trapping on every device
+            register access costs a VM exit (microseconds) per
+            operation, so virtio defines paravirtual devices around
+            shared-memory descriptor rings, the io_uring shape again,
+            with exits only for doorbells, and this machine's own
+            disk is a virtio-blk device behind exactly that design.
+            The endpoint of the minimalist line is Firecracker
+            (Amazon, NSDI 2020): a ~50k-line Rust VMM offering only
+            virtio-net, virtio-blk, and a serial console, booting a
+            microVM in about 125 ms at ~5 MiB overhead, cheap enough
+            to give every serverless function hardware isolation,
+            the container density story with the shared-kernel risk
+            removed.
+          </p>
+
+          <h2>Worked problems</h2>
+          <p>
+            Six problems are worked in context above (syscall budgets,
+            the CFS derivation, the banker, the page walk, Belady, and
+            inode arithmetic). Three more round out the set.
+          </p>
+          <div class="problem">
+            <span class="plabel">Problem 7</span>
+            <p>
+              Using this machine's measured 1,885 ns per context
+              switch: (a) compute scheduling overhead at quanta of 10
+              ms, 1 ms, and 100 &micro;s; (b) find the smallest quantum
+              keeping direct overhead under 0.5%; (c) with 20 runnable
+              tasks and a 5 ms quantum, bound the worst-case response
+              time for a newly woken task, and explain which EEVDF
+              parameter shrinks it without changing anyone's long-run
+              share.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> (a) Overhead is
+                \( s/(q+s) \) with \( s = 1.885 \) &micro;s. At
+                \( q = 10 \) ms: \( 1.885/10001.885 = 0.019\% \). At
+                \( q = 1 \) ms: \( 1.885/1001.885 = 0.188\% \). At
+                \( q = 100 \) &micro;s: \( 1.885/101.885 = 1.85\% \).
+                (b) Require \( s/(q+s) \le 0.005 \Rightarrow q \ge
+                199\,s = 375.1 \) &micro;s. (c) Worst case, the woken
+                task waits behind 19 full quanta:
+                \( 19 \times 5 = 95 \) ms, plus 19 switches
+                (\( 35.8 \) &micro;s, negligible). Under EEVDF the
+                task's <em>slice</em> \( r_i \) sets its virtual
+                deadline \( d_i = v_e + r_i/w_i \): a smaller slice
+                gives an earlier deadline and therefore earlier
+                selection among eligible tasks, improving wakeup
+                latency, while its weight, and hence its long-run
+                share, is untouched. This is the decoupling CFS could
+                not express: under CFS the only latency lever was
+                priority, which also changed the share.
+              </p>
+            </div>
+          </div>
+          <div class="problem">
+            <span class="plabel">Problem 8</span>
+            <p>
+              A process on x86-64 (4-level, 4 KiB pages) maps four
+              regions: 64 MiB of text+data, a 32 MiB heap, an 8 MiB
+              stack, and a 16 MiB shared library, each contiguous,
+              placed far apart, and fully populated. Compute the exact
+              page-table storage, compare it to the flat-table
+              alternative and to the mapped data, and recompute for
+              the same regions backed by 2 MiB huge pages.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> Leaf PT pages: each covers 2
+                MiB (512 entries x 4 KiB), so
+                \( 64/2 + 32/2 + 8/2 + 16/2 = 32 + 16 + 4 + 8 = 60 \)
+                PT pages. PD pages: each covers 1 GiB; each region
+                needs one and they are far apart, so 4 (each holding
+                32, 16, 4, 8 live entries respectively). PDPT pages:
+                each covers 512 GiB; user space spans 128 TiB, so
+                assume the regions land under 2 distinct PDPTs (text
+                low, stack and mmap regions high): 2. One PML4. Total
+                \( 60 + 4 + 2 + 1 = 67 \) pages
+                \( = 274{,}432 \) bytes, about 268 KiB. Against the
+                mapped 120 MiB this is 0.22% overhead; against the
+                flat table's \( 2^{36} \times 8 = 512 \) GiB it is
+                seven orders of magnitude, the radix tree's sparsity
+                doing exactly its job. With 2 MiB huge pages the PD
+                entries become leaves: the 60 PT pages vanish, leaving
+                \( 4 + 2 + 1 = 7 \) pages, 28 KiB, and every
+                translation is one level shorter. The general formula:
+                populated span divided by 2 MiB gives PT pages, and
+                each higher level divides its child count by 512,
+                so table storage is a geometric series dominated by
+                the leaf level, which huge pages delete.
+              </p>
+            </div>
+          </div>
+          <div class="problem">
+            <span class="plabel">Problem 9</span>
+            <p>
+              Model effective memory access time as
+              \( \text{EAT} = t + (1-h)\,w \), where \( t \) is the
+              access cost with a TLB hit, \( h \) the TLB hit rate, and
+              \( w \) the added walk penalty on a miss. (a) Use this
+              machine's 32 GiB chase measurements (255.0 ns at 4 KiB
+              pages where essentially every access misses the TLB,
+              134.6 ns with 2 MiB THP where the residual translation
+              cost is small because the walk is one level shorter and
+              its 128 KiB of PMD entries stay cache-resident) to
+              estimate \( w \). (b) Predict the slowdown for a
+              workload with \( h = 0.98 \) and \( t = 100 \) ns, and
+              for the same workload inside a VM if a cold composed
+              walk is 24/4 times as expensive. (c) State the huge-page
+              reach argument in one line of arithmetic.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> (a) Treat the THP number as
+                \( t \approx 134.6 \) ns (hit-dominated) and the 4 KiB
+                number as \( t + w \) (miss-dominated):
+                \( w \approx 255.0 - 134.6 = 120.4 \) ns, a walk
+                penalty comparable to the DRAM access itself, which is
+                what "the walk misses cache too" means quantitatively.
+                (b) Native: \( \text{EAT} = 100 + 0.02 \times 120.4 =
+                102.4 \) ns, a 2.4% tax. Virtualized, scaling the
+                penalty by \( 24/4 = 6 \): \( w' = 722.4 \) ns and
+                \( \text{EAT} = 100 + 0.02 \times 722.4 = 114.4 \) ns,
+                14.4%: the same hit rate hurts six times more, which
+                is why TLB behavior is the first thing to profile when
+                a workload "mysteriously" runs slower in a VM. (c)
+                A 1,536-entry TLB reaches \( 1536 \times 4\,\text{KiB}
+                = 6 \) MiB with base pages but \( 1536 \times
+                2\,\text{MiB} = 3 \) GiB with huge pages: a 512x
+                reach change from a flags bit.
+              </p>
+            </div>
+          </div>
+
+          <h2>Implementation: watching translation happen</h2>
+          <p>
+            The kernel exports enough introspection to verify the
+            virtual-memory story empirically, no kernel module
+            required. <code>/proc/self/pagemap</code> is an array of
+            64-bit records, one per virtual page, holding the physical
+            frame number and flag bits; reading entry
+            \( \text{va} / 4096 \) translates any address the process
+            owns. The programs below map memory, translate it, and
+            make copy-on-write directly observable: after fork, parent
+            and child report the <em>same physical frame</em> for a
+            page until one writes to it, at which point the writer's
+            frame number changes. (Reading frame numbers needs
+            <code>CAP_SYS_ADMIN</code> on hardened kernels; the
+            soft-dirty and present bits work unprivileged.)
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="c" class="active">C</button>
+              <button data-lang="python">Python</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="c" class="shl lang active"><code class="language-cpp"><span class="c">/* vatophys.c: translate a virtual address via /proc/self/pagemap and</span>
+<span class="c"> * watch COW break sharing after fork. gcc -O2 vatophys.c (run as root</span>
+<span class="c"> * to see frame numbers; kernels hide them from unprivileged readers) */</span>
+<span class="k">#define</span> <span class="m1">_GNU_SOURCE</span>
+<span class="k">#include</span> <span class="s">&lt;stdio.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;stdint.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;stdlib.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;fcntl.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;unistd.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;sys/wait.h&gt;</span>
+
+<span class="k">static</span> <span class="k">uint64_t</span> <span class="m1">pagemap_entry</span><span class="b0">(</span><span class="k">void</span> <span class="k">*</span><span class="v0">va</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">int</span> <span class="v5">fd</span> = <span class="m1">open</span><span class="b1">(</span><span class="s">"/proc/self/pagemap"</span>, <span class="v0">O_RDONLY</span><span class="b1">)</span>;
+    <span class="k">uint64_t</span> <span class="v2">ent</span> = <span class="n">0</span>;
+    <span class="k">off_t</span> <span class="v2">off</span> = <span class="b1">(</span><span class="b2">(</span><span class="k">uintptr_t</span><span class="b2">)</span><span class="v0">va</span> / <span class="n">4096</span><span class="b1">)</span> * <span class="k">sizeof</span><span class="b1">(</span><span class="k">uint64_t</span><span class="b1">)</span>;
+    <span class="m1">pread</span><span class="b1">(</span><span class="v5">fd</span>, &amp;<span class="v2">ent</span>, <span class="v2">sizeof</span> <span class="v2">ent</span>, <span class="v2">off</span><span class="b1">)</span>;
+    <span class="m1">close</span><span class="b1">(</span><span class="v5">fd</span><span class="b1">)</span>;
+    <span class="k">return</span> <span class="v2">ent</span>;<span class="c">               /* bit 63: present; bits 0-54: PFN */</span>
+<span class="b0">}</span>
+
+<span class="k">int</span> <span class="m1">main</span><span class="b0">(</span><span class="k">void</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">char</span> *<span class="v6">p</span> = <span class="m1">aligned_alloc</span><span class="b1">(</span><span class="n">4096</span>, <span class="n">4096</span><span class="b1">)</span>;
+    *<span class="v6">p</span> = <span class="s">'x'</span>;<span class="c">                 /* fault it in */</span>
+    <span class="k">uint64_t</span> <span class="v6">e</span> = <span class="m1">pagemap_entry</span><span class="b1">(</span><span class="v6">p</span><span class="b1">)</span>;
+    <span class="m1">printf</span><span class="b1">(</span><span class="s">"va=%p present=%llu pfn=%#llx\n"</span>, <span class="b2">(</span><span class="k">void</span> *<span class="b2">)</span><span class="v6">p</span>,
+           <span class="b2">(</span><span class="k">unsigned</span> <span class="k">long</span> <span class="k">long</span><span class="b2">)(</span><span class="v6">e</span> &gt;&gt; <span class="n">63</span><span class="b2">)</span>,
+           <span class="b2">(</span><span class="k">unsigned</span> <span class="k">long</span> <span class="k">long</span><span class="b2">)(</span><span class="v6">e</span> &amp; <span class="b0">(</span><span class="b1">(</span><span class="n">1</span><span class="k">ull</span> &lt;&lt; <span class="n">55</span><span class="b1">)</span> - <span class="n">1</span><span class="b0">)</span><span class="b2">)</span><span class="b1">)</span>;
+
+    <span class="k">if</span> <span class="b1">(</span><span class="m1">fork</span><span class="b2">()</span> == <span class="n">0</span><span class="b1">)</span> <span class="b1">{</span><span class="c">        /* child: same PFN until the write */</span>
+        <span class="m1">printf</span><span class="b2">(</span><span class="s">"child  pre-write pfn=%#llx\n"</span>,
+               <span class="b0">(</span><span class="k">unsigned</span> <span class="k">long</span> <span class="k">long</span><span class="b0">)(</span><span class="m1">pagemap_entry</span><span class="b1">(</span><span class="v6">p</span><span class="b1">)</span> &amp; <span class="b1">(</span><span class="b2">(</span><span class="n">1</span><span class="k">ull</span>&lt;&lt;<span class="n">55</span><span class="b2">)</span>-<span class="n">1</span><span class="b1">)</span><span class="b0">)</span><span class="b2">)</span>;
+        *<span class="v6">p</span> = <span class="s">'y'</span>;<span class="c">             /* COW fault: ~2.0 us measured here */</span>
+        <span class="m1">printf</span><span class="b2">(</span><span class="s">"child post-write pfn=%#llx\n"</span>,
+               <span class="b0">(</span><span class="k">unsigned</span> <span class="k">long</span> <span class="k">long</span><span class="b0">)(</span><span class="m1">pagemap_entry</span><span class="b1">(</span><span class="v6">p</span><span class="b1">)</span> &amp; <span class="b1">(</span><span class="b2">(</span><span class="n">1</span><span class="k">ull</span>&lt;&lt;<span class="n">55</span><span class="b2">)</span>-<span class="n">1</span><span class="b1">)</span><span class="b0">)</span><span class="b2">)</span>;
+        <span class="m1">_exit</span><span class="b2">(</span><span class="n">0</span><span class="b2">)</span>;
+    <span class="b1">}</span>
+    <span class="m1">wait</span><span class="b1">(</span><span class="k">NULL</span><span class="b1">)</span>;
+    <span class="k">return</span> <span class="n">0</span>;
+<span class="b0">}</span>
+</code></pre>
+            <pre data-lang="python" class="shl lang"><code class="language-python"><span class="c"># Same idea from Python: translate an address through pagemap and</span>
+<span class="c"># decompose it into the 4-level indices of Problem 4.</span>
+<span class="k">import</span> <span class="m1">ctypes</span>, <span class="m1">os</span>, <span class="m1">struct</span>
+
+<span class="k">def</span> <span class="m1">pagemap_entry</span><span class="b0">(</span><span class="v0">va</span>: <span class="m1">int</span><span class="b0">)</span> -&gt; <span class="m1">int</span>:
+    <span class="k">with</span> <span class="m1">open</span><span class="b0">(</span><span class="s">"/proc/self/pagemap"</span>, <span class="s">"rb"</span><span class="b0">)</span> <span class="k">as</span> <span class="v0">f</span>:
+        <span class="v0">f</span>.<span class="m2">seek</span><span class="b0">(</span><span class="b1">(</span><span class="v0">va</span> // <span class="n">4096</span><span class="b1">)</span> * <span class="n">8</span><span class="b0">)</span>
+        <span class="k">return</span> <span class="m1">struct</span>.<span class="m2">unpack</span><span class="b0">(</span><span class="s">"&lt;Q"</span>, <span class="v0">f</span>.<span class="m2">read</span><span class="b1">(</span><span class="n">8</span><span class="b1">)</span><span class="b0">)[</span><span class="n">0</span><span class="b0">]</span>
+
+<span class="k">def</span> <span class="m1">walk_indices</span><span class="b0">(</span><span class="v0">va</span>: <span class="m1">int</span><span class="b0">)</span>:
+    <span class="k">return</span> <span class="b0">{</span>
+        <span class="s">"pml4"</span>:   <span class="b1">(</span><span class="v0">va</span> &gt;&gt; <span class="n">39</span><span class="b1">)</span> &amp; <span class="n">0x1FF</span>,
+        <span class="s">"pdpt"</span>:   <span class="b1">(</span><span class="v0">va</span> &gt;&gt; <span class="n">30</span><span class="b1">)</span> &amp; <span class="n">0x1FF</span>,
+        <span class="s">"pd"</span>:     <span class="b1">(</span><span class="v0">va</span> &gt;&gt; <span class="n">21</span><span class="b1">)</span> &amp; <span class="n">0x1FF</span>,
+        <span class="s">"pt"</span>:     <span class="b1">(</span><span class="v0">va</span> &gt;&gt; <span class="n">12</span><span class="b1">)</span> &amp; <span class="n">0x1FF</span>,
+        <span class="s">"offset"</span>:  <span class="v0">va</span>        &amp; <span class="n">0xFFF</span>,
+    <span class="b0">}</span>
+
+<span class="v6">buf</span> = <span class="m1">ctypes</span>.<span class="m2">create_string_buffer</span><span class="b0">(</span><span class="n">4096</span><span class="b0">)</span>
+<span class="v6">buf</span><span class="b0">[</span><span class="n">0</span><span class="b0">]</span> = <span class="s">b"x"</span>                                <span class="c"># fault the page in</span>
+<span class="v0">va</span> = <span class="m1">ctypes</span>.<span class="m2">addressof</span><span class="b0">(</span><span class="v6">buf</span><span class="b0">)</span>
+<span class="v2">ent</span> = <span class="m1">pagemap_entry</span><span class="b0">(</span><span class="v0">va</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">f"va={</span><span class="v0">va</span><span class="s">:#x} indices={</span><span class="m1">walk_indices</span><span class="b1">(</span><span class="v0">va</span><span class="b1">)</span><span class="s">}"</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">f"present={</span><span class="v2">ent</span> &gt;&gt; <span class="n">63</span><span class="s">} pfn={</span><span class="v2">ent</span> &amp; <span class="b1">(</span><span class="b2">(</span><span class="n">1</span> &lt;&lt; <span class="n">55</span><span class="b2">)</span> - <span class="n">1</span><span class="b1">)</span><span class="s">:#x}"</span><span class="b0">)</span>
+<span class="c"># sanity check against Problem 4's example address:</span>
+<span class="k">assert</span> <span class="m1">walk_indices</span><span class="b0">(</span><span class="n">0x7F3BD1C04A20</span><span class="b0">)</span> == <span class="b0">{</span>
+    <span class="s">"pml4"</span>: <span class="n">254</span>, <span class="s">"pdpt"</span>: <span class="n">239</span>, <span class="s">"pd"</span>: <span class="n">142</span>, <span class="s">"pt"</span>: <span class="n">4</span>, <span class="s">"offset"</span>: <span class="n">0xA20</span><span class="b0">}</span>
+</code></pre>
+          </div>
+
+          <h2>How it is done in practice</h2>
+          <p>
+            The production Linux stack in 2026, mapped to this page's
+            sections: scheduling is EEVDF (since 6.6; this machine's
+            6.8 runs it), with cgroup cpu.weight carrying the same
+            weight arithmetic across container boundaries and
+            sched_ext (6.12) letting fleets load BPF schedulers
+            without kernel forks. Memory is 4 KiB pages with THP in
+            madvise mode almost everywhere, explicit hugetlbfs for
+            databases and hypervisors that preallocate, and the
+            multi-generational LRU handling reclaim on Android,
+            ChromeOS, and increasingly servers. Storage is ext4 or XFS
+            in ordered journaling for general fleets, Btrfs where
+            snapshots pay their way, F2FS on phones, with io_uring
+            behind high-performance proxies and databases and its
+            syscall surface restricted in several managed platforms
+            after a run of privilege-escalation bugs, security and
+            performance negotiating in public, as usual.
+          </p>
+          <p>
+            The gap between the textbook and the fleet shows up in the
+            incidents this material lets one read correctly. The 2018
+            PostgreSQL fsync affair: kernels historically could mark
+            pages clean after an fsync <em>failure</em>, so a database
+            that retried fsync and saw success had durably lost data;
+            the fix was application-level (treat fsync failure as
+            fatal) and kernel-level (error reporting reworked), and
+            the lesson is this page's journaling section applied
+            adversarially. Cgroup CPU quota throttling: services
+            observing 100 ms latency spikes at p99.9 traced to
+            cpu.max periods, fixed by switching limits to weights, the
+            arithmetic worked above. THP compaction stalls in
+            latency-sensitive stores, diagnosed by exactly the
+            AnonHugePages bookkeeping used in the TLB section. And the
+            standing cloud design choice, containers versus microVMs,
+            is a table on this page: share the kernel and its 1,885 ns
+            switches, or take Firecracker's 125 ms boots and hardware
+            isolation. None of these yield to intuition; all yield to
+            the measured numbers and the data structures.
+          </p>
+
+          <h2>The current research frontier</h2>
+          <p>
+            Scheduling has left the kernel. Google's ghOSt (SOSP 2021)
+            delegates policy to user space, with BPF and agents making
+            microsecond-scale decisions for fleets; Linux mainlined
+            the idea's spirit as sched_ext, and published schedulers
+            from Meta and Valve (latency-sensitive gaming) now iterate
+            in weeks instead of kernel-release years. The
+            kernel-bypass line runs in parallel: Shenango (NSDI 2019)
+            and Caladan (OSDI 2020) from MIT reallocate cores between
+            latency-critical and batch tasks at 5 &micro;s
+            granularity, treating the kernel scheduler itself as too
+            slow, and Microsoft's Demikernel (SOSP 2021) proposes a
+            library-OS shape for kernel-bypass I/O. Memory management
+            research concentrates on tiering now that CXL makes
+            far-memory a hardware product: Meta's TPP (ASPLOS 2023)
+            and Microsoft's Pond (ASPLOS 2023) place pages across
+            DRAM and CXL by temperature, the working-set model wearing
+            new clothes; DAMON, contributed by Amazon and in-tree,
+            makes access-pattern monitoring first-class. Huge-page
+            policy remains open, the Ingens/HawkEye line continuing
+            against THP's bloat/latency trade. On the assurance side,
+            seL4 (SOSP 2009, NICTA/UNSW) remains the benchmark: a
+            machine-checked proof from specification to C of a
+            capability microkernel, with the total effort the paper
+            reports, on the order of twenty person-years across kernel
+            and proof, defining the current price of certainty.
+            And the boundary itself is being renegotiated: eBPF
+            programs now implement schedulers, security policy, and
+            network functions inside the kernel safely, Rust is
+            accepted for drivers since 6.1, and io_uring keeps
+            absorbing syscalls, three different answers to the same
+            question of how much power to grant which side of the
+            133 ns line measured at the top of this page.
+          </p>
+
+          <h2>Open source to read</h2>
+          <p>
+            The kernel is unusually rewarding to read source-first,
+            because the papers above map to specific files.
+          </p>
+          <ul>
+            <li><a href="https://github.com/torvalds/linux" target="_blank" rel="noreferrer">torvalds/linux</a>:
+              the reference for everything here. Start with
+              <code>kernel/sched/fair.c</code> (EEVDF:
+              <code>entity_eligible</code>, <code>pick_eevdf</code>,
+              and the vruntime bookkeeping), then
+              <code>mm/memory.c</code> (<code>handle_mm_fault</code>:
+              demand paging, COW, and huge-page faults in one file),
+              then <code>fs/ext4/extents.c</code> for the extent tree
+              this page's inode arithmetic evolved into.</li>
+            <li><a href="https://github.com/mit-pdos/xv6-riscv" target="_blank" rel="noreferrer">mit-pdos/xv6-riscv</a>:
+              MIT's teaching reimplementation of v6 UNIX, a complete
+              multiprocessor OS in about 10k lines. Read
+              <code>kernel/proc.c</code> (fork, exit, wait, scheduler)
+              and <code>kernel/vm.c</code> (a page-table walker in a
+              page of code); it is the fastest route to holding a
+              whole kernel in one's head.</li>
+            <li><a href="https://github.com/axboe/liburing" target="_blank" rel="noreferrer">axboe/liburing</a>:
+              the io_uring userspace library by the interface's
+              author. <code>examples/io_uring-cp.c</code> first, then
+              <code>test/</code> as an encyclopedia of ring idioms.</li>
+            <li><a href="https://github.com/opencontainers/runc" target="_blank" rel="noreferrer">opencontainers/runc</a>:
+              the reference container runtime.
+              <code>libcontainer/</code> shows the namespace, cgroup,
+              and pivot_root choreography of this page's container
+              section as shipping code.</li>
+            <li><a href="https://github.com/containerd/containerd" target="_blank" rel="noreferrer">containerd/containerd</a>:
+              the layer above runc that registries, snapshots, and
+              Kubernetes actually talk to; read it to see where images
+              end and processes begin.</li>
+            <li><a href="https://github.com/firecracker-microvm/firecracker" target="_blank" rel="noreferrer">firecracker-microvm/firecracker</a>:
+              the minimal KVM VMM in Rust. <code>src/vmm/</code> is a
+              legible tour of what a hypervisor must actually do:
+              VMCS setup via KVM ioctls, virtio queues, and nothing
+              else.</li>
+            <li><a href="https://github.com/qemu/qemu" target="_blank" rel="noreferrer">qemu/qemu</a>:
+              the maximal device model, useful as the contrast:
+              <code>hw/virtio/</code> implements the ring protocol
+              this page sketches.</li>
+            <li><a href="https://github.com/google/gvisor" target="_blank" rel="noreferrer">google/gvisor</a>:
+              a user-space kernel in Go that intercepts syscalls to
+              shrink the shared-kernel attack surface;
+              <code>pkg/sentry/</code> is an OS textbook written
+              defensively.</li>
+            <li><a href="https://github.com/sched-ext/scx" target="_blank" rel="noreferrer">sched-ext/scx</a>:
+              production BPF schedulers. <code>scheds/c/scx_simple.bpf.c</code>
+              is a complete scheduling policy in a few hundred lines,
+              the frontier section made runnable.</li>
+          </ul>
+
+          <h2>Common misconceptions</h2>
+          <p>
+            <strong>"A system call is a context switch."</strong> It is
+            a mode switch: privilege changes, the address space and
+            task do not, and no scheduler runs. The measured gap is an
+            order of magnitude, 134 ns for a trap against 1,885 ns for
+            an actual switch, and the working-set tax makes real
+            switches more expensive still. Conflating them misprices
+            every design that trades syscalls against threads.
+          </p>
+          <p>
+            <strong>"fork copies the process's memory."</strong> It
+            copies page tables and marks both sides read-only;
+            memory copies happen later, one page per first write, at
+            ~2 &micro;s each. Measured here: forking a 2 GiB process
+            costs 14.3 ms of table work, about 27 ns per resident
+            page, an order of magnitude cheaper than the roughly 200 ms
+            a 2 GiB copy would cost at a typical 10 GB/s single-thread
+            memcpy rate, and pages never written are never copied at
+            all.
+          </p>
+          <p>
+            <strong>"The OS is a program running in the background,
+            scheduling things."</strong> The kernel is not a process
+            and does not run between processes; it is code that runs
+            within some task's context on traps, interrupts, and
+            returns. When nothing traps, the kernel is not running
+            anywhere, which is why a spinning userspace loop with
+            interrupts masked off (in a guest, say) can wedge a CPU:
+            there is no scheduler daemon to intervene, only the timer
+            interrupt that was masked.
+          </p>
+          <p>
+            <strong>"More memory can only reduce page faults."</strong>
+            True for stack algorithms like LRU, false in general:
+            FIFO on the string worked in Problem 5 faults 9 times
+            with 3 frames and 10 with 4. The anomaly is not a
+            curiosity; it is the reason replacement-policy structure
+            (the inclusion property) matters, and the same
+            non-monotonicity reappears in cache hierarchies and
+            TLB sizing.
+          </p>
+          <p>
+            <strong>"mmap is faster than read()."</strong> Not on this
+            machine for warm sequential access: 7.35 GB/s through the
+            mapping versus 9.02 GB/s through read(), because 32,768
+            minor faults outcost the copies they avoid. mmap earns its
+            keep for sparse random access, page-granular sharing, and
+            files larger than memory, an access-pattern decision, not
+            a universal upgrade.
+          </p>
+          <p>
+            <strong>"Huge pages are free performance."</strong> The
+            measured upside here is real, 1.9x on a 32 GiB random
+            chase, but so are the downsides: up to 512x internal
+            fragmentation for sparse regions, a larger first-touch
+            stall, compaction-induced latency spikes, and, as this
+            machine demonstrated, a silent per-process prctl veto that
+            made THP a no-op until explicitly cleared. Measure
+            AnonHugePages; never assume.
+          </p>
+          <p>
+            <strong>"A journaling file system means my data is safe
+            after a crash."</strong> Default ordered-mode journaling
+            makes <em>metadata</em> atomic and guarantees pointers
+            never reference garbage; it does not make your write
+            durable. Durability requires fsync, measured at 608.7
+            &micro;s for a 4 KiB append here, 530x the unsynced cost,
+            and applications that skip it are choosing performance
+            over durability whether they know it or not.
+          </p>
+          <p>
+            <strong>"Containers are lightweight VMs."</strong>
+            Containers are processes with restricted naming
+            (namespaces) and metered consumption (cgroups) under the
+            <em>same kernel</em>; a VM runs its own kernel above
+            hardware-enforced translation. The measured consequences
+            differ in both directions: container "boot" is a ~500
+            &micro;s fork+exec while a microVM boots in ~125 ms, but
+            one kernel exploit escapes every container on the host,
+            which no VMCS misconfiguration short of a hypervisor bug
+            can match. gVisor and Firecracker exist precisely because
+            the two models are not interchangeable.
+          </p>
+
+          <h2>Self-check</h2>
+          <div class="quiz" data-quiz>
+            <script type="application/json" class="quiz-data">[
+              {"id": "q1", "qtype": "mcq",
+               "stem": "On this machine getpid() costs 134 ns while clock_gettime costs 32 ns. What explains clock_gettime being cheaper than the cheapest real system call?",
+               "options": ["The kernel caches time more aggressively than pids",
+                           "clock_gettime executes entirely in user space via the vDSO, reading kernel-published timekeeping data without a trap",
+                           "clock_gettime uses a faster trap instruction",
+                           "getpid invalidates the TLB on entry"],
+               "correctIndex": 1,
+               "explanation": "The vDSO is kernel-provided code mapped into every process; calls it can satisfy from shared data never cross the privilege boundary at all. Forcing clock_gettime through the trap costs 188.6 ns, more than getpid."},
+              {"id": "q2", "qtype": "mcq",
+               "stem": "Two CFS tasks share a CPU: nice 0 (weight 1024) and nice -5 (weight 3121). Over 100 ms, what does each receive, and by how much do their vruntimes advance?",
+               "options": ["50 ms each; vruntimes advance 50 ms each",
+                           "24.7 ms and 75.3 ms; vruntimes advance 24.7 ms each",
+                           "24.7 ms and 75.3 ms; vruntimes advance 24.7 ms and 75.3 ms",
+                           "It depends on the tick frequency"],
+               "correctIndex": 1,
+               "explanation": "CPU divides by weight: 1024/4145 and 3121/4145 of 100 ms. Each task's vruntime advance is its CPU time scaled by 1024/weight, giving 24.7 ms for both: equal vruntime advance IS weight-proportional sharing."},
+              {"id": "q3", "qtype": "mcq",
+               "stem": "What does EEVDF add over CFS that eliminates the old wakeup-preemption heuristics?",
+               "options": ["A faster red-black tree",
+                           "Per-CPU runqueues",
+                           "An eligibility test based on lag plus a virtual deadline set by each task's slice, so latency and share are controlled by separate parameters",
+                           "Automatic nice adjustment for interactive tasks"],
+               "correctIndex": 2,
+               "explanation": "EEVDF runs the eligible task with the earliest virtual deadline d = ve + slice/weight. A small slice earns early service without changing long-run share; CFS could only trade the two together."},
+              {"id": "q4", "qtype": "mcq",
+               "stem": "In the futex mutex, why must a woken waiter set the lock word to 2 (contended) rather than 1 (locked)?",
+               "options": ["State 2 has higher scheduler priority",
+                           "Other waiters may still be asleep; locking as 1 would make the next unlock skip FUTEX_WAKE and strand them",
+                           "The kernel requires the word to match the WAIT value",
+                           "It avoids an extra CAS on the fast path"],
+               "correctIndex": 1,
+               "explanation": "Unlock only issues FUTEX_WAKE when it observes state 2. A waiter that re-locked as 1 would erase the evidence that sleepers exist, and the following unlock would store 0 and wake nobody."},
+              {"id": "q5", "qtype": "truefalse",
+               "stem": "The banker's algorithm may refuse a request even when enough resources are physically free to grant it.",
+               "options": ["True", "False"],
+               "correctIndex": 0,
+               "explanation": "It grants only if the post-grant state is safe. In Problem 3(c) a unit was free, but granting it left no order in which all processes could reach their maxima, so the request is deferred."},
+              {"id": "q6", "qtype": "ordering",
+               "stem": "Order the steps of resolving a load at virtual address V with a cold TLB on 4-level x86-64.",
+               "options": ["Read PML4 entry at CR3 + 8x(bits 47-39 of V)",
+                           "Read PDPT entry selected by bits 38-30",
+                           "Read PD entry selected by bits 29-21",
+                           "Read PT entry selected by bits 20-12, then access the data page at offset bits 11-0"],
+               "correctIndex": -1,
+               "explanation": "The walk descends the radix tree from CR3, one 9-bit index per level, with the 12-bit offset applied to the final frame: 4 table reads plus the data access, which is what the TLB exists to avoid."},
+              {"id": "q7", "qtype": "mcq",
+               "stem": "The 32 GiB random chase measured 255 ns/access on 4 KiB pages and 134.6 ns on 2 MiB huge pages. What causes most of the difference?",
+               "options": ["Huge pages are allocated in faster DRAM",
+                           "Nearly every access misses the TLB at 4 KiB granularity and pays a page walk whose own reads miss cache; 2 MiB entries give 512x TLB reach so translations mostly hit",
+                           "The kernel prefetches huge pages more aggressively",
+                           "4 KiB mappings are read-only"],
+               "correctIndex": 1,
+               "explanation": "DRAM traffic is identical by construction. At 32 GiB there are 8M distinct 4 KiB translations, far past TLB and walk-cache capacity, so the ~120 ns walk penalty lands on essentially every access."},
+              {"id": "q8", "qtype": "mcq",
+               "stem": "ext4's default data=ordered mode journals only metadata. What specifically does its ordering rule (data before metadata commit) prevent?",
+               "options": ["Any data loss on crash",
+                           "A committed inode durably pointing at blocks still holding prior contents, i.e. exposure of stale or garbage data",
+                           "Journal wraparound",
+                           "Double writes of data blocks"],
+               "correctIndex": 1,
+               "explanation": "If metadata committed before data reached disk, a crash leaves the file pointing at whatever the blocks held before. Ordered mode forbids that window; what it does not provide is durability of the data itself without fsync."},
+              {"id": "q9", "qtype": "mcq",
+               "stem": "An LFS-style system (or SSD FTL) runs its segments at 90% live-data utilization. What is the write cost per byte of new data?",
+               "options": ["1.1x", "2x", "10x", "20x"],
+               "correctIndex": 3,
+               "explanation": "Cleaning cost is 2/(1-u): read one segment, rewrite u live, net 1-u of new space, giving (1+u+(1-u))/(1-u). At u=0.9 that is 20, which is why cleaners chase cold, empty segments and why SSDs reserve spare area."},
+              {"id": "q10", "qtype": "truefalse",
+               "stem": "Because io_uring batches submissions, it made the warm-page-cache random reads in this page's benchmark several times faster than a pread loop.",
+               "options": ["True", "False"],
+               "correctIndex": 1,
+               "explanation": "Measured: 1078 ns pread vs 956 ns at depth 32, about 11%, because warm reads are dominated by the 4 KiB copy, not the syscall. The 4x win appeared on COLD reads, where queue depth lets the device work in parallel."},
+              {"id": "q11", "qtype": "mcq",
+               "stem": "A guest workload thrashes the TLB. Why does virtualization amplify the pain?",
+               "options": ["Guests receive fewer TLB entries by quota",
+                           "Every guest page walk is composed with an EPT walk: a cold translation can cost up to 24 memory references instead of 4",
+                           "The hypervisor flushes the TLB on every timer tick",
+                           "EPT forbids huge pages"],
+               "correctIndex": 1,
+               "explanation": "Each of the guest walk's 4 loads is a guest-physical address requiring its own 4-level EPT walk, plus the data address: (4+1)x(4+1)-1 = 24. TLB hits hide this; workloads that miss pay the composed cost."},
+              {"id": "q12", "qtype": "mcq",
+               "stem": "unshare --user --pid --fork reports pid 1 and uid 0 for an unprivileged user's shell. What actually changed?",
+               "options": ["The process gained root on the host",
+                           "The kernel booted a nested instance",
+                           "Only the process's view: new pid and user namespaces renumber identities inside, while the host sees an ordinary unprivileged process",
+                           "The shell moved into a new cgroup"],
+               "correctIndex": 2,
+               "explanation": "Namespaces virtualize naming, not privilege over the host: uid 0 inside maps via uid_map to the original unprivileged uid outside. Resource limits are the separate, cgroup half of containment."}
+            ]</script>
+          </div>
+
+          <h2>References</h2>
+          <ol class="refs">
+            <li>Arpaci-Dusseau, R., Arpaci-Dusseau, A. <em>Operating Systems: Three Easy Pieces</em>, v1.10. Arpaci-Dusseau Books, 2023. Free online. <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/" target="_blank" rel="noreferrer">ostep.org</a></li>
+            <li>Tanenbaum, A., Bos, H. <em>Modern Operating Systems</em>, 4th edition. Pearson, 2014.</li>
+            <li>Love, R. <em>Linux Kernel Development</em>, 3rd edition. Addison-Wesley, 2010.</li>
+            <li>Kerrisk, M. <em>The Linux Programming Interface</em>. No Starch Press, 2010.</li>
+            <li>Ritchie, D., Thompson, K. "The UNIX Time-Sharing System." <em>Communications of the ACM</em> 17(7), 1974. <a href="https://doi.org/10.1145/361011.361061" target="_blank" rel="noreferrer">doi:10.1145/361011.361061</a></li>
+            <li>Corbat&oacute;, F., Merwin Daggett, M., Daley, R. "An Experimental Time-Sharing System." <em>AFIPS Spring Joint Computer Conference</em>, 1962. <a href="https://doi.org/10.1145/1460833.1460871" target="_blank" rel="noreferrer">doi:10.1145/1460833.1460871</a></li>
+            <li>McKusick, M. K., Joy, W., Leffler, S., Fabry, R. "A Fast File System for UNIX." <em>ACM Transactions on Computer Systems</em> 2(3), 1984. <a href="https://doi.org/10.1145/989.990" target="_blank" rel="noreferrer">doi:10.1145/989.990</a></li>
+            <li>Rosenblum, M., Ousterhout, J. "The Design and Implementation of a Log-Structured File System." <em>ACM Transactions on Computer Systems</em> 10(1), 1992. <a href="https://doi.org/10.1145/146941.146943" target="_blank" rel="noreferrer">doi:10.1145/146941.146943</a></li>
+            <li>Ganger, G., McKusick, M. K., Soules, C., Patt, Y. "Soft Updates: A Solution to the Metadata Update Problem in File Systems." <em>ACM Transactions on Computer Systems</em> 18(2), 2000. <a href="https://doi.org/10.1145/350853.350863" target="_blank" rel="noreferrer">doi:10.1145/350853.350863</a></li>
+            <li>Mathur, A., Cao, M., Bhattacharya, S., Dilger, A., Tomas, A., Vivier, L. "The New ext4 Filesystem: Current Status and Future Plans." <em>Ottawa Linux Symposium</em>, 2007. <a href="https://www.kernel.org/doc/ols/2007/ols2007v2-pages-21-34.pdf" target="_blank" rel="noreferrer">kernel.org/doc/ols</a></li>
+            <li>Belady, L. "A Study of Replacement Algorithms for a Virtual-Storage Computer." <em>IBM Systems Journal</em> 5(2), 1966. <a href="https://doi.org/10.1147/sj.52.0078" target="_blank" rel="noreferrer">doi:10.1147/sj.52.0078</a></li>
+            <li>Belady, L., Nelson, R., Shedler, G. "An Anomaly in Space-Time Characteristics of Certain Programs Running in a Paging Machine." <em>Communications of the ACM</em> 12(6), 1969. <a href="https://doi.org/10.1145/363011.363155" target="_blank" rel="noreferrer">doi:10.1145/363011.363155</a></li>
+            <li>Denning, P. "The Working Set Model for Program Behavior." <em>Communications of the ACM</em> 11(5), 1968. <a href="https://doi.org/10.1145/363095.363141" target="_blank" rel="noreferrer">doi:10.1145/363095.363141</a></li>
+            <li>Waldspurger, C., Weihl, W. "Lottery Scheduling: Flexible Proportional-Share Resource Management." <em>OSDI</em>, 1994. <a href="https://www.usenix.org/legacy/publications/library/proceedings/osdi/full_papers/waldspurger.pdf" target="_blank" rel="noreferrer">usenix.org</a></li>
+            <li>Stoica, I., Abdel-Wahab, H. "Earliest Eligible Virtual Deadline First: A Flexible and Accurate Mechanism for Proportional Share Resource Allocation." Old Dominion University TR-95-22, 1996. See also Corbet, J., "An EEVDF CPU Scheduler for Linux," LWN, 2023. <a href="https://lwn.net/Articles/925371/" target="_blank" rel="noreferrer">lwn.net/Articles/925371</a></li>
+            <li>Franke, H., Russell, R., Kirkwood, M. "Fuss, Futexes and Furwocks: Fast Userlevel Locking in Linux." <em>Ottawa Linux Symposium</em>, 2002. <a href="https://www.kernel.org/doc/ols/2002/ols2002-pages-479-495.pdf" target="_blank" rel="noreferrer">kernel.org/doc/ols</a></li>
+            <li>Drepper, U. "Futexes Are Tricky." Technical report, 2011. <a href="https://www.akkadia.org/drepper/futex.pdf" target="_blank" rel="noreferrer">akkadia.org/drepper/futex.pdf</a></li>
+            <li>Coffman, E. G., Elphick, M., Shoshani, A. "System Deadlocks." <em>ACM Computing Surveys</em> 3(2), 1971. <a href="https://doi.org/10.1145/356586.356588" target="_blank" rel="noreferrer">doi:10.1145/356586.356588</a></li>
+            <li>Popek, G., Goldberg, R. "Formal Requirements for Virtualizable Third Generation Architectures." <em>Communications of the ACM</em> 17(7), 1974. <a href="https://doi.org/10.1145/361011.361073" target="_blank" rel="noreferrer">doi:10.1145/361011.361073</a></li>
+            <li>Barham, P., Dragovic, B., Fraser, K., Hand, S., Harris, T., Ho, A., Neugebauer, R., Pratt, I., Warfield, A. "Xen and the Art of Virtualization." <em>SOSP</em>, 2003. <a href="https://doi.org/10.1145/945445.945462" target="_blank" rel="noreferrer">doi:10.1145/945445.945462</a></li>
+            <li>Adams, K., Agesen, O. "A Comparison of Software and Hardware Techniques for x86 Virtualization." <em>ASPLOS</em>, 2006. <a href="https://doi.org/10.1145/1168857.1168860" target="_blank" rel="noreferrer">doi:10.1145/1168857.1168860</a></li>
+            <li>Axboe, J. "Efficient IO with io_uring." Technical report, 2019. <a href="https://kernel.dk/io_uring.pdf" target="_blank" rel="noreferrer">kernel.dk/io_uring.pdf</a></li>
+            <li>Klein, G., Elphinstone, K., Heiser, G., et al. "seL4: Formal Verification of an OS Kernel." <em>SOSP</em>, 2009. <a href="https://doi.org/10.1145/1629575.1629596" target="_blank" rel="noreferrer">doi:10.1145/1629575.1629596</a></li>
+            <li>Humphries, J., Natu, N., Chaugule, A., Weisse, O., Rhoden, B., Don, J., Rizzo, L., Rombakh, O., Turner, P., Kozyrakis, C. "ghOSt: Fast and Flexible User-Space Delegation of Linux Scheduling." <em>SOSP</em>, 2021. <a href="https://doi.org/10.1145/3477132.3483542" target="_blank" rel="noreferrer">doi:10.1145/3477132.3483542</a></li>
+            <li>Agache, A., Brooker, M., Iordache, A., Liguori, A., Neugebauer, R., Piwonka, P., Popa, D. "Firecracker: Lightweight Virtualization for Serverless Applications." <em>NSDI</em>, 2020. <a href="https://www.usenix.org/conference/nsdi20/presentation/agache" target="_blank" rel="noreferrer">usenix.org/nsdi20</a></li>
+          </ol>
+
+          <h2>Key takeaway</h2>
+          <div class="takeaway">
+            <p>
+              An operating system is three virtualizations and a
+              boundary, and every one of them was measured on this page
+              rather than asserted. The boundary costs 134 ns to cross
+              and 1,885 ns to switch across, numbers that price every
+              design above them: the vDSO exists to skip the first, the
+              futex to skip both, io_uring to amortize the first over a
+              queue. The CPU virtualization is arithmetic, vruntime and
+              virtual deadlines, and the live kernel matches the
+              hand-computed shares to three digits. The memory
+              virtualization is a radix tree whose sparsity makes it
+              affordable and whose depth makes the TLB mandatory; huge
+              pages bought back 1.9x on this machine precisely when
+              reach ran out, and copy-on-write turned a 2 GiB copy into
+              14 ms of page-table work. The storage virtualization is
+              an inode map plus a write-ahead argument about crash
+              orderings, with the log-structured endpoint reappearing
+              inside every SSD. Namespaces, cgroups, and hypervisors
+              are the same ideas applied recursively: rename, meter,
+              translate, one level down. The craft is knowing which of
+              these costs dominates the system in front of you, and the
+              only reliable way to know is the one used throughout:
+              measure it.
+            </p>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>&copy; <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;&middot;&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/classes/math.js"></script>
+    <script defer src="/code-tabs.js"></script>
+    <script defer src="/quiz.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/code-copy.js"></script>
+  </body>
+</html>

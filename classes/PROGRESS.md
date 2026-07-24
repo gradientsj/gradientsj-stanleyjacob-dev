@@ -89,15 +89,15 @@ history.
 
 | Group | Pages | Done |
 | --- | --- | --- |
-| Machine learning foundations | 5 | 3 |
+| Machine learning foundations | 5 | 5 (group complete) |
 | Language, generative, multimodal | 11 | 5 |
-| Reinforcement learning and decisions | 7 | 3 |
-| Systems, architecture, data at scale | 10 | 5 |
-| Algorithms, theory, optimization, security | 7 | 1 |
+| Reinforcement learning and decisions | 7 | 4 |
+| Systems, architecture, data at scale | 10 | 6 |
+| Algorithms, theory, optimization, security | 7 | 2 |
 | Graphics, rendering, 3D | 5 | 0 |
 | Robotics and embodied intelligence | 5 | 0 |
 | Applied domains, product, interfaces | 6 | 0 |
-| **Total** | **56** | **17** |
+| **Total** | **56** | **23** |
 
 Complete and validated: algorithm-design-and-analysis, computer-architecture,
 computer-networks, concurrent-systems-programming, deep-generative-models,
@@ -133,9 +133,18 @@ the index.
   by running Python; CUDA snippets compiled with nvcc sm_90; PyTorch/JAX tabs
   executed before inclusion. 17/56 live, 0 validator errors. Pushed as
   8a14896.
-- Batch 2 in flight (wip, claimed by agents): learning-theory, ai-principles,
-  operating-systems, databases, self-improving-agents,
-  combinatorial-optimization.
+- Batch 2 complete: learning-theory (1963 lines, real double-descent and
+  implicit-bias experiments run on the H100), ai-principles (1743, all search
+  and inference numbers from real runs), operating-systems (2378, new
+  measurements merged into `data/os.json`: THP page-chase, io_uring sweep,
+  syscall costs), databases (1882, real SQLite-vs-DuckDB experiments),
+  self-improving-agents (1747, includes a real H100 self-consistency demo
+  with Qwen2.5-0.5B), combinatorial-optimization (1426, AdamW verified
+  against torch.optim to 1.5e-7). ML foundations group is complete.
+  23/56 live, 0 validator errors.
+- Batch 3 in flight (wip, claimed by agents): multimodal-foundation-models,
+  applied-generative-ai, sequence-models-state-spaces,
+  advanced-systems-architecture, numerical-methods, cryptography.
 
 ### Session 1 (2026-07-23)
 
