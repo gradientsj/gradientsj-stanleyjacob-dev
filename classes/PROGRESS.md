@@ -90,24 +90,28 @@ history.
 | Group | Pages | Done |
 | --- | --- | --- |
 | Machine learning foundations | 5 | 5 (group complete) |
-| Language, generative, multimodal | 11 | 8 |
-| Reinforcement learning and decisions | 7 | 4 |
+| Language, generative, multimodal | 11 | 11 (group complete) |
+| Reinforcement learning and decisions | 7 | 7 (group complete) |
 | Systems, architecture, data at scale | 10 | 7 |
 | Algorithms, theory, optimization, security | 7 | 4 |
 | Graphics, rendering, 3D | 5 | 0 |
 | Robotics and embodied intelligence | 5 | 0 |
 | Applied domains, product, interfaces | 6 | 0 |
-| **Total** | **56** | **30** |
+| **Total** | **56** | **36** |
 
-Remaining (26): language group — natural-language-understanding,
-speech-and-spoken-language, generative-adversarial-networks; RL group —
-advanced-rl-topics, decision-making-under-uncertainty, general-game-playing;
-systems group — compilers-and-program-analysis, programming-languages,
-computer-security is DONE; algorithms group — advanced-data-structures,
-modern-algorithmic-toolbox; graphics group (5, all todo); robotics group
-(5, all todo); applied-domains group (6, all todo). See classes_data.py for
-slugs. sequence-models-state-spaces is live but leaner than siblings
-(951 lines) — expand if time allows.
+Batch 4 complete: natural-language-understanding, speech-and-spoken-language,
+generative-adversarial-networks, advanced-rl-topics,
+decision-making-under-uncertainty, general-game-playing. Language and RL
+groups are both complete. 36/56 live, 0 validator errors.
+
+Remaining (20): systems group — compilers-and-program-analysis,
+programming-languages (2); algorithms group — advanced-data-structures,
+modern-algorithmic-toolbox (2); graphics group (5, all todo); robotics
+group (5, all todo); applied-domains group (6, all todo). See
+classes_data.py for slugs. sequence-models-state-spaces is live but leaner
+than siblings (951 lines) — expand if time allows. Orphan data-prep scripts
+data/bench_genomics.py and data/bench_robotics.py are staged for the
+genomics and embodied-foundation-models pages.
 
 Complete and validated: algorithm-design-and-analysis, computer-architecture,
 computer-networks, concurrent-systems-programming, deep-generative-models,
