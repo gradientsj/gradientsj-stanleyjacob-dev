@@ -703,6 +703,22 @@
             middle phase into a single pass, reaching memcpy-rate scans;
             it is the algorithm inside CUB's DeviceScan today.
           </p>
+          <p>
+            The measured cost of that difference on this machine, scanning \(n = 2^{26}\)
+            floats: a three-phase Triton scan written for this page runs in 0.405 ms
+            (1324.9 GB/s counting one read and one write), while torch.cumsum, which
+            dispatches to CUB's single-pass decoupled look-back, runs in 0.270 ms (1987.1
+            GB/s), agreeing to a maximum relative error of \(1.1 \times 10^{-6}\). Both
+            are far below the 3034.7 GB/s the reduction reaches, and the reason is
+            structural rather than a coding defect: a three-phase scan touches the data
+            twice, once to scan blocks and once to add carries, so its floor is four
+            traversals of memory rather than two. Decoupled look-back exists precisely to
+            get back to two, by having each block publish its aggregate and then inspect
+            its predecessors' published state instead of waiting for a separate global
+            pass. <mark>Scan is the primitive where the gap between an obvious
+            implementation and the state of the art is a factor, not a percentage, and the
+            factor is entirely memory traffic.</mark>
+          </p>
 
           <div class="problem">
             <span class="plabel">Problem 4</span>
@@ -769,8 +785,176 @@
             that comparison sorting has no inherent depth barrier above
             \(\log n\).
           </p>
+          <p>
+            The bitonic network deserves its depth counted, because the count explains
+            where it is used. A bitonic sequence rises then falls; Batcher's observation is
+            that a compare-exchange between element \(i\) and element \(i + n/2\) of a
+            bitonic sequence of length \(n\) splits it into two bitonic halves with every
+            element of the lower half no greater than every element of the upper. Sorting a
+            bitonic sequence of length \(n\) therefore takes \(\log_2 n\) rounds of \(n/2\)
+            compare-exchanges each, and building a bitonic sequence of length \(n\)
+            requires bitonically sorting two halves of length \(n/2\) in opposite
+            directions first. Writing \(D(n)\) for the depth of the full sort,
+            \(D(n) = D(n/2) + \log_2 n\), which unrolls to
+            \(D(n) = \sum_{k=1}^{\log_2 n} k = \tfrac{1}{2}\log_2 n(\log_2 n + 1)\)
+            rounds, so \(W = \tfrac{n}{4}\log_2 n(\log_2 n+1)\) compare-exchanges. For
+            \(n = 1024\) that is 55 rounds and 28,160 comparisons against \(n \log_2 n =
+            10{,}240\) for an optimal comparison sort: a \(2.75\times\) work premium bought
+            for a completely oblivious, branch-free, index-computable schedule. Inside a
+            block or a warp, where lanes would otherwise idle and any data-dependent
+            control flow costs divergence, that is a good trade; across a device, where the
+            work premium is paid in real bandwidth, radix sort wins. The measured
+            comparison on this machine: torch.sort on \(2^{26}\) random 32-bit keys, which
+            dispatches to CUB's radix sort, takes 4.473 ms, or 15.0 billion keys per
+            second, which is roughly 8 passes over 268 MB at close to streaming rate.
+          </p>
+          <p>
+            <strong>Stream compaction</strong> is the third member of the scan family and
+            the one that shows up most in real pipelines: given \(n\) elements and a
+            predicate, produce the surviving elements packed contiguously, in order. The
+            algorithm is two lines of the algebra above. Compute the flag vector \(f_i \in
+            \{0,1\}\), take its exclusive scan to get each survivor's destination index,
+            and scatter. Work is \(O(n)\), depth is the scan's \(O(\log n)\), and the
+            output length is the scan's total. Everything that filters on a GPU is this:
+            removing terminated rays in a path tracer, gathering active particles,
+            selecting the tokens routed to one expert in a mixture-of-experts layer,
+            collecting the non-zeros of a sparse operation. The measured version on this
+            machine, a Triton kernel that computes per-tile popcounts, scans the tile
+            counts, and then scatters survivors in one pass over \(n = 2^{26}\) floats with
+            a 50 percent predicate, runs in 0.976 ms against 0.522 ms for torch's fused
+            masked_select, with exact agreement. Both are well under the streaming ceiling
+            because the scatter writes are only half-dense and the output addresses are
+            data-dependent, which is the permanent tax on compaction: reads coalesce,
+            writes do not.
+          </p>
 
-          <h2>SPMD: one program, many lanes</h2>
+          <h2>Shared memory: threads, locks, and the memory model</h2>
+          <p>
+            Shared-memory parallelism is treated compactly here because it has its own
+            page; see <a href="/classes/concurrent-systems-programming">concurrent systems
+            programming</a> for the full treatment of memory models, linearizability,
+            condition variables, and the lock-free landscape. What follows is the subset a
+            performance-minded parallel programmer must have loaded: the cost model, not
+            the correctness theory.
+          </p>
+
+          <h3>Locks, barriers, and what they cost</h3>
+          <p>
+            A thread is a schedulable instruction stream sharing an address space with its
+            siblings, which is what makes communication free and correctness hard. A
+            <em>mutex</em> restores serialization over a region; its cost has three parts,
+            and only the third usually matters. The uncontended acquire is a single
+            successful atomic compare-and-swap, tens of cycles. The contended acquire adds
+            a futex-style descheduling round trip, a few microseconds. The real cost is
+            Amdahl's: a critical section of length \(c\) entered by \(p\) threads at rate
+            \(\lambda\) each serializes at utilization \(\rho = p\lambda c\), and as \(\rho
+            \to 1\) the queue explodes. The practical rule follows directly, and it is the
+            only lock rule worth memorizing: shrink the critical section or shard the lock,
+            because making the lock itself faster moves a term that was never dominant.
+          </p>
+          <p>
+            A <em>barrier</em> makes every thread wait for the slowest, which converts load
+            imbalance into wall-clock time with no discount. If thread \(i\) takes time
+            \(T_i\) in a phase, the phase costs \(\max_i T_i\), and the expected maximum of
+            \(p\) independent draws grows with \(p\) even when the mean does not; with
+            \(p = 1000\) workers whose times are normal with mean \(\mu\) and standard
+            deviation \(\sigma\), the expected maximum is about \(\mu + 3.24\sigma\). This
+            is the quantitative reason bulk-synchronous designs lose to asynchronous ones
+            at scale, and the reason a straggler in a data-parallel training step costs the
+            whole cluster. CUDA's <code>__syncthreads</code> is a barrier over one block
+            only, which is why it is fast, tens of cycles when warps are already
+            co-resident, and why the CUDA model refuses to offer a cheap grid-wide barrier:
+            it would force all blocks to be resident simultaneously and destroy the
+            scheduling freedom that makes kernels portable across GPU sizes.
+          </p>
+
+          <h3>Atomics and the acquire/release model</h3>
+          <p>
+            An atomic read-modify-write does two separable jobs, and conflating them is the
+            most common source of both bugs and needless slowness. The first is
+            <em>atomicity</em>: the read, the modify, and the write are indivisible with
+            respect to other atomics on the same location. The second is
+            <em>ordering</em>: which other memory operations, on other locations, are
+            visible to be before or after it. C++ and the hardware expose these separately.
+            <code>memory_order_relaxed</code> buys atomicity alone and is the right choice
+            for a statistics counter or a histogram bin, where no other data is being
+            published. <code>release</code> on a store guarantees that everything the
+            storing thread wrote before it becomes visible to any thread that performs an
+            <code>acquire</code> load reading that value; the pair is a one-way fence, and
+            together they implement the publish-then-observe idiom that every lock, every
+            queue, and every reference count is built from. Sequential consistency, the
+            default, additionally imposes a single global order on all such operations,
+            which on x86 costs an <code>mfence</code> and on weakly ordered machines like
+            ARM or the GPU costs considerably more.
+          </p>
+          <p>
+            The mapping to GPUs is direct and worth stating because CUDA's atomics are
+            usually taught without it. <code>atomicAdd</code> in CUDA is relaxed: it
+            orders nothing. Publishing data between blocks requires
+            <code>__threadfence()</code>, which is the release/acquire machinery spelled
+            out, and the correct modern spelling is
+            <code>cuda::atomic_ref</code> with an explicit scope
+            (<code>thread_scope_block</code>, <code>thread_scope_device</code>,
+            <code>thread_scope_system</code>). Scope is the extra dimension GPUs add:
+            a block-scoped atomic can be satisfied in the SM's shared memory or L1 and
+            never leave the SM, which is exactly why the privatized histogram measured
+            later is \(144.6\times\) faster than the device-scoped version.
+          </p>
+
+          <h3>False sharing: a cache-line calculation</h3>
+          <p>
+            Coherence is maintained in units of cache lines, 64 bytes on x86 and 128 on
+            some ARM parts, not in units of variables. Two threads writing to different
+            variables that happen to share a line will ping-pong that line between their
+            private caches, each write invalidating the other's copy, with no logical
+            sharing at all. The arithmetic: a 64-byte line holds sixteen 4-byte counters,
+            so eight threads writing eight adjacent <code>int</code> counters occupy a
+            single line and every one of their writes is a coherence miss. Under MESI, a
+            write to a line held Shared or Modified elsewhere requires a
+            read-for-ownership, invalidating every other copy; the round trip through the
+            last-level cache or the interconnect costs on the order of 100 nanoseconds
+            against roughly 1 nanosecond for an L1 hit, a factor of about 100 per write.
+            Padding each counter to <code>alignas(64)</code> costs 60 wasted bytes per
+            counter and removes the traffic entirely.
+          </p>
+          <p>
+            Measured on this machine's 26-core Xeon Platinum 8480+: eight threads each
+            performing 50 million relaxed atomic increments take 4.245 s when the eight
+            counters share one 64-byte line and 0.304 s when each is padded to its own
+            line, a \(14.0\times\) penalty. Per increment that is 10.6 ns versus 0.76 ns,
+            which brackets the coherence round trip predicted above once the atomic's own
+            cost is included. <mark>No line of algorithm pseudocode shows this; it is a
+            property of the layout, and it is the single most common reason a
+            correctly-parallelized loop fails to scale.</mark> The same phenomenon appears
+            at every level of the hierarchy: on the GPU it is called a bank conflict inside
+            shared memory and sector overfetch in HBM, and the measured transpose and
+            strided-read numbers below are its GPU-side equivalents.
+          </p>
+
+          <h3>Lock-free structures and ABA</h3>
+          <p>
+            A lock-free structure guarantees system-wide progress: some thread always
+            completes in a bounded number of steps, so a descheduled thread cannot block
+            the others. The canonical construction is Treiber's stack, whose push loads the
+            head, points the new node at it, and installs the new node with a
+            compare-and-swap, retrying if the head moved. It is correct, simple, and
+            carries a trap. Suppose thread A reads head \(= X\) and is descheduled; threads
+            B and C pop \(X\), pop \(Y\), and push \(X\) back; thread A resumes and its
+            compare-and-swap succeeds because the head is again \(X\), but the rest of the
+            list behind \(X\) is now different, and A has spliced a freed node back into the
+            structure. This is the <strong>ABA problem</strong>: compare-and-swap tests a
+            value, not a history. The standard remedies are a tagged pointer that packs a
+            monotone counter beside the address so the compare covers a version, hazard
+            pointers that publish which nodes a thread is reading so no one reclaims them,
+            and epoch-based reclamation that defers frees until every thread has passed a
+            grace point. Every one of these is a memory-reclamation scheme, which is the
+            real lesson: the hard part of lock-free programming is not the algorithm, it is
+            deciding when memory may be freed. On GPUs the question mostly evaporates,
+            because kernels are bulk-synchronous and allocation happens on the host, which
+            is one reason GPU code gets away with far cruder synchronization than CPU code.
+          </p>
+
+          <h2>SPMD, vectorization, and the CPU runtime</h2>
           <h3>The model, and why compilers cannot do this alone</h3>
           <p>
             Nearly all parallel code today is written in the single
@@ -840,6 +1024,95 @@
 <span class="b0">}</span></code></pre>
           </div>
 
+          <h3>Gang width, SIMD width, and the cost of divergence</h3>
+          <p>
+            The width is a hardware constant and the programmer's unit of waste. On this
+            machine's Xeon, AVX-512 gives 16 fp32 lanes, so an ISPC gang of 16 program
+            instances occupies one register; AVX2 gives 8, NEON and SVE at 128 bits give 4,
+            and a CUDA warp gives 32. Divergence costs the same way in all of them. If a
+            branch splits a gang so that a fraction \(\phi\) of lanes take the
+            \(t\)-cycle side and \(1-\phi\) take the \(e\)-cycle side, a masked
+            implementation executes both, costing \(t + e\) instead of the
+            \(\phi t + (1-\phi)e\) a scalar machine would pay. The worst case is a
+            balanced two-way branch, where efficiency drops to 50 percent, and an
+            \(n\)-way switch in which every lane picks a different arm drops it to
+            \(1/n\). Two corollaries follow. First, divergence is only a problem
+            <em>within</em> a gang: 32 warps that each take a different branch, uniformly
+            within themselves, cost nothing at all, which is why sorting or bucketing work
+            so that a warp's lanes agree is a standard and highly effective optimization.
+            Second, the cost is bounded by the sum of the arms, so short divergent regions
+            are cheap and long ones are not; hoisting a long branch out of a kernel and
+            launching two kernels is frequently the right answer.
+          </p>
+
+          <h3>Thread pools, work stealing, and the Cilk bound</h3>
+          <p>
+            Task-parallel CPU code needs a scheduler, and the argument for which one is
+            settled. A thread pool with a single shared queue is correct and contends on
+            one lock at every task boundary, which caps throughput at roughly one task per
+            lock round trip. Work stealing, introduced in this form by Blumofe and
+            Leiserson for Cilk in 1994, gives each worker its own double-ended queue: the
+            owner pushes and pops at the bottom with no synchronization in the common case,
+            and an idle worker steals from the <em>top</em> of a random victim's deque.
+            Stealing from the opposite end matters twice over. It minimizes contention,
+            since owner and thief touch different ends, and it steals the oldest task,
+            which in a divide-and-conquer recursion is the largest remaining subtree, so
+            one steal buys a lot of work.
+          </p>
+          <p>
+            The result that justifies the design is a probabilistic bound: a work-stealing
+            scheduler executes a fully strict computation with work \(T_1\) and span
+            \(T_\infty\) on \(p\) processors in expected time
+          </p>
+          $$ T_p \;\le\; \frac{T_1}{p} \;+\; O(T_\infty) , $$
+          <p>
+            which is Brent's bound recovered by a decentralized, randomized scheduler with
+            no global knowledge. The proof idea is an accounting argument on steal attempts:
+            every time a processor is idle it makes a steal attempt, and a potential
+            function on the remaining critical path shows that \(\Theta(p)\) steal attempts
+            suffice in expectation to reduce the potential by a constant factor, so the
+            total number of steal attempts is \(O(pT_\infty)\), and dividing the
+            processor-cycles spent stealing by \(p\) gives the \(O(T_\infty)\) additive
+            term. The same paper bounds the space, \(S_p \le p S_1\), and the communication.
+            This is the theoretical backing for essentially every modern task runtime:
+            Intel's TBB, Java's ForkJoinPool, Go's goroutine scheduler, Rust's Rayon,
+            OpenMP's task construct, and the async runtimes built on Tokio all implement
+            per-worker deques with randomized stealing.
+          </p>
+          <p>
+            OpenMP is the loop-parallel counterpart and remains the shortest path from a
+            serial loop to a scaling one. Its scheduling clauses are the assignment
+            decision made explicit: <code>static</code> partitions the index range at entry
+            with zero runtime overhead and is right when iterations cost the same;
+            <code>dynamic</code> hands out chunks from a shared counter and is right when
+            they do not, at the cost of an atomic per chunk; <code>guided</code> starts
+            with large chunks and shrinks them, amortizing overhead early and balancing
+            late. The measured OpenMP reduction below shows what the ceiling is on a CPU
+            once the assignment is right: it is memory, not arithmetic.
+          </p>
+
+          <h3>Processes versus threads, in practice</h3>
+          <p>
+            Threads share an address space; processes do not, and the choice is usually
+            forced by something other than performance. Threads win on communication, which
+            is a pointer, and lose on isolation and on any global interpreter state. The
+            second clause is why Python data pipelines historically used
+            <code>multiprocessing</code>: with a global interpreter lock, threads
+            interleave bytecode rather than executing it concurrently, so CPU-bound Python
+            gets no scaling from threads and full scaling from processes, at the price of
+            pickling every argument across a pipe. That constraint is loosening, with
+            free-threaded builds landing as an option, but the operational shape of the
+            ecosystem still assumes it. The costs are quantitative and stable: creating a
+            thread is tens of microseconds, creating a process is hundreds; a shared-memory
+            handoff between threads is nanoseconds, a pipe or socket handoff between
+            processes is single-digit microseconds plus a copy unless a shared-memory
+            segment is used explicitly. In GPU work the distinction resolves itself: the
+            standard distributed-training layout is one process per GPU, precisely so that
+            each has its own CUDA context and its own Python interpreter, with NCCL rather
+            than shared memory carrying the data between them. The GIL then stops mattering,
+            because the Python thread's job is only to enqueue asynchronous kernels.
+          </p>
+
           <h2>The CUDA execution model</h2>
           <h3>Grids, blocks, warps: the three-level contract</h3>
           <p>
@@ -877,6 +1150,45 @@
             and at \(B = 3\) TB/s, \(L = 500\) ns that is 1.5 MB of
             outstanding requests, far more than any single thread can
             generate. Warps are the mechanism that generates it.
+          </p>
+
+          <h3>The memory hierarchy in numbers</h3>
+          <p>
+            Every optimization on this page is a move between two levels of the following
+            table, so the constants are worth holding. Registers are per-thread and
+            private, 65,536 32-bit registers per SM, addressable only by index known at
+            compile time; a register access is free in the sense that it is part of the
+            instruction. Shared memory is per-block, carved out of a 256 KB unified block
+            with L1 on Hopper, with 48 KB available per block by default and up to 227 KB
+            with an explicit opt-in; latency is roughly 20 to 30 cycles and bandwidth per
+            SM is a few thousand bytes per cycle across 32 banks. L1 is the same physical
+            array, hardware-managed. L2 is 50 MB, device-wide, shared by all SMs, and is the
+            coherence point for global memory. HBM3 is 80 GB at a measured 3063.5 GB/s and
+            roughly 500 to 700 nanoseconds of latency. Beyond that lies host memory over
+            PCIe at tens of GB/s, and other GPUs over NVLink at a measured 328.3 GB/s of
+            bus bandwidth.
+          </p>
+          <pre class="flow">level        scope        size (H100)      latency        who manages it
+ registers    thread       256 KB/SM        ~0             compiler
+ shared/L1    block        256 KB/SM        ~25 cyc        programmer / hw
+ L2           device       50 MB            ~200 cyc       hardware
+ HBM3         device       80 GB            ~500-700 ns    hardware
+ NVLink       node         peer GPUs        ~2-10 us       NCCL
+ PCIe/host    system       host DRAM        ~10 us         driver
+
+ capacity x ~200 per step down, bandwidth / ~10, latency x ~20.
+ Every kernel optimization below is: move a reuse pattern one level up.</pre>
+          <p>
+            Two consequences shape everything after. First, Little's law: sustaining
+            \(B = 3\) TB/s at \(L = 600\) ns requires \(B \times L = 1.8\) MB of requests in
+            flight, which no single thread can generate, so occupancy is not a vanity
+            metric but the mechanism that supplies concurrency to the memory system.
+            Second, the ratios above mean an optimization is worth roughly a factor of ten
+            per level climbed, and the measured progressions confirm it: tiling moves matmul
+            reuse from HBM to shared memory for \(1.4\times\) on this kernel shape, register
+            blocking moves it from shared memory to registers for \(3.1\times\), and fusing
+            attention moves the entire score matrix from HBM to registers for
+            \(27.7\times\).
           </p>
 
           <h3>Coalescing, measured</h3>
@@ -1017,6 +1329,84 @@
             reduction is the base case of essentially every CUB block
             primitive.
           </p>
+          <h3>Streams, asynchronous copy, and cooperative groups</h3>
+          <p>
+            A CUDA <em>stream</em> is an ordered queue of work; operations in one stream
+            execute in issue order, operations in different streams have no ordering
+            relative to each other, and <code>cudaEvent</code> objects insert explicit
+            cross-stream dependencies. Streams are what turn a GPU program into a pipeline:
+            copy the next batch on one stream while computing the current batch on another,
+            and the transfer time disappears under the compute as long as the host memory
+            is page-locked, since only pinned memory can be DMA'd without a staging copy.
+            The same mechanism underlies overlapping the gradient all-reduce with the
+            backward pass in data-parallel training, which is a two-stream pipeline with
+            events at the bucket boundaries. Because kernel launch is asynchronous, a host
+            thread can run far ahead of the device, and this is exactly what hides launch
+            latency; it is also what makes naive timing wrong, since without a
+            synchronization the host measures the enqueue, not the work. CUDA graphs go
+            further and record a whole dependency DAG of launches once, then replay it with
+            a single submission, which matters when kernels are short enough that the
+            per-launch overhead of a few microseconds is a real fraction of the step: the
+            small-batch inference regime is exactly an Amdahl problem in launch overhead.
+          </p>
+          <p>
+            Inside a kernel, <code>cuda::memcpy_async</code> and the underlying
+            <code>cp.async</code> instruction (Ampere onward) copy global memory into shared
+            memory without routing the data through registers and without blocking the
+            issuing warp, so a kernel can prefetch the next tile while computing the current
+            one. This is software pipelining expressed in the memory system, and it is the
+            difference between the tiled matmul on this page and the library kernels it
+            loses to. <em>Cooperative groups</em> generalize the synchronization vocabulary
+            beyond <code>__syncthreads</code>: <code>tiled_partition&lt;32&gt;</code> names a
+            warp explicitly so shuffle-based reductions can be written generically,
+            <code>coalesced_threads()</code> names the currently active lanes after
+            divergence, and a cooperative launch plus <code>grid_group::sync()</code> gives
+            a genuine grid-wide barrier, at the cost of requiring that the entire grid be
+            co-resident, which caps the grid at what the device can hold and gives up the
+            portability that ordinary kernels enjoy.
+          </p>
+
+          <h3>Hopper: TMA, thread block clusters, and warpgroup matmul</h3>
+          <p>
+            The H100 measured throughout this page adds three mechanisms that break the
+            classical grid-block-thread abstraction, and current high-performance kernels
+            are organized around them. The <strong>Tensor Memory Accelerator</strong> is a
+            dedicated unit that performs bulk asynchronous copies between global and shared
+            memory given a multi-dimensional tensor descriptor: one thread issues the copy,
+            the hardware generates all the addresses, handles boundary clamping, and signals
+            completion through a shared-memory barrier. Compared with
+            <code>cp.async</code>, it removes the address arithmetic from the instruction
+            stream entirely, which matters because in a well-tuned matmul that arithmetic
+            was competing with the actual math for issue slots. <strong>Thread block
+            clusters</strong> add a level between grid and block: a cluster is a set of
+            blocks (up to 8 on the H100) guaranteed to be co-resident on the same GPU
+            processing cluster, able to synchronize with each other and to read each other's
+            shared memory through a <em>distributed shared memory</em> address space. That
+            is a genuinely new capability, since before it the only inter-block channel was
+            global memory. <strong>Warpgroup matrix multiply-accumulate</strong>
+            (<code>wgmma</code>) issues a matmul from a warpgroup of four warps, 128 threads,
+            asynchronously, reading its operands directly from shared memory rather than
+            requiring them staged into registers first.
+          </p>
+          <p>
+            The three combine into a structure that looks nothing like the SPMD kernels
+            earlier on this page: <em>warp specialization</em>, in which some warpgroups
+            act as producers issuing TMA loads into a circular buffer of shared-memory
+            tiles, and others act as consumers issuing <code>wgmma</code> against those
+            tiles, with asynchronous barriers carrying the handoff. It is a dataflow
+            pipeline running inside one thread block. FlashAttention-3 is the canonical
+            published example, and it is where the measured 640.1 TFLOPS at \(L = 16384\)
+            comes from: overlapping the softmax, which runs on the ordinary vector units,
+            with the two matmuls, which run on the tensor cores, so that neither datapath
+            idles. CUTLASS 3 exposes the same structures generically through its CuTe layout
+            algebra. The honest summary for a practitioner is that these features are
+            currently reached through libraries and compilers rather than written by hand:
+            Triton emits <code>wgmma</code> and TMA operations from ordinary
+            <code>tl.dot</code> and <code>tl.load</code> code, which is why the Triton matmul
+            measured on this page reaches 511.6 TFLOPS without a single Hopper-specific
+            line.
+          </p>
+
           <h3>Atomics and privatization: the measured histogram</h3>
           <p>
             Reductions to <em>many</em> cells, a histogram being the pure
@@ -1164,6 +1554,44 @@
             peak. Attention, next section, is the interesting case: its
             intensity is a <em>design choice</em>.
           </p>
+          <p>
+            Classifying every kernel measured on this page against the two ridges,
+            \(I^*_{\text{fp32}} = 16.7\) and \(I^*_{\text{bf16}} = 243\) flops per byte,
+            gives the whole page as one table. Intensity is computed from first-principles
+            byte and flop counts, not from a profiler.
+          </p>
+          <div class="tbl-wrap"><table class="data">
+            <thead><tr><th>Kernel</th><th>Arithmetic intensity</th><th>Bound by</th><th>Measured</th><th>Fraction of its roof</th></tr></thead>
+            <tbody>
+              <tr><td>vector add</td><td>1/12 flop/byte</td><td>memory</td><td>2785.3 GB/s</td><td>91% of 3063.5</td></tr>
+              <tr><td>reduction (reduce5)</td><td>1/4</td><td>memory</td><td>3034.7 GB/s</td><td>99%</td></tr>
+              <tr><td>fused elementwise chain</td><td>~1</td><td>memory</td><td>2616.6 GB/s</td><td>85%</td></tr>
+              <tr><td>transpose (tiled, padded)</td><td>0 (pure movement)</td><td>memory</td><td>2694.0 GB/s</td><td>95% of copy</td></tr>
+              <tr><td>histogram (privatized)</td><td>~1/1 on 1-byte input</td><td>memory</td><td>670.1 GB/s</td><td>22%, atomics-limited</td></tr>
+              <tr><td>softmax (fused, fp32)</td><td>~5 (exp counted as 1)</td><td>memory</td><td>1480.3 GB/s</td><td>48%</td></tr>
+              <tr><td>LayerNorm (Welford, fp32)</td><td>~5</td><td>memory</td><td>1928.6 GB/s</td><td>63%</td></tr>
+              <tr><td>RMSNorm (fp32)</td><td>~4</td><td>memory</td><td>2137.6 GB/s</td><td>70%</td></tr>
+              <tr><td>scan (three-phase)</td><td>1/8 over 4 traversals</td><td>memory</td><td>1324.9 GB/s</td><td>43%</td></tr>
+              <tr><td>stream compaction</td><td>0</td><td>memory, scattered writes</td><td>481.2 GB/s</td><td>16%</td></tr>
+              <tr><td>SGEMM fp32 n=4096 (naive)</td><td>1/4 realized</td><td>memory + issue</td><td>5.9 TFLOPS</td><td>see text</td></tr>
+              <tr><td>SGEMM fp32 (blocked128)</td><td>32 realized</td><td>compute (smem/issue)</td><td>25.1 TFLOPS</td><td>49% of 51.2</td></tr>
+              <tr><td>cuBLAS SGEMM n=8192</td><td>683</td><td>compute</td><td>51.4 TFLOPS</td><td>100%</td></tr>
+              <tr><td>naive attention L=8192</td><td>~1 realized</td><td>memory</td><td>22.2 TFLOPS</td><td>at the memory roof</td></tr>
+              <tr><td>fused attention L=16384</td><td>~L/4, unbounded</td><td>compute (tensor core)</td><td>640.1 TFLOPS</td><td>86% of 744.6</td></tr>
+            </tbody>
+          </table></div>
+          <p>
+            Two rows repay a second look. The histogram at 670.1 GB/s is memory-bound in
+            form but atomics-bound in fact: its input is one byte per element and its
+            traffic ought to run at streaming rate, but shared-memory atomic throughput on
+            256 bins caps it well short. The normalization kernels sit at 48 to 70 percent
+            of the streaming roof because they must read each row twice, once to compute
+            statistics and once to apply them, unless the row fits in registers; the
+            measured RMSNorm is fastest of the three precisely because it computes one
+            statistic instead of two and skips the bias. <mark>Every entry in the table
+            except the last two is memory-bound, which is the empirical form of the claim
+            that modern accelerators are memory machines with arithmetic attached.</mark>
+          </p>
 
           <h2>Attention: the kernel-design capstone</h2>
           <h3>Why naive attention is memory-bound at any scale</h3>
@@ -1232,6 +1660,77 @@
             torch.softmax at 0.301 ms confirming the library does the
             same fusion.
           </p>
+          <h3>FlashAttention: the tiling and rescaling, derived in full</h3>
+          <p>
+            The online-softmax identity handles one row's normalizer. FlashAttention's
+            contribution is to carry the same rebase through the value accumulation so that
+            an entire attention row can be finished without ever holding the row. Fix one
+            query row \(q \in \R^{d}\) and partition the \(L\) keys into blocks
+            \(B_1, \dots, B_T\) of \(B_c\) keys each. Define, after processing blocks
+            \(1..t\), the three state variables
+          </p>
+          $$ m^{(t)} = \max_{j \in B_1 \cup \cdots \cup B_t} s_j , \qquad
+             \ell^{(t)} = \!\!\sum_{j \in B_1 \cup \cdots \cup B_t}\!\! e^{\,s_j - m^{(t)}} ,
+             \qquad
+             o^{(t)} = \!\!\sum_{j \in B_1 \cup \cdots \cup B_t}\!\! e^{\,s_j - m^{(t)}} v_j , $$
+          <p>
+            where \(s_j = q^{\T}k_j/\sqrt{d}\). The claim is that these can be updated from
+            block \(t+1\) alone. Let \(\tilde m = \max_{j \in B_{t+1}} s_j\), \(m' =
+            \max(m^{(t)}, \tilde m)\), and write \(\alpha = e^{\,m^{(t)} - m'}\),
+            \(\beta = e^{\,\tilde m - m'}\). Then, splitting the sum at the block boundary
+            and multiplying each part by one in the form \(e^{m - m'}e^{m' - m}\),
+          </p>
+          $$ \ell^{(t+1)} = \sum_{j \le B_t} e^{\,s_j - m'} + \sum_{j \in B_{t+1}} e^{\,s_j - m'}
+             = \alpha \underbrace{\sum_{j \le B_t} e^{\,s_j - m^{(t)}}}_{\ell^{(t)}}
+             + \beta \underbrace{\sum_{j \in B_{t+1}} e^{\,s_j - \tilde m}}_{\tilde\ell} , $$
+          $$ o^{(t+1)} = \alpha\, o^{(t)} \;+\; \beta \sum_{j \in B_{t+1}} e^{\,s_j - \tilde m} v_j
+             \;=\; \alpha\, o^{(t)} \;+\; \beta\, \tilde P_{t+1} V_{t+1} , $$
+          <p>
+            because \(e^{s_j - m'} = e^{s_j - m^{(t)}} e^{m^{(t)} - m'}\) is an exact
+            identity for every \(j\) in the first group and correspondingly for the second.
+            <mark>Nothing is approximated: the rescaling is multiplication by one, written
+            in a form that changes which max the accumulator is referenced to.</mark> After
+            the last block, \(o = o^{(T)}/\ell^{(T)}\) is exactly
+            \(\softmax(s)^{\T}V\). The numerical property that makes it usable is that
+            every exponential argument \(s_j - m'\) is at most zero, so no term can
+            overflow, and the largest is exactly zero, so no term underflows to
+            insignificance relative to the largest.
+          </p>
+          <pre class="flow">flash forward, one query block Q_i of B_r rows, T key blocks
+
+ load Q_i  (B_r x d)  into registers/smem       once, stays resident
+ m = -inf (B_r), l = 0 (B_r), O = 0 (B_r x d)   online-softmax state
+ for t = 1..T:
+     load K_t, V_t  (B_c x d) into shared memory        <-- the only HBM reads
+     S  = Q_i K_t^T * scale            (B_r x B_c)      tensor cores, on chip
+     m' = max(m, rowmax(S))                              merge maxima
+     P  = exp(S - m')                  (B_r x B_c)       never leaves the SM
+     a  = exp(m - m')                                    rebase factor
+     l  = a*l + rowsum(P);  O = a*O + P V_t              tensor cores again
+     m  = m'
+ store O / l  (B_r x d)                                 <-- the only HBM write
+
+ HBM traffic per query block: d*B_r (read Q) + 2*L*d (stream K,V) + d*B_r (write O)
+ HBM traffic materialized:    the same, plus 4 * L * B_r for S and P</pre>
+          <p>
+            The traffic arithmetic makes the measured table exact rather than suggestive.
+            With \(L/B_r\) query blocks each streaming all of \(K\) and \(V\), total HBM
+            traffic is
+            \(\Theta\!\left(\frac{L}{B_r}\cdot Ld\right) = \Theta(L^2 d / B_r)\), and since
+            the shared-memory budget \(M\) must hold a \(K\) tile, a \(V\) tile, and the
+            \(Q\) tile, \(B_r\) and \(B_c\) scale like \(M/d\), giving the paper's
+            \(\Theta(L^2d^2/M)\) against the materialized algorithm's \(\Theta(L^2 + Ld)\).
+            The ratio is \(d^2/M\), a factor of tens at \(d = 64\) and \(M \approx 100\)
+            KB. Concretely, at the measured configuration (\(BH = 128\), \(L = 8192\),
+            \(d = 64\), 2 bytes per element), streaming \(Q, K, V, O\) once costs
+            \(4 \times 128 \times 8192 \times 64 \times 2 = 0.54\) GB, while the two score
+            tensors cost \(4 \times 128 \times 8192^2 \times 2 = 68.7\) GB: a
+            \(127\times\) difference in bytes for identical arithmetic. At \(3063.5\)
+            GB/s those are 0.18 ms and 22.4 ms of unavoidable traffic respectively, and the
+            measured 3.575 ms fused against 98.946 ms naive sits above both floors by the
+            same factor, as it must, because the fused kernel is compute-bound at 615.1
+            TFLOPS while the naive one is traffic-bound at 22.2.
+          </p>
           <p>
             The IO accounting from the FlashAttention paper explains the
             table's shape. With on-chip memory of size \(M\), tiles of
@@ -1268,6 +1767,78 @@
             language with a good compiler is enough to be
             production-competitive on this kernel, which is precisely the
             argument Triton's designers made.
+          </p>
+
+          <h3>Multi-head attention as a whole block</h3>
+          <p>
+            Attention in a real model is never the bare kernel. A multi-head attention
+            block takes \(X \in \R^{B \times L \times d_{\text{model}}}\), applies three
+            projections (usually fused into one \(d_{\text{model}} \times 3d_{\text{model}}\)
+            matmul), reshapes into \(H\) heads of width \(d_h = d_{\text{model}}/H\), runs
+            attention per head, concatenates, and applies an output projection. The
+            parallel structure is worth stating precisely because it is the reason the
+            transformer trains at all: the head axis is pure data parallelism with no
+            communication, the batch axis likewise, and the only sequential dependence is
+            within a head's softmax. That means the natural grid is \((L/B_r, B \cdot H)\),
+            exactly the two-dimensional launch the Triton kernel below uses, and it is why
+            attention scales to \(10^5\)-way parallelism without any algorithmic cleverness.
+          </p>
+          <p>
+            The flop accounting splits into two pieces with different intensities. The
+            projections cost \(2BLd_{\text{model}}(3d_{\text{model}}) + 2BLd_{\text{model}}^2
+            = 8BLd_{\text{model}}^2\) flops and are ordinary matmuls, compute-bound and
+            handled well by cuBLAS. The attention itself costs \(4BHL^2d_h = 4BL^2
+            d_{\text{model}}\) flops, halved by causal masking. Their ratio is
+            \(2d_{\text{model}}/L\) (before the causal factor), so the crossover where
+            attention starts to dominate the block is \(L \approx 2 d_{\text{model}}\):
+            below it the projections are the cost, above it attention is, and this single
+            ratio explains why long-context work is dominated by attention kernel
+            engineering while short-context serving is dominated by GEMM shapes.
+          </p>
+          <p>
+            Measured on this H100 for a full causal block at \(B = 8\), \(L = 4096\),
+            \(d_{\text{model}} = 1024\), \(H = 16\) heads of width 64, bf16, including both
+            projections and verified to a relative error of \(3.7 \times 10^{-3}\) between
+            the two paths:
+          </p>
+          <div class="tbl-wrap"><table class="data">
+            <thead><tr><th>Multi-head attention block, causal</th><th>Time (ms)</th><th>TFLOPS</th><th>Peak memory</th></tr></thead>
+            <tbody>
+              <tr><td>naive: materialized (B,H,L,L) scores + masked_fill + softmax</td><td>24.044</td><td>22.9</td><td>9.29 GB</td></tr>
+              <tr><td>fused: same projections, flash SDPA backend</td><td>1.352</td><td>406.6</td><td>0.68 GB</td></tr>
+              <tr><td>ratio</td><td>17.78x</td><td>17.8x</td><td>13.7x</td></tr>
+            </tbody>
+          </table></div>
+          <p>
+            The block does 274.9 GFLOP of projection work and 274.9 GFLOP of causal
+            attention work, an even split at exactly the \(L = 2d_{\text{model}}\)
+            crossover derived above. That split is what makes the fused number instructive:
+            at 406.6 TFLOPS the block is below the 728.7 TFLOPS that a pure bf16 matmul
+            reaches on this machine, and the reason is not inefficiency in either half but
+            the mix, since the causal kernel wastes half its tiles on masked-out regions
+            unless it skips them, and the projections at \(L d_{\text{model}} = 4096 \times
+            1024\) are a smaller, less efficient GEMM shape than the \(n = 8192\) square
+            case. The naive path's 22.9 TFLOPS matches the standalone naive attention
+            numbers almost exactly, confirming that in that path the projections are
+            invisible: essentially all of the 24 ms is spent writing and reading the
+            \(8 \times 16 \times 4096^2 \times 2 = 8.6\) GB score tensor, plus the masking
+            pass over it, plus the softmax pass over it.
+          </p>
+          <p>
+            A separate measurement isolates the causal case for the hand-written kernel.
+            A causal Triton flash kernel written for this page, which skips key blocks
+            entirely beyond the diagonal, runs at \(BH = 64\), \(L = 4096\), \(d = 64\),
+            fp16 in 0.577 ms and 238.3 TFLOPS, against PyTorch's flash backend at 0.533 ms
+            and 257.9 TFLOPS, with a maximum absolute error of \(4.9 \times 10^{-4}\).
+            Ninety-two percent of a production kernel from forty lines of Triton is the
+            headline, but the more useful observation is the shape of the remaining gap:
+            the loop bound \(\lceil (i+1)B_r / B_c \rceil\) skips whole blocks but still
+            computes the full \(B_r \times B_c\) tile on the diagonal, wasting slightly
+            under half of one block-row, and production kernels additionally balance the
+            triangular work across the grid so that programs handling early query blocks
+            do not finish long before those handling late ones. Load imbalance in a
+            triangular loop is a decomposition problem, and it is the same problem the
+            assignment discussion opened with.
           </p>
 
           <h2>Worked problems</h2>
@@ -1572,6 +2143,116 @@
 <span class="v4">x</span> = <span class="m1">torch</span>.<span class="m2">randn</span><span class="b0">(</span><span class="n">1</span> &lt;&lt; <span class="n">28</span>, <span class="v6">device</span>=<span class="s">"cuda"</span><span class="b0">)</span>
 <span class="c"># atomics reorder float adds across runs: compare with a tolerance</span>
 <span class="k">assert</span> <span class="m1">torch</span>.<span class="m2">allclose</span><span class="b0">(</span><span class="m1">gpu_sum</span><span class="b1">(</span><span class="v4">x</span><span class="b1">)</span>, <span class="v4">x</span>.<span class="m2">sum</span><span class="b1">()</span>, <span class="v4">rtol</span>=<span class="n">1e-4</span><span class="b0">)</span></code></pre>
+          </div>
+
+          <h3>Transpose: shared memory and one column of padding</h3>
+          <p>
+            A transpose computes nothing; it only moves \(n^2\) elements, so its ceiling is
+            the copy rate and every deficit is a memory-system fault. The naive kernel
+            cannot coalesce both ends at once: if the read is contiguous the write has
+            stride \(n\), and at \(n = 8192\) that is 32 KB between consecutive lanes, one
+            sector per lane. Staging a \(32 \times 32\) tile through shared memory fixes
+            both ends, since the transpose happens on chip. That introduces the second
+            fault: reading a column of a \(32 \times 32\) shared array puts all 32 lanes in
+            the same bank, a 32-way conflict serializing the access. Padding the row to 33
+            floats shifts each row by one bank, so column \(c\) of row \(r\) lands in bank
+            \((33r + c) \bmod 32 = (r + c) \bmod 32\), all distinct across \(r\). Measured
+            at \(n = 8192\) (536.9 MB read, 536.9 MB written), each version verified
+            bit-exact against <code>x.t().contiguous()</code>: naive 451.1 GB/s, tiled
+            1702.9 GB/s, tiled with padding 2694.0 GB/s, against 2837.4 GB/s for a straight
+            copy. One byte of padding per row is worth \(1.58\times\).
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="cuda" class="active">CUDA</button>
+              <button data-lang="triton">Triton</button>
+              <button data-lang="pytorch">PyTorch</button>
+            </div>
+            <pre data-lang="cuda" class="lang active"><code class="language-cpp">// transpose.cu, n = 8192 fp32. Measured on this H100:
+//   naive 451.1 GB/s | tiled 1702.9 | tiled+pad 2694.0 | copy 2837.4
+// ptxas (padded): 28 regs, 4224 B smem (= 32 * 33 * 4), 0 spills.
+#include &lt;cuda_runtime.h&gt;
+
+// Naive: reads coalesce (consecutive x = consecutive addresses),
+// writes do not (consecutive x = addresses n floats apart).
+__global__ void transpose_naive(const float* __restrict__ in,
+                                float* __restrict__ out, int n) {
+    int x = blockIdx.x * 32 + threadIdx.x;      // column
+    int y = blockIdx.y * 32 + threadIdx.y;      // row (block is 32 x 8)
+    for (int j = 0; j &lt; 32; j += 8)             // 4 rows per thread
+        if (x &lt; n &amp;&amp; y + j &lt; n)
+            out[(long)x * n + (y + j)] = in[(long)(y + j) * n + x];
+}
+
+// Tiled: both global accesses coalesce; the transpose happens in smem.
+// PAD = 1 makes the stride 33, so a column of the tile spans 32 banks.
+template &lt;int PAD&gt;
+__global__ void transpose_tiled(const float* __restrict__ in,
+                                float* __restrict__ out, int n) {
+    __shared__ float tile[32][32 + PAD];
+    int x = blockIdx.x * 32 + threadIdx.x;
+    int y = blockIdx.y * 32 + threadIdx.y;
+    for (int j = 0; j &lt; 32; j += 8)             // coalesced read of a tile
+        if (x &lt; n &amp;&amp; y + j &lt; n)
+            tile[threadIdx.y + j][threadIdx.x] = in[(long)(y + j) * n + x];
+    __syncthreads();
+    x = blockIdx.y * 32 + threadIdx.x;          // swap block indices so the
+    y = blockIdx.x * 32 + threadIdx.y;          // write is also coalesced
+    for (int j = 0; j &lt; 32; j += 8)
+        if (x &lt; n &amp;&amp; y + j &lt; n)                 // column read of the tile:
+            out[(long)(y + j) * n + x] = tile[threadIdx.x][threadIdx.y + j];
+}
+// launch: dim3 grid(n/32, n/32), block(32, 8);
+//         transpose_tiled&lt;1&gt;&lt;&lt;&lt;grid, block&gt;&gt;&gt;(in, out, n);</code></pre>
+            <pre data-lang="triton" class="lang"><code class="language-python"># Triton transpose. Measured: 0.216 ms, 2488.8 GB/s at n = 8192.
+# The compiler owns the shared-memory staging and the swizzle that
+# replaces the hand-written padding column.
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def transpose_kernel(in_ptr, out_ptr, n,
+                     BM: tl.constexpr, BN: tl.constexpr):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    rm = pid_m * BM + tl.arange(0, BM)          # (BM,) rows of input
+    rn = pid_n * BN + tl.arange(0, BN)          # (BN,) cols of input
+    src = in_ptr + rm[:, None] * n + rn[None, :]        # (BM, BN)
+    x = tl.load(src, mask=(rm[:, None] &lt; n) &amp; (rn[None, :] &lt; n))
+    dst = out_ptr + rn[:, None] * n + rm[None, :]       # (BN, BM)
+    tl.store(dst, tl.trans(x), mask=(rn[:, None] &lt; n) &amp; (rm[None, :] &lt; n))
+
+def transpose(x):
+    n = x.shape[0]
+    o = torch.empty_like(x)
+    grid = (triton.cdiv(n, 64), triton.cdiv(n, 64))
+    transpose_kernel[grid](x, o, n, BM=64, BN=64)
+    return o
+
+x = torch.randn(8192, 8192, device="cuda")
+assert torch.equal(transpose(x), x.t().contiguous())</code></pre>
+            <pre data-lang="pytorch" class="lang"><code class="language-python">import torch
+
+# The reference. x.t() is free: it only rewrites the stride metadata,
+# producing a non-contiguous view with no data movement at all.
+x = torch.randn(8192, 8192, device="cuda")
+v = x.t()                          # (8192, 8192) view, stride (1, 8192)
+assert v.data_ptr() == x.data_ptr()
+assert not v.is_contiguous()
+
+# .contiguous() is the kernel that actually moves 1.07 GB. This is what
+# the CUDA and Triton tabs reimplement, and it is what a "free" transpose
+# costs the moment something downstream demands a contiguous layout.
+y = v.contiguous()                 # measured baseline for the tabs above
+
+# The practical lesson: prefer operators that accept strides. cuBLAS and
+# tl.dot both take a transpose flag, so a matmul against x.t() never
+# needs this kernel; a reshape after a transpose always does.
+q = torch.randn(8, 4096, 16, 64, device="cuda")   # (B, L, H, d)
+q = q.transpose(1, 2)                             # (B, H, L, d) view
+# .reshape here would force a copy; .contiguous() makes the cost explicit.
+assert not q.is_contiguous()</code></pre>
           </div>
 
           <h3>Scan: the three-phase decomposition in tensor code</h3>

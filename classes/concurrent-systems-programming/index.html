@@ -361,6 +361,326 @@ fork() ────────────────────────�
             the same isolation into its escape hatch from the GIL.
           </p>
 
+          <h3>Zombies, orphans, and the duty to reap</h3>
+          <p>
+            Process termination on Unix is a two-party protocol, and both
+            failure modes have names. When a child exits, the kernel keeps
+            a minimal record, exit status, resource usage, and the pid
+            itself, until the parent collects it with
+            <code>wait</code>. Until then the child is a
+            <em>zombie</em>: no address space, no threads, nothing left to
+            schedule, but still occupying a process-table slot and a pid.
+            The demonstration is short enough to run: fork a child that
+            exits immediately, sleep, and ask <code>ps</code> about it.
+            On this machine that prints
+            <code>4142637 Z zombie &lt;defunct&gt;</code>; after the
+            parent calls <code>waitpid</code>, the same query prints
+            nothing, because the entry is gone. A long-lived server that
+            forks and never waits leaks one pid per child until it hits
+            <code>/proc/sys/kernel/pid_max</code> and
+            <code>fork</code> starts failing with <code>EAGAIN</code>,
+            a failure that presents as "cannot start any new process
+            anywhere on the box" and confuses everyone in the room.
+          </p>
+          <p>
+            The mirror-image case is the <em>orphan</em>: the parent exits
+            first, leaving a running child with no one to report to. The
+            kernel reparents orphans to pid 1, or to the nearest ancestor
+            that called <code>prctl(PR_SET_CHILD_SUBREAPER)</code>, and
+            that reaper waits on them, which is why an orphan is a
+            bookkeeping event rather than a leak. Orphaning is also how
+            daemonization traditionally works: fork, let the parent exit,
+            and the child continues under init with no controlling
+            terminal. The pattern to internalize is that a zombie is a
+            parent's bug and an orphan is usually a deliberate design.
+          </p>
+          <p>
+            Reaping correctly has one subtlety worth stating because it is
+            missed constantly. <code>SIGCHLD</code> is a standard signal,
+            not a queued one, so several children exiting close together
+            may deliver <em>one</em> signal. A handler that calls
+            <code>waitpid</code> once therefore leaves zombies behind
+            under load; the handler must loop with
+            <code>WNOHANG</code> until it returns 0 or -1. On Linux,
+            setting <code>SIGCHLD</code> to <code>SIG_IGN</code> asks the
+            kernel to auto-reap, trading away the ability to read exit
+            statuses: with that set, the measured program above forks
+            three children and a subsequent <code>waitpid(-1, WNOHANG)</code>
+            returns -1, meaning there is nothing left to wait for.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="c" class="active">C</button>
+              <button data-lang="rust">Rust</button>
+              <button data-lang="python">Python</button>
+            </div>
+            <pre data-lang="c" class="lang active"><code class="language-cpp">/* The only correct SIGCHLD handler shape: loop, WNOHANG, save errno. */
+#include &lt;errno.h&gt;
+#include &lt;signal.h&gt;
+#include &lt;sys/wait.h&gt;
+#include &lt;unistd.h&gt;
+
+static volatile sig_atomic_t reaped = 0;
+
+static void on_sigchld(int sig) {
+    (void)sig;
+    int saved = errno;                 /* handlers must not clobber errno */
+    pid_t p;
+    /* WNOHANG + loop: signals coalesce, so one delivery may mean many
+       exits. Calling waitpid once here is the classic zombie leak. */
+    while ((p = waitpid(-1, NULL, WNOHANG)) &gt; 0)
+        reaped++;
+    errno = saved;
+}
+
+void install(void) {
+    struct sigaction sa;
+    sa.sa_handler = on_sigchld;
+    sigemptyset(&amp;sa.sa_mask);
+    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;  /* restart interrupted syscalls */
+    sigaction(SIGCHLD, &amp;sa, NULL);
+    /* Alternative on Linux: signal(SIGCHLD, SIG_IGN) auto-reaps, but then
+       exit statuses are unrecoverable. Measured: waitpid then returns -1. */
+}
+</code></pre>
+            <pre data-lang="rust" class="lang"><code class="language-rust">use std::process::{Command, Stdio};
+
+// Rust's Child does NOT wait on drop: dropping the handle without wait()
+// leaves a zombie exactly as in C. The type system does not save you here
+// because a leaked kernel resource is not a memory-safety violation.
+fn main() -&gt; std::io::Result&lt;()&gt; {
+    let mut child = Command::new("true").stdout(Stdio::null()).spawn()?;
+
+    // try_wait() is waitpid(WNOHANG): poll without blocking.
+    loop {
+        match child.try_wait()? {
+            Some(status) =&gt; {
+                println!("reaped: {status}");
+                break;
+            }
+            None =&gt; std::thread::sleep(std::time::Duration::from_millis(1)),
+        }
+    }
+    // Or simply child.wait()?; which blocks until the child is collected.
+    Ok(())
+}
+</code></pre>
+            <pre data-lang="python" class="lang"><code class="language-python">import os, signal, subprocess
+
+# subprocess.Popen objects are reaped by wait()/poll(); the module also
+# reaps stragglers opportunistically when new Popens are created, which
+# hides the bug in short scripts and exposes it in long-lived servers.
+p = subprocess.Popen(["true"])
+p.wait()                       # collects the status; no zombie
+
+# Raw fork/wait is available and behaves exactly like C:
+pid = os.fork()
+if pid == 0:
+    os._exit(0)
+os.waitpid(pid, 0)
+
+# Auto-reap, giving up exit statuses (POSIX: SA_NOCLDWAIT):
+signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+</code></pre>
+          </div>
+
+          <h3>IPC beyond the pipe</h3>
+          <p>
+            Once processes are the unit of concurrency, every byte they
+            share has to be arranged explicitly, and the mechanism chosen
+            determines both the cost per message and what synchronization
+            still has to be built by hand. Four mechanisms cover nearly
+            all real use.
+          </p>
+          <div class="tbl-wrap"><table class="data">
+            <thead><tr><th>Mechanism</th><th>Copies per message</th><th>Framing</th><th>Synchronization</th><th>Best for</th></tr></thead>
+            <tbody>
+              <tr><td>Pipe / FIFO</td><td>2 (user&#8594;kernel&#8594;user)</td><td>byte stream; writes &le; PIPE_BUF atomic</td><td>free: blocking read/write, EOF on last close</td><td>pipelines, small control messages</td></tr>
+              <tr><td>Unix domain socket</td><td>2</td><td>stream or datagram; datagrams preserve boundaries</td><td>free; also passes descriptors via SCM_RIGHTS</td><td>request/response, descriptor handoff, local RPC</td></tr>
+              <tr><td>POSIX message queue</td><td>2</td><td>discrete messages with priorities</td><td>free; blocking send/receive, bounded depth</td><td>priority work queues between processes</td></tr>
+              <tr><td>Shared memory (shm_open + mmap)</td><td>0</td><td>none: it is memory</td><td><em>none</em>: you must add it yourself</td><td>bulk data, zero-copy frames and tensors</td></tr>
+            </tbody>
+          </table></div>
+          <p>
+            The table's last row is the interesting one and its last two
+            columns explain each other. Shared memory is the only
+            zero-copy option, and it is the only one that gives back the
+            entire shared-mutable-state problem: two processes mapping the
+            same pages need a mutex, and a pthread mutex works across
+            processes only if it lives inside the shared region and is
+            initialized with <code>PTHREAD_PROCESS_SHARED</code>. The
+            common production compromise is the one measured earlier in
+            Python: put the bulk payload in shared memory and send only a
+            small descriptor, an offset and a length, over a socket or
+            pipe, so the kernel provides ordering and wakeups while the
+            data never gets copied. Moving a 64 MiB array to a worker cost
+            205 ms pickled through a pipe versus 11 ms when only the
+            shared-memory name crossed the pipe, 18.7 times faster,
+            and the difference is exactly the two copies the table
+            promises.
+          </p>
+          <p>
+            The C version below is the shape of that compromise: a shared
+            region created with <code>shm_open</code> and
+            <code>mmap</code>, plus a <code>socketpair</code> used purely
+            as a doorbell. It runs as written and prints
+            <code>child processed generation 1 of a 8200-byte shared
+            region</code>.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="c" class="active">C</button>
+              <button data-lang="cpp">C++</button>
+              <button data-lang="rust">Rust</button>
+              <button data-lang="python">Python</button>
+            </div>
+            <pre data-lang="c" class="lang active"><code class="language-cpp">/* gcc -O2 ipc.c -lrt : zero-copy payload, socket used only as a doorbell */
+#define _GNU_SOURCE
+#include &lt;fcntl.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;sys/socket.h&gt;
+#include &lt;sys/wait.h&gt;
+#include &lt;unistd.h&gt;
+
+struct Region { unsigned long seq; double payload[1024]; };
+
+int main(void) {
+    const char *name = "/conc_demo";
+    shm_unlink(name);                             /* start clean */
+    int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+    ftruncate(fd, sizeof(struct Region));         /* size the object */
+    struct Region *r = mmap(NULL, sizeof *r, PROT_READ | PROT_WRITE,
+                            MAP_SHARED, fd, 0);   /* MAP_SHARED: both see writes */
+
+    int sv[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv);      /* the doorbell */
+
+    if (fork() == 0) {                            /* child */
+        close(sv[0]);
+        char c;
+        while (read(sv[1], &amp;c, 1) == 1) {         /* wait for "data ready" */
+            double sum = 0;
+            for (int i = 0; i &lt; 1024; i++) sum += r-&gt;payload[i];
+            r-&gt;seq++;                             /* no copy of the payload */
+            write(sv[1], &amp;c, 1);                  /* "done" */
+        }
+        _exit(0);
+    }
+    close(sv[1]);
+    for (int i = 0; i &lt; 1024; i++) r-&gt;payload[i] = i;
+    char c = 'x';
+    write(sv[0], &amp;c, 1);                          /* ring */
+    read(sv[0], &amp;c, 1);                           /* wait for completion */
+    printf("child processed generation %lu of a %zu-byte shared region\n",
+           r-&gt;seq, sizeof *r);
+    close(sv[0]);
+    wait(NULL);
+    munmap(r, sizeof *r);
+    shm_unlink(name);                             /* names persist otherwise */
+    return 0;
+}
+</code></pre>
+            <pre data-lang="cpp" class="lang"><code class="language-cpp">// C++ uses the same syscalls; the value it adds is putting a real
+// process-shared mutex INSIDE the shared region, which is what any
+// design with multiple writers needs.
+#include &lt;pthread.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;cstdio&gt;
+#include &lt;cerrno&gt;
+
+struct Shared {
+    pthread_mutex_t m;      // must live in the shared pages, not in either heap
+    unsigned long seq;
+    double payload[1024];
+};
+
+Shared *attach(const char *name, bool create) {
+    int fd = shm_open(name, create ? (O_CREAT | O_RDWR) : O_RDWR, 0600);
+    if (create) ftruncate(fd, sizeof(Shared));
+    auto *s = static_cast&lt;Shared *&gt;(mmap(nullptr, sizeof(Shared),
+                  PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
+    if (create) {
+        pthread_mutexattr_t a;
+        pthread_mutexattr_init(&amp;a);
+        // Without PROCESS_SHARED the mutex is undefined across processes.
+        pthread_mutexattr_setpshared(&amp;a, PTHREAD_PROCESS_SHARED);
+        // ROBUST: if the holder dies, the next locker gets EOWNERDEAD
+        // instead of hanging forever. Crashes are normal across processes.
+        pthread_mutexattr_setrobust(&amp;a, PTHREAD_MUTEX_ROBUST);
+        pthread_mutex_init(&amp;s-&gt;m, &amp;a);
+    }
+    close(fd);
+    return s;
+}
+
+void bump(Shared *s) {
+    int rc = pthread_mutex_lock(&amp;s-&gt;m);
+    if (rc == EOWNERDEAD) pthread_mutex_consistent(&amp;s-&gt;m);  // repair invariants
+    s-&gt;seq++;
+    pthread_mutex_unlock(&amp;s-&gt;m);
+}
+</code></pre>
+            <pre data-lang="rust" class="lang"><code class="language-rust">// std gives unix sockets directly; shared memory needs a crate (memmap2)
+// or raw libc, because mapping the same bytes into two processes is
+// exactly the aliasing the type system cannot check.
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
+use std::thread;
+
+fn main() -&gt; std::io::Result&lt;()&gt; {
+    // socketpair(2), typed: two connected endpoints, no filesystem name
+    let (mut a, mut b) = UnixStream::pair()?;
+
+    let t = thread::spawn(move || -&gt; std::io::Result&lt;()&gt; {
+        let mut buf = [0u8; 5];
+        b.read_exact(&amp;mut buf)?;          // datagram-like framing must be
+        b.write_all(b"pong!")?;           // built by hand on SOCK_STREAM
+        Ok(())
+    });
+
+    a.write_all(b"ping!")?;
+    let mut reply = [0u8; 5];
+    a.read_exact(&amp;mut reply)?;
+    println!("{}", std::str::from_utf8(&amp;reply).unwrap());
+    t.join().unwrap()?;
+    Ok(())
+}
+// For zero-copy across processes: memmap2::MmapMut over a shm_open fd,
+// then an explicit protocol. The unsafe is unavoidable and honest: no
+// compiler can know what the other process is doing to those pages.
+</code></pre>
+            <pre data-lang="python" class="lang"><code class="language-python">from multiprocessing import Process, shared_memory
+import numpy as np
+
+def worker(name: str, n: int, out):
+    shm = shared_memory.SharedMemory(name=name)     # maps the SAME pages
+    a = np.ndarray((n,), dtype=np.float32, buffer=shm.buf)
+    out.send(float(a.sum()))                        # only the result is pickled
+    shm.close()
+
+if __name__ == "__main__":
+    from multiprocessing import Pipe
+    n = 16 * 1024 * 1024                            # 64 MiB
+    shm = shared_memory.SharedMemory(create=True, size=n * 4)
+    a = np.ndarray((n,), dtype=np.float32, buffer=shm.buf)
+    a[:] = 1.0
+
+    parent, child = Pipe()
+    p = Process(target=worker, args=(shm.name, n, child))
+    p.start()
+    print(parent.recv())
+    p.join()
+    shm.close()
+    shm.unlink()          # unlink exactly once, or the segment leaks in /dev/shm
+
+# Measured on this machine: 11 ms this way versus 205 ms passing the same
+# array by value through a Pool (pickle over a pipe): 18.7x.
+</code></pre>
+          </div>
+
           <h2>Threads and locks: the shared-memory contract</h2>
           <h3>What a thread is, and what it costs</h3>
           <p>
@@ -658,6 +978,579 @@ fork() ────────────────────────�
             which is why the advice to start with locks is not
             condescension but arithmetic.
           </p>
+          <h3>Reader-writer locks, semaphores, and barriers</h3>
+          <p>
+            The mutex and the condition variable are complete in the sense
+            that everything else can be built from them, and three
+            derived primitives are standard enough to be in every
+            library. A <em>reader-writer lock</em> splits acquisition into
+            shared and exclusive modes: any number of readers, or one
+            writer, never both. It is the right tool exactly when reads
+            vastly outnumber writes and each critical section is long
+            enough to amortize the lock's own bookkeeping, which is a
+            narrower window than it sounds, because a rwlock's shared
+            acquire still writes a reader count, so it still bounces a
+            cache line between cores. For a critical section of a few
+            nanoseconds, the measured 87 ns of coherence traffic dominates
+            and a plain mutex, or better, per-thread state or RCU, wins.
+            The other trap is <em>writer starvation</em>: an
+            implementation that always admits an arriving reader will
+            never let a writer in under sustained read load, so real
+            implementations choose a policy, and the choice belongs in the
+            design notes rather than in a surprise.
+          </p>
+          <p>
+            A <em>semaphore</em> is a counter with atomic wait and post,
+            Dijkstra's P and V. Its two uses are worth separating: a
+            binary semaphore used for mutual exclusion is a worse mutex,
+            since it has no notion of an owner and therefore cannot
+            support priority inheritance or error checking, but a
+            <em>counting</em> semaphore expresses resource pools, at most
+            \(k\) concurrent uploads, \(k\) database handles, \(k\) GPU
+            streams, which a mutex cannot express at all. A
+            <em>barrier</em> holds \(n\) participants until all \(n\)
+            arrive, the natural fit for bulk-synchronous iteration: every
+            worker updates its shard, everyone waits, everyone reads the
+            merged result. Barriers make the phase boundary a
+            happens-before edge, which is why data written before a
+            barrier is safe to read after it without further
+            synchronization.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="c" class="active">C</button>
+              <button data-lang="cpp">C++</button>
+              <button data-lang="rust">Rust</button>
+              <button data-lang="python">Python</button>
+            </div>
+            <pre data-lang="c" class="lang active"><code class="language-cpp">/* gcc -O2 syncprims.c -lpthread ; prints config=8 total_ops=8000 */
+#define _GNU_SOURCE
+#include &lt;pthread.h&gt;
+#include &lt;semaphore.h&gt;
+#include &lt;stdio.h&gt;
+
+static pthread_rwlock_t rw = PTHREAD_RWLOCK_INITIALIZER;
+static long shared_config = 7;
+static sem_t slots;                     /* counting semaphore: 3 permits */
+static pthread_barrier_t barrier;
+static __thread long tls_ops = 0;       /* one instance per thread */
+static long total_ops = 0;
+static pthread_mutex_t total_m = PTHREAD_MUTEX_INITIALIZER;
+
+static void *worker(void *arg) {
+    long id = (long)arg;
+    for (int i = 0; i &lt; 1000; i++) {
+        pthread_rwlock_rdlock(&amp;rw);     /* many readers concurrently */
+        volatile long v = shared_config; (void)v;
+        pthread_rwlock_unlock(&amp;rw);
+        tls_ops++;                      /* private: no synchronization */
+    }
+    if (id == 0) {
+        pthread_rwlock_wrlock(&amp;rw);     /* exclusive against all readers */
+        shared_config = 8;
+        pthread_rwlock_unlock(&amp;rw);
+    }
+    sem_wait(&amp;slots);                   /* at most 3 threads inside */
+    sem_post(&amp;slots);
+    pthread_barrier_wait(&amp;barrier);     /* all 8 arrive before any leaves */
+    pthread_mutex_lock(&amp;total_m);
+    total_ops += tls_ops;               /* fold private counters once */
+    pthread_mutex_unlock(&amp;total_m);
+    return NULL;
+}
+
+int main(void) {
+    sem_init(&amp;slots, 0, 3);
+    pthread_barrier_init(&amp;barrier, NULL, 8);
+    pthread_t t[8];
+    for (long i = 0; i &lt; 8; i++) pthread_create(&amp;t[i], NULL, worker, (void *)i);
+    for (int i = 0; i &lt; 8; i++) pthread_join(t[i], NULL);
+    printf("config=%ld total_ops=%ld (main's tls_ops=%ld)\n",
+           shared_config, total_ops, tls_ops);   /* main's own copy is 0 */
+    return 0;
+}
+</code></pre>
+            <pre data-lang="cpp" class="lang"><code class="language-cpp">// C++17 gave shared_mutex; C++20 gave semaphore, barrier, latch, jthread.
+// g++ -O2 -std=c++20 cppprims.cpp -lpthread
+#include &lt;barrier&gt;
+#include &lt;cstdio&gt;
+#include &lt;mutex&gt;
+#include &lt;semaphore&gt;
+#include &lt;shared_mutex&gt;
+#include &lt;thread&gt;
+#include &lt;vector&gt;
+
+std::shared_mutex rw;
+long config = 7;
+std::counting_semaphore&lt;3&gt; slots{3};
+std::barrier sync_point{8};
+thread_local long tls_ops = 0;         // language-level TLS since C++11
+std::mutex total_m;
+long total_ops = 0;
+
+int main() {
+    std::vector&lt;std::jthread&gt; ts;      // jthread joins in its destructor
+    for (int i = 0; i &lt; 8; i++)
+        ts.emplace_back([i] {
+            for (int j = 0; j &lt; 1000; j++) {
+                std::shared_lock rl(rw);       // reader
+                volatile long v = config; (void)v;
+                rl.unlock();
+                tls_ops++;
+            }
+            if (i == 0) { std::unique_lock wl(rw); config = 8; }  // writer
+            slots.acquire();
+            slots.release();
+            sync_point.arrive_and_wait();
+            std::lock_guard g(total_m);
+            total_ops += tls_ops;
+        });
+    ts.clear();                        // joins all eight
+    printf("config=%ld total_ops=%ld main_tls=%ld\n",
+           config, total_ops, tls_ops);         // prints 8, 8000, 0
+}
+</code></pre>
+            <pre data-lang="rust" class="lang"><code class="language-rust">// std has RwLock and Barrier; a counting semaphore lives in tokio::sync
+// or is three lines of Mutex + Condvar. thread_local! is the TLS macro.
+use std::cell::Cell;
+use std::sync::{Barrier, Mutex, RwLock};
+use std::thread;
+
+thread_local! {
+    static TLS_OPS: Cell&lt;u64&gt; = const { Cell::new(0) };
+}
+
+fn main() {
+    let config = RwLock::new(7i64);
+    let barrier = Barrier::new(8);
+    let total = Mutex::new(0u64);
+
+    thread::scope(|s| {
+        let (config, barrier, total) = (&amp;config, &amp;barrier, &amp;total);
+        for i in 0..8 {
+            s.spawn(move || {
+                for _ in 0..1000 {
+                    let v = *config.read().unwrap();   // shared mode
+                    std::hint::black_box(v);
+                    TLS_OPS.with(|c| c.set(c.get() + 1));
+                }
+                if i == 0 {
+                    *config.write().unwrap() = 8;      // exclusive mode
+                }
+                barrier.wait();
+                *total.lock().unwrap() += TLS_OPS.with(|c| c.get());
+            });
+        }
+    });
+    println!("config={} total={} main_tls={}",         // 8, 8000, 0
+             config.read().unwrap(), total.lock().unwrap(),
+             TLS_OPS.with(|c| c.get()));
+}
+</code></pre>
+            <pre data-lang="python" class="lang"><code class="language-python">import threading
+
+# threading has Semaphore, Barrier, RLock, and local(), but NO rwlock:
+# the writer-preferring minimum is a Condition plus three counters.
+class RWLock:
+    def __init__(self):
+        self._c = threading.Condition()
+        self._readers = 0
+        self._writer = False
+        self._waiting_writers = 0        # prevents writer starvation
+
+    def acquire_read(self):
+        with self._c:
+            while self._writer or self._waiting_writers:
+                self._c.wait()           # while, never if
+            self._readers += 1
+
+    def release_read(self):
+        with self._c:
+            self._readers -= 1
+            if self._readers == 0:
+                self._c.notify_all()
+
+    def acquire_write(self):
+        with self._c:
+            self._waiting_writers += 1
+            while self._writer or self._readers:
+                self._c.wait()
+            self._waiting_writers -= 1
+            self._writer = True
+
+    def release_write(self):
+        with self._c:
+            self._writer = False
+            self._c.notify_all()
+
+slots = threading.Semaphore(3)           # counting: 3 permits
+barrier = threading.Barrier(8)
+tls = threading.local()                  # attributes are per-thread
+# Measured: 8 workers x 1000 ops fold to total_ops = 8000, and the main
+# thread's tls has no 'ops' attribute at all: separate storage, not a copy.
+</code></pre>
+          </div>
+          <h3>Recursive locks are a design smell</h3>
+          <p>
+            A recursive (reentrant) mutex lets the thread that already
+            holds it acquire it again, counting the acquisitions and
+            releasing only when the count returns to zero. It exists
+            because a natural refactor breaks without it: a public method
+            takes the lock and calls another public method that also takes
+            the lock, and with a plain mutex the second acquisition
+            self-deadlocks. Reaching for the recursive variant fixes the
+            symptom and hides the real problem, which is that the class
+            has no stated invariant boundary. The reason to care is
+            precise rather than aesthetic. A mutex's contract is that
+            invariants hold whenever the lock is not held; recursive
+            acquisition means the inner critical section runs while the
+            outer one has the object <em>half-updated</em>, so the inner
+            code sees a state the class documentation says is impossible.
+            Worse, a condition variable cannot be used correctly with a
+            recursive lock: <code>wait</code> releases the mutex once, not
+            \(n\) times, so a nested waiter sleeps while still holding the
+            lock, and nothing can wake it.
+          </p>
+          <p>
+            The standard fix is the two-layer split: public methods take
+            the lock and immediately delegate to private
+            <code>_locked</code> methods that assume it is held and never
+            take it themselves. Every language on this page offers the
+            recursive variant (<code>PTHREAD_MUTEX_RECURSIVE</code>,
+            <code>std::recursive_mutex</code>,
+            <code>threading.RLock</code>) and every style guide worth
+            following treats its appearance as a question to answer, not
+            a tool to reach for. Python is the exception that proves the
+            rule: <code>RLock</code> is the default recommendation there
+            because module-level code and <code>__del__</code> can
+            re-enter almost anything, and the interpreter's own
+            import lock is reentrant for exactly that reason.
+          </p>
+          <h3>Thread-local storage</h3>
+          <p>
+            Thread-local storage is the primitive that makes the other
+            primitives unnecessary, and it is underused for exactly that
+            reason: it solves the problem by deleting it. A thread-local
+            variable has one instance per thread, so accesses need no
+            synchronization at all, no atomics, no locks, no coherence
+            traffic. The measured payoff was already quoted in the
+            sharded-counter row: per-thread padded counters ran at 21,780
+            Mops against 11.5 Mops for the same work behind one mutex,
+            a factor of about 1,900, because the shared version pays a
+            cache-line migration per operation and the thread-local
+            version pays nothing. The implementation is cheap: on x86-64
+            Linux, a thread-local access with the initial-exec model is a
+            single <code>mov</code> off the <code>%fs</code> segment base,
+            which is why <code>__thread</code> and
+            <code>thread_local</code> cost roughly what a global costs.
+            Dynamically loaded modules pay more, since the general-dynamic
+            model calls <code>__tls_get_addr</code>.
+          </p>
+          <p>
+            The idiom is the same in all four languages and appears in the
+            code above: accumulate privately, fold once. Per-thread
+            allocator arenas (tcmalloc, jemalloc, mimalloc), per-thread
+            random number generators, per-CPU statistics in the kernel,
+            and Python's <code>threading.local()</code> request contexts
+            are all one pattern. The costs to remember are lifetime and
+            leakage: thread-local objects are destroyed when the thread
+            exits, so a pool that recycles threads carries state from one
+            task to the next, which is the source of the classic bug
+            where a request's authentication context leaks into an
+            unrelated later request served by the same pool worker.
+          </p>
+
+          <h2>Deadlock, livelock, and priority inversion</h2>
+          <h3>The four Coffman conditions</h3>
+          <p>
+            Deadlock is a set of threads each waiting for a resource
+            another member of the set holds, so none ever proceeds.
+            Coffman, Elphick, and Shoshani (1971) showed that four
+            conditions must hold <em>simultaneously</em>, which is useful
+            because it converts prevention into a menu: break any one and
+            deadlock becomes impossible.
+          </p>
+          <div class="tbl-wrap"><table class="data">
+            <thead><tr><th>Condition</th><th>Statement</th><th>How real systems break it</th></tr></thead>
+            <tbody>
+              <tr><td>Mutual exclusion</td><td>a resource is held exclusively</td><td>use immutable data, copies, or lock-free structures; RCU for read paths</td></tr>
+              <tr><td>Hold and wait</td><td>a holder requests more while holding</td><td>acquire all locks at once (<code>std::scoped_lock</code>) or none: take, then release, then retake</td></tr>
+              <tr><td>No preemption</td><td>a lock cannot be taken away</td><td>try-lock with timeout and rollback; database transactions abort a victim</td></tr>
+              <tr><td>Circular wait</td><td>a cycle exists in the wait-for graph</td><td>impose a total order on locks and always acquire in it. This is the practical answer.</td></tr>
+            </tbody>
+          </table></div>
+          <p>
+            Circular wait is the condition to attack, because it is the
+            only one that can be enforced statically by convention and
+            checked mechanically. Assign every lock a level; require that
+            a thread holding a lock at level \(k\) may acquire only locks
+            at levels \(&gt; k\); then the wait-for graph is a DAG by
+            construction, since an edge always increases level and a cycle
+            would need one to decrease. Linux's lockdep validator does
+            precisely this at runtime, learning the observed order between
+            lock classes on the first acquisition and reporting a splat
+            the first time any execution violates it, which finds
+            potential deadlocks even in runs that did not deadlock. That
+            last property is the important one: deadlocks are timing
+            dependent, so testing for them directly is nearly worthless,
+            and order checking is the only scalable defense.
+          </p>
+          <h3>A worked deadlock and three fixes</h3>
+          <p>
+            The canonical example is transferring between two accounts,
+            each guarded by its own mutex, where a thread locks the source
+            and then the destination. Two threads transferring in opposite
+            directions, A to B and B to A, produce the cycle. This is not
+            hypothetical: the version below, compiled with g++ -O2 and run
+            on this machine with a 50 &micro;s sleep between the two
+            acquisitions to widen the window, hangs on every run and had
+            to be killed by a 5-second timeout (exit status 124). The same
+            program with <code>std::scoped_lock</code> completes 400
+            transfers and conserves the balances (a=1000, b=1000,
+            sum=2000).
+          </p>
+          <pre class="flow">thread 1: transfer(a → b)          thread 2: transfer(b → a)
+──────────────────────────         ──────────────────────────
+lock(a.m)          ✓               lock(b.m)          ✓
+       ... 50 µs window ...
+lock(b.m)          ✗ blocked       lock(a.m)          ✗ blocked
+       │                                  │
+       └──── waits for thread 2 ──────────┘
+             waits for thread 1
+                 wait-for graph: a cycle of length 2 → deadlock</pre>
+          <p>
+            Three repairs, in the order a reviewer should prefer them.
+            <em>Order the locks</em>: sort the two mutexes by address (or
+            by account id, or by any total order agreed program-wide) and
+            always take the smaller first, which removes the cycle and
+            costs one comparison. <em>Take them together</em>:
+            <code>std::scoped_lock</code>, <code>std::lock</code>, and
+            Rust's equivalents use a try-and-back-off algorithm that never
+            holds one while blocking on another, breaking hold-and-wait.
+            <em>Try-lock with backoff</em>: attempt the second lock with
+            <code>try_lock</code>, and on failure release the first, wait
+            a randomized interval, and retry. The third is the general
+            technique when no total order exists, for instance when locks
+            are discovered dynamically, and its hazard is the subject of
+            the next subsection: without randomization, two threads can
+            retry in lockstep forever.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="cpp" class="active">C++</button>
+              <button data-lang="c">C</button>
+              <button data-lang="rust">Rust</button>
+              <button data-lang="python">Python</button>
+            </div>
+            <pre data-lang="cpp" class="lang active"><code class="language-cpp">#include &lt;mutex&gt;
+#include &lt;thread&gt;
+
+struct Account { long id; long balance; std::mutex m; };
+
+// BROKEN: locks in the order the arguments arrive. Measured: hangs,
+// killed by a 5 s timeout on every run.
+void transfer_broken(Account &amp;from, Account &amp;to, long amount) {
+    std::lock_guard&lt;std::mutex&gt; g1(from.m);
+    std::this_thread::sleep_for(std::chrono::microseconds(50));
+    std::lock_guard&lt;std::mutex&gt; g2(to.m);      // ← the cycle closes here
+    from.balance -= amount;
+    to.balance   += amount;
+}
+
+// FIX 1: a total order on addresses. Every thread agrees, so no cycle.
+void transfer_ordered(Account &amp;from, Account &amp;to, long amount) {
+    Account *a = &amp;from, *b = &amp;to;
+    if (a &gt; b) std::swap(a, b);
+    std::lock_guard&lt;std::mutex&gt; g1(a-&gt;m);
+    std::lock_guard&lt;std::mutex&gt; g2(b-&gt;m);
+    from.balance -= amount;
+    to.balance   += amount;
+}
+
+// FIX 2: acquire both atomically. scoped_lock never blocks holding one.
+void transfer_scoped(Account &amp;from, Account &amp;to, long amount) {
+    std::scoped_lock lk(from.m, to.m);         // measured: 400 transfers,
+    from.balance -= amount;                    // balances conserved
+    to.balance   += amount;
+}
+
+// FIX 3: try-lock with randomized backoff, for dynamically found locks.
+void transfer_trylock(Account &amp;from, Account &amp;to, long amount) {
+    for (int spin = 0;; spin++) {
+        std::unique_lock&lt;std::mutex&gt; l1(from.m);
+        std::unique_lock&lt;std::mutex&gt; l2(to.m, std::try_to_lock);
+        if (l2.owns_lock()) {
+            from.balance -= amount;
+            to.balance   += amount;
+            return;
+        }
+        l1.unlock();                           // release before retrying:
+        // randomized so two threads do not retry in lockstep (livelock)
+        std::this_thread::sleep_for(
+            std::chrono::microseconds(1 + (rand() % (1 &lt;&lt; std::min(spin, 10)))));
+    }
+}
+</code></pre>
+            <pre data-lang="c" class="lang"><code class="language-cpp">/* C has no scoped_lock, so the total order is the whole technique.
+   The convention must be written down; nothing checks it for you. */
+#include &lt;pthread.h&gt;
+
+struct account { long id; long balance; pthread_mutex_t m; };
+
+void transfer(struct account *from, struct account *to, long amount) {
+    struct account *first = from, *second = to;
+    if (first-&gt;id &gt; second-&gt;id) {          /* order by a stable key, not by
+                                              address, if ids are stable   */
+        first = to; second = from;
+    }
+    pthread_mutex_lock(&amp;first-&gt;m);
+    pthread_mutex_lock(&amp;second-&gt;m);
+    from-&gt;balance -= amount;
+    to-&gt;balance   += amount;
+    pthread_mutex_unlock(&amp;second-&gt;m);      /* unlock order is irrelevant  */
+    pthread_mutex_unlock(&amp;first-&gt;m);       /* to correctness, only to
+                                              convoy behaviour             */
+}
+
+/* try-lock variant: pthread_mutex_trylock returns EBUSY instead of blocking */
+int transfer_try(struct account *a, struct account *b, long amt) {
+    pthread_mutex_lock(&amp;a-&gt;m);
+    if (pthread_mutex_trylock(&amp;b-&gt;m) != 0) {
+        pthread_mutex_unlock(&amp;a-&gt;m);       /* never hold while waiting */
+        return -1;                          /* caller backs off and retries */
+    }
+    a-&gt;balance -= amt; b-&gt;balance += amt;
+    pthread_mutex_unlock(&amp;b-&gt;m);
+    pthread_mutex_unlock(&amp;a-&gt;m);
+    return 0;
+}
+</code></pre>
+            <pre data-lang="rust" class="lang"><code class="language-rust">// Rust prevents data races, NOT deadlocks: this compiles and hangs
+// exactly like the C++ version. The fix is the same discipline.
+use std::sync::Mutex;
+
+pub struct Account {
+    pub id: u64,
+    pub balance: Mutex&lt;i64&gt;,
+}
+
+pub fn transfer(from: &amp;Account, to: &amp;Account, amount: i64) {
+    // Total order on a stable key. Sorting by id, not by pointer, keeps
+    // the order stable across runs and across processes.
+    let (first, second) = if from.id &lt; to.id { (from, to) } else { (to, from) };
+    let mut a = first.balance.lock().unwrap();
+    let mut b = second.balance.lock().unwrap();
+    if std::ptr::eq(first, from) {
+        *a -= amount;
+        *b += amount;
+    } else {
+        *b -= amount;
+        *a += amount;
+    }
+} // both guards drop here, in reverse order
+
+pub fn transfer_try(from: &amp;Account, to: &amp;Account, amount: i64) -&gt; bool {
+    let Ok(mut a) = from.balance.try_lock() else { return false };
+    let Ok(mut b) = to.balance.try_lock() else { return false };  // a drops
+    *a -= amount;                                                 // on return
+    *b += amount;
+    true
+}
+</code></pre>
+            <pre data-lang="python" class="lang"><code class="language-python">import random, threading, time
+
+class Account:
+    def __init__(self, ident, balance):
+        self.id = ident
+        self.balance = balance
+        self.lock = threading.Lock()
+
+def transfer(a: Account, b: Account, amount: int) -&gt; None:
+    # id() is not stable across processes; use a domain key when one exists
+    first, second = (a, b) if a.id &lt; b.id else (b, a)
+    with first.lock:
+        with second.lock:
+            a.balance -= amount
+            b.balance += amount
+
+def transfer_try(a: Account, b: Account, amount: int) -&gt; None:
+    backoff = 0.0001
+    while True:
+        with a.lock:
+            if b.lock.acquire(blocking=False):    # try-lock
+                try:
+                    a.balance -= amount
+                    b.balance += amount
+                    return
+                finally:
+                    b.lock.release()
+        # released a.lock by leaving the with-block before sleeping
+        time.sleep(random.uniform(0, backoff))    # randomize or livelock
+        backoff = min(backoff * 2, 0.05)
+</code></pre>
+          </div>
+          <h3>Livelock and starvation</h3>
+          <p>
+            A livelock is the failure the try-lock fix invites: threads
+            are running, changing state, and making no progress. Two
+            threads each acquire their first lock, fail the second, back
+            off by the same fixed interval, and retry in perfect
+            lockstep forever. The system is busy, the CPUs are hot, no
+            transfer completes, and no deadlock detector fires because
+            nothing is blocked. The cure is the one used by Ethernet's
+            binary exponential backoff and by every retry loop that
+            works: randomize, and grow the interval, so the symmetry that
+            causes the collision is broken probabilistically. The code
+            above does both, doubling to a cap with a uniform random
+            multiplier.
+          </p>
+          <p>
+            Starvation is weaker and more common: a thread makes no
+            progress while others do. Sources are a barging mutex where
+            an arriving thread can steal the lock from a queued waiter
+            (which is what makes most fast mutexes fast, and unfair), a
+            reader-preferring rwlock under constant read load, and any
+            priority scheme without aging. The remedies cost throughput,
+            which is why they are opt-in: ticket locks and MCS locks
+            (Mellor-Crummey and Scott, 1991) grant in FIFO order and, as
+            a side benefit, have each waiter spin on its own cache line
+            rather than on one shared word, which is why they scale to
+            high core counts where a naive test-and-set lock collapses.
+          </p>
+          <h3>Priority inversion</h3>
+          <p>
+            Priority inversion is the pathology where a high-priority
+            thread waits on a lock held by a low-priority thread, which
+            is itself preempted by an unrelated medium-priority thread.
+            The high-priority thread is effectively running at the low
+            thread's priority, and the medium thread, which needs no
+            locks at all, holds up the whole system. The famous instance
+            is the Mars Pathfinder lander in 1997: a high-priority bus
+            management task blocked on a mutex held by a low-priority
+            meteorological task, a medium-priority communications task
+            kept preempting the latter, and the watchdog rebooted the
+            spacecraft repeatedly until engineers enabled priority
+            inheritance remotely by flipping a VxWorks flag.
+          </p>
+          <p>
+            Two standard countermeasures exist, both supported by POSIX
+            through <code>pthread_mutexattr_setprotocol</code>.
+            <em>Priority inheritance</em> (<code>PTHREAD_PRIO_INHERIT</code>)
+            temporarily raises the lock holder to the highest priority
+            among its waiters, so the low-priority holder cannot be
+            preempted by the medium-priority thread and exits the
+            critical section promptly. <em>Priority ceiling</em>
+            (<code>PTHREAD_PRIO_PROTECT</code>) raises any holder to a
+            statically assigned ceiling, the maximum priority of any
+            thread that can ever take the lock, which additionally
+            prevents deadlock among ceiling-ordered locks at the cost of
+            requiring the analysis up front. Neither is free, and neither
+            is on by default: inversion is a real-time problem, and code
+            with no priority differences cannot suffer it, which is one
+            more argument for keeping thread priorities uniform unless
+            there is a specific reason not to.
+          </p>
+
           <h2>Data races: what actually goes wrong</h2>
           <h3>A definition worth being precise about</h3>
           <p>
