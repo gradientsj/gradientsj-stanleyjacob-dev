@@ -86,6 +86,7 @@
     }
     function clearHi() {
       chunks.forEach(function (c) { if (c.el) c.el.classList.remove("reader-reading"); });
+      clearWord();
     }
     function highlight(i) {
       clearHi();
@@ -96,12 +97,73 @@
     }
     function finish() { speaking = false; paused = false; mode = null; clearHi(); note.textContent = ""; label(false); }
 
+    /* ---- current-word highlight (CSS Custom Highlight API, no DOM edits) ----
+       The utterance text is the element's textContent with whitespace collapsed,
+       so a map from collapsed-text offsets back to (text node, offset) lets a
+       word boundary event place a Range over the exact word being spoken, even
+       when the word spans inline markup. Falls back silently where the API or
+       boundary events are missing. */
+    var wordApiOk = typeof window.Highlight === "function" && window.CSS && CSS.highlights;
+    var wordMap = null;
+
+    function clearWord() {
+      if (wordApiOk) CSS.highlights.delete("reader-word");
+    }
+
+    function buildWordMap(el) {
+      var map = [];       // collapsed index -> { node, offset }
+      var out = "";
+      var lastSpace = true;
+      var walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+      var node;
+      while ((node = walker.nextNode())) {
+        var s = node.nodeValue;
+        for (var i = 0; i < s.length; i++) {
+          var ch = s.charAt(i);
+          if (/\s/.test(ch)) {
+            if (!lastSpace) { out += " "; map.push({ node: node, offset: i }); lastSpace = true; }
+          } else {
+            out += ch; map.push({ node: node, offset: i }); lastSpace = false;
+          }
+        }
+      }
+      if (out.charAt(out.length - 1) === " ") { out = out.slice(0, -1); map.pop(); }
+      return { text: out, map: map };
+    }
+
+    function highlightWord(chunkText, charIndex, charLength) {
+      if (!wordApiOk || !wordMap) return;
+      try {
+        var end = charIndex + (charLength || 0);
+        if (!charLength) {
+          var m = /\S+/.exec(chunkText.slice(charIndex));
+          if (!m) return;
+          end = charIndex + m.index + m[0].length;
+          charIndex = charIndex + m.index;
+        }
+        if (charIndex >= wordMap.map.length) return;
+        var a = wordMap.map[charIndex];
+        var b = wordMap.map[Math.min(end, wordMap.map.length) - 1];
+        if (!a || !b) return;
+        var r = document.createRange();
+        r.setStart(a.node, a.offset);
+        r.setEnd(b.node, b.offset + 1);
+        CSS.highlights.set("reader-word", new Highlight(r));
+      } catch (e) { /* never let highlighting break playback */ }
+    }
+
     function speakFrom(i) {
       if (i >= chunks.length) { finish(); return; }
       idx = i; highlight(i); note.textContent = chunks[i].text;
+      wordMap = chunks[i].el ? buildWordMap(chunks[i].el) : null;
       var u = new SpeechSynthesisUtterance(chunks[i].text);
       var v = pickVoice(); if (v) u.voice = v;
-      u.onend = function () { if (speaking && !paused) speakFrom(i + 1); };
+      u.onboundary = function (e) {
+        if (e.name === "word" || e.name === undefined) {
+          highlightWord(chunks[i].text, e.charIndex || 0, e.charLength || 0);
+        }
+      };
+      u.onend = function () { clearWord(); if (speaking && !paused) speakFrom(i + 1); };
       window.speechSynthesis.speak(u);
     }
     function startSpeech() {
