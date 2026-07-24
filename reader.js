@@ -47,18 +47,31 @@
     return out;
   }
 
+  // Network voices (Chrome's "Google ..." voices, Microsoft "... Online")
+  // sound natural at 1x but slur badly when the rate is raised, the classic
+  // "drunk at 2x". Offline voices stay coherent at speed, so prefer a local
+  // English voice and only fall back to a network one when nothing local
+  // exists. The chosen voice is cached so it stays stable across sentences.
+  var chosenVoice = null, voicePicked = false;
   function pickVoice() {
+    if (voicePicked) return chosenVoice;
     if (!("speechSynthesis" in window)) return null;
     var vs = window.speechSynthesis.getVoices();
-    if (!vs.length) return null;
-    for (var p = 0; p < VOICE_PREFS.length; p++)
-      for (var i = 0; i < vs.length; i++)
-        if (vs[i].name.indexOf(VOICE_PREFS[p]) >= 0) return vs[i];
-    for (var j = 0; j < vs.length; j++)
-      if (vs[j].name.indexOf("Natural") >= 0 && /^en/i.test(vs[j].lang)) return vs[j];
-    for (var k = 0; k < vs.length; k++)
-      if (/^en/i.test(vs[k].lang)) return vs[k];
-    return vs[0];
+    if (!vs.length) return null;                 // list not ready yet, retry next call
+    var en = vs.filter(function (v) { return /^en/i.test(v.lang); });
+    var pool = en.length ? en : vs;
+    var local = pool.filter(function (v) { return v.localService; });
+    var ranked = local.length ? local : pool;    // prefer offline voices
+    var pick = null;
+    for (var p = 0; p < VOICE_PREFS.length && !pick; p++)
+      for (var i = 0; i < ranked.length; i++)
+        if (ranked[i].name.indexOf(VOICE_PREFS[p]) >= 0) { pick = ranked[i]; break; }
+    if (!pick)
+      for (var j = 0; j < ranked.length; j++)
+        if (/natural|enhanced|premium/i.test(ranked[j].name)) { pick = ranked[j]; break; }
+    chosenVoice = pick || ranked[0];
+    voicePicked = true;
+    return chosenVoice;
   }
 
   // sentence boundaries: punctuation, whitespace, then something that starts a
@@ -284,8 +297,11 @@
       range.value = String(i); setPos((i + 1) + " / " + units.length);
       var myGen = gen;
       var utt = new SpeechSynthesisUtterance(u.text);
-      utt.rate = rate;
       var v = pickVoice(); if (v) utt.voice = v;
+      // a network voice cannot stay coherent much past 1.5x, so cap its
+      // effective rate there; an offline voice gets the full requested speed
+      utt.rate = (v && v.localService === false) ? Math.min(rate, 1.5) : rate;
+      utt.pitch = 1; utt.volume = 1;
       utt.onboundary = function (e) {
         if (myGen !== gen) return;
         if (e.name === "word" || e.name === undefined) {
