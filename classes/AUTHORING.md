@@ -54,7 +54,10 @@ Read `/ml/attention/index.html` before writing your first page; it is the
 reference for tone and density. Do not use em dashes. The owner also dislikes
 colons and semicolons in prose, so rework sentences to flow with commas and
 periods instead (code is exempt). Keep the voice calm, with no exuberant
-phrasing like "I love building". Do not address the reader as "you" more than
+phrasing like "I love building". Spell out every acronym at its first
+mention on a page, for example "MBPP (Mostly Basic Python Problems)" or
+"byte pair encoding (BPE)", except acronyms any programmer knows (API, CPU,
+GPU, HTML, CSS, URL, JSON, SQL, HTTP, RAM). Do not address the reader as "you" more than
 sparingly.
 
 ## Page skeleton
