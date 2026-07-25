@@ -1,21 +1,24 @@
 # stanleyjacob.dev personal site
 
-A tiny static site (no build step):
+A static portfolio and technical library with no build step:
 
-- `index.html` → **stanleyjacob.dev** (about me, areas, skills)
-- `ai/index.html` → **stanleyjacob.dev/ai** (machine learning projects + notes)
-- `robotics/index.html` → **stanleyjacob.dev/robotics** (robotics projects + notes)
-- `software/index.html` → **stanleyjacob.dev/software** (software projects + notes,
-  incl. a live preview of [status.stanleyjacob.dev](https://status.stanleyjacob.dev))
-- `style.css` → shared light theme
+- `index.html` → employer-facing overview
+- `work/index.html` → filterable, evidence-first case-study index
+- `robotics/index.html` → embodied AI, simulation, and robot-learning work
+- `ai/index.html` → model systems, audio, retrieval, evaluation, and decision products
+- `software/index.html` → AI coding, GPU kernels, architecture, and production software
+- `classes/`, `systems/`, `ml/`, `rl/`, `oss/` → supporting technical library
+- `style.css` → shared responsive light/dark design system
 
 ## Add a project or note
-- **Project:** copy a `.proj` card block on the relevant area page. Use the
-  `badge wip` ("In progress") badge until it ships, then swap to the green
-  `badge` ("Live now") badge and add a real link.
+- **Project:** add a case study with a status, repository/artifact, evaluation
+  protocol, results, failure analysis, and limitations. Use `status-pill
+  building` until the artifact and evidence exist; do not present a design
+  dossier as shipped work.
 - **Note / blog post:** add an `<li>` to the `.notes` list on the area page
-  (replacing the "First notes coming soon" empty state), linking to a new HTML
-  page for the post. No build tools needed; just edit and redeploy.
+  or a `.proj`/`.blueprint` card on the relevant index.
+- **Fast-changing claims:** include an exact model/version, primary source, and
+  visible verification date.
 
 ## Run locally
 Any static server works, e.g.:
@@ -25,6 +28,14 @@ npx --yes serve .
 python -m http.server 8000
 ```
 Then open http://localhost:8000 (or :3000 for `serve`).
+
+## Validate
+
+```bash
+python3 tools/check_html.py .
+python3 tools/check_internal_links.py .
+git diff --check
+```
 
 ## Deploy (Vercel)
 1. Push this folder to its own GitHub repo (e.g. `gradientsj/stanleyjacob-dev`).

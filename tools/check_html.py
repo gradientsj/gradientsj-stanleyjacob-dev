@@ -1,7 +1,8 @@
 """Structural checks the content validator cannot see: tag nesting and math
 delimiter balance.
 
-    python tools/check_html.py [dir]     # defaults to classes/
+    python tools/check_html.py [path]    # file or recursive directory;
+                                         # defaults to classes/
 
 Mismatched tags usually render as a subtly broken layout rather than an error,
 and an odd number of `$$` makes KaTeX swallow the rest of the page, so both
@@ -72,10 +73,11 @@ def check(path):
 
 def main():
     root = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "classes")
+    files = [root] if root.is_file() else sorted(root.rglob("index.html"))
     bad = 0
-    for f in sorted(root.glob("*/index.html")):
+    for f in files:
         msgs = check(f)
-        print(("OK   " if not msgs else "FAIL ") + f.parent.name + "  " + "; ".join(msgs))
+        print(("OK   " if not msgs else "FAIL ") + str(f) + "  " + "; ".join(msgs))
         bad += bool(msgs)
     print(f"\n{bad} file(s) with structural problems")
     return 1 if bad else 0
