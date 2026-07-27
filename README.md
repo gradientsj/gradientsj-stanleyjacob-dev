@@ -7,6 +7,7 @@ A static portfolio and technical library with no build step:
 - `robotics/index.html` → embodied AI, simulation, and robot-learning work
 - `ai/index.html` → model systems, audio, retrieval, evaluation, and decision products
 - `software/index.html` → AI coding, GPU kernels, architecture, and production software
+- `software/cpp/index.html` → modern C++ language, standards, and interview-pattern field guide
 - `classes/`, `systems/`, `ml/`, `rl/`, `oss/` → supporting technical library
 - `style.css` → shared responsive light/dark design system
 
