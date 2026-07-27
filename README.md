@@ -7,7 +7,9 @@ A static portfolio and technical library with no build step:
 - `robotics/index.html` → embodied AI, simulation, and robot-learning work
 - `ai/index.html` → model systems, audio, retrieval, evaluation, and decision products
 - `software/index.html` → AI coding, GPU kernels, architecture, and production software
-- `software/cpp/index.html` → modern C++ language, standard-library internals, and algorithm field guide
+- `software/cpp/index.html` → modern C++ language and standard-library internals
+- `software/cpp/patterns/` → seven C++-only algorithm-pattern chapters and recognition map
+- `examples/cpp-patterns/` → tested C++20 implementations with sanitizer and differential-test coverage
 - `benchmarks/cpp-two-sum/` → differential tests, Google Benchmark measurements, raw results, and Linux `perf stat` collection
 - `classes/`, `systems/`, `ml/`, `rl/`, `oss/` → supporting technical library
 - `style.css` → shared responsive light/dark design system
@@ -37,6 +39,10 @@ Then open http://localhost:8000 (or :3000 for `serve`).
 python3 tools/check_html.py .
 python3 tools/check_internal_links.py .
 node tools/check_cpp_guide.mjs
+node tools/check_cpp_pattern_pages.mjs
+cmake -S examples/cpp-patterns -B examples/cpp-patterns/build -DCMAKE_BUILD_TYPE=Release
+cmake --build examples/cpp-patterns/build --parallel
+ctest --test-dir examples/cpp-patterns/build --output-on-failure
 git diff --check
 ```
 
