@@ -7,7 +7,8 @@ A static portfolio and technical library with no build step:
 - `robotics/index.html` → embodied AI, simulation, and robot-learning work
 - `ai/index.html` → model systems, audio, retrieval, evaluation, and decision products
 - `software/index.html` → AI coding, GPU kernels, architecture, and production software
-- `software/cpp/index.html` → modern C++ language, standards, and interview-pattern field guide
+- `software/cpp/index.html` → modern C++ language, standard-library internals, and algorithm field guide
+- `benchmarks/cpp-two-sum/` → differential tests, Google Benchmark measurements, raw results, and Linux `perf stat` collection
 - `classes/`, `systems/`, `ml/`, `rl/`, `oss/` → supporting technical library
 - `style.css` → shared responsive light/dark design system
 
@@ -35,6 +36,7 @@ Then open http://localhost:8000 (or :3000 for `serve`).
 ```bash
 python3 tools/check_html.py .
 python3 tools/check_internal_links.py .
+node tools/check_cpp_guide.mjs
 git diff --check
 ```
 
