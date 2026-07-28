@@ -28,16 +28,19 @@
  *   - One giant TTS request for a long article. Providers cap request length, so this script
  *     splits the text into chunks and concatenates the audio.
  */
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, writeFile, access } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 
 const API_KEY = process.env.ELEVENLABS_API_KEY;
 const VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "pNInz6obpgDQGcFmaJgB"; // "Adam", a warm natural male voice; override with ELEVENLABS_VOICE_ID
 const MODEL_ID = process.env.ELEVENLABS_MODEL_ID || "eleven_multilingual_v2";
+const VOICE_SETTINGS = { stability: 0.45, similarity_boost: 0.8, style: 0.0 };
+const FORCE = process.argv.includes("--force");
 
 function fail(msg) { console.error("error: " + msg); process.exit(1); }
 
-const htmlPath = process.argv[2];
+const htmlPath = process.argv.find((arg) => !arg.startsWith("--") && arg !== process.argv[0] && arg !== process.argv[1]);
 if (!htmlPath) fail("pass the path to an article, e.g. node scripts/generate-audio.mjs systems/robinhood/index.html");
 if (!API_KEY) fail("set ELEVENLABS_API_KEY in your environment first");
 
@@ -95,7 +98,7 @@ async function tts(text) {
     body: JSON.stringify({
       text,
       model_id: MODEL_ID,
-      voice_settings: { stability: 0.45, similarity_boost: 0.8, style: 0.0 },
+      voice_settings: VOICE_SETTINGS,
     }),
   });
   if (!res.ok) fail(`ElevenLabs returned ${res.status}: ${await res.text()}`);
@@ -105,6 +108,25 @@ async function tts(text) {
 const html = await readFile(htmlPath, "utf8");
 const text = extractText(html);
 const chunks = chunk(text);
+const out = join(dirname(htmlPath), "listen.mp3");
+const metaPath = join(dirname(htmlPath), "listen.meta.json");
+const contentHash = createHash("sha256")
+  .update(JSON.stringify({ text, voiceId: VOICE_ID, modelId: MODEL_ID, voiceSettings: VOICE_SETTINGS }))
+  .digest("hex");
+
+if (!FORCE) {
+  try {
+    await access(out);
+    const existing = JSON.parse(await readFile(metaPath, "utf8"));
+    if (existing.contentHash === contentHash) {
+      console.log(`audio is current; reusing ${out}`);
+      process.exit(0);
+    }
+  } catch {
+    // A missing or malformed cache record means synthesis is required.
+  }
+}
+
 console.log(`extracted ${text.length} chars in ${chunks.length} chunk(s), synthesizing...`);
 
 const buffers = [];
@@ -112,6 +134,17 @@ for (let i = 0; i < chunks.length; i++) {
   process.stdout.write(`  chunk ${i + 1}/${chunks.length}\r`);
   buffers.push(await tts(chunks[i]));
 }
-const out = join(dirname(htmlPath), "listen.mp3");
-await writeFile(out, Buffer.concat(buffers));
-console.log(`\nwrote ${out} (${(Buffer.concat(buffers).length / 1024).toFixed(0)} KB)`);
+const audio = Buffer.concat(buffers);
+await writeFile(out, audio);
+await writeFile(metaPath, JSON.stringify({
+  schemaVersion: 1,
+  contentHash,
+  source: htmlPath,
+  voiceId: VOICE_ID,
+  modelId: MODEL_ID,
+  voiceSettings: VOICE_SETTINGS,
+  generatedAt: new Date().toISOString(),
+  bytes: audio.length,
+}, null, 2) + "\n");
+console.log(`\nwrote ${out} (${(audio.length / 1024).toFixed(0)} KB)`);
+console.log(`wrote ${metaPath}; unchanged content will not call ElevenLabs again`);
