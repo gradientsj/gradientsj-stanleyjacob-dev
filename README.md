@@ -46,6 +46,27 @@ ctest --test-dir examples/cpp-patterns/build --output-on-failure
 git diff --check
 ```
 
+## Generate and cache article narration
+
+Article pages use `/reader.js`. If a page has
+`<div class="reader" data-reader data-audio="listen.mp3"></div>`, the player
+serves that static MP3 through Vercel's CDN and falls back to the browser voice
+when the file has not been generated yet.
+
+Generate an ElevenLabs narration from a trusted local or CI environment:
+
+```bash
+export ELEVENLABS_API_KEY=...
+export ELEVENLABS_VOICE_ID=... # optional
+node scripts/generate-audio.mjs rl/dpo/index.html
+```
+
+The script writes `listen.mp3` and `listen.meta.json` beside the article. The
+metadata contains a hash of the narration text, voice, model, and settings.
+Running the command again reuses the existing audio unless one of those inputs
+changed. Use `--force` only when regeneration is intentional. The API key
+must remain server-side and must never be added to page JavaScript or Git.
+
 ## Deploy (Vercel)
 1. Push this folder to its own GitHub repo (e.g. `gradientsj/stanleyjacob-dev`).
 2. Vercel → New Project → import that repo. Framework preset: **Other** (it's
