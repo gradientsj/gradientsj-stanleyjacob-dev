@@ -5,14 +5,14 @@
 
   // category name -> [color, icon]
   var PALETTE = {
-    "Distributed building blocks": ["#7a5af0", "🧩"],
-    "Search and discovery": ["#0e9488", "🔍"],
-    "Social and messaging": ["#d6336c", "💬"],
-    "Media and storage": ["#e8590c", "🎬"],
-    "Location and maps": ["#2f9e44", "🗺"],
-    "Data pipelines and observability": ["#1098ad", "📊"],
-    "Reservations and money": ["#b08900", "💳"],
-    "Machine learning systems": ["#6741d9", "🤖"]
+    "Distributed building blocks": ["#8F3F71", "🧩"],
+    "Search and discovery": ["#35624A", "🔍"],
+    "Social and messaging": ["#9A3403", "💬"],
+    "Media and storage": ["#8A5A0F", "🎬"],
+    "Location and maps": ["#43684A", "🗺"],
+    "Data pipelines and observability": ["#35624A", "📊"],
+    "Reservations and money": ["#8A5A0F", "💳"],
+    "Machine learning systems": ["#8F3F71", "🤖"]
   };
 
   function txt(el) { return (el.textContent || "").trim(); }
@@ -27,7 +27,7 @@
       if (!section) return;
       var h2 = section.querySelector("h2");
       var name = h2 ? txt(h2) : "";
-      var meta = PALETTE[name] || ["#868e96", "•"];
+      var meta = PALETTE[name] || ["#756D60", "•"];
       section.classList.add("cat-section");
       section.style.setProperty("--cat", meta[0]);
       if (h2 && !h2.querySelector(".cat-ico")) {
