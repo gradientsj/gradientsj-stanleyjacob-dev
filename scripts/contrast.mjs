@@ -7,7 +7,7 @@ const css = readFileSync(new URL("../style.css", import.meta.url), "utf8");
 
 const TOKENS = {
   bg: "#FAF6F0", bgSoft: "#F2EDE4", bgCard: "#FCF9F4", bgCardHover: "#F5EEE1",
-  text: "#2B2621", muted: "#6F675C", muted2: "#756D60",
+  text: "#2B2621", muted: "#6F675C", muted2: "#756D60", chipText: "#625B51",
   accent: "#AF3A03", accentPress: "#9A3403",
   tealText: "#35624A", sageText: "#43684A", goldText: "#8A5A0F",
   plumText: "#8F3F71", terraText: "#9A3403",
@@ -50,6 +50,8 @@ for (const s of surfaces) {
     ["accent", TOKENS.accent, s], ["accentPress", TOKENS.accentPress, s]);
 }
 pairs.push(["muted2/meta", TOKENS.muted2, TOKENS.bg]);
+// default (un-hued) .tag chip: chip-text on the 9% neutral tint over every surface
+for (const s of surfaces) pairs.push(["neutral-chip", TOKENS.chipText, over("#6F675C", s, 0.09)]);
 // hue text on its own 9% chip tint composited over every surface
 for (const [hue, tint] of Object.entries(TINTS)) {
   const text = TOKENS[hue + "Text"];
