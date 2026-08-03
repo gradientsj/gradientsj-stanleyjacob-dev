@@ -29,18 +29,18 @@
       return (x && x.trim()) || fallback;
     }
     return {
-      bg: v("--bg", "#0b0f16"),
+      bg: v("--bg", "#FAF6F0"),
       card: v("--card", "#131c28"),
       soft: v("--bg-soft", "#121a25"),
       text: v("--text", "#e9eff6"),
       muted: v("--muted", "#a7b4c4"),
       line: v("--line", "#263341"),
-      accent: v("--accent", "#56a8ff"),
+      accent: v("--accent", "#AF3A03"),
       good: v("--good", "#4ecb8a"),
       warn: v("--warn", "#e0b44e"),
       bad: v("--bad", "#f2726f"),
       pool: [
-        v("--accent", "#56a8ff"),
+        v("--accent", "#AF3A03"),
         v("--good", "#4ecb8a"),
         v("--warn", "#e0b44e"),
         v("--bad", "#f2726f"),
