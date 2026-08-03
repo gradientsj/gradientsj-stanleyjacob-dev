@@ -1,0 +1,1288 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Applied generative AI &middot; Stanley Jacob</title>
+    <meta name="description" content="Applied generative AI derived end to end: LoRA and QLoRA memory arithmetic, NF4 and double quantization, the DPO closed form, GPTQ and AWQ, retrieval-augmented generation with reranking, constrained decoding, agent loops, and a serving cost model worked from measured H100 numbers." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%232B2621'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+      <script>(function(){try{var t=localStorage.getItem("theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes" class="active">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/classes">Classes</a></div>
+        <h1>Applied generative AI, from adaptation and retrieval to agents and serving</h1>
+        <p class="lead">A pretrained language model is a fixed artifact. Turning it into a
+          product is a sequence of engineering decisions about how to adapt it cheaply, how
+          to ground it in facts it was never trained on, how to make it call tools and emit
+          machine-readable output, and how to serve it at a cost that closes. This page
+          derives the parts that have real mathematics behind them. It covers why a rank-16 update to a
+          7B model trains in a tenth of the memory of full fine-tuning, why NF4 with double
+          quantization costs 4.13 bits per weight, why DPO's loss is a two-line consequence of
+          a KL-constrained optimum, and why decode throughput is set by memory bandwidth until
+          the batch crosses a ridge point near 250. It closes with a serving cost model worked
+          from measured H100 80GB throughput, arriving at a spread from $3.98 to $0.016 per
+          million tokens depending entirely on batching. The reader should come away able to
+          size a fine-tuning job, read a quantization paper critically, design a retrieval
+          pipeline, and defend a cost estimate in an interview.</p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+
+<h2>Why this subject matters now</h2>
+<p>
+Five years ago the applied task was training a model. Today, for all but a handful of labs,
+the base model is a given, a frozen checkpoint downloaded from a hub, or a hosted endpoint
+behind an API. The value has moved to everything that surrounds it. A practitioner is now
+expected to adapt a base model to a domain on a single consumer GPU, ground its outputs in a
+private corpus so it answers questions about documents it never saw in pretraining, force its
+output to satisfy a JSON schema so downstream code can parse it, wire it into an agent loop
+that calls tools and reacts to their results, and then serve the whole thing at a
+cost-per-token that a business can absorb. Each of these has become its own body of technique
+with its own literature, and the techniques interact. Quantization changes what fits in the
+KV cache, which changes the batch size, which changes the cost model.
+</p>
+<p>
+What changed to make this possible was a cluster of results, most from 2021 through 2023, that
+each attacked a different bottleneck. Low-rank adaptation (Hu et al., 2021) showed that the
+weight <em>update</em> during fine-tuning has low intrinsic rank, so it can be trained as a
+pair of thin matrices while the base stays frozen. QLoRA (Dettmers et al., 2023) pushed the
+frozen base to four-bit precision with a data type matched to the Gaussian shape of weights,
+bringing 65B fine-tuning onto one 48GB card. Direct preference optimization (Rafailov et al.,
+2023) collapsed the reinforcement-learning alignment pipeline into a single supervised loss.
+Retrieval-augmented generation (Lewis et al., 2020) separated parametric knowledge from a
+non-parametric store that can be edited without retraining. Constrained decoding (Willard and
+Louf, 2023) made grammar-conformant output a compile-time index rather than a sampling gamble.
+And paged attention (Kwon et al., 2023) made the memory of serving cheap enough that
+continuous batching became standard. This page treats each of these as a derivation, not a
+recipe. The full reinforcement-learning treatment of alignment, including PPO and GRPO, lives
+in the <a href="/classes/deep-reinforcement-learning/">deep reinforcement learning</a> page.
+The vector-index internals (HNSW, IVF) live in the <a href="/classes/databases/">databases</a>
+page. Agent self-improvement loops live in
+<a href="/classes/self-improving-agents/">self-improving agents</a>. Here we cross-link those
+and derive what sits between them.
+</p>
+
+<h2>Core theory</h2>
+
+<h3>The low-rank hypothesis and LoRA</h3>
+<p>
+Full fine-tuning updates every weight. For a linear layer with weight \( W_0 \in \R^{d \times
+k} \), gradient descent produces \( W = W_0 + \Delta W \) with \( \Delta W \) a dense \( d
+\times k \) matrix, and it stores an optimizer state for every one of those \( dk \) entries.
+The empirical observation behind LoRA is that the useful part of \( \Delta W \) lives in a
+low-dimensional subspace. The model was already competent after pretraining, and adapting it
+to a task nudges it along a handful of directions rather than reshaping every coordinate
+independently. Aghajanyan et al. (2020) measured this directly, finding that large pretrained
+models can be fine-tuned in a randomly projected subspace of only a few hundred to a few
+thousand dimensions and still reach most of full-fine-tuning quality. LoRA takes that as a
+structural prior on the update.
+</p>
+<p>
+The reparametrization is to constrain the update to rank \( r \ll \min(d,k) \) by writing it
+as a product of two thin matrices,
+</p>
+$$ W = W_0 + \Delta W = W_0 + \frac{\alpha}{r} B A, \qquad B \in \R^{d \times r}, \quad A \in \R^{r \times k}. $$
+<p>
+The base \( W_0 \) is frozen. Only \( A \) and \( B \) receive gradients. The forward pass on
+input \( x \in \R^{k} \) is \( h = W_0 x + \frac{\alpha}{r} B (A x) \), computed as two small
+matrix-vector products added to the frozen path, so no dense \( d \times k \) matrix is ever
+materialized for the update. At initialization \( A \) is drawn from a small random Gaussian
+and \( B \) is set to zero, so \( \Delta W = 0 \) and the adapted model is identical to the
+base on the first step. Training then grows the update from nothing, which keeps the early
+optimization well-conditioned and means an untrained adapter never degrades the base. The
+scalar \( \alpha/r \) is a fixed scaling, not a learned parameter. Its purpose is to decouple
+the learning rate from the rank. If you double \( r \), the singular values of a randomly
+initialized \( BA \) grow roughly like \( \sqrt{r} \), and dividing by \( r \) keeps the
+update magnitude comparable across ranks so a tuned learning rate transfers. In practice
+people set \( \alpha \) to a constant (often \( \alpha = 2r \) or \( \alpha = r \)) and forget
+it.
+</p>
+<p>
+Why does this save so much? The trainable parameter count drops from \( dk \) to \( r(d + k)
+\). For a square projection \( d = k = 4096 \) and \( r = 16 \), that is \( 16{,}777{,}216 \)
+parameters down to \( 16 \times 8192 = 131{,}072 \), a factor of 128. But the headline number
+in a fine-tuning budget is not the parameter count, it is the optimizer state. Mixed-precision
+AdamW keeps, per trainable parameter, a 16-bit weight and gradient plus three 32-bit tensors
+(a master copy of the weight, the first moment \( m \), and the second moment \( v \)),
+totalling \( 2 + 2 + 4 + 4 + 4 = 16 \) bytes (the accounting is the one Rajbhandari et al.,
+2019, use in the ZeRO paper). Full fine-tuning of a 7B model therefore needs \( 16 \times 7
+\times 10^9 = 112 \) GB of optimizer and model state alone, before activations, which does not
+fit on an 80GB card. LoRA keeps the frozen base in 16-bit (\( 2 \times 7\text{B} = 14 \) GB,
+read-only, no optimizer state) and applies the 16-byte treatment only to the adapters. With
+adapters on the query and value projections of all 32 layers at \( r = 16 \), the adapter
+count is \( 2 \times 32 \times 16 \times (4096 + 4096) = 8{,}388{,}608 \) parameters, whose
+optimizer state is \( 16 \times 8.39 \times 10^6 \approx 134 \) MB. The trainable footprint
+went from 112 GB to 134 MB. The total (base plus adapters) is about 14.1 GB. That is the whole
+argument for why LoRA fits where full fine-tuning does not, and Problem 1 works it in detail.
+</p>
+<p>
+Two properties follow that matter in production. First, the adapter is <em>mergeable</em>. At
+inference you can fold \( W_0 \gets W_0 + \frac{\alpha}{r}BA \) once and serve with zero added
+latency, because the merged model has the base's exact shape. Second, adapters are
+<em>composable and swappable</em>. One frozen base in memory can serve many tasks by hot-
+swapping small adapter tensors, which is the basis of multi-tenant LoRA serving (S-LoRA,
+Sheng et al., 2023). The cost is that a merged adapter is task-specific. Serving many
+un-merged adapters simultaneously reintroduces the small \( BA \) matmul per request.
+</p>
+
+<h3>QLoRA with NF4, double quantization, and paged optimizers</h3>
+<p>
+LoRA froze the base in 16-bit. QLoRA asks whether the frozen base can be stored in four bits
+without hurting the gradients that flow to the adapters, and answers yes, with three ideas.
+</p>
+<p>
+<strong>NF4 (4-bit NormalFloat).</strong> A naive 4-bit integer quantizer places its 16
+levels uniformly across \( [-\text{absmax}, +\text{absmax}] \). But neural-network weights are
+not uniform. Within a block they are approximately zero-mean Gaussian. Uniform levels waste
+resolution in the tails where few weights live and starve the center where most do. NF4
+instead places its levels at the quantiles of a standard normal, so each of the 16 bins holds
+an equal <em>probability mass</em> of a Gaussian rather than an equal width. Concretely, the
+level values are chosen as \( q_i = \frac{1}{2}\big( Q_N(\tfrac{i}{17}) + Q_N(\tfrac{i+1}{17})
+\big) \) style quantile midpoints of \( Q_N \), the standard-normal inverse CDF, then rescaled
+so the outermost levels sit at \( \pm 1 \). This makes NF4 information-theoretically optimal
+for exactly-Gaussian inputs (it is the Lloyd-Max quantizer for the normal density under the
+constraint of 16 fixed levels), and it is symmetric with an exact zero. To quantize a real
+weight block, divide by the block's absolute maximum so it lands in \( [-1, 1] \), then snap to
+the nearest NF4 level and store the 4-bit index plus one scale per block.
+</p>
+<p>
+<strong>Double quantization.</strong> Blockwise quantization with block size 64 stores one
+32-bit scale per 64 weights. That scale costs \( 32/64 = 0.5 \) bits per weight, so the true
+cost of NF4 is not 4 but 4.5 bits per weight. Double quantization quantizes the scales
+themselves. The fp32 block scales are grouped (block size 256) and stored as 8-bit values with
+their own single fp32 scale per group. The per-weight cost becomes
+</p>
+$$ 4 + \frac{8}{64} + \frac{32}{64 \times 256} = 4.127 \text{ bits per weight}, $$
+<p>
+down from 4.5, a saving of about 0.37 bits per weight, or roughly 3 GB on a 65B model for free.
+The 8-bit re-quantization of scales is nearly lossless because scales vary slowly.
+</p>
+<p>
+<strong>Paged optimizers.</strong> Even with a frozen 4-bit base, a long-sequence
+backward pass produces gradient-memory spikes that can momentarily exceed the card. QLoRA uses
+NVIDIA unified memory to <em>page</em> optimizer state between GPU and CPU RAM on demand, the
+same mechanism the OS uses for virtual memory, so a transient spike evicts cold pages instead
+of triggering an out-of-memory kill. This is a robustness trick, not a compression trick. It
+turns rare OOM crashes into graceful slowdowns.
+</p>
+<p>
+The dequantization happens on the fly during the forward and backward passes. The 4-bit base
+weight is expanded to the compute dtype (bf16), used in the matmul, and discarded, so the base
+never occupies more than its 4-bit footprint in storage. Gradients flow through the frozen,
+dequantized weights to the LoRA adapters, which are kept in bf16 and are the only trainable
+parameters. The full memory accounting for a 7B model is worked in Problem 1. The QLoRA base
+is about 3.5 GB, versus 14 GB for LoRA's 16-bit base and 112 GB of state for full
+fine-tuning.
+</p>
+
+<h3>Adapters and prefix tuning, briefly</h3>
+<p>
+LoRA is one point in a family of parameter-efficient methods. The original <em>adapter</em>
+(Houlsby et al., 2019) inserts small bottleneck modules, a down-projection to dimension \( m
+\ll d \), a nonlinearity, an up-projection back to \( d \), plus a residual, after each
+sub-layer, \( h \gets h + f(h W_{\text{down}}) W_{\text{up}} \). It adds \( 2dm \) parameters
+per insertion and, unlike LoRA, cannot be merged into the base, so it costs a small fixed
+latency at inference. <em>Prefix tuning</em> (Li and Liang, 2021) and the related prompt
+tuning prepend a set of trainable "virtual token" vectors to the keys and values at every
+layer. The model attends to these learned prefixes as if they were context, and only the
+prefix vectors are trained. Prefix methods shine when you want many lightweight task
+specializations of one served base, because a prefix is just a small tensor of KV vectors, but
+they consume context budget and are generally less expressive per parameter than LoRA on hard
+adaptation tasks. The unifying view (He et al., 2021) is that all three inject a low-cost,
+learned perturbation into a frozen network at a chosen location. They differ in where they
+inject and whether the injection folds back into the base.
+</p>
+
+<h3>Instruction tuning and data curation</h3>
+<p>
+A base model trained only on next-token prediction over web text will continue a prompt rather
+than answer it. Asked "List three uses of a paperclip," it may produce a plausible-looking
+multiple-choice question instead, because that is a common web pattern. Instruction tuning is
+supervised fine-tuning on (instruction, response) pairs that teaches the model to treat the
+prompt as a request. FLAN (Wei et al., 2021) and its scaled successor (Chung et al., 2022)
+showed that fine-tuning on a large, diverse mixture of tasks phrased as instructions produces
+strong zero-shot generalization to <em>held-out</em> task types, and that the number of
+distinct tasks matters more than the number of examples per task. The mechanism is not new
+knowledge. It is format alignment, teaching the model the mapping from an instruction surface
+form to the answer-generating behavior it already latently has.
+</p>
+<p>
+Because the objective is imitation, data quality dominates. The LIMA result (Zhou et al.,
+2023) is the sharp version of this claim. A strong base fine-tuned on only 1,000 carefully
+curated, diverse, high-quality examples matched models trained on orders of magnitude more,
+supporting a "superficial alignment hypothesis" that most capability is learned in
+pretraining and instruction tuning mainly selects a response style. The practical
+consequences are that deduplication (near-duplicate instructions inflate apparent dataset size
+without adding signal), diversity of task types, and removing low-quality or templated
+responses buy more than raw scale, and that a handful of mislabeled or sycophantic examples
+can teach a persistent bad behavior because the model is imitating, not averaging. Curation is
+where most instruction-tuning effort actually goes.
+</p>
+
+<h3>Alignment, from the RLHF pipeline to the DPO closed form</h3>
+<p>
+Instruction tuning gets format. It does not get preference. To make a model prefer helpful,
+harmless, honest responses when several completions are all fluent, the standard pipeline is
+reinforcement learning from human feedback (Ouyang et al., 2022, InstructGPT). It has three
+stages. First, supervised fine-tuning on demonstrations, producing a reference policy \(
+\pi_{\text{ref}} \). Second, a reward model. Collect human preference pairs \( (x, y_w, y_l)
+\) where \( y_w \) is preferred to \( y_l \), and fit a scalar reward \( r_\phi(x,y) \) under
+the Bradley-Terry likelihood \( \P(y_w \succ y_l \mid x) = \sigma\big( r_\phi(x,y_w) -
+r_\phi(x,y_l) \big) \). Third, optimize the policy to maximize expected reward while staying
+close to the reference, penalizing drift with a KL term so the policy does not collapse onto
+degenerate high-reward text,
+</p>
+$$ \max_{\pi_\theta} \E_{x,\, y \sim \pi_\theta}\big[ r_\phi(x,y) \big] - \beta\, \KL\big( \pi_\theta(\cdot \mid x) \,\|\, \pi_{\text{ref}}(\cdot \mid x) \big). $$
+<p>
+The full treatment of stage three, PPO's clipped surrogate, generalized advantage estimation,
+and GRPO's value-free variant, is derived on the
+<a href="/classes/deep-reinforcement-learning/">deep reinforcement learning</a> page. That
+page owns the RL. Here we derive only the result that lets you skip stage three entirely.
+</p>
+<p>
+DPO (Rafailov et al., 2023) observes that the KL-constrained objective has a closed-form
+optimum. Fixing a prompt \( x \), the inner maximization over the response distribution \( \pi
+\) is solved by a Boltzmann tilt of the reference,
+</p>
+$$ \pi^*(y \mid x) = \frac{1}{Z(x)}\, \pi_{\text{ref}}(y \mid x)\, \exp\!\Big( \tfrac{1}{\beta}\, r(x,y) \Big), \qquad Z(x) = \sum_{y} \pi_{\text{ref}}(y \mid x)\, e^{r(x,y)/\beta}. $$
+<p>
+This is standard, the variational solution to a KL-regularized reward maximization. The
+step-by-step proof, completing the square as a KL against \( \pi^* \), is on the deep-RL
+page. The DPO move is to run it backwards. Solving for the reward,
+</p>
+$$ r(x,y) = \beta \log \frac{\pi^*(y \mid x)}{\pi_{\text{ref}}(y \mid x)} + \beta \log Z(x), $$
+<p>
+so every reward is a scaled log-ratio between its own optimal policy and the reference, plus a
+prompt-dependent constant \( \beta \log Z(x) \). Substituting into the Bradley-Terry
+likelihood, the intractable partition term cancels because it is the same for \( y_w \) and \(
+y_l \) at a shared \( x \). Reparameterizing the unknown optimal policy directly as the
+trainable \( \pi_\theta \) and doing maximum likelihood on the preference data gives the DPO
+loss, restated here for reference,
+</p>
+$$ \L_{\text{DPO}}(\theta) = -\,\E_{(x,y_w,y_l)}\!\left[ \log \sigma\!\left( \beta \log \frac{\pi_\theta(y_w \mid x)}{\pi_{\text{ref}}(y_w \mid x)} - \beta \log \frac{\pi_\theta(y_l \mid x)}{\pi_{\text{ref}}(y_l \mid x)} \right) \right]. $$
+<p>
+No reward model, no sampling from the policy, no RL loop. The policy is its own implicit reward
+model, trained by supervised classification on which completion humans preferred. Writing the
+implicit reward \( \hat r_\theta(x,y) = \beta \log \frac{\pi_\theta(y\mid x)}{\pi_{\text{ref}}(y
+\mid x)} \), the gradient is
+</p>
+$$ \nabla_\theta \L_{\text{DPO}} = -\beta\, \E\Big[ \sigma\big( \hat r_\theta(x,y_l) - \hat r_\theta(x,y_w) \big) \big( \nabla_\theta \log \pi_\theta(y_w \mid x) - \nabla_\theta \log \pi_\theta(y_l \mid x) \big) \Big], $$
+<p>
+which raises the chosen completion's log-probability and lowers the rejected one's, weighted by
+how wrong the current implicit reward is. The weight \( \sigma(\hat r_\theta(x,y_l) - \hat
+r_\theta(x,y_w)) \) is near 1 when the model has the pair backwards and decays toward 0 once
+the pair is ranked with margin. Problem 2 puts numbers on this. What DPO gives up relative to
+online RLHF, the on-policy state distribution and the ability to explore beyond the preference
+dataset, is discussed on the deep-RL page. The two are complementary, and many production
+pipelines use DPO as a cheaper replacement or a warm start for a shorter RL phase.
+</p>
+
+<h3>Quantization for serving</h3>
+<p>
+Training quantization (QLoRA) compresses a frozen base so it fits during fine-tuning. Serving
+quantization compresses a finished model so it is cheaper and faster to run, and the
+constraints are different. Latency and throughput matter, and the quantized model must stay
+accurate under real inputs. The unit of the decision is where the low precision goes.
+</p>
+<p>
+<strong>Weight-only vs activation quantization.</strong> Decode is memory-bandwidth bound
+(derived in the serving section). Each generated token must read every weight from HBM.
+Halving the weight bytes nearly halves decode latency at small batch, independent of whether
+the arithmetic is faster. Weight-only quantization (store weights in 4-bit, dequantize to bf16
+for the matmul) therefore buys latency even though the matmul itself runs in bf16. Activation
+quantization additionally stores and multiplies activations in low precision (INT8 or FP8),
+which unlocks faster tensor-core paths (INT8 and FP8 matmul run at roughly twice bf16 on
+H100), but activations have outliers that weights do not, and quantizing them badly destroys
+accuracy.
+</p>
+<p>
+<strong>The outlier problem, and LLM.int8().</strong> Dettmers et al. (2022) found that beyond
+about 6.7B parameters, transformer activations develop systematic outlier features, a few
+hidden dimensions with magnitudes 10 to 100 times the rest, concentrated in the same channels
+across tokens. A single per-tensor INT8 scale set by the max is then dominated by these
+outliers, and everything else quantizes to a handful of levels, collapsing accuracy.
+LLM.int8() handles them by decomposition. The outlier columns (identified by a magnitude
+threshold) are computed in fp16, and the remaining 99.9% of the matrix in INT8, then summed.
+This is exact on the outliers and cheap on the bulk, and it is why 8-bit inference became
+usable for large models.
+</p>
+<p>
+<strong>SmoothQuant</strong> (Xiao et al., 2022) attacks the same outliers differently, by
+migrating the difficulty from activations, which are hard to quantize, into weights, which are
+easy. Because a linear layer computes \( XW \), you can insert a per-channel diagonal rescaling
+\( X W = (X \diag(s)^{-1})(\diag(s) W) \) that leaves the product unchanged but shrinks the
+activation outliers by \( s_j \) and grows the corresponding weight rows. Choosing \( s_j =
+\max_i |X_{ij}|^{\alpha} / \max_i |W_{ji}|^{1-\alpha} \) balances the dynamic ranges so both
+sides quantize well, enabling full INT8 (weights and activations) with little accuracy loss.
+</p>
+<p>
+<strong>GPTQ</strong> (Frantar et al., 2022) is a weight-only, one-shot, post-training
+quantizer that pushes to 3 to 4 bits by being careful about quantization <em>order and
+compensation</em>. It descends from Optimal Brain Quantization (Frantar and Alistarh, 2022),
+which frames rounding one weight as an error to be compensated by adjusting the
+not-yet-quantized weights. Minimizing the layerwise output error \( \| XW - X\hat W \|_2^2 \)
+makes the relevant curvature the Hessian \( H = 2 X^\top X \) (the input second-moment
+matrix). Quantizing weight \( w_q \) to \( \hat w_q \) and optimally compensating the rest
+updates the remaining weights by
+</p>
+$$ \delta = -\frac{w_q - \hat w_q}{[H^{-1}]_{qq}}\, H^{-1}_{:,q}, $$
+<p>
+the closed-form OBQ step, and then the row and column \( q \) are removed from \( H \) (a
+Gaussian elimination). GPTQ's contribution is to make this practical at LLM scale. It quantizes in
+a fixed column order, updates all remaining weights of the block with a single Cholesky-based
+solve rather than re-inverting the Hessian each step, and processes weights in blocks for
+cache efficiency. The result quantizes a 175B model to 3 to 4 bits in a few GPU-hours with
+small perplexity loss.
+</p>
+<p>
+<strong>AWQ</strong> (Lin et al., 2023) starts from a different observation. Not all weights
+matter equally, and the ones that matter are identifiable from the <em>activations</em>. The
+weight channels that multiply large-magnitude activation features are salient. Protecting just
+the top ~1% of channels (by activation magnitude) from quantization error recovers most of the
+loss. Rather than keep those channels in high precision (which breaks hardware regularity), AWQ
+scales them up before quantizing and down after, per output channel, so the quantization grid
+spends more resolution where it matters. It is training-free, needs only a small calibration
+set to measure activation statistics, and produces 4-bit weights that are both accurate and
+fast to serve. GPTQ and AWQ are the two dominant weight-only 4-bit methods. They make similar
+accuracy at 4 bits, with AWQ often simpler to deploy and GPTQ more established.
+</p>
+<p>
+<strong>FP8 vs INT8.</strong> INT8 is a uniform integer grid. FP8 (the E4M3 and E5M2 formats
+standardized by Micikevicius et al., 2022) spends some bits on an exponent, giving a
+floating grid that resolves small values finely and large values coarsely. For tensors with
+wide dynamic range (activations with outliers), FP8's non-uniform spacing tolerates the range
+without a decomposition trick, which is why H100-class hardware added native FP8 tensor cores
+and FP8 has become the default for high-throughput serving. INT8 remains competitive on
+weights and on hardware without FP8. The general accuracy/latency tradeoff is monotone but not
+linear. 8-bit is nearly lossless and roughly doubles compute throughput. 4-bit weight-only
+roughly halves weight bytes (a big decode-latency win) at a small, usually recoverable
+perplexity cost. Below 4 bits the accuracy cliff steepens and needs either mixed precision or
+quantization-aware training to stay usable.
+</p>
+<p>
+<strong>KV-cache quantization.</strong> At long context and large batch, the KV cache, not the
+weights, dominates memory. For a model with \( L \) layers, \( n_{\text{kv}} \) key/value
+heads of dimension \( d_h \), the cache is \( 2 L\, n_{\text{kv}}\, d_h \) values per token per
+sequence. In fp16 a 32-layer model with 8 KV heads of dimension 128 costs \( 2 \times 32
+\times 8 \times 128 \times 2 = 131{,}072 \) bytes = 128 KB per token, so 8k tokens across a
+batch of 64 is 64 GB, exceeding the weights. Quantizing the cache to INT8 or FP8 halves that,
+directly doubling the batch or the context that fits, and the accuracy cost is small because
+attention is a weighted average that is forgiving of KV noise. This is why KV quantization is
+often the highest-leverage serving optimization. It trades a barely-measurable quality loss
+for a doubling of the throughput ceiling.
+</p>
+
+<h3>Distillation</h3>
+<p>
+Quantization shrinks a model's precision. Distillation shrinks its size by training a small
+<em>student</em> to imitate a large <em>teacher</em>. The original formulation (Hinton et al.,
+2015) trains the student to match the teacher's softened output distribution. With logits \( z
+\), the softened probability at temperature \( T \) is \( p_i^{(T)} = \softmax(z/T)_i \), and
+the student minimizes the KL to the teacher's softened distribution, usually alongside the
+ordinary hard-label loss,
+</p>
+$$ \L = (1-\lambda)\, \L_{\text{CE}}(y, p^{(1)}_{\text{student}}) + \lambda\, T^2\, \KL\big( p^{(T)}_{\text{teacher}} \,\|\, p^{(T)}_{\text{student}} \big). $$
+<p>
+The temperature is the point of the method. At \( T = 1 \) the teacher is nearly one-hot and
+conveys little beyond the label. Raising \( T \) softens the distribution and exposes the
+teacher's relative confidences over the wrong classes, the "dark knowledge" that class 7 looks
+a bit like class 1 but nothing like class 4, which is a far richer training signal than a hard
+label. The \( T^2 \) factor rescales the KL gradient, which shrinks like \( 1/T^2 \) under
+softening, so the distillation term keeps a stable magnitude as \( T \) changes. For language
+models the same idea takes several forms, matching next-token distributions (DistilBERT, Sanh
+et al., 2019, reaching ~97% of BERT quality at 40% of the size), matching hidden states, or,
+increasingly, <em>sequence-level</em> distillation where the teacher generates completions
+that become supervised targets for the student. The last of these is how much of today's
+frontier-to-small-model transfer actually happens. A strong model labels or generates data, a
+small model imitates it, and the small model inherits a slice of the large one's behavior at a
+fraction of the serving cost.
+</p>
+
+<h3>Retrieval-augmented generation</h3>
+<p>
+A language model's knowledge is frozen at its training cutoff and stored diffusely across its
+weights, where it cannot be edited, audited, or attributed. RAG (Lewis et al., 2020) separates
+the two kinds of knowledge. Parametric knowledge stays in the weights, and non-parametric
+knowledge goes into an external store that is retrieved at inference and placed in the context.
+The model then answers conditioned on retrieved passages rather than on memory alone, which
+lets it cite sources, stay current as the store is updated, and answer questions about private
+documents it never saw in pretraining. The pipeline has four stages, each with real design
+decisions.
+</p>
+<p>
+<strong>Chunking.</strong> Documents are split into passages small enough to embed
+meaningfully and to fit several into a context budget, but large enough to be self-contained.
+Too small and a chunk loses the antecedent of a pronoun or the subject of a clause. Too large
+and its embedding averages several topics into a vague centroid that matches nothing well, and
+it wastes context budget. Typical sizes are a few hundred tokens with a small overlap (so a
+fact spanning a boundary appears whole in at least one chunk). Structure-aware chunking (split
+on headings, paragraphs, or sentences rather than a fixed token count) helps because it keeps
+semantic units intact. Problem 4 works the chunk-budget arithmetic. Given a context budget and
+a chunk size, it asks how many chunks you can retrieve and how that interacts with recall.
+</p>
+<p>
+<strong>Embedding and retrieval.</strong> Each chunk is mapped to a dense vector by an
+embedding model, and the query is embedded the same way. Relevant chunks are the query
+vector's nearest neighbors under cosine similarity. Dense passage retrieval (Karpukhin et al.,
+2020) trains the encoder with a contrastive objective so that a question and its answer-bearing
+passage land close while unrelated passages are pushed apart. For a question \( q \), positive
+passage \( p^+ \), and negatives \( p^-_j \), minimize \( -\log \frac{e^{\text{sim}(q,p^+)}}{
+e^{\text{sim}(q,p^+)} + \sum_j e^{\text{sim}(q,p^-_j)}} \). In-batch negatives make this cheap, since
+every other passage in the batch serves as a negative for free. DPR showed dense retrieval
+beating the strong lexical baseline BM25 on open-domain QA, and modern embedding models
+(trained on far more pairs, with hard negatives mined explicitly) are stronger still, though
+BM25 remains a hard-to-beat baseline for keyword-heavy and out-of-domain queries, so hybrid
+dense-plus-lexical retrieval is common. The nearest-neighbor search itself, over millions of
+vectors, uses an approximate index (HNSW, IVF), whose internals, graph construction, the
+recall/latency tradeoff, and when to prefer one over the other, are derived on the
+<a href="/classes/databases/">databases</a> page. Here it is enough that the index returns an
+approximate top-\( N \) in sublinear time at a tunable recall.
+</p>
+<p>
+<strong>Reranking with cross-encoders.</strong> The retriever is a <em>bi-encoder</em>. It
+embeds the query and each passage independently, so their vectors can be precomputed and
+indexed, which is what makes retrieval over millions of documents fast. The price of
+independence is that the query and passage never attend to each other, so the score is a blunt
+cosine between two summaries. A <em>cross-encoder</em> (Nogueira and Cho, 2019) concatenates
+the query and one candidate passage into a single sequence and runs full cross-attention,
+producing a far more accurate relevance score, at the cost of one forward pass per candidate,
+which cannot be precomputed. The standard architecture uses both. The bi-encoder retrieves a
+cheap top-\( N \) (say 100) from millions, and the cross-encoder reranks those \( N \) down to
+the top few that go into the prompt. This two-stage design is the retrieval analogue of a
+coarse filter followed by an exact check, and Problem 4 shows how reranking raises precision at
+fixed recall.
+</p>
+<p>
+<strong>Evaluating RAG.</strong> RAG has two failure modes that ordinary generation metrics
+miss. The retriever can fail to surface the relevant passage, and the generator can ignore or
+contradict a passage it did retrieve. Evaluation therefore splits along the pipeline. Retrieval
+is scored with recall@\( k \) (did a relevant passage appear in the top \( k \)) and precision,
+or ranking metrics like MRR and nDCG. Generation is scored on <em>faithfulness</em>
+(groundedness). Does every claim in the answer follow from the retrieved context, or did the
+model hallucinate beyond it. Frameworks like RAGAS (Es et al., 2023) operationalize this by
+decomposing the answer into atomic claims and checking each against the retrieved context,
+usually with an LLM judge, and by measuring answer relevance and context precision separately.
+The key discipline is to attribute failures to the right stage. A low faithfulness score with
+high retrieval recall is a generation problem (the passage was there and the model ignored it).
+Low recall is a retrieval or chunking problem no prompt change will fix.
+</p>
+
+<h3>Tool use and agent loops</h3>
+<p>
+A model that can only emit text is limited to what it knows and can compute in a forward pass.
+Giving it tools, a calculator, a search API, a code interpreter, a database query, lets it
+offload what it is bad at (exact arithmetic, current facts, long computation) to systems that
+are good at it. The interface is <em>function calling</em>. The model is shown a set of tool
+schemas (name, description, typed arguments), and instead of answering it may emit a
+structured call naming a tool and its arguments. The runtime executes the call, appends the
+result to the context, and lets the model continue. The model never runs anything itself. It
+proposes calls that a trusted harness executes, which is also the security boundary.
+</p>
+<p>
+ReAct (Yao et al., 2022) is the loop that makes this work for multi-step tasks. It interleaves
+<em>reasoning</em> traces with <em>actions</em>. The model thinks ("I need the population, then
+divide"), acts (calls a search tool), observes the result, thinks again, and repeats until it
+can answer. The reasoning steps keep the action selection grounded and let the model recover
+from a tool result that surprised it, and the actions keep the reasoning grounded in real
+observations rather than confabulated ones. The loop terminates when the model emits a final
+answer instead of a tool call, or when a step budget is hit. Reliability engineering on top of
+this, retries, verification, planning, self-correction, and the ways agents improve their own
+policies over episodes, is the subject of the
+<a href="/classes/self-improving-agents/">self-improving agents</a> page. Here the essential
+point is that the agent loop is a control loop around a stateless model, and its correctness
+depends far more on the harness (schema validation, error handling, tool sandboxing, budget
+enforcement) than on the model's raw capability.
+</p>
+
+<h3>Structured and constrained decoding</h3>
+<p>
+Function calling and any machine-consumed output need the model to emit text that parses,
+valid JSON, matching a schema, or conforming to a grammar. Prompting for JSON and hoping is
+unreliable. A single missing brace breaks the parser, and the failure rate is nonzero at any
+scale. Constrained decoding makes invalid output <em>impossible</em> by construction rather
+than unlikely by training. At each step the model produces a distribution over the vocabulary.
+Constrained decoding computes the set of tokens that could legally come next given the target
+grammar and the text generated so far, and masks the logits of every other token to \( -\infty
+\) before sampling. The model still chooses among valid continuations by its own
+probabilities, but it can never choose an invalid one.
+</p>
+<p>
+The naive implementation, re-parsing the partial output against the grammar at every step to
+find allowed tokens, is too slow. It costs work proportional to the grammar and the output
+length on every one of thousands of decoding steps. The Outlines approach (Willard and Louf,
+2023) precompiles the grammar (a regular expression, or a JSON schema lowered to one) into a
+finite-state machine, then builds an index mapping each FSM state to the set of vocabulary
+tokens that advance it to a valid next state. At decode time, generating a token is a single
+lookup. From the current FSM state, read the precomputed allowed-token mask, apply it, sample,
+and transition. The per-step cost drops from a parse to a dictionary lookup, making constrained
+generation nearly free relative to unconstrained. The construction is done once per schema and
+amortized over every request that uses it. The demo in the implementation section builds a
+tiny version of this mask. Grammars richer than regular (full context-free JSON with arbitrary
+nesting) need a pushdown automaton rather than a finite one, which is what production libraries
+implement, but the finite-state case carries the whole idea.
+</p>
+
+<h3>Evaluation harnesses and LLM-as-judge</h3>
+<p>
+Multiple-choice benchmarks with a known answer are scored automatically by a harness that
+formats each question, runs the model, and extracts the answer, and the main correctness
+subtlety is scoring. Comparing the log-likelihood the model assigns to each answer choice is
+more robust than parsing free-form generation, and small formatting differences (how options
+are labeled, whether a space precedes the answer) shift scores by points, which is why a
+standardized harness like lm-evaluation-harness exists so numbers are comparable across
+models. Open-ended quality, whether a summary is good, whether a chatbot response is helpful,
+has no reference answer, and human evaluation is slow and expensive. The now-standard shortcut
+is <em>LLM-as-judge</em>, prompting a strong model to score or compare responses. MT-Bench and the
+Chatbot Arena analysis (Zheng et al., 2023) validated that a strong judge model agrees with
+human preferences at roughly the rate two humans agree with each other, which makes it a usable
+proxy.
+</p>
+<p>
+The biases are real and must be controlled. Judges show <em>position bias</em> (a systematic
+preference for the first or second response in a pairwise comparison, independent of content),
+<em>verbosity bias</em> (longer answers rated higher even when padded), <em>self-preference</em>
+(a judge favors text in its own style, or its own family's outputs), and sensitivity to
+superficial fluency over correctness. The mitigations are mechanical. Randomize and average
+over both orderings to cancel position bias, control for length, use multiple judges or a
+reference answer, and reserve human evaluation for the high-stakes final comparison. The honest
+framing is that LLM-as-judge is a fast, cheap, biased instrument, excellent for iteration and
+regression testing, dangerous as the sole basis of a headline claim, and never a substitute for
+a task-grounded metric when one exists.
+</p>
+
+<h3>The serving cost model</h3>
+<p>
+The economics of a deployed model come down to tokens per second per dollar, and the number
+that governs it is which resource is the bottleneck. Generation has two phases with opposite
+characteristics. <em>Prefill</em> processes the whole prompt in one forward pass. All prompt
+tokens go through the network together, so the matmuls are large and dense and the phase is
+<em>compute-bound</em>, running near the hardware's peak FLOP rate. <em>Decode</em> generates
+one token at a time, each conditioned on all previous tokens via the KV cache. Each step is a
+single-token forward pass, a sequence of matrix-vector products, and to produce one token the
+hardware must read every weight from HBM. Decode is therefore <em>memory-bandwidth-bound</em>
+at small batch. Its speed is set not by how fast the GPU multiplies but by how fast it can
+stream the weights.
+</p>
+<p>
+Put numbers on it with the measured H100 80GB figures from this repository. Sustained memory
+bandwidth for a bf16 streaming kernel is 2930 GB/s (the <code>copy_bf16</code> measurement),
+and sustained bf16 matmul throughput at large size is 728.7 TFLOP/s (the <code>n8192</code>
+measurement). For a 7B model in fp16, decoding one token for a single sequence reads all \( 2
+\times 7\times 10^9 = 1.4 \times 10^{10} \) weight bytes, so the batch-1 decode ceiling is
+</p>
+$$ \frac{2930 \times 10^9 \text{ B/s}}{1.4 \times 10^{10}\text{ B}} \approx 209 \text{ tokens/s}, $$
+<p>
+a hard roofline no kernel cleverness beats, because it is set by bandwidth and model size
+alone. The way out is <em>continuous batching</em> (Yu et al., 2022, and the vLLM system, Kwon et
+al., 2023), serving many sequences at once so that a single read of the weights produces a token
+for every sequence in the batch. The weights are read once per decode step regardless of batch
+size \( B \), while the arithmetic scales with \( B \), so decode stays memory-bound until \( B
+\) is large enough that the compute of \( B \) tokens takes longer than the single weight read.
+That crossover, the roofline ridge point, is the ratio of peak compute to peak bandwidth,
+</p>
+$$ B^* = \frac{\text{peak FLOP/s}}{\text{peak B/s}} = \frac{728.7 \times 10^{12}}{2930 \times 10^9} \approx 249, $$
+<p>
+in units of FLOP per byte. Below \( B^* \) adding sequences is nearly free (same weight read,
+more tokens out). Above it the GPU is compute-bound and throughput saturates at \( 728.7\times
+10^{12} / (2 \times 7\times 10^9) \approx 52{,}000 \) tokens/s aggregate. This factor-of-250
+spread between batch-1 latency-optimal serving and batch-saturated throughput-optimal serving
+is the central fact of LLM serving economics, and it is why the cost per token
+depends far more on how you batch than on which GPU you rent. Problem 3 turns these throughputs
+into dollars per million tokens, roughly $3.98 per million at batch 1 versus $0.016 per million
+at saturation, from the identical hardware. Continuous batching, which admits and evicts
+sequences from the batch as they arrive and finish rather than waiting for a fixed batch to
+drain, plus paged KV cache (Kwon et al., 2023) so the cache is not fragmented into fixed slots,
+is what lets a real server run near the throughput ceiling while still bounding per-request
+latency.
+</p>
+
+<h2>Worked problems</h2>
+
+<div class="problem">
+  <span class="plabel">Problem 1</span>
+  <p>
+  Size the memory to fine-tune a 7B-parameter transformer (\( d_{\text{model}} = 4096 \), 32
+  layers) three ways, using mixed-precision AdamW throughout. (a) Full fine-tuning. (b) LoRA
+  at rank \( r = 16 \) on the query and value projections of every layer, with a 16-bit frozen
+  base. (c) QLoRA at the same rank with an NF4 double-quantized base. Count optimizer and model
+  state only (ignore activations). Then state the per-weight bit cost of NF4 with and without
+  double quantization.
+  </p>
+  <div class="solution">
+    <p><strong>Solution.</strong> Mixed-precision AdamW stores, per <em>trainable</em>
+    parameter, a 16-bit weight (2 B), a 16-bit gradient (2 B), and three fp32 tensors, master
+    weight, first moment \( m \), second moment \( v \) (4 B each), for \( 2+2+4+4+4 = 16 \)
+    bytes.</p>
+    <p><em>(a) Full fine-tuning.</em> Every one of \( 7 \times 10^9 \) parameters is trainable,
+    so the state is \( 16 \times 7 \times 10^9 = 1.12 \times 10^{11} \) B \( = 112 \) GB. This does not fit on
+    an 80GB card, which is the whole motivation for the alternatives.</p>
+    <p><em>(b) LoRA, \( r = 16 \).</em> The base is frozen and needs no optimizer state, only
+    storage in fp16, \( 2 \times 7 \times 10^9 = 14 \) GB. The adapters cover the query and
+    value projections (\( 4096 \times 4096 \) each) of 32 layers, so \( 2 \times 32 = 64 \)
+    matrices, each contributing \( r(d_{\text{in}} + d_{\text{out}}) = 16 \times (4096 + 4096)
+    = 131{,}072 \) parameters. The adapters total \( 64 \times 131{,}072 = 8{,}388{,}608 \)
+    parameters, about 0.12% of the base. Their optimizer state is \( 16 \times 8.39 \times
+    10^6 \approx 134 \) MB. The total is \( 14 \text{ GB} + 0.134 \text{ GB} \approx 14.1 \) GB. The
+    trainable footprint fell from 112 GB to 134 MB.</p>
+    <p><em>(c) QLoRA, \( r = 16 \).</em> The frozen base is stored in 4-bit NF4 rather than
+    fp16. At 4 bits per weight that is \( 0.5 \text{ B} \times 7 \times 10^9 = 3.5 \) GB, and the
+    adapters are unchanged at 134 MB. The total is \( \approx 3.63 \) GB, small enough to fine-tune a
+    7B model on a 6-8 GB budget once activations are added, or a 65B model on a single 48 GB
+    card.</p>
+    <p><em>NF4 bit cost.</em> Blockwise NF4 with block size 64 stores one fp32 scale per 64
+    weights, so the cost is \( 4 + 32/64 = 4.5 \) bits/weight. Double quantization re-quantizes those scales
+    to 8-bit in groups of 256 with one fp32 group scale,
+    giving \( 4 + 8/64 + 32/(64\times 256) = 4 + 0.125 + 0.00195 = 4.127 \) bits/weight, a saving of
+    about 0.37 bits/weight (~3 GB on a 65B model) at negligible accuracy cost. The lesson is that the
+    optimizer state, not the weight storage, is what full fine-tuning cannot afford, and PEFT
+    wins by making almost nothing trainable.</p>
+  </div>
+</div>
+
+<div class="problem">
+  <span class="plabel">Problem 2</span>
+  <p>
+  A DPO run uses \( \beta = 0.1 \). For one preference pair the summed log-probabilities are
+  \( \log \pi_\theta(y_w) = -12 \) and \( \log \pi_{\text{ref}}(y_w) = -13 \) for the chosen response, and
+  \( \log \pi_\theta(y_l) = -15 \) and \( \log \pi_{\text{ref}}(y_l) = -14 \) for the rejected. Compute the implicit
+  rewards, the loss, and the scalar gradient weight, and verify the sign of the update. Then
+  recompute the weight if the policy becomes more confident on the chosen response,
+  \( \log \pi_\theta(y_w) = -8 \), and interpret.
+  </p>
+  <div class="solution">
+    <p><strong>Solution.</strong> The implicit reward is \( \hat r_\theta(x,y) = \beta\big(
+    \log \pi_\theta(y) - \log \pi_{\text{ref}}(y) \big) \). For the chosen response,
+    \( \hat r_w = 0.1 \times (-12 - (-13)) = 0.1 \times 1 = 0.1 \). For the rejected,
+    \( \hat r_l = 0.1 \times (-15 - (-14)) = 0.1 \times (-1) = -0.1 \). The margin is
+    \( \hat r_w - \hat r_l = 0.2 \).</p>
+    <p>The per-example loss is \( -\log \sigma(\text{margin}) = -\log \sigma(0.2) \). With
+    \( \sigma(0.2) = 1/(1+e^{-0.2}) = 0.5498 \), the loss is \( -\log 0.5498 = 0.598 \). The
+    gradient weight (the coefficient on the log-prob difference) is
+    \( \sigma(\hat r_l - \hat r_w) = \sigma(-0.2) = 0.4502 \). Because this weight is positive
+    and the update is \( +\beta\, w \big(\nabla \log \pi_\theta(y_w) - \nabla \log
+    \pi_\theta(y_l)\big) \) (descending the negative-log-sigmoid), a gradient step raises
+    \( \log \pi_\theta(y_w) \) and lowers \( \log \pi_\theta(y_l) \). The chosen response is
+    pushed up, the rejected one down, as intended.</p>
+    <p><em>Confident case.</em> Set \( \log \pi_\theta(y_w) = -8 \), so \( \hat r_w = 0.1
+    \times (-8 - (-13)) = 0.5 \), margin \( = 0.5 - (-0.1) = 0.6 \). The loss falls to
+    \( -\log \sigma(0.6) = 0.437 \) and the weight to \( \sigma(-0.6) = 0.354 \). As the pair
+    becomes correctly ranked with larger margin, the gradient weight shrinks toward zero. DPO
+    self-anneals, spending gradient on pairs it still gets wrong and easing off pairs it has
+    learned. This is the property plain supervised cloning of the chosen response lacks, and it
+    is exactly the sigmoid weight in the gradient derived above.</p>
+  </div>
+</div>
+
+<div class="problem">
+  <span class="plabel">Problem 3</span>
+  <p>
+  Using the measured H100 80GB figures (bf16 streaming bandwidth 2930 GB/s, bf16 matmul
+  throughput 728.7 TFLOP/s at large size), and a 7B fp16 model served for decode, compute
+  (a) the batch-1 decode throughput, (b) the batch \( B^* \) at which decode stops being
+  memory-bound, (c) the saturated aggregate throughput, and (d) the cost per million output
+  tokens at each regime, assuming the card rents at $3.00/hour.
+  </p>
+  <div class="solution">
+    <p><strong>Solution.</strong> <em>(a)</em> Decoding one token reads all weights once,
+    \( 2 \times 7\times 10^9 = 1.4\times 10^{10} \) bytes. At 2930 GB/s the ceiling is
+    \( 2.930\times 10^{12} / 1.4\times 10^{10} = 209 \) tokens/s for a single sequence,
+    memory-bound.</p>
+    <p><em>(b)</em> Weights are read once per decode step regardless of batch \( B \). The
+    arithmetic is \( B \times 2P \) FLOP per step (two FLOP per parameter per token). Decode
+    is compute-bound when \( B \cdot 2P / \text{FLOPs} > 2P / \text{BW} \), i.e. when \( B >
+    \text{FLOPs}/\text{BW} = 728.7\times 10^{12} / 2.930\times 10^{12} = 249 \). The ridge is
+    \( B^* \approx 249 \), in FLOP-per-byte units, and it is a property of the hardware, not the
+    model. The 7B cancels out.</p>
+    <p><em>(c)</em> At and above \( B^* \) the GPU runs at peak compute, so aggregate
+    throughput is \( 728.7\times 10^{12} / (2 \times 7\times 10^9) = 52{,}050 \) tokens/s.
+    A consistency check is \( B^* \times 209 = 249 \times 209 \approx 52{,}000 \), matching the
+    compute-bound number, as the roofline requires.</p>
+    <p><em>(d)</em> At $3.00/hour, count what a card produces per hour. Batch 1 gives \( 209 \times 3600 =
+    752{,}400 \) tokens = 0.752 M/hr, so \( 3.00 / 0.752 = \$3.98 \) per million tokens.
+    Saturated gives \( 52{,}050 \times 3600 = 1.874\times 10^{8} \) tokens = 187.4 M/hr, so
+    \( 3.00 / 187.4 = \$0.016 \) per million tokens. Identical hardware, a 250-fold cost spread,
+    set entirely by batching. This is why unbatched single-user serving is expensive and why
+    continuous batching is not an optimization but the difference between a viable and an
+    unviable product. (The $3.00 rental price is an assumption, not a measurement. The
+    throughput figures are measured on this repository's H100 80GB.)</p>
+  </div>
+</div>
+
+<div class="problem">
+  <span class="plabel">Problem 4</span>
+  <p>
+  A RAG system has a 4000-token budget for retrieved passages and chunks documents at 512
+  tokens each. (a) How many chunks fit? (b) A query has 3 relevant chunks in the corpus. The
+  bi-encoder retrieves 20 candidates, of which 2 are relevant. Compute retrieval recall,
+  precision, and F1. (c) A cross-encoder reranks the 20 down to 5, and both relevant chunks
+  land in the top 5. Recompute recall, precision, and F1, and explain what reranking bought.
+  </p>
+  <div class="solution">
+    <p><strong>Solution.</strong> <em>(a)</em> \( \lfloor 4000 / 512 \rfloor = 7 \) chunks fit
+    in budget (with a little room to spare). The prompt can hold at most 7 retrieved passages,
+    so the reranker must select a handful, which is why retrieval returns a larger candidate set
+    than the prompt can use.</p>
+    <p><em>(b)</em> With 2 of 3 relevant chunks retrieved among 20 candidates,
+    recall \( = 2/3 = 0.667 \) and precision \( = 2/20 = 0.10 \). F1
+    \( = 2 \cdot \frac{0.667 \times 0.10}{0.667 + 0.10} = 2 \cdot \frac{0.0667}{0.767} = 0.174 \).
+    Recall is decent and precision is poor. The top-20 is mostly noise, appropriate for a cheap
+    first stage whose job is to not miss relevant passages, not to be precise.</p>
+    <p><em>(c)</em> After reranking to 5 with both relevant chunks retained,
+    recall \( = 2/3 = 0.667 \) (unchanged, since the reranker cannot recover a chunk the retriever
+    missed), precision \( = 2/5 = 0.40 \), F1
+    \( = 2 \cdot \frac{0.667 \times 0.40}{0.667 + 0.40} = 2 \cdot \frac{0.267}{1.067} = 0.50 \).
+    Reranking left recall fixed and quadrupled precision (0.10 to 0.40), nearly tripling F1
+    (0.174 to 0.50), by promoting the relevant chunks above the noise. This is the division of
+    labor. The bi-encoder maximizes recall cheaply over millions of chunks, and the cross-encoder
+    maximizes precision expensively over a hundred. Note that no reranker fixes the missing
+    third chunk. That ceiling is set by the retriever and by chunking, which is why recall@\( N \)
+    of the first stage is the number to watch.</p>
+  </div>
+</div>
+
+<h2>Implementation</h2>
+<p>
+The first block implements a LoRA linear layer from scratch in PyTorch and JAX, a frozen base
+matmul plus the scaled low-rank path, with \( B \) initialized to zero so the adapted layer
+starts identical to the base. The shapes are annotated. Note that only \( A \) and \( B \)
+carry gradients.
+</p>
+<div class="code-tabs">
+  <div class="lang-row">
+    <button data-lang="pytorch" class="active">PyTorch</button>
+    <button data-lang="jax">JAX</button>
+  <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+  <pre data-lang="pytorch" class="shl lang active"><code class="language-python"><span class="k">import</span> <span class="m1">torch</span>
+<span class="k">import</span> <span class="m1">torch</span>.<span class="m2">nn</span> <span class="k">as</span> <span class="m1">nn</span>
+
+<span class="k">class</span> <span class="m1">LoRALinear</span><span class="b0">(</span><span class="m1">nn</span>.<span class="m1">Module</span><span class="b0">)</span>:
+    <span class="c"># y = x W0^T + (alpha/r) x A^T B^T ,  W0 frozen</span>
+    <span class="k">def</span> <span class="m1">__init__</span><span class="b0">(</span><span class="k">self</span>, <span class="v5">d_in</span>, <span class="v4">d_out</span>, <span class="v2">r</span>=<span class="n">16</span>, <span class="v5">alpha</span>=<span class="n">32</span><span class="b0">)</span>:
+        <span class="m1">super</span><span class="b0">()</span>.<span class="m1">__init__</span><span class="b0">()</span>
+        <span class="k">self</span>.<span class="m2">W0</span> = <span class="m1">nn</span>.<span class="m2">Linear</span><span class="b0">(</span><span class="v5">d_in</span>, <span class="v4">d_out</span>, <span class="v4">bias</span>=<span class="k">False</span><span class="b0">)</span>
+        <span class="k">self</span>.<span class="m2">W0</span>.<span class="m2">weight</span>.<span class="m2">requires_grad_</span><span class="b0">(</span><span class="k">False</span><span class="b0">)</span>        <span class="c"># base is frozen</span>
+        <span class="k">self</span>.<span class="m2">A</span> = <span class="m1">nn</span>.<span class="m2">Parameter</span><span class="b0">(</span><span class="m1">torch</span>.<span class="m2">randn</span><span class="b1">(</span><span class="v2">r</span>, <span class="v5">d_in</span><span class="b1">)</span> / <span class="b1">(</span><span class="v2">r</span> ** <span class="n">0.5</span><span class="b1">)</span><span class="b0">)</span>  <span class="c"># (r, d_in)</span>
+        <span class="k">self</span>.<span class="m2">B</span> = <span class="m1">nn</span>.<span class="m2">Parameter</span><span class="b0">(</span><span class="m1">torch</span>.<span class="m2">zeros</span><span class="b1">(</span><span class="v4">d_out</span>, <span class="v2">r</span><span class="b1">)</span><span class="b0">)</span>              <span class="c"># (d_out, r), starts at 0</span>
+        <span class="k">self</span>.<span class="m2">scale</span> = <span class="v5">alpha</span> / <span class="v2">r</span>
+
+    <span class="k">def</span> <span class="m1">forward</span><span class="b0">(</span><span class="k">self</span>, <span class="v4">x</span><span class="b0">)</span>:                <span class="c"># x: (batch, d_in)</span>
+        <span class="v0">base</span> = <span class="k">self</span>.<span class="m2">W0</span><span class="b0">(</span><span class="v4">x</span><span class="b0">)</span>                <span class="c"># (batch, d_out), frozen path</span>
+        <span class="v3">lora</span> = <span class="b0">(</span><span class="v4">x</span> @ <span class="k">self</span>.<span class="m2">A</span>.<span class="m2">T</span><span class="b0">)</span> @ <span class="k">self</span>.<span class="m2">B</span>.<span class="m2">T</span> <span class="c"># (batch, r) then (batch, d_out)</span>
+        <span class="k">return</span> <span class="v0">base</span> + <span class="k">self</span>.<span class="m2">scale</span> * <span class="v3">lora</span>
+
+<span class="c"># sanity: at init B=0 so the layer equals its frozen base</span>
+<span class="m1">layer</span> = <span class="m1">LoRALinear</span><span class="b0">(</span><span class="n">4096</span>, <span class="n">4096</span>, <span class="v2">r</span>=<span class="n">16</span>, <span class="v5">alpha</span>=<span class="n">32</span><span class="b0">)</span>
+<span class="v4">x</span> = <span class="m1">torch</span>.<span class="m2">randn</span><span class="b0">(</span><span class="n">8</span>, <span class="n">4096</span><span class="b0">)</span>
+<span class="k">assert</span> <span class="m1">torch</span>.<span class="m2">allclose</span><span class="b0">(</span><span class="m1">layer</span><span class="b1">(</span><span class="v4">x</span><span class="b1">)</span>, <span class="m1">layer</span>.<span class="m2">W0</span><span class="b1">(</span><span class="v4">x</span><span class="b1">)</span>, <span class="v2">atol</span>=<span class="n">1e-5</span><span class="b0">)</span>
+<span class="v4">trainable</span> = <span class="m1">sum</span><span class="b0">(</span><span class="v6">p</span>.<span class="m2">numel</span><span class="b1">()</span> <span class="k">for</span> <span class="v6">p</span> <span class="k">in</span> <span class="m1">layer</span>.<span class="m2">parameters</span><span class="b1">()</span> <span class="k">if</span> <span class="v6">p</span>.<span class="m2">requires_grad</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">"trainable params:"</span>, <span class="v4">trainable</span><span class="b0">)</span>   <span class="c"># 16*(4096+4096) = 131072</span>
+</code></pre>
+  <pre data-lang="jax" class="shl lang"><code class="language-python"><span class="k">import</span> <span class="m1">jax</span>, <span class="m1">jax</span>.<span class="m2">numpy</span> <span class="k">as</span> <span class="m1">jnp</span>
+<span class="k">from</span> <span class="m1">flax</span> <span class="k">import</span> <span class="m1">linen</span> <span class="k">as</span> <span class="m1">nn</span>
+
+<span class="k">class</span> <span class="m1">LoRALinear</span><span class="b0">(</span><span class="m1">nn</span>.<span class="m1">Module</span><span class="b0">)</span>:
+    <span class="v4">d_out</span>: <span class="m1">int</span>
+    <span class="v2">r</span>: <span class="m1">int</span> = <span class="n">16</span>
+    <span class="v5">alpha</span>: <span class="m1">float</span> = <span class="n">32.0</span>
+
+    <span class="m1">@nn.compact</span>
+    <span class="k">def</span> <span class="m1">__call__</span><span class="b0">(</span><span class="k">self</span>, <span class="v4">x</span><span class="b0">)</span>:               <span class="c"># x: (batch, d_in)</span>
+        <span class="v5">d_in</span> = <span class="v4">x</span>.<span class="m2">shape</span><span class="b0">[</span>-<span class="n">1</span><span class="b0">]</span>
+        <span class="c"># frozen base: mark non-trainable by stopping its gradient</span>
+        <span class="v2">W0</span> = <span class="k">self</span>.<span class="m2">param</span><span class="b0">(</span><span class="s">"W0"</span>, <span class="m1">nn</span>.<span class="m2">initializers</span>.<span class="m2">lecun_normal</span><span class="b1">()</span>, <span class="b1">(</span><span class="v5">d_in</span>, <span class="k">self</span>.<span class="m2">d_out</span><span class="b1">)</span><span class="b0">)</span>
+        <span class="v2">W0</span> = <span class="m1">jax</span>.<span class="m2">lax</span>.<span class="m2">stop_gradient</span><span class="b0">(</span><span class="v2">W0</span><span class="b0">)</span>
+        <span class="v6">A</span> = <span class="k">self</span>.<span class="m2">param</span><span class="b0">(</span><span class="s">"A"</span>, <span class="k">lambda</span> <span class="v6">k</span>, <span class="v4">s</span>: <span class="m1">jax</span>.<span class="m2">random</span>.<span class="m2">normal</span><span class="b1">(</span><span class="v6">k</span>, <span class="v4">s</span><span class="b1">)</span> / <span class="b1">(</span><span class="k">self</span>.<span class="m2">r</span> ** <span class="n">0.5</span><span class="b1">)</span>,
+                       <span class="b1">(</span><span class="k">self</span>.<span class="m2">r</span>, <span class="v5">d_in</span><span class="b1">)</span><span class="b0">)</span>    <span class="c"># (r, d_in)</span>
+        <span class="v0">B</span> = <span class="k">self</span>.<span class="m2">param</span><span class="b0">(</span><span class="s">"B"</span>, <span class="m1">nn</span>.<span class="m2">initializers</span>.<span class="m2">zeros</span>, <span class="b1">(</span><span class="k">self</span>.<span class="m2">d_out</span>, <span class="k">self</span>.<span class="m2">r</span><span class="b1">)</span><span class="b0">)</span>  <span class="c"># (d_out, r)</span>
+        <span class="v0">base</span> = <span class="v4">x</span> @ <span class="v2">W0</span>                      <span class="c"># (batch, d_out)</span>
+        <span class="v3">lora</span> = <span class="b0">(</span><span class="v4">x</span> @ <span class="v6">A</span>.<span class="m2">T</span><span class="b0">)</span> @ <span class="v0">B</span>.<span class="m2">T</span>             <span class="c"># (batch, r) then (batch, d_out)</span>
+        <span class="k">return</span> <span class="v0">base</span> + <span class="b0">(</span><span class="k">self</span>.<span class="m2">alpha</span> / <span class="k">self</span>.<span class="m2">r</span><span class="b0">)</span> * <span class="v3">lora</span>
+
+<span class="v4">key</span> = <span class="m1">jax</span>.<span class="m2">random</span>.<span class="m2">PRNGKey</span><span class="b0">(</span><span class="n">0</span><span class="b0">)</span>
+<span class="v0">model</span> = <span class="m1">LoRALinear</span><span class="b0">(</span><span class="v4">d_out</span>=<span class="n">4096</span>, <span class="v2">r</span>=<span class="n">16</span>, <span class="v5">alpha</span>=<span class="n">32.0</span><span class="b0">)</span>
+<span class="v4">x</span> = <span class="m1">jax</span>.<span class="m2">random</span>.<span class="m2">normal</span><span class="b0">(</span><span class="v4">key</span>, <span class="b1">(</span><span class="n">8</span>, <span class="n">4096</span><span class="b1">)</span><span class="b0">)</span>
+<span class="v1">params</span> = <span class="v0">model</span>.<span class="m2">init</span><span class="b0">(</span><span class="v4">key</span>, <span class="v4">x</span><span class="b0">)</span>
+<span class="c"># at init B=0, so output equals the frozen base path</span>
+<span class="v0">base</span> = <span class="v4">x</span> @ <span class="m1">jax</span>.<span class="m2">lax</span>.<span class="m2">stop_gradient</span><span class="b0">(</span><span class="v1">params</span><span class="b1">[</span><span class="s">"params"</span><span class="b1">][</span><span class="s">"W0"</span><span class="b1">]</span><span class="b0">)</span>
+<span class="k">assert</span> <span class="m1">jnp</span>.<span class="m2">allclose</span><span class="b0">(</span><span class="v0">model</span>.<span class="m2">apply</span><span class="b1">(</span><span class="v1">params</span>, <span class="v4">x</span><span class="b1">)</span>, <span class="v0">base</span>, <span class="v2">atol</span>=<span class="n">1e-4</span><span class="b0">)</span>
+</code></pre>
+</div>
+
+<p>
+The second block implements the DPO loss in both frameworks. The inputs are per-sequence summed
+log-probabilities of the chosen and rejected completions under the trainable policy and the
+frozen reference. The loss is the negative log-sigmoid of the \( \beta \)-scaled difference of
+implicit rewards, exactly the closed form derived above.
+</p>
+<div class="code-tabs">
+  <div class="lang-row">
+    <button data-lang="pytorch" class="active">PyTorch</button>
+    <button data-lang="jax">JAX</button>
+  <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+  <pre data-lang="pytorch" class="shl lang active"><code class="language-python"><span class="k">import</span> <span class="m1">torch</span>
+<span class="k">import</span> <span class="m1">torch</span>.<span class="m2">nn</span>.<span class="m2">functional</span> <span class="k">as</span> <span class="m1">F</span>
+
+<span class="k">def</span> <span class="m1">dpo_loss</span><span class="b0">(</span><span class="v4">logp_w</span>, <span class="v5">logp_l</span>, <span class="v0">ref_logp_w</span>, <span class="v3">ref_logp_l</span>, <span class="v4">beta</span>=<span class="n">0.1</span><span class="b0">)</span>:
+    <span class="c"># all args: (batch,) summed log-probs of the full completion</span>
+    <span class="v5">rhat_w</span> = <span class="v4">beta</span> * <span class="b0">(</span><span class="v4">logp_w</span> - <span class="v0">ref_logp_w</span><span class="b0">)</span>   <span class="c"># implicit reward, chosen</span>
+    <span class="v0">rhat_l</span> = <span class="v4">beta</span> * <span class="b0">(</span><span class="v5">logp_l</span> - <span class="v3">ref_logp_l</span><span class="b0">)</span>   <span class="c"># implicit reward, rejected</span>
+    <span class="v6">margin</span> = <span class="v5">rhat_w</span> - <span class="v0">rhat_l</span>                 <span class="c"># (batch,)</span>
+    <span class="v6">loss</span> = -<span class="m1">F</span>.<span class="m2">logsigmoid</span><span class="b0">(</span><span class="v6">margin</span><span class="b0">)</span>.<span class="m2">mean</span><span class="b0">()</span>      <span class="c"># -log sigma(margin)</span>
+    <span class="v6">acc</span> = <span class="b0">(</span><span class="v6">margin</span> &gt; <span class="n">0</span><span class="b0">)</span>.<span class="m2">float</span><span class="b0">()</span>.<span class="m2">mean</span><span class="b0">()</span>        <span class="c"># fraction ranked correctly</span>
+    <span class="k">return</span> <span class="v6">loss</span>, <span class="v6">acc</span>
+
+<span class="c"># reproduce Problem 2</span>
+<span class="v4">logp_w</span> = <span class="m1">torch</span>.<span class="m2">tensor</span><span class="b0">(</span><span class="b1">[</span>-<span class="n">12.0</span><span class="b1">]</span><span class="b0">)</span>; <span class="v3">ref_w</span> = <span class="m1">torch</span>.<span class="m2">tensor</span><span class="b0">(</span><span class="b1">[</span>-<span class="n">13.0</span><span class="b1">]</span><span class="b0">)</span>
+<span class="v5">logp_l</span> = <span class="m1">torch</span>.<span class="m2">tensor</span><span class="b0">(</span><span class="b1">[</span>-<span class="n">15.0</span><span class="b1">]</span><span class="b0">)</span>; <span class="v6">ref_l</span> = <span class="m1">torch</span>.<span class="m2">tensor</span><span class="b0">(</span><span class="b1">[</span>-<span class="n">14.0</span><span class="b1">]</span><span class="b0">)</span>
+<span class="v6">loss</span>, <span class="v6">acc</span> = <span class="m1">dpo_loss</span><span class="b0">(</span><span class="v4">logp_w</span>, <span class="v5">logp_l</span>, <span class="v3">ref_w</span>, <span class="v6">ref_l</span>, <span class="v4">beta</span>=<span class="n">0.1</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="m1">float</span><span class="b1">(</span><span class="v6">loss</span><span class="b1">)</span>, <span class="m1">float</span><span class="b1">(</span><span class="v6">acc</span><span class="b1">)</span><span class="b0">)</span>   <span class="c"># ~0.598, 1.0</span>
+</code></pre>
+  <pre data-lang="jax" class="shl lang"><code class="language-python"><span class="k">import</span> <span class="m1">jax</span>.<span class="m2">numpy</span> <span class="k">as</span> <span class="m1">jnp</span>
+<span class="k">import</span> <span class="m1">jax</span>.<span class="m2">nn</span> <span class="k">as</span> <span class="m1">jnn</span>
+
+<span class="k">def</span> <span class="m1">dpo_loss</span><span class="b0">(</span><span class="v4">logp_w</span>, <span class="v5">logp_l</span>, <span class="v0">ref_logp_w</span>, <span class="v3">ref_logp_l</span>, <span class="v4">beta</span>=<span class="n">0.1</span><span class="b0">)</span>:
+    <span class="c"># all args: (batch,) summed log-probs of the full completion</span>
+    <span class="v5">rhat_w</span> = <span class="v4">beta</span> * <span class="b0">(</span><span class="v4">logp_w</span> - <span class="v0">ref_logp_w</span><span class="b0">)</span>    <span class="c"># implicit reward, chosen</span>
+    <span class="v0">rhat_l</span> = <span class="v4">beta</span> * <span class="b0">(</span><span class="v5">logp_l</span> - <span class="v3">ref_logp_l</span><span class="b0">)</span>    <span class="c"># implicit reward, rejected</span>
+    <span class="v6">margin</span> = <span class="v5">rhat_w</span> - <span class="v0">rhat_l</span>
+    <span class="v6">loss</span> = -<span class="m1">jnp</span>.<span class="m2">mean</span><span class="b0">(</span><span class="m1">jnn</span>.<span class="m2">log_sigmoid</span><span class="b1">(</span><span class="v6">margin</span><span class="b1">)</span><span class="b0">)</span>
+    <span class="v6">acc</span> = <span class="m1">jnp</span>.<span class="m2">mean</span><span class="b0">(</span><span class="b1">(</span><span class="v6">margin</span> &gt; <span class="n">0</span><span class="b1">)</span>.<span class="m2">astype</span><span class="b1">(</span><span class="m1">jnp</span>.<span class="m2">float32</span><span class="b1">)</span><span class="b0">)</span>
+    <span class="k">return</span> <span class="v6">loss</span>, <span class="v6">acc</span>
+
+<span class="v4">logp_w</span> = <span class="m1">jnp</span>.<span class="m2">array</span><span class="b0">(</span><span class="b1">[</span>-<span class="n">12.0</span><span class="b1">]</span><span class="b0">)</span>; <span class="v3">ref_w</span> = <span class="m1">jnp</span>.<span class="m2">array</span><span class="b0">(</span><span class="b1">[</span>-<span class="n">13.0</span><span class="b1">]</span><span class="b0">)</span>
+<span class="v5">logp_l</span> = <span class="m1">jnp</span>.<span class="m2">array</span><span class="b0">(</span><span class="b1">[</span>-<span class="n">15.0</span><span class="b1">]</span><span class="b0">)</span>; <span class="v6">ref_l</span> = <span class="m1">jnp</span>.<span class="m2">array</span><span class="b0">(</span><span class="b1">[</span>-<span class="n">14.0</span><span class="b1">]</span><span class="b0">)</span>
+<span class="v6">loss</span>, <span class="v6">acc</span> = <span class="m1">dpo_loss</span><span class="b0">(</span><span class="v4">logp_w</span>, <span class="v5">logp_l</span>, <span class="v3">ref_w</span>, <span class="v6">ref_l</span>, <span class="v4">beta</span>=<span class="n">0.1</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="m1">float</span><span class="b1">(</span><span class="v6">loss</span><span class="b1">)</span>, <span class="m1">float</span><span class="b1">(</span><span class="v6">acc</span><span class="b1">)</span><span class="b0">)</span>   <span class="c"># ~0.598, 1.0</span>
+</code></pre>
+</div>
+
+<p>
+The third block is a minimal end-to-end RAG pipeline in NumPy. It embeds a small corpus, retrieves
+the top-\( k \) by cosine similarity, and assembles a grounded prompt. It uses a toy hashing
+embedder so it runs with no downloads. In production the embedder is a trained dense encoder
+and the linear scan is replaced by an approximate index (see the
+<a href="/classes/databases/">databases</a> page).
+</p>
+<div class="code-tabs">
+  <div class="lang-row">
+    <button data-lang="python" class="active">Python</button>
+  <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+  <pre data-lang="python" class="shl lang active"><code class="language-python"><span class="k">import</span> <span class="m1">numpy</span> <span class="k">as</span> <span class="m1">np</span>
+
+<span class="k">def</span> <span class="m1">embed</span><span class="b0">(</span><span class="v1">text</span>, <span class="v5">dim</span>=<span class="n">256</span><span class="b0">)</span>:
+    <span class="c"># toy bag-of-hashed-tokens embedder; stands in for a trained encoder</span>
+    <span class="v3">v</span> = <span class="m1">np</span>.<span class="m2">zeros</span><span class="b0">(</span><span class="v5">dim</span><span class="b0">)</span>
+    <span class="k">for</span> <span class="v1">tok</span> <span class="k">in</span> <span class="v1">text</span>.<span class="m2">lower</span><span class="b0">()</span>.<span class="m2">split</span><span class="b0">()</span>:
+        <span class="v3">v</span><span class="b0">[</span><span class="m1">hash</span><span class="b1">(</span><span class="v1">tok</span><span class="b1">)</span> % <span class="v5">dim</span><span class="b0">]</span> += <span class="n">1.0</span>
+    <span class="v5">n</span> = <span class="m1">np</span>.<span class="m2">linalg</span>.<span class="m2">norm</span><span class="b0">(</span><span class="v3">v</span><span class="b0">)</span>
+    <span class="k">return</span> <span class="v3">v</span> / <span class="v5">n</span> <span class="k">if</span> <span class="v5">n</span> &gt; <span class="n">0</span> <span class="k">else</span> <span class="v3">v</span>
+
+<span class="v3">corpus</span> = <span class="b0">[</span>
+    <span class="s">"The H100 GPU has 80 GB of HBM3 memory."</span>,
+    <span class="s">"LoRA freezes the base model and trains low-rank adapters."</span>,
+    <span class="s">"Continuous batching amortizes weight reads across many sequences."</span>,
+    <span class="s">"Paris is the capital of France."</span>,
+<span class="b0">]</span>
+<span class="v2">emb</span> = <span class="m1">np</span>.<span class="m2">stack</span><span class="b0">(</span><span class="b1">[</span><span class="m1">embed</span><span class="b2">(</span><span class="v1">c</span><span class="b2">)</span> <span class="k">for</span> <span class="v1">c</span> <span class="k">in</span> <span class="v3">corpus</span><span class="b1">]</span><span class="b0">)</span>       <span class="c"># (n_docs, dim)</span>
+
+<span class="k">def</span> <span class="m1">retrieve</span><span class="b0">(</span><span class="v4">query</span>, <span class="v6">k</span>=<span class="n">2</span><span class="b0">)</span>:
+    <span class="v1">q</span> = <span class="m1">embed</span><span class="b0">(</span><span class="v4">query</span><span class="b0">)</span>                              <span class="c"># (dim,)</span>
+    <span class="v2">sims</span> = <span class="v2">emb</span> @ <span class="v1">q</span>                                <span class="c"># (n_docs,) cosine, since normalized</span>
+    <span class="v3">topk</span> = <span class="m1">np</span>.<span class="m2">argsort</span><span class="b0">(</span>-<span class="v2">sims</span><span class="b0">)[</span>:<span class="v6">k</span><span class="b0">]</span>                  <span class="c"># indices of k best</span>
+    <span class="k">return</span> <span class="b0">[</span><span class="b1">(</span><span class="v3">corpus</span><span class="b2">[</span><span class="v3">i</span><span class="b2">]</span>, <span class="m1">float</span><span class="b2">(</span><span class="v2">sims</span><span class="b0">[</span><span class="v3">i</span><span class="b0">]</span><span class="b2">)</span><span class="b1">)</span> <span class="k">for</span> <span class="v3">i</span> <span class="k">in</span> <span class="v3">topk</span><span class="b0">]</span>
+
+<span class="k">def</span> <span class="m1">build_prompt</span><span class="b0">(</span><span class="v4">query</span>, <span class="v6">k</span>=<span class="n">2</span><span class="b0">)</span>:
+    <span class="v6">hits</span> = <span class="m1">retrieve</span><span class="b0">(</span><span class="v4">query</span>, <span class="v6">k</span><span class="b0">)</span>
+    <span class="v3">context</span> = <span class="s">"\n"</span>.<span class="m2">join</span><span class="b0">(</span><span class="s">f"[{</span><span class="v3">i</span>+<span class="n">1</span><span class="s">}] {</span><span class="v5">doc</span><span class="s">}"</span> <span class="k">for</span> <span class="v3">i</span>, <span class="b1">(</span><span class="v5">doc</span>, <span class="v4">_</span><span class="b1">)</span> <span class="k">in</span> <span class="m1">enumerate</span><span class="b1">(</span><span class="v6">hits</span><span class="b1">)</span><span class="b0">)</span>
+    <span class="k">return</span> <span class="s">f"Context:\n{</span><span class="v3">context</span><span class="s">}\n\nQuestion: {</span><span class="v4">query</span><span class="s">}\nAnswer using only the context."</span>
+
+<span class="m1">print</span><span class="b0">(</span><span class="m1">retrieve</span><span class="b1">(</span><span class="s">"how much memory does the H100 have"</span>, <span class="v6">k</span>=<span class="n">2</span><span class="b1">)</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="m1">build_prompt</span><span class="b1">(</span><span class="s">"what does LoRA train"</span>, <span class="v6">k</span>=<span class="n">2</span><span class="b1">)</span><span class="b0">)</span>
+</code></pre>
+</div>
+
+<p>
+The fourth block demonstrates constrained decoding, with a finite-state machine for a small grammar
+(a signed integer, then a decimal point and digits) and a per-step logit mask that zeroes out
+any token whose character cannot legally follow the text produced so far. This is the
+finite-state kernel of the Outlines approach, on a character vocabulary for clarity.
+</p>
+<div class="code-tabs">
+  <div class="lang-row">
+    <button data-lang="python" class="active">Python</button>
+  <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+  <pre data-lang="python" class="shl lang active"><code class="language-python"><span class="k">import</span> <span class="m1">numpy</span> <span class="k">as</span> <span class="m1">np</span>
+
+<span class="c"># Grammar: optional '-', one or more digits, optional ('.' one or more digits).</span>
+<span class="c"># States: START, INT (in integer part), DOT (just saw '.'), FRAC (in fraction).</span>
+<span class="v6">VOCAB</span> = <span class="m1">list</span><span class="b0">(</span><span class="s">"0123456789.-"</span><span class="b0">)</span>             <span class="c"># character vocabulary</span>
+<span class="v3">DIGITS</span> = <span class="m1">set</span><span class="b0">(</span><span class="s">"0123456789"</span><span class="b0">)</span>
+
+<span class="k">def</span> <span class="m1">allowed</span><span class="b0">(</span><span class="v6">state</span>, <span class="v0">seen_frac_digit</span><span class="b0">)</span>:
+    <span class="c"># return the set of characters that keep the string grammar-valid</span>
+    <span class="k">if</span> <span class="v6">state</span> == <span class="s">"START"</span>:
+        <span class="k">return</span> <span class="v3">DIGITS</span> | <span class="b0">{</span><span class="s">"-"</span><span class="b0">}</span>
+    <span class="k">if</span> <span class="v6">state</span> == <span class="s">"INT"</span>:
+        <span class="k">return</span> <span class="v3">DIGITS</span> | <span class="b0">{</span><span class="s">"."</span><span class="b0">}</span>            <span class="c"># more digits, or start a fraction</span>
+    <span class="k">if</span> <span class="v6">state</span> == <span class="s">"DOT"</span>:
+        <span class="k">return</span> <span class="v3">DIGITS</span>                    <span class="c"># must have at least one fraction digit</span>
+    <span class="k">if</span> <span class="v6">state</span> == <span class="s">"FRAC"</span>:
+        <span class="k">return</span> <span class="v3">DIGITS</span>                    <span class="c"># more fraction digits only</span>
+    <span class="k">return</span> <span class="m1">set</span><span class="b0">()</span>
+
+<span class="k">def</span> <span class="m1">step</span><span class="b0">(</span><span class="v6">state</span>, <span class="v2">ch</span><span class="b0">)</span>:
+    <span class="k">if</span> <span class="v6">state</span> <span class="k">in</span> <span class="b0">(</span><span class="s">"START"</span>, <span class="s">"INT"</span><span class="b0">)</span>:
+        <span class="k">if</span> <span class="v2">ch</span> <span class="k">in</span> <span class="v3">DIGITS</span>: <span class="k">return</span> <span class="s">"INT"</span>
+        <span class="k">if</span> <span class="v2">ch</span> == <span class="s">"-"</span>:    <span class="k">return</span> <span class="s">"INT"</span> <span class="k">if</span> <span class="v6">state</span> == <span class="s">"START"</span> <span class="k">else</span> <span class="v6">state</span>
+        <span class="k">if</span> <span class="v2">ch</span> == <span class="s">"."</span> <span class="k">and</span> <span class="v6">state</span> == <span class="s">"INT"</span>: <span class="k">return</span> <span class="s">"DOT"</span>
+    <span class="k">if</span> <span class="v6">state</span> <span class="k">in</span> <span class="b0">(</span><span class="s">"DOT"</span>, <span class="s">"FRAC"</span><span class="b0">)</span> <span class="k">and</span> <span class="v2">ch</span> <span class="k">in</span> <span class="v3">DIGITS</span>:
+        <span class="k">return</span> <span class="s">"FRAC"</span>
+    <span class="k">raise</span> <span class="m1">ValueError</span><span class="b0">(</span><span class="s">"illegal transition"</span><span class="b0">)</span>
+
+<span class="k">def</span> <span class="m1">mask_logits</span><span class="b0">(</span><span class="v6">logits</span>, <span class="v6">state</span><span class="b0">)</span>:
+    <span class="c"># set logits of disallowed tokens to -inf so sampling can never pick them</span>
+    <span class="v6">ok</span> = <span class="m1">allowed</span><span class="b0">(</span><span class="v6">state</span>, <span class="k">None</span><span class="b0">)</span>
+    <span class="v4">masked</span> = <span class="v6">logits</span>.<span class="m2">copy</span><span class="b0">()</span>
+    <span class="k">for</span> <span class="v3">i</span>, <span class="v2">ch</span> <span class="k">in</span> <span class="m1">enumerate</span><span class="b0">(</span><span class="v6">VOCAB</span><span class="b0">)</span>:
+        <span class="k">if</span> <span class="v2">ch</span> <span class="k">not</span> <span class="k">in</span> <span class="v6">ok</span>:
+            <span class="v4">masked</span><span class="b0">[</span><span class="v3">i</span><span class="b0">]</span> = -<span class="m1">np</span>.<span class="m2">inf</span>
+    <span class="k">return</span> <span class="v4">masked</span>
+
+<span class="c"># greedy-decode a grammar-valid number from arbitrary raw logits</span>
+<span class="v4">rng</span> = <span class="m1">np</span>.<span class="m2">random</span>.<span class="m2">default_rng</span><span class="b0">(</span><span class="n">0</span><span class="b0">)</span>
+<span class="v6">state</span>, <span class="v2">out</span> = <span class="s">"START"</span>, <span class="s">""</span>
+<span class="k">for</span> <span class="v4">_</span> <span class="k">in</span> <span class="m1">range</span><span class="b0">(</span><span class="n">6</span><span class="b0">)</span>:
+    <span class="v6">logits</span> = <span class="v4">rng</span>.<span class="m2">normal</span><span class="b0">(</span><span class="v6">size</span>=<span class="m1">len</span><span class="b1">(</span><span class="v6">VOCAB</span><span class="b1">)</span><span class="b0">)</span>
+    <span class="v4">m</span> = <span class="m1">mask_logits</span><span class="b0">(</span><span class="v6">logits</span>, <span class="v6">state</span><span class="b0">)</span>
+    <span class="v2">ch</span> = <span class="v6">VOCAB</span><span class="b0">[</span><span class="m1">int</span><span class="b1">(</span><span class="m1">np</span>.<span class="m2">argmax</span><span class="b2">(</span><span class="v4">m</span><span class="b2">)</span><span class="b1">)</span><span class="b0">]</span>        <span class="c"># best *legal* token</span>
+    <span class="v2">out</span> += <span class="v2">ch</span>
+    <span class="v6">state</span> = <span class="m1">step</span><span class="b0">(</span><span class="v6">state</span>, <span class="v2">ch</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="v2">out</span><span class="b0">)</span>   <span class="c"># always a valid signed number, e.g. "-3.72" or "580"</span>
+</code></pre>
+</div>
+
+<h2>How it is done in practice</h2>
+<p>
+The gap between these derivations and a deployed system is mostly plumbing, and the plumbing is
+where the reliability lives. Fine-tuning in practice is almost never full fine-tuning. The
+default is LoRA or QLoRA through a library like Hugging Face PEFT, with the base model quantized
+by bitsandbytes and the training loop wrapped by TRL for the DPO or SFT objective. The
+practitioner's decisions are which layers to adapt (attention projections are cheapest, while
+adapting the MLP too costs more but helps on harder shifts), the rank (8 to 64 covers most
+cases, and higher ranks rarely help and risk overfitting small datasets), and the learning rate
+(LoRA tolerates larger learning rates than full fine-tuning because the update is
+constrained). A common failure is forgetting that a merged adapter bakes in the base's dtype.
+Merge a QLoRA adapter into a 4-bit base and the merge is lossy, so people merge into a
+dequantized base and re-quantize.
+</p>
+<p>
+Serving in practice means vLLM, TensorRT-LLM, or a similar engine, not a bare model forward.
+The engine implements continuous batching and paged KV cache so that the 250-fold throughput
+spread from Problem 3 is actually captured, and it applies a serving quantization (FP8 or 4-bit
+weight-only via GPTQ/AWQ) chosen against the accuracy budget. The KV cache is usually the
+binding constraint at scale, so paged attention (which stores the cache in fixed-size blocks
+like OS pages, eliminating the fragmentation that fixed per-sequence slots cause) and KV
+quantization together set the achievable batch size, and therefore the cost. The prefill/decode
+split shows up as a real scheduling problem. Prefill is a compute-heavy burst that can stall
+ongoing decodes, so engines chunk long prefills and interleave them with decode steps
+(chunked prefill) to keep tail latency bounded. Speculative decoding, a small draft model
+proposes several tokens that the large model verifies in one batched forward pass, is the main
+lever for cutting decode latency below the batch-1 roofline, because it turns several sequential
+memory-bound steps into one, at the cost of some wasted draft compute.
+</p>
+<p>
+RAG in practice is dominated by the unglamorous parts, such as chunking strategy, keeping the index
+fresh as documents change, and hybrid retrieval (dense plus BM25) because pure dense retrieval
+misses exact-match queries like error codes and part numbers. The reranker is often the highest-
+value single addition, because retrieval recall is usually fine and precision is what fails, as
+Problem 4 showed. Evaluation is run continuously. A held-out set of question-answer-source
+triples measures retrieval recall and answer faithfulness on every index or prompt change, so
+that a regression is caught before it ships. And the agent layer, tool calling in a loop, needs
+hard engineering around the model. That means schema validation on every tool call, timeouts and retries,
+sandboxed execution, and a strict step budget, because an unbounded agent loop is a way to spend
+money and hit rate limits with nothing to show. Constrained decoding is what makes the tool-call
+JSON parse every time rather than almost every time, which is the difference between a demo and a
+service.
+</p>
+
+<h2>The current research frontier</h2>
+<p>
+Parameter-efficient adaptation keeps getting sharper. DoRA (Liu et al., NVIDIA, 2024)
+decomposes the weight update into magnitude and direction and applies LoRA only to the
+direction, closing much of the remaining gap to full fine-tuning. VeRA (Kopiczko et al.,
+Amsterdam, 2024) shares frozen random \( A \) and \( B \) across layers and trains only tiny
+per-layer scaling vectors, cutting adapter parameters by another order of magnitude. On the
+quantization side, the frontier is sub-4-bit and quantization-aware pretraining. AQLM
+(Egiazarian et al., 2024) uses additive vector quantization to reach 2 to 3 bits with
+surprising quality, QuIP# (Cornell, 2024) uses incoherence processing and lattice codebooks,
+and the "1.58-bit" BitNet line (Microsoft Research, 2024) trains ternary-weight models from
+scratch, arguing that quantization belongs in pretraining rather than as a post-hoc step.
+</p>
+<p>
+Alignment beyond DPO is a crowded field. The direct-preference family has spawned IPO (Azar et
+al., DeepMind, 2023), which fixes DPO's tendency to overfit deterministic preferences, KTO
+(Ethayarajh et al., 2024), which learns from unpaired good/bad labels using a prospect-theory
+value function so it does not need preference pairs, and ORPO (Hong et al., 2024), which folds
+preference optimization into the SFT stage with no reference model at all. Meanwhile online and
+on-policy variants argue that DPO's offline nature is the real limitation and that a short RL
+phase, or on-policy preference sampling, recovers what DPO gives up. GRPO (DeepSeek, 2024) and
+the reasoning-model training that made it famous are treated on the
+<a href="/classes/deep-reinforcement-learning/">deep RL</a> page. Retrieval is moving toward
+learned, end-to-end pipelines, with late-interaction retrievers like ColBERT (Khattab and Zaharia,
+Stanford, 2020) that keep per-token embeddings for finer matching, and retrieval that is trained
+jointly with the generator rather than bolted on. Long-context models raise the question of
+whether RAG is even needed. The emerging answer is that retrieval and long context are
+complementary, since a 100k-token window still cannot hold a corporate wiki, and retrieval is
+cheaper than attending over everything. On serving, the research is in scheduling (disaggregated
+prefill and decode on separate hardware pools, as in DistServe and Splitwise) and in
+speculative decoding variants (Medusa's multiple heads, EAGLE's feature-level drafting) that
+push decode throughput past the single-model roofline.
+</p>
+
+<h2>Open source to read</h2>
+<ul>
+  <li><a href="https://github.com/huggingface/peft">huggingface/peft</a>, the reference
+    implementation of LoRA, DoRA, prefix tuning, and the adapter family. Read
+    <code>src/peft/tuners/lora/layer.py</code> to see the exact forward-pass reparametrization
+    and the merge logic.</li>
+  <li><a href="https://github.com/huggingface/trl">huggingface/trl</a>, which provides SFT, reward modeling,
+    PPO, and DPO trainers. Open <code>trl/trainer/dpo_trainer.py</code> and find the
+    concatenated-forward that computes chosen and rejected log-probs in one pass, and the loss
+    that matches the derivation above.</li>
+  <li><a href="https://github.com/artidoro/qlora">artidoro/qlora</a>, the original QLoRA code,
+    small enough to read end to end. <code>qlora.py</code> shows NF4 loading, the paged
+    optimizer, and the training loop.</li>
+  <li><a href="https://github.com/TimDettmers/bitsandbytes">TimDettmers/bitsandbytes</a>, the
+    4-bit and 8-bit kernels underneath QLoRA and LLM.int8(). The NF4 quantization and blockwise
+    double-quantization live in the CUDA sources under <code>csrc/</code>.</li>
+  <li><a href="https://github.com/vllm-project/vllm">vllm-project/vllm</a>, production serving
+    with paged attention and continuous batching. Start with the paged KV-cache block manager
+    and the scheduler to see how the throughput ceiling from Problem 3 is captured.</li>
+  <li><a href="https://github.com/outlines-dev/outlines">outlines-dev/outlines</a>, constrained
+    decoding via FSM compilation. Read the regex-to-FSM index construction to see how the
+    per-step allowed-token mask is precomputed and cached.</li>
+  <li><a href="https://github.com/run-llama/llama_index">run-llama/llama_index</a>, a full RAG
+    toolkit, good for seeing how chunking, indexing, retrieval, and reranking are composed into
+    a pipeline, and where the seams are.</li>
+  <li><a href="https://github.com/EleutherAI/lm-evaluation-harness">EleutherAI/lm-evaluation-harness</a>,
+    the standard benchmark harness. Read a task YAML and the log-likelihood scoring path to see
+    why formatting choices move scores.</li>
+</ul>
+
+<h2>Common misconceptions</h2>
+<p>
+<strong>"LoRA saves memory because it trains fewer parameters."</strong> It saves memory
+because it trains fewer parameters <em>and each trainable parameter carries 16 bytes of
+optimizer state while each frozen one carries 2</em>. The dominant term is the optimizer state
+(three fp32 tensors per trainable parameter), not the weights, which is why the saving is a
+factor of hundreds, not the factor implied by parameter count alone. Problem 1 makes this
+explicit, with 112 GB of state collapsing to 134 MB.
+</p>
+<p>
+<strong>"QLoRA quantizes the model, so it must hurt quality."</strong> QLoRA quantizes the
+<em>frozen base</em> to 4 bits during fine-tuning, but the adapters train in bf16 and the
+gradients flow through dequantized weights. The NF4 data type is matched to the Gaussian shape
+of weights, and the original paper matched 16-bit LoRA quality. The base's precision is a
+storage decision, not a capability ceiling.
+</p>
+<p>
+<strong>"DPO is just supervised fine-tuning on the chosen responses."</strong> It is not.
+Cloning the chosen response has no term that pushes the rejected one down, and no reference
+model. DPO's gradient contains the difference \( \nabla \log \pi_\theta(y_w) - \nabla \log
+\pi_\theta(y_l) \) weighted by a sigmoid that self-anneals as the pair is learned. It optimizes
+a <em>relative</em> preference against a frozen reference, which is why it changes behavior that
+plain SFT on the same chosen text does not.
+</p>
+<p>
+<strong>"A bigger GPU makes decoding faster."</strong> Batch-1 decode is bounded by memory
+bandwidth and model size, not FLOP throughput. A GPU with twice the FLOPs but the same
+bandwidth decodes a single stream no faster. The way to use more compute is to batch more
+sequences, up to the ridge point near \( B^* \approx 249 \). Throughput and per-stream latency
+are different axes.
+</p>
+<p>
+<strong>"RAG fixes hallucination."</strong> RAG grounds answers <em>when the relevant passage
+is retrieved and the model uses it</em>. It introduces two new failure modes, the retriever
+missing the passage (a recall problem no prompt fixes) and the generator ignoring or contradicting
+a retrieved passage (a faithfulness problem). Measuring these separately, as in Problem 4 and
+the RAG-evaluation discussion, is the only way to know which one is biting.
+</p>
+<p>
+<strong>"Constrained decoding makes the model smarter."</strong> It makes the output
+<em>parse</em>, not the content correct. Masking illegal tokens guarantees valid JSON or a
+grammar-conformant string, but the model can still fill valid structure with wrong values.
+Constrained decoding buys reliability of form, which is a real and necessary property for
+tool-calling, and nothing about the substance.
+</p>
+<p>
+<strong>"LLM-as-judge is objective because it is automated."</strong> It has measurable
+position bias, verbosity bias, and self-preference. It is a fast, cheap, biased instrument,
+useful for iteration and regression testing, and it must be debiased (order randomization,
+length control, multiple judges) and backstopped by human evaluation for any decision that
+matters.
+</p>
+
+<h2>Self-check</h2>
+<div class="quiz" data-quiz>
+  <script type="application/json" class="quiz-data">[
+    {"id": "q1", "qtype": "mcq",
+     "stem": "In LoRA, why is the low-rank matrix B initialized to zero while A is random?",
+     "options": ["To make the adapter untrainable at first", "So the update BA is zero at init, making the adapted model identical to the base on the first step", "Because zero matrices train faster", "To halve the memory of the adapter"],
+     "correctIndex": 1,
+     "explanation": "With B=0 the product BA is zero, so the adapter contributes nothing initially and training grows the update from a well-conditioned start; an untrained adapter never degrades the base."},
+    {"id": "q2", "qtype": "mcq",
+     "stem": "For a 7B model with AdamW, why does full fine-tuning need ~112 GB of state while LoRA needs ~134 MB of trainable state?",
+     "options": ["LoRA uses a smaller model", "The optimizer keeps ~16 bytes of state per trainable parameter, and LoRA makes almost nothing trainable", "LoRA stores weights in 4 bits", "Full fine-tuning duplicates the model four times"],
+     "correctIndex": 1,
+     "explanation": "AdamW keeps 16 bytes (weight, grad, fp32 master, m, v) per trainable parameter. LoRA freezes the base (no optimizer state) so only the ~8.4M adapter params carry that cost."},
+    {"id": "q3", "qtype": "mcq",
+     "stem": "What is the per-weight bit cost of NF4 with double quantization (block 64, scales re-quantized to 8-bit in groups of 256)?",
+     "options": ["4.0 bits", "4.5 bits", "4.127 bits", "5.0 bits"],
+     "correctIndex": 2,
+     "explanation": "4 + 8/64 + 32/(64*256) = 4 + 0.125 + 0.00195 = 4.127 bits/weight, down from 4.5 without double quantization."},
+    {"id": "q4", "qtype": "truefalse",
+     "stem": "The DPO loss requires a separately trained reward model at optimization time.",
+     "options": ["True", "False"],
+     "correctIndex": 1,
+     "explanation": "DPO's derivation shows the policy is its own implicit reward model; the loss is supervised classification on preference pairs against a frozen reference, with no reward model and no RL loop."},
+    {"id": "q5", "qtype": "mcq",
+     "stem": "In the DPO gradient, what does the sigmoid weight sigma(r_l - r_w) do as a pair becomes correctly ranked with margin?",
+     "options": ["Grows toward 1", "Stays constant", "Shrinks toward 0, so learned pairs get little gradient", "Becomes negative"],
+     "correctIndex": 2,
+     "explanation": "The weight decays toward zero once the implicit reward ranks the pair with margin, so DPO self-anneals and spends gradient on pairs it still gets wrong."},
+    {"id": "q6", "qtype": "mcq",
+     "stem": "Why is single-sequence (batch-1) LLM decode bounded by memory bandwidth rather than compute?",
+     "options": ["Because attention is quadratic", "Because each generated token must read every weight from HBM, and one token is too little arithmetic to hide that read", "Because the KV cache is in fp32", "Because the softmax is slow"],
+     "correctIndex": 1,
+     "explanation": "Decode is a sequence of matrix-vector products; to produce one token the hardware streams all weights once, so speed is set by bandwidth/model-size, not FLOP rate."},
+    {"id": "q7", "qtype": "mcq",
+     "stem": "The roofline ridge batch B* for decode on the measured H100 (728.7 TFLOP/s, 2930 GB/s) is about 249. What does batching beyond B* achieve?",
+     "options": ["Lower per-stream latency", "Nothing; throughput saturates at the compute-bound ceiling", "Higher memory bandwidth", "Smaller KV cache"],
+     "correctIndex": 1,
+     "explanation": "Below B* adding sequences is nearly free; above it decode is compute-bound and aggregate throughput saturates near 52,000 tok/s. B* is a hardware property (FLOP per byte)."},
+    {"id": "q8", "qtype": "truefalse",
+     "stem": "A cross-encoder reranker can raise retrieval recall by recovering relevant chunks the bi-encoder failed to return.",
+     "options": ["True", "False"],
+     "correctIndex": 1,
+     "explanation": "The reranker only reorders the candidates the retriever returned; it raises precision but cannot recover a relevant chunk that was never retrieved. Recall is set by the first stage and by chunking."},
+    {"id": "q9", "qtype": "mcq",
+     "stem": "What problem does SmoothQuant solve, and how?",
+     "options": ["Weight outliers, by pruning them", "Activation outliers, by migrating dynamic range from activations into weights via a per-channel diagonal rescaling", "Slow attention, by fusing kernels", "KV-cache size, by paging it"],
+     "correctIndex": 1,
+     "explanation": "SmoothQuant inserts X W = (X diag(s)^-1)(diag(s) W), which is identity on the product but shrinks activation outliers and enlarges weight rows, so both quantize well in INT8."},
+    {"id": "q10", "qtype": "mcq",
+     "stem": "In knowledge distillation, why is the softmax temperature T raised above 1?",
+     "options": ["To speed up the student", "To soften the teacher distribution and expose relative confidences over wrong classes (dark knowledge), a richer signal than a hard label", "To reduce the student's parameter count", "To prevent overfitting to the temperature"],
+     "correctIndex": 1,
+     "explanation": "High T reveals the teacher's structure over incorrect classes; the T^2 factor keeps the KL gradient magnitude stable as T changes."},
+    {"id": "q11", "qtype": "ordering",
+     "stem": "Order the stages of a standard bi-encoder-plus-reranker RAG query from first to last.",
+     "options": ["Embed the query", "Approximate nearest-neighbor search returns top-N candidates", "Cross-encoder reranks candidates to top-k", "Assemble the top-k into the prompt and generate"],
+     "correctIndex": -1,
+     "explanation": "Embed the query, retrieve a cheap large candidate set by ANN, rerank it precisely with a cross-encoder, then place the top few in the prompt for generation."},
+    {"id": "q12", "qtype": "truefalse",
+     "stem": "Constrained decoding via a precompiled FSM guarantees the generated text is grammar-valid and also guarantees the values are semantically correct.",
+     "options": ["True", "False"],
+     "correctIndex": 1,
+     "explanation": "It guarantees valid form only. The mask forbids illegal tokens, so the output parses, but the model can still place wrong values inside a valid structure."}
+  ]</script>
+</div>
+
+<h2>References</h2>
+<ol class="refs">
+  <li>Jurafsky, D. and Martin, J. H. <em>Speech and Language Processing</em>, 3rd edition draft. Stanford, ongoing. The standard reference for NLP fundamentals underlying retrieval and generation.</li>
+  <li>Murphy, K. P. <em>Probabilistic Machine Learning: Advanced Topics</em>. MIT Press, 2023. Covers the variational and information-theoretic tools behind KL-regularized objectives and quantization.</li>
+  <li>Hu, E. J., Shen, Y., Wallis, P., Allen-Zhu, Z., Li, Y., Wang, S., Wang, L., and Chen, W. LoRA: Low-Rank Adaptation of Large Language Models. 2021. <a href="https://arxiv.org/abs/2106.09685">arXiv:2106.09685</a>.</li>
+  <li>Aghajanyan, A., Zettlemoyer, L., and Gupta, S. Intrinsic Dimensionality Explains the Effectiveness of Language Model Fine-Tuning. 2020. <a href="https://arxiv.org/abs/2012.13255">arXiv:2012.13255</a>.</li>
+  <li>Dettmers, T., Pagnoni, A., Holtzman, A., and Zettlemoyer, L. QLoRA: Efficient Finetuning of Quantized LLMs. 2023. <a href="https://arxiv.org/abs/2305.14314">arXiv:2305.14314</a>.</li>
+  <li>Dettmers, T., Lewis, M., Belkada, Y., and Zettlemoyer, L. LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale. 2022. <a href="https://arxiv.org/abs/2208.07339">arXiv:2208.07339</a>.</li>
+  <li>Frantar, E., Ashkboos, S., Hoefler, T., and Alistarh, D. GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers. 2022. <a href="https://arxiv.org/abs/2210.17323">arXiv:2210.17323</a>.</li>
+  <li>Frantar, E. and Alistarh, D. Optimal Brain Compression / Optimal Brain Quantization. 2022. <a href="https://arxiv.org/abs/2208.11580">arXiv:2208.11580</a>.</li>
+  <li>Lin, J., Tang, J., Tang, H., Yang, S., Dang, X., and Han, S. AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration. 2023. <a href="https://arxiv.org/abs/2306.00978">arXiv:2306.00978</a>.</li>
+  <li>Xiao, G., Lin, J., Seznec, M., Wu, H., Demouth, J., and Han, S. SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models. 2022. <a href="https://arxiv.org/abs/2211.10438">arXiv:2211.10438</a>.</li>
+  <li>Micikevicius, P., et al. FP8 Formats for Deep Learning. 2022. <a href="https://arxiv.org/abs/2209.05433">arXiv:2209.05433</a>.</li>
+  <li>Rafailov, R., Sharma, A., Mitchell, E., Ermon, S., Manning, C. D., and Finn, C. Direct Preference Optimization: Your Language Model is Secretly a Reward Model. 2023. <a href="https://arxiv.org/abs/2305.18290">arXiv:2305.18290</a>.</li>
+  <li>Ouyang, L., et al. Training Language Models to Follow Instructions with Human Feedback (InstructGPT). 2022. <a href="https://arxiv.org/abs/2203.02155">arXiv:2203.02155</a>.</li>
+  <li>Wei, J., et al. Finetuned Language Models Are Zero-Shot Learners (FLAN). 2021. <a href="https://arxiv.org/abs/2109.01652">arXiv:2109.01652</a>.</li>
+  <li>Zhou, C., et al. LIMA: Less Is More for Alignment. 2023. <a href="https://arxiv.org/abs/2305.11206">arXiv:2305.11206</a>.</li>
+  <li>Houlsby, N., et al. Parameter-Efficient Transfer Learning for NLP (Adapters). 2019. <a href="https://arxiv.org/abs/1902.00751">arXiv:1902.00751</a>.</li>
+  <li>Li, X. L. and Liang, P. Prefix-Tuning: Optimizing Continuous Prompts for Generation. 2021. <a href="https://arxiv.org/abs/2101.00190">arXiv:2101.00190</a>.</li>
+  <li>Hinton, G., Vinyals, O., and Dean, J. Distilling the Knowledge in a Neural Network. 2015. <a href="https://arxiv.org/abs/1503.02531">arXiv:1503.02531</a>.</li>
+  <li>Sanh, V., Debut, L., Chaumond, J., and Wolf, T. DistilBERT, a distilled version of BERT. 2019. <a href="https://arxiv.org/abs/1910.01108">arXiv:1910.01108</a>.</li>
+  <li>Lewis, P., et al. Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks. 2020. <a href="https://arxiv.org/abs/2005.11401">arXiv:2005.11401</a>.</li>
+  <li>Karpukhin, V., et al. Dense Passage Retrieval for Open-Domain Question Answering. 2020. <a href="https://arxiv.org/abs/2004.04906">arXiv:2004.04906</a>.</li>
+  <li>Izacard, G. and Grave, E. Leveraging Passage Retrieval with Generative Models for Open Domain QA (Fusion-in-Decoder). 2021. <a href="https://arxiv.org/abs/2007.01282">arXiv:2007.01282</a>.</li>
+  <li>Nogueira, R. and Cho, K. Passage Re-ranking with BERT. 2019. <a href="https://arxiv.org/abs/1901.04085">arXiv:1901.04085</a>.</li>
+  <li>Es, S., James, J., Espinosa-Anke, L., and Schockaert, S. RAGAS: Automated Evaluation of Retrieval Augmented Generation. 2023. <a href="https://arxiv.org/abs/2309.15217">arXiv:2309.15217</a>.</li>
+  <li>Yao, S., et al. ReAct: Synergizing Reasoning and Acting in Language Models. 2022. <a href="https://arxiv.org/abs/2210.03629">arXiv:2210.03629</a>.</li>
+  <li>Willard, B. T. and Louf, R. Efficient Guided Generation for Large Language Models (Outlines). 2023. <a href="https://arxiv.org/abs/2307.09702">arXiv:2307.09702</a>.</li>
+  <li>Zheng, L., et al. Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena. 2023. <a href="https://arxiv.org/abs/2306.05685">arXiv:2306.05685</a>.</li>
+  <li>Kwon, W., et al. Efficient Memory Management for Large Language Model Serving with PagedAttention (vLLM). 2023. <a href="https://arxiv.org/abs/2309.06180">arXiv:2309.06180</a>.</li>
+  <li>Rajbhandari, S., Rasley, J., Ruwase, O., and He, Y. ZeRO: Memory Optimizations Toward Training Trillion Parameter Models. 2019. <a href="https://arxiv.org/abs/1910.02054">arXiv:1910.02054</a>.</li>
+  <li>Liu, S.-Y., et al. DoRA: Weight-Decomposed Low-Rank Adaptation. 2024. <a href="https://arxiv.org/abs/2402.09353">arXiv:2402.09353</a>.</li>
+</ol>
+
+<div class="takeaway">
+Applied generative AI is the discipline of turning a fixed base model into a product through a
+chain of decisions that each have real mathematics behind them. Parameter-efficient adaptation
+works because the useful weight update is low-rank and because the optimizer state, not the
+weights, is what full fine-tuning cannot afford. LoRA collapses 112 GB of state to 134 MB, and
+QLoRA's NF4 with double quantization stores the frozen base at 4.13 bits per weight. Alignment
+has a closed form. DPO's loss falls out of the KL-constrained optimum in two steps, making the
+policy its own implicit reward model. Serving is governed by a roofline, decode is
+memory-bandwidth-bound until the batch crosses a ridge near 249, which is why the same H100 can
+cost anywhere from $3.98 to $0.016 per million tokens depending only on batching. Retrieval
+grounds the model but shifts the failure modes to recall and faithfulness, which must be
+measured separately. Constrained decoding buys valid form but not correct content, and the
+agent loop is a control loop whose reliability lives in the harness. The common thread is that
+each layer trades a known quantity, precision, on-policy exploration, latency, form, for another,
+and the practitioner's job is to know the exchange rate.
+</div>
+
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>&copy; <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;&middot;&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/classes/math.js"></script>
+    <script defer src="/code-tabs.js"></script>
+    <script defer src="/quiz.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/code-copy.js"></script>
+      <script defer src="/theme.js"></script>
+  </body>
+</html>

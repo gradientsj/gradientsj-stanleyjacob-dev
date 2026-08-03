@@ -1,0 +1,203 @@
+# Coursework section: build log and handoff notes
+
+Working log for the `/classes` section so a fresh agent can pick this up
+mid-build. Update the status table at the bottom after every batch.
+
+## What this is
+
+A coursework tab holding 56 long-form technical write-ups, one per subject,
+covering machine learning, language and generative models, reinforcement
+learning, systems and architecture, algorithms and theory, graphics, robotics,
+and applied domains. The pages are study material: full derivations, worked
+problems with real arithmetic, PyTorch and JAX implementations side by side,
+production practice, the current research frontier, open-source pointers, a
+self-check quiz, and references to textbooks and papers.
+
+The owner's stated goal is internalizing this material to a level competitive
+for a top applied-ML position, so depth beats breadth on every page.
+
+## Non-negotiable constraint
+
+**No page may reference a course, course number, department, professor,
+syllabus, lecture, or problem set.** Everything is anchored on textbooks and
+research papers instead. The source request listed university courses only as a
+scope definition. A page containing "CS 229", "in lecture", or "problem set" is
+a defect and must be rewritten.
+
+Naming an institution is a different matter and is encouraged: attributing a
+result or project to the group that produced it ("Berkeley's Gemmini", "a line
+of work at ETH Zurich") is exactly the cross-referencing these pages are for.
+The validator flags course scaffolding, not citations.
+
+## Files
+
+| Path | Role |
+| --- | --- |
+| `tools/classes_data.py` | Taxonomy: groups, slugs, titles, blurbs, tags. Single source of truth. |
+| `tools/generate_classes.py` | Renders `classes/index.html` from the taxonomy. Re-run after adding pages; unwritten pages render as dimmed non-links. |
+| `tools/add_classes_nav.py` | Idempotent sitewide nav insertion (already run over 194 pages). |
+| `classes/AUTHORING.md` | The spec every article is written against. Read before authoring. |
+| `classes/math.js` | KaTeX loader (CDN, auto-render, `$$`/`\(`), with macros. |
+| `classes/data/bench_h100.py` | Benchmark script for the measured numbers. |
+| `classes/data/h100.json` | Its output: real H100 80GB numbers, quotable in articles. |
+| `scripts/highlight.mjs` | Build-time syntax highlighting. Run after writing pages. |
+| `quiz.js`, `code-tabs.js`, `code-copy.js` | Client behavior the pages opt into. |
+
+## Build commands
+
+Node is not installed system-wide on this machine. It was installed locally to
+`~/.local/node`, so put it on PATH first:
+
+```bash
+export PATH="$HOME/.local/node/bin:$PATH"
+node scripts/highlight.mjs          # bake syntax highlighting + copy buttons
+python tools/generate_classes.py    # relink index against pages that now exist
+python tools/add_classes_nav.py     # only if new top-level pages appear
+python tools/check_classes.py       # validate pages against AUTHORING.md
+```
+
+`check_classes.py` enforces the no-course-reference rule, verifies the quiz JSON
+parses, checks that every tabbed `<pre>` has a matching language button, and
+warns on pages that are short on problems or references. It deliberately does
+not flag institution names: attributing a result to the group that produced it
+is the cross-referencing these pages are for.
+
+## Measured hardware numbers
+
+`classes/data/h100.json`, from an NVIDIA H100 80GB HBM3 (132 SMs, compute
+capability 9.0, PyTorch 2.7.0, CUDA 12.8) on the machine this was built on.
+Highlights worth quoting:
+
+- HBM streaming bandwidth about 3.0-3.1 TB/s (copy, add, and sum all land there)
+- Dense matmul at 8192: 51 TFLOPS fp32, 410 TFLOPS tf32, 729 TFLOPS bf16
+- Attention at 8192 tokens (batch 8, 16 heads, head dim 64): naive materialized
+  scores 98.9 ms and 35.0 GB peak, fused path 3.58 ms and 0.57 GB, a 27.7x
+  speedup at 61x less memory
+- At 16384 tokens the naive path cannot run at all: the score matrix alone is
+  68.7 GB. The fused path does it in 13.7 ms at 640 TFLOPS.
+- Elementwise chain fusion via `torch.compile`: 0.911 ms to 0.214 ms, 4.3x
+
+Rerun with `python classes/data/bench_h100.py > classes/data/h100.json`.
+
+## Status
+
+Legend: `todo` not started, `wip` claimed by an agent, `done` written and
+highlighted.
+
+Counts are updated at the end of each batch; see the git log for per-page
+history.
+
+| Group | Pages | Done |
+| --- | --- | --- |
+| Machine learning foundations | 5 | 5 (group complete) |
+| Language, generative, multimodal | 11 | 11 (group complete) |
+| Reinforcement learning and decisions | 7 | 7 (group complete) |
+| Systems, architecture, data at scale | 10 | 10 (group complete) |
+| Algorithms, theory, optimization, security | 7 | 7 (group complete) |
+| Graphics, rendering, 3D | 5 | 2 |
+| Robotics and embodied intelligence | 5 | 0 |
+| Applied domains, product, interfaces | 6 | 0 |
+| **Total** | **56** | **42** |
+
+Batch 5 complete: compilers-and-program-analysis, programming-languages,
+advanced-data-structures, modern-algorithmic-toolbox, rendering-foundations,
+physically-based-rendering. Systems and algorithms groups are both complete;
+graphics group is 2/5. 42/56 live, 0 validator errors.
+
+Batch 6 in flight (wip, claimed by agents): interactive-graphics,
+animation-and-simulation, neural-3d-representations (finishes graphics);
+robot-kinematics-and-control (also fixes data/bench_robotics.py MuJoCo call
+and regenerates data/robotics.json), advanced-manipulation,
+embodied-foundation-models. Batch 7 (remaining) will be interactive-robotics,
+collaborative-robotics + the 6 applied-domains pages. The genomics data
+script data/bench_genomics.py needs a numpy/scipy fix (scipy.optimize import
+fails under numpy 1.21); the genomics agent in batch 7 must fix it or use the
+isolated numpy venv approach the numerical-methods agent used.
+
+Remaining (14): graphics group — interactive-graphics,
+animation-and-simulation, neural-3d-representations (3); robotics group —
+robot-kinematics-and-control, advanced-manipulation, interactive-robotics,
+collaborative-robotics, embodied-foundation-models (5); applied-domains
+group — deep-learning-genomics, audio-signal-processing,
+computational-music-analysis, ios-swiftui, product-design,
+modern-web-development (6). See classes_data.py for slugs.
+sequence-models-state-spaces is live but leaner than siblings (951 lines) —
+expand if time allows. Orphan data-prep scripts data/bench_genomics.py and
+data/bench_robotics.py are staged for the genomics and
+embodied-foundation-models pages.
+
+Complete and validated: algorithm-design-and-analysis, computer-architecture,
+computer-networks, concurrent-systems-programming, deep-generative-models,
+deep-learning-engineering, deep-reinforcement-learning,
+diffusion-and-large-vision-models, graph-machine-learning,
+language-models-from-scratch, meta-learning-and-multitask,
+mining-massive-datasets, nlp-deep-learning, parallel-computing,
+probabilistic-graphical-models, reinforcement-learning-fundamentals,
+statistical-learning.
+
+The index generator treats a page as live only when it contains both a
+reference list and a closing takeaway, so partial pages are not linked from
+the index.
+
+## Log
+
+### Session 2 (2026-07-24)
+
+- Resumed after a usage-limit cutoff. Committed the in-flight checkpoint
+  (graph ML rewrite, RL foundations expansion, `algorithms.json`,
+  `parallel.json`, `networks.json`) as fc929db.
+- Corrected the stale status table above: 11 pages were done as of the
+  cutoff, not 0.
+- Launched parallel authoring agents for the six pages listed as in flight
+  above. Coordinator loop per batch: validate with `tools/check_classes.py`,
+  bake highlighting with `node scripts/highlight.mjs`, regenerate the index,
+  update this file, commit, push.
+- Batch 1 complete: algorithm-design-and-analysis (2461 lines, finished the
+  cut-off stub), parallel-computing (2112), concurrent-systems-programming
+  (2538, with fresh Xeon benchmarks recorded in `data/concurrency.json`),
+  computer-networks (2203), language-models-from-scratch (1958),
+  statistical-learning (1578). All arithmetic in worked problems was verified
+  by running Python; CUDA snippets compiled with nvcc sm_90; PyTorch/JAX tabs
+  executed before inclusion. 17/56 live, 0 validator errors. Pushed as
+  8a14896.
+- Batch 2 complete: learning-theory (1963 lines, real double-descent and
+  implicit-bias experiments run on the H100), ai-principles (1743, all search
+  and inference numbers from real runs), operating-systems (2378, new
+  measurements merged into `data/os.json`: THP page-chase, io_uring sweep,
+  syscall costs), databases (1882, real SQLite-vs-DuckDB experiments),
+  self-improving-agents (1747, includes a real H100 self-consistency demo
+  with Qwen2.5-0.5B), combinatorial-optimization (1426, AdamW verified
+  against torch.optim to 1.5e-7). ML foundations group is complete.
+  23/56 live, 0 validator errors.
+- Batch 3 hit the session usage limit mid-write. Salvage: cryptography
+  finished and is live (3819 lines, valid) and was committed as 7876c1a.
+  The other five agents died before writing a complete page. On disk after
+  the cutoff: multimodal-foundation-models and advanced-systems-architecture
+  were PARTIAL stubs (~700/650 lines, no refs/takeaway, not linked from the
+  index); applied-generative-ai, sequence-models-state-spaces, and
+  numerical-methods were MISSING. Two orphan benchmark scripts,
+  data/bench_genomics.py and data/bench_robotics.py, were dropped by killed
+  data-prep agents (kept, untracked, for the future genomics/robotics pages).
+  Note: computer-security (3930 lines, commit 0df77f3) was authored before
+  this session and is live; the earlier "11 done" count was off by one, the
+  true baseline was 12.
+- Batch 3 relaunch (wip, claimed by agents): multimodal-foundation-models
+  (overwrite stub), applied-generative-ai (new), sequence-models-state-spaces
+  (new), advanced-systems-architecture (overwrite stub), numerical-methods
+  (new). Live count is 25/56 with cryptography and computer-security counted.
+
+### Session 1 (2026-07-23)
+
+- Surveyed the existing site: static HTML, no framework, no client-side
+  libraries, build-time syntax highlighting via Shiki, existing sections
+  `/ai /robotics /software /algorithms /systems /ml /rl /oss`. Matched that
+  structure rather than introducing tooling.
+- Added the `Classes` nav link to all 194 existing pages and a Classes section
+  on the homepage (section shading re-alternated to stay consistent).
+- Introduced KaTeX for real math, loaded only on coursework pages, so the rest
+  of the site keeps its zero-client-library property.
+- Wrote and ran the H100 benchmark suite; results in `classes/data/h100.json`.
+- Wrote `classes/AUTHORING.md` (the article spec) and generated the index from
+  the taxonomy.
+- Wired the previously unused `quiz.js` engine into the article spec, since the
+  pages are meant for self-testing.

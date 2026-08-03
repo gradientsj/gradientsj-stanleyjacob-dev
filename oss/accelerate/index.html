@@ -1,0 +1,1211 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Accelerate walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A full chapter on huggingface/accelerate: the thin layer that runs one PyTorch training loop unchanged on CPU, one GPU, many GPUs, or TPU. The Accelerator object and prepare(), device placement, gradient accumulation, mixed precision, how it wraps DDP, FSDP, and DeepSpeed, the accelerate launch config and notebook_launcher, a traced life of prepare() and one training step, internals deep dives, a reading path, labs, and understanding checks." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%232B2621'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+      <script>(function(){try{var t=localStorage.getItem("theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>Accelerate</h1>
+        <p class="lead">
+          <a href="https://github.com/huggingface/accelerate" target="_blank" rel="noreferrer">Accelerate</a>
+          is Hugging Face's answer to a narrow but universal problem, which is
+          that the same PyTorch training loop should run on a laptop CPU, on one
+          GPU, across eight GPUs, across many nodes, or on a TPU pod without being
+          rewritten for each. It is a thin layer, not a framework, and it keeps
+          your loop. You add one object, the <code>Accelerator</code>, wrap a few
+          things through <code>prepare()</code>, swap <code>loss.backward()</code>
+          for <code>accelerator.backward(loss)</code>, and the library takes over
+          device placement, data sharding, gradient accumulation, mixed
+          precision, and the choice of
+          <a href="https://arxiv.org/abs/2006.15704" target="_blank" rel="noreferrer">DistributedDataParallel</a>,
+          <a href="https://arxiv.org/abs/2304.11277" target="_blank" rel="noreferrer">FSDP</a>, or
+          DeepSpeed underneath. This chapter is three things at once, a practical
+          tutorial for launching real runs, a systems walkthrough that follows one
+          call to <code>prepare()</code> and one training step from
+          <code>accelerate launch</code> down to the collectives, and a staged
+          guide to reading the repository. It ends with runnable labs,
+          understanding checks with model answers, and a compact framework for
+          keeping the whole thing in your head.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">accelerate launch train.py     reads default_config.yaml, picks a launcher
+      |
+      v
+torch.distributed.run          spawns num_processes ranks (one per GPU / CPU / TPU core)
+      |                         sets RANK, LOCAL_RANK, WORLD_SIZE in the environment
+      v
+Accelerator()                  reads the env, builds the AcceleratorState singleton
+      |
+      v
+prepare(model, opt, dl, sched)   adapts each object to the current backend
+      |     model     -&gt; .to(device), then DDP / FSDP / DeepSpeed wrap + autocast
+      |     dataloader -&gt; shard across ranks, or dispatch from rank 0
+      |     optimizer  -&gt; AcceleratedOptimizer (owns the GradScaler, the sync gate)
+      |     scheduler  -&gt; AcceleratedScheduler (steps once per real optimizer step)
+      v
+your unchanged loop            for batch in dl: out = model(batch); accelerator.backward(loss)
+      |                         opt.step(); sched.step(); opt.zero_grad()
+      v
+collectives (NCCL / gloo / xla)  DDP all-reduce of grads, gather/reduce for metrics</pre>
+          <p>
+            The one-sentence identity. <mark>Accelerate is a device-and-backend
+            abstraction that makes the distribution strategy a property of the
+            launch environment rather than a property of your training code, so a
+            single loop written for one device runs unchanged across all of them.</mark>
+            The classic way to add multi-GPU training is invasive. You sprinkle
+            <code>.cuda()</code> and <code>.to(device)</code> through the model and
+            the batch, wrap the model in <code>DistributedDataParallel</code>, build
+            a <code>DistributedSampler</code>, guard every print and save behind a
+            rank check, and add a <code>GradScaler</code> for mixed precision. Each
+            of those is a place the code now assumes a particular world. Accelerate
+            removes the assumptions. You ask the <code>Accelerator</code> for the
+            device, you let <code>prepare()</code> wrap the objects, and the same
+            file runs whether the launcher spun up one process or a thousand.
+          </p>
+          <p>
+            The load-bearing idea sits inside <code>prepare()</code>. It is a
+            polymorphic adapter. You hand it your model, your optimizer, your
+            dataloader, and your learning-rate scheduler, and it returns objects of
+            the same shape that behave correctly in whatever environment the launch
+            configured. On one CPU it does almost nothing. On eight GPUs it moves
+            the model to the local device and wraps it in DDP, replaces the
+            dataloader with one that shards batches across ranks, and wraps the
+            optimizer so it cooperates with mixed precision and gradient
+            accumulation. On a DeepSpeed or FSDP config it swaps the wrapping
+            strategy without touching the surface. Because the adaptation lives in
+            the returned objects rather than in your loop, <mark>the loop reads like
+            ordinary single-device PyTorch and the distribution is somebody else's
+            problem, which is the entire point.</mark>
+          </p>
+          <p>
+            A useful contrast to hold from the start. Accelerate is deliberately
+            not a trainer. It has no <code>fit()</code>, no callbacks that own your
+            epoch, no config schema for your model. It gives you the primitives to
+            keep writing the loop yourself. That is the opposite bet from a
+            framework like PyTorch Lightning, and it is a different job from a
+            pretraining platform like <a href="/oss/torchtitan">torchtitan</a>,
+            which owns the model definition and composes four parallelisms over
+            DTensor. Everything in this chapter is described against Accelerate as
+            it stands in mid 2026. The public API here has been stable for years,
+            but the plugin surfaces for FSDP and DeepSpeed track fast-moving
+            upstreams, so where a detail is likely to have shifted I say so and stay
+            at the level of the concept.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <p>
+            Accelerate is a pure-Python library and installs from PyPI with no
+            build step. It runs anywhere PyTorch runs, including macOS and plain
+            CPU, which is part of why it is pleasant to learn on.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">pip</span> <span class="s">install</span> <span class="s">accelerate</span>
+<span class="c"># optional extras that pull in the integrations you plan to use:</span>
+<span class="c">#   pip install "accelerate[deepspeed]"     for the DeepSpeed backend</span>
+<span class="c">#   pip install "accelerate[test]"          for the test suite</span></code></pre></div>
+          <p>
+            The first thing to run is not training, it is the config wizard.
+            <code>accelerate config</code> asks a short series of questions about
+            your machine, this compute environment, how many processes, whether you
+            want mixed precision, whether to use DeepSpeed or FSDP, and writes the
+            answers to a YAML file. The default location is
+            <code>~/.cache/huggingface/accelerate/default_config.yaml</code>, and
+            <code>accelerate launch</code> reads it unless you pass another with
+            <code>--config_file</code>.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">accelerate</span> <span class="s">config</span>          <span class="c"># interactive: writes default_config.yaml</span>
+<span class="m1">accelerate</span> <span class="s">env</span>             <span class="c"># prints the resolved environment and the config it found</span>
+<span class="m1">accelerate</span> <span class="s">test</span>            <span class="c"># runs a built-in script that exercises the full setup path</span></code></pre></div>
+          <p>
+            <code>accelerate test</code> is the equivalent of a smoke test. It
+            launches the configured world, runs gather and reduce operations across
+            the processes, and reports whether the distributed setup actually works,
+            which is a far better first failure than discovering a broken NCCL
+            config three hours into a run. Now the code. A minimal training script
+            that already runs on every backend looks like this, and the comments
+            mark the only four kinds of change from a single-device loop.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">accelerate</span> <span class="k">import</span> <span class="m1">Accelerator</span>
+<span class="k">import</span> <span class="m1">torch</span>
+
+<span class="v2">accelerator</span> = <span class="m1">Accelerator</span><span class="b0">()</span>                      <span class="c"># 1. one object, reads the launch env</span>
+
+<span class="m1">model</span> = <span class="m1">MyModel</span><span class="b0">()</span>
+<span class="v4">optimizer</span> = <span class="m1">torch</span>.<span class="m2">optim</span>.<span class="m2">AdamW</span><span class="b0">(</span><span class="m1">model</span>.<span class="m2">parameters</span><span class="b1">()</span>, <span class="v4">lr</span>=<span class="n">3e-4</span><span class="b0">)</span>
+<span class="v0">train_dl</span> = <span class="m1">torch</span>.<span class="m2">utils</span>.<span class="m2">data</span>.<span class="m2">DataLoader</span><span class="b0">(</span><span class="v2">train_ds</span>, <span class="v3">batch_size</span>=<span class="n">16</span>, <span class="v2">shuffle</span>=<span class="k">True</span><span class="b0">)</span>
+<span class="v2">scheduler</span> = <span class="m1">torch</span>.<span class="m2">optim</span>.<span class="m2">lr_scheduler</span>.<span class="m2">LinearLR</span><span class="b0">(</span><span class="v4">optimizer</span><span class="b0">)</span>
+
+<span class="c"># 2. prepare everything together, in one call, and reassign the results</span>
+<span class="m1">model</span>, <span class="v4">optimizer</span>, <span class="v0">train_dl</span>, <span class="v2">scheduler</span> = <span class="v2">accelerator</span>.<span class="m2">prepare</span><span class="b0">(</span>
+    <span class="m1">model</span>, <span class="v4">optimizer</span>, <span class="v0">train_dl</span>, <span class="v2">scheduler</span>
+<span class="b0">)</span>
+
+<span class="k">for</span> <span class="v4">epoch</span> <span class="k">in</span> <span class="m1">range</span><span class="b0">(</span><span class="v1">num_epochs</span><span class="b0">)</span>:
+    <span class="k">for</span> <span class="v6">batch</span> <span class="k">in</span> <span class="v0">train_dl</span>:                       <span class="c"># already sharded, already on device</span>
+        <span class="v4">optimizer</span>.<span class="m2">zero_grad</span><span class="b0">()</span>
+        <span class="v0">inputs</span>, <span class="v1">targets</span> = <span class="v6">batch</span>                  <span class="c"># 3. no .to(device) needed</span>
+        <span class="v5">outputs</span> = <span class="m1">model</span><span class="b0">(</span><span class="v0">inputs</span><span class="b0">)</span>
+        <span class="v6">loss</span> = <span class="m1">loss_fn</span><span class="b0">(</span><span class="v5">outputs</span>, <span class="v1">targets</span><span class="b0">)</span>
+        <span class="v2">accelerator</span>.<span class="m2">backward</span><span class="b0">(</span><span class="v6">loss</span><span class="b0">)</span>               <span class="c"># 4. not loss.backward()</span>
+        <span class="v4">optimizer</span>.<span class="m2">step</span><span class="b0">()</span>
+        <span class="v2">scheduler</span>.<span class="m2">step</span><span class="b0">()</span>
+
+<span class="v2">accelerator</span>.<span class="m2">print</span><span class="b0">(</span><span class="s">"done"</span><span class="b0">)</span>                        <span class="c"># prints on the main process only</span></code></pre></div>
+          <p>
+            Read the four changes as a set. First, construct one
+            <code>Accelerator</code>. Second, pass model, optimizer, dataloader, and
+            scheduler through <code>prepare()</code> and reassign the returned
+            handles, because the returned objects are the wrapped ones and the
+            originals are now stale. Third, stop moving tensors to a device by hand,
+            since the prepared dataloader yields batches already on
+            <code>accelerator.device</code>. Fourth, call
+            <code>accelerator.backward(loss)</code> instead of
+            <code>loss.backward()</code>, because backward is where the library
+            applies the mixed-precision gradient scaler and the gradient
+            accumulation scaling. Everything else, the epoch loop, the loss
+            function, the optimizer step, is untouched.
+          </p>
+          <p>
+            To run it, do not call <code>python train.py</code>. Use the launcher,
+            which reads the config and spawns the processes.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">accelerate</span> <span class="s">launch</span> <span class="s">train.py</span>                       <span class="c"># uses default_config.yaml</span>
+<span class="m1">accelerate</span> <span class="s">launch</span> <span class="s">--multi_gpu</span> <span class="s">--num_processes</span> <span class="s">4</span> <span class="s">train.py</span>    <span class="c"># override on the CLI</span>
+<span class="m1">accelerate</span> <span class="s">launch</span> <span class="s">--num_processes</span> <span class="s">1</span> <span class="s">--cpu</span> <span class="s">train.py</span>          <span class="c"># force single CPU</span></code></pre></div>
+          <p>
+            The same script also runs under plain <code>python train.py</code>,
+            where it degrades gracefully to one process on whatever device is
+            available, and it runs under <code>torchrun</code> if you prefer that
+            launcher, because Accelerate reads the standard distributed environment
+            variables either way. That property, one script that runs three ways, is
+            what makes it comfortable to develop on a CPU and deploy on a cluster.
+          </p>
+          <p>
+            Now the mistakes beginners make. First and most common, forgetting to
+            reassign the results of <code>prepare()</code>. If you write
+            <code>accelerator.prepare(model, optimizer, ...)</code> and discard the
+            return value, your loop keeps using the unwrapped model and the
+            unsharded dataloader, and the run either crashes or silently trains on
+            duplicated data across ranks. Second, calling <code>loss.backward()</code>
+            out of habit. With fp16 that skips the gradient scaler and your loss goes
+            to NaN, and with gradient accumulation it skips the loss scaling, both
+            silent. Third, mishandling metrics. Every process computes its own loss
+            and its own accuracy, and if you log the local number you are logging one
+            rank's view, so you gather first.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="c"># wrong: this logs rank 0's local loss, not the global loss</span>
+<span class="v2">accelerator</span>.<span class="m2">print</span><span class="b0">(</span><span class="v6">loss</span>.<span class="m2">item</span><span class="b1">()</span><span class="b0">)</span>
+
+<span class="c"># right: gather across processes, then reduce, and only the main process logs</span>
+<span class="v5">all_losses</span> = <span class="v2">accelerator</span>.<span class="m2">gather</span><span class="b0">(</span><span class="v6">loss</span>.<span class="m2">detach</span><span class="b1">()</span><span class="b0">)</span>
+<span class="k">if</span> <span class="v2">accelerator</span>.<span class="m2">is_main_process</span>:
+    <span class="m1">log</span><span class="b0">(</span><span class="v5">all_losses</span>.<span class="m2">mean</span><span class="b1">()</span>.<span class="m2">item</span><span class="b1">()</span><span class="b0">)</span></code></pre></div>
+          <p>
+            Fourth, batch-size confusion, which is the same trap as everywhere in
+            distributed training. By default each process gets a full
+            <code>batch_size</code>, so the effective global batch is
+            <code>batch_size</code> times <code>num_processes</code>. If you want a
+            fixed global batch split across processes instead, you set
+            <code>split_batches=True</code>. Fifth, saving. Do not
+            <code>torch.save(model.state_dict())</code> a DDP- or FSDP-wrapped model,
+            because the keys carry the wrapper prefix and, under FSDP, each rank only
+            holds a shard. Unwrap first, and let the library gather.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="v2">accelerator</span>.<span class="m2">wait_for_everyone</span><span class="b0">()</span>                  <span class="c"># barrier so all ranks reach the save</span>
+<span class="v0">unwrapped</span> = <span class="v2">accelerator</span>.<span class="m2">unwrap_model</span><span class="b0">(</span><span class="v0">model</span><span class="b0">)</span>      <span class="c"># strip DDP / FSDP wrapper</span>
+<span class="v2">accelerator</span>.<span class="m2">save_model</span><span class="b0">(</span><span class="v0">unwrapped</span>, <span class="s">"out/"</span><span class="b0">)</span>        <span class="c"># gathers shards, writes on main only</span></code></pre></div>
+
+          <h2>Part III: When it is the right tool</h2>
+          <p>
+            Accelerate is the right tool when you want to keep writing your own
+            training loop and still run it across whatever hardware you happen to
+            have. That describes a lot of real work, a researcher iterating on a
+            custom loss who moves from a laptop to a single A100 to a node of eight,
+            a team that wants explicit control over the loop but does not want to
+            hand-roll DDP and samplers, and anyone adding mixed precision or
+            gradient accumulation to an existing script with the smallest possible
+            diff. It is also the layer that
+            <a href="/oss/transformers">Transformers</a>' own <code>Trainer</code>
+            sits on, so understanding Accelerate is understanding what the Trainer
+            does underneath, and the two share the same launch and config machinery.
+          </p>
+          <p>
+            The honest cases for alternatives. If you want the framework to own the
+            loop, with callbacks, logging, checkpointing, early stopping, and
+            multi-backend support handled for you, PyTorch Lightning is the mature
+            choice and you write a <code>LightningModule</code> rather than a loop.
+            If your job is large-scale pretraining of transformer models and you
+            want a reference platform that composes FSDP2, tensor, pipeline, and
+            context parallelism, <a href="/oss/torchtitan">torchtitan</a> is built
+            for exactly that and owns the model definition to get it. If you need
+            the deepest DeepSpeed features and want to configure
+          <a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noreferrer">ZeRO</a> stages,
+            offload, and custom optimizers directly, using DeepSpeed on its own
+            gives you the whole surface, though Accelerate can also drive it. If you
+            want a training-specific library with speedup methods baked in, MosaicML
+            Composer took that path, and if you want cluster orchestration and data
+            pipelines around training, Ray Train operates a level up. Accelerate
+            deliberately does less than all of these. It is the thin waist, not the
+            platform.
+          </p>
+          <p>
+            The scope-shaped warning. Accelerate handles distribution and
+            precision, and it does not make your model architecture fast. It will
+            not fuse your attention, it will not pick your parallelism degrees for
+            a 70B model, and it will not rescue a loop that is bound by a slow Python
+            dataloader. It sits above the collectives and below the model, and it is
+            excellent in that band. The moment your problem is really about how the
+            model itself is sharded across a large cluster, you are in
+            torchtitan or
+            <a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noreferrer">Megatron</a>
+            territory, and the moment it is really about
+            serving tokens fast you are in <a href="/oss/vllm">vLLM</a> territory.
+            Reaching for Accelerate to solve those is using a good tool on the wrong
+            layer.
+          </p>
+          <pre class="flow">layer map (where Accelerate sits)
+
+  your training loop            you write this, Accelerate keeps it yours
+  ---------------------------
+  Accelerate                    device placement, DDP/FSDP/DeepSpeed wrap,
+                                data sharding, mixed precision, accumulation
+  ---------------------------
+  torch.distributed / NCCL      the collectives themselves
+  ---------------------------
+  CUDA / XLA / CPU              the hardware</pre>
+
+          <h2>Part IV: The full life of one call to prepare(), and one step</h2>
+          <p>
+            The specimen. A script launched with
+            <code>accelerate launch --multi_gpu --num_processes 4 --mixed_precision bf16 train.py</code>
+            on one node with four GPUs, using the minimal loop from Part II with
+            <code>Accelerator(gradient_accumulation_steps=2)</code>. We follow the
+            program from the launch command through the setup and one full training
+            step, and note where the path forks for other backends.
+          </p>
+
+          <h3>Stage 1: accelerate launch and the launcher choice</h3>
+          <p>
+            <code>accelerate launch</code> is a CLI entry point implemented in
+            <code>src/accelerate/commands/launch.py</code>. It parses your flags,
+            loads the config YAML (unless the flags fully specify the world), and
+            then chooses a launcher based on the resolved
+            <code>distributed_type</code>. For a multi-GPU run it uses PyTorch's
+            elastic launch machinery, effectively the same thing
+            <code>torchrun</code> does, spawning <code>num_processes</code> worker
+            processes and setting <code>RANK</code>, <code>LOCAL_RANK</code>,
+            <code>WORLD_SIZE</code>, <code>MASTER_ADDR</code>, and
+            <code>MASTER_PORT</code> in each. For a TPU run it routes through the XLA
+            multiprocessing spawn. For CPU or a single process it just runs the
+            script. From here every worker is running the same
+            <code>train.py</code>, which is the SPMD model, one program on every
+            rank, and the launcher's whole job was to set the environment so each
+            process knows who it is.
+          </p>
+
+          <h3>Stage 2: Accelerator() and the state singleton</h3>
+          <p>
+            The first line that matters is <code>Accelerator()</code>, defined in
+            the large <code>src/accelerate/accelerator.py</code>. Its constructor
+            does not talk to any GPU yet. It builds an <code>AcceleratorState</code>,
+            which is defined in <code>src/accelerate/state.py</code> and is a
+            singleton in the Borg sense, all instances share one class-level
+            dictionary of state. <code>AcceleratorState</code> is layered on top of a
+            lighter <code>PartialState</code>, which reads the environment, decides
+            the <code>DistributedType</code> (here <code>MULTI_GPU</code>),
+            initializes the process group through
+            <code>torch.distributed</code> if more than one process exists, and
+            records <code>num_processes</code>, <code>process_index</code>,
+            <code>local_process_index</code>, and the <code>device</code> for this
+            rank. The split between <code>PartialState</code> and
+            <code>AcceleratorState</code> is deliberate. <mark>The distributed facts
+            of the world are separated from the training-specific configuration like
+            mixed precision and the DeepSpeed plugin, so code that only needs to know
+            the rank and device can ask <code>PartialState</code> without pulling in
+            a trainer's worth of setup.</mark> Because the state is a singleton,
+            constructing a second <code>Accelerator</code> anywhere in the program
+            reuses the same world rather than reinitializing it.
+          </p>
+          <p>
+            Two more things are constructed here. A <code>GradientState</code>, also
+            a singleton, which tracks whether the current step is a gradient sync
+            step and whether the dataloader has reached its end. And, because we
+            asked for bf16, the mixed-precision mode is recorded. Note that bf16
+            needs no gradient scaler, so no <code>GradScaler</code> is created. Had
+            we asked for fp16, the constructor would build
+            <code>self.scaler = torch.cuda.amp.GradScaler()</code>, and that object
+            would thread through backward and the optimizer step later.
+          </p>
+
+          <h3>Stage 3: prepare() dispatches on type</h3>
+          <p>
+            <code>accelerator.prepare(model, optimizer, train_dl, scheduler)</code>
+            is the heart of the library. It walks its arguments, checks the type of
+            each, and routes it to the right internal method, then returns the
+            wrapped objects in the same order. The dispatch is roughly this shape.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="c"># conceptual sketch of prepare's dispatch, not the verbatim source</span>
+<span class="k">def</span> <span class="m1">prepare</span><span class="b0">(</span><span class="k">self</span>, *<span class="v2">args</span><span class="b0">)</span>:
+    <span class="v5">result</span> = <span class="b0">[]</span>
+    <span class="k">for</span> <span class="v6">obj</span> <span class="k">in</span> <span class="v2">args</span>:
+        <span class="k">if</span> <span class="m1">isinstance</span><span class="b0">(</span><span class="v6">obj</span>, <span class="m1">torch</span>.<span class="m2">nn</span>.<span class="m2">Module</span><span class="b0">)</span>:
+            <span class="v5">result</span>.<span class="m2">append</span><span class="b0">(</span><span class="k">self</span>.<span class="m2">prepare_model</span><span class="b1">(</span><span class="v6">obj</span><span class="b1">)</span><span class="b0">)</span>
+        <span class="k">elif</span> <span class="m1">isinstance</span><span class="b0">(</span><span class="v6">obj</span>, <span class="m1">torch</span>.<span class="m2">optim</span>.<span class="m2">Optimizer</span><span class="b0">)</span>:
+            <span class="v5">result</span>.<span class="m2">append</span><span class="b0">(</span><span class="k">self</span>.<span class="m2">prepare_optimizer</span><span class="b1">(</span><span class="v6">obj</span><span class="b1">)</span><span class="b0">)</span>
+        <span class="k">elif</span> <span class="m1">isinstance</span><span class="b0">(</span><span class="v6">obj</span>, <span class="m1">torch</span>.<span class="m2">utils</span>.<span class="m2">data</span>.<span class="m2">DataLoader</span><span class="b0">)</span>:
+            <span class="v5">result</span>.<span class="m2">append</span><span class="b0">(</span><span class="k">self</span>.<span class="m2">prepare_data_loader</span><span class="b1">(</span><span class="v6">obj</span><span class="b1">)</span><span class="b0">)</span>
+        <span class="k">elif</span> <span class="m1">isinstance</span><span class="b0">(</span><span class="v6">obj</span>, <span class="v6">LRScheduler</span><span class="b0">)</span>:
+            <span class="v5">result</span>.<span class="m2">append</span><span class="b0">(</span><span class="k">self</span>.<span class="m2">prepare_scheduler</span><span class="b1">(</span><span class="v6">obj</span><span class="b1">)</span><span class="b0">)</span>
+        <span class="k">else</span>:
+            <span class="v5">result</span>.<span class="m2">append</span><span class="b0">(</span><span class="v6">obj</span><span class="b0">)</span>                   <span class="c"># passed through untouched</span>
+    <span class="k">return</span> <span class="m1">tuple</span><span class="b0">(</span><span class="v5">result</span><span class="b0">)</span></code></pre></div>
+          <p>
+            The reason you pass everything in one call, rather than preparing the
+            model here and the optimizer there, is that the wrappers need to know
+            about each other. The optimizer wrapper needs the gradient scaler and
+            the gradient state, the scheduler wrapper needs to know how many
+            processes there are so it can step the right number of times, and under
+            DeepSpeed the model and optimizer are initialized together into one
+            engine. Preparing them as a set lets the library wire the references
+            correctly.
+          </p>
+
+          <h3>Stage 4: prepare_model wraps for the backend</h3>
+          <p>
+            <code>prepare_model</code> is where the distribution strategy becomes
+            concrete. In order, it moves the model to <code>accelerator.device</code>
+            (unless device placement is disabled), then applies the backend wrapper.
+            For our <code>MULTI_GPU</code> run that is
+            <code>torch.nn.parallel.DistributedDataParallel</code> with
+            <code>device_ids=[local_process_index]</code>, so gradients all-reduce
+            across the four ranks during backward. For an FSDP config it instead
+            applies <code>FullyShardedDataParallel</code> from
+            <code>torch.distributed.fsdp</code>, configured by the
+            <code>FullyShardedDataParallelPlugin</code>, which shards parameters,
+            gradients, and optimizer state across ranks. For DeepSpeed the model is
+            not wrapped here at all, it is held for the joint
+            <code>deepspeed.initialize()</code> call. Finally, if mixed precision is
+            on, <code>prepare_model</code> patches the model's <code>forward</code>
+            so it runs under <code>torch.autocast</code> and casts its outputs back
+            to fp32, which is why you never write an autocast block in the loop
+            yourself. <mark>The single method <code>prepare_model</code> is the seam
+            where CPU, DDP, FSDP, and DeepSpeed diverge, and everything above it in
+            your loop is written as if that seam did not exist.</mark>
+          </p>
+
+          <h3>Stage 5: prepare_data_loader shards the data</h3>
+          <p>
+            <code>prepare_data_loader</code>, in
+            <code>src/accelerate/data_loader.py</code>, replaces your
+            <code>DataLoader</code> with one of two Accelerate classes. The default
+            for a map-style dataset is <code>DataLoaderShard</code>, which arranges
+            for each of the four processes to see a disjoint quarter of every batch
+            stream and moves the batches to the device as they come out. The
+            alternative, <code>DataLoaderDispatcher</code>, iterates the dataset only
+            on the main process and scatters slices to the others, which is the right
+            choice for iterable datasets or when the data pipeline is expensive and
+            you do not want four copies of it running. Two options shape the
+            behavior. <code>split_batches</code> decides whether the
+            <code>batch_size</code> you set is per-process or split across processes.
+            <code>even_batches</code> pads the last, uneven batch so every process
+            runs the same number of iterations, which matters because a process that
+            finishes early would hang the others at the next collective. That padding
+            is a small correctness debt that Stage 8 pays back.
+          </p>
+
+          <h3>Stage 6: prepare_optimizer and prepare_scheduler</h3>
+          <p>
+            The optimizer is wrapped in <code>AcceleratedOptimizer</code>, from
+            <code>src/accelerate/optimizer.py</code>. This wrapper holds a reference
+            to the gradient scaler and the gradient state, and it changes the
+            behavior of <code>step()</code> in two ways that matter later. It only
+            actually steps when the gradient state says this is a sync step, which is
+            how gradient accumulation is enforced, and when a scaler is present it
+            routes the step through <code>scaler.step()</code> and
+            <code>scaler.update()</code> so that fp16 inf-and-NaN handling works. The
+            scheduler is wrapped in <code>AcceleratedScheduler</code>, from
+            <code>src/accelerate/scheduler.py</code>, which by default steps once per
+            real optimizer step and accounts for the number of processes, so your
+            learning-rate schedule advances at the rate you intended rather than
+            once per rank.
+          </p>
+
+          <h3>Stage 7: the training step, forward and backward</h3>
+          <p>
+            Now the loop runs. A batch comes off the prepared dataloader already on
+            the GPU. <code>model(inputs)</code> runs the DDP-wrapped forward under
+            bf16 autocast. The loss is computed in fp32. Then
+            <code>accelerator.backward(loss)</code> does three jobs that a bare
+            <code>loss.backward()</code> would not. First, because we set
+            <code>gradient_accumulation_steps=2</code>, it divides the loss by two,
+            so that summing gradients over the two microbatches yields the mean, not
+            the sum. Second, if a scaler existed it would scale the loss before
+            backward, though for bf16 it does not. Third, for a DeepSpeed engine it
+            would call the engine's own backward instead. Underneath, DDP's backward
+            hooks fire, and on a sync step they all-reduce the gradients across the
+            four ranks so every process ends with the same averaged gradient. On a
+            non-sync accumulation step, the <code>accumulate</code> context manager
+            would have entered <code>no_sync</code> to skip that all-reduce, which is
+            the whole efficiency argument for accumulation, though the plain loop
+            here relies on the optimizer's sync gate rather than the context manager.
+          </p>
+
+          <h3>Stage 8: step, and gathering metrics honestly</h3>
+          <p>
+            <code>optimizer.step()</code> on the <code>AcceleratedOptimizer</code>
+            checks the gradient state. On the first of the two accumulation
+            microbatches it is a no-op, gradients simply keep accumulating. On the
+            second it performs the real step, applying the averaged gradients, and if
+            fp16 were active the scaler would step and update here and skip the step
+            entirely on an inf. Then <code>scheduler.step()</code> advances the
+            learning rate once, and <code>zero_grad()</code> clears for the next
+            group. When you want to log the loss or compute accuracy, you gather
+            across processes, and here the padding from Stage 5 comes due. A plain
+            <code>gather()</code> would include the duplicated samples that
+            <code>even_batches</code> added, which would bias your metric. The library
+            provides <code>gather_for_metrics()</code>, which gathers and then drops
+            exactly those padding duplicates using the dataloader's recorded length.
+            <mark>Using <code>gather_for_metrics</code> rather than raw
+            <code>gather</code> is the difference between a correct evaluation number
+            and one that is slightly wrong in a way you will never notice until it
+            matters.</mark> That closes one step. Data sharded in, gradients
+            all-reduced across the mesh, parameters updated once per accumulation
+            group, and a metric gathered without double counting.
+          </p>
+
+          <h2>Part V: Internals deep dives</h2>
+
+          <h3>Deep dive: the Accelerator, and the state singletons</h3>
+          <p>
+            The <code>Accelerator</code> object is a facade. It holds almost no state
+            of its own and instead delegates to the singletons, which is why you can
+            create it freely and why libraries built on Accelerate can each
+            construct their own without fighting over the world. The two singletons
+            do different jobs. <code>PartialState</code> is the answer to who am I,
+            it knows the distributed type, the device, the process count, and the
+            rank, and it exposes conveniences like
+            <code>state.is_main_process</code>, the
+            <code>state.main_process_first()</code> context manager for doing work on
+            rank zero before the others proceed, and
+            <code>state.split_between_processes()</code> for splitting a list of
+            inputs across ranks during distributed inference.
+            <code>AcceleratorState</code> adds the training configuration on top,
+            the mixed-precision mode and the FSDP or DeepSpeed plugin.
+            <code>GradientState</code> is the third, and it is the quiet coordinator
+            behind gradient accumulation, tracking <code>sync_gradients</code> and
+            whether the dataloader has reached its end so the final short
+            accumulation group still syncs.
+          </p>
+          <p>
+            The useful trap to internalize is that these are process-global. There is
+            exactly one <code>AcceleratorState</code> per process, so a stray second
+            <code>Accelerator</code> with conflicting arguments does not create a
+            second world, it either reuses the first or raises. This is what lets the
+            <code>Trainer</code> in Transformers and your own code coexist, and it is
+            why the constructor is cheap. The state is built once and shared.
+          </p>
+
+          <h3>Deep dive: how prepare wraps DDP, FSDP, and DeepSpeed</h3>
+          <p>
+            All three backends enter through the same <code>prepare()</code> call and
+            diverge inside <code>prepare_model</code> and the DeepSpeed path. The
+            table names what each one shards and where its wrapping decision lives.
+          </p>
+          <table>
+            <tr><th>Backend</th><th>Wrapper applied</th><th>Shards</th><th>Configured by</th></tr>
+            <tr><td>DDP (MULTI_GPU)</td><td>DistributedDataParallel</td><td>nothing, replicates the model</td><td>DistributedDataParallelKwargs</td></tr>
+            <tr><td>FSDP</td><td>FullyShardedDataParallel</td><td>params, grads, optimizer state</td><td>FullyShardedDataParallelPlugin</td></tr>
+            <tr><td>DeepSpeed</td><td>deepspeed.initialize engine</td><td>params, grads, optimizer state (ZeRO)</td><td>DeepSpeedPlugin or a JSON config</td></tr>
+          </table>
+          <p>
+            DDP is the simplest and the default for multi-GPU. Every rank holds a
+            full copy of the model, and DDP's backward hooks all-reduce gradients so
+            the replicas stay in step. You tune it with a
+            <code>DistributedDataParallelKwargs</code> handler passed to the
+            <code>Accelerator</code>, which is how you set options like
+            <code>find_unused_parameters</code> without Accelerate needing a flag for
+            every DDP knob.
+          </p>
+          <p>
+            FSDP shards the model itself, so each rank stores only a slice of the
+            parameters, gradients, and optimizer state, and all-gathers a layer's
+            full parameters just in time for its forward and backward. Accelerate
+            drives this through the <code>FullyShardedDataParallelPlugin</code> in
+            <code>src/accelerate/utils/dataclasses.py</code>, which carries the
+            sharding strategy, the auto-wrap policy that decides which submodules
+            become their own FSDP units, the mixed-precision policy, and CPU
+            offloading. Recent Accelerate also supports the newer FSDP2 design that
+            keeps parameters as per-parameter DTensors, selected through a version
+            field on the plugin, and the exact plugin fields have moved as upstream
+            FSDP has evolved, so treat the plugin as the stable seam and read its
+            current fields rather than memorizing them. The important idea is that
+            FSDP trades communication for memory, and Accelerate exposes that trade
+            as configuration rather than as code you write.
+          </p>
+          <p>
+            DeepSpeed is the different one. Here Accelerate does not wrap the model
+            in <code>prepare_model</code>, it calls <code>deepspeed.initialize()</code>
+            with the model, the optimizer, and the scheduler together, producing a
+            single engine that owns all three. That is why, under DeepSpeed,
+            <code>accelerator.backward(loss)</code> routes to the engine's backward
+            and the optimizer step routes to the engine's step, because DeepSpeed
+            implements ZeRO partitioning, its own loss scaling, and its own optimizer
+            internally. The <code>DeepSpeedPlugin</code> lets you set the ZeRO stage
+            and offloading in Python, and it resolves the many <code>auto</code>
+            values in a DeepSpeed JSON config against your batch size and precision
+            so the two config worlds agree. <mark>The lesson of the three backends is
+            that Accelerate does not reimplement any of them, it normalizes their
+            surfaces so your loop calls one <code>backward</code> and one
+            <code>step</code> regardless of which one is running underneath.</mark>
+          </p>
+
+          <h3>Deep dive: the dataloader, sharding versus dispatch</h3>
+          <p>
+            <code>data_loader.py</code> is the most underappreciated file in the
+            repository, because getting data distribution right is subtle and it
+            hides all of that. The two strategies answer the same question, how do
+            four processes consume one dataset without overlap, in opposite ways.
+          </p>
+          <pre class="flow">DataLoaderShard (default, map-style datasets)
+   dataset [0 1 2 3 4 5 6 7 ...]
+   rank0 sees [0 4 8 ...]   rank1 [1 5 9 ...]   rank2 [2 6 ...]   rank3 [3 7 ...]
+   each rank reads independently, in parallel, and moves its batch to its device
+
+DataLoaderDispatcher (iterable datasets, or expensive pipelines)
+   only rank0 iterates the dataset
+   rank0 --scatter batch slices--&gt; rank1, rank2, rank3
+   one data pipeline, results distributed by collective</pre>
+          <p>
+            <code>DataLoaderShard</code> is the parallel-read strategy. Each process
+            runs the pipeline over its own share of indices, chosen so the shares are
+            disjoint and cover the dataset. It is efficient because the four
+            processes read in parallel, and it is the default for map-style datasets
+            where random access is cheap. <code>DataLoaderDispatcher</code> is the
+            single-reader strategy. Process zero owns the one dataloader, and each
+            iteration it scatters the per-rank slices to the others over a collective.
+            This is the correct choice for a streaming or iterable dataset that
+            cannot be indexed, and for a pipeline so expensive that four copies would
+            be wasteful. The <code>even_batches</code> option, mentioned in Part IV,
+            pads the last batch so all processes iterate the same number of times,
+            and the padding is later removed by <code>gather_for_metrics</code>.
+            <code>split_batches</code> controls whether your configured
+            <code>batch_size</code> is the per-process size or the global size that
+            gets divided. In newer Accelerate these options are grouped into a
+            <code>DataLoaderConfiguration</code> dataclass passed as
+            <code>dataloader_config</code> to the <code>Accelerator</code>, replacing
+            the older direct keyword arguments, so old examples that pass
+            <code>split_batches=True</code> straight to <code>Accelerator</code>
+            still describe the right behavior even if the argument has moved.
+          </p>
+
+          <h3>Deep dive: gradient accumulation and the sync gate</h3>
+          <p>
+            Gradient accumulation lets you simulate a large batch on small memory by
+            running several microbatches before each optimizer step. The naive
+            version has two bugs, and Accelerate fixes both. The first bug is
+            communication waste, because DDP would all-reduce gradients on every
+            microbatch when only the last one needs the synchronized result. The
+            second is scaling, because summed gradients over N microbatches are N
+            times too large unless the loss is divided by N. The intended API is the
+            <code>accumulate</code> context manager.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="v2">accelerator</span> = <span class="m1">Accelerator</span><span class="b0">(</span><span class="v3">gradient_accumulation_steps</span>=<span class="n">4</span><span class="b0">)</span>
+<span class="m1">model</span>, <span class="v4">optimizer</span>, <span class="v3">dl</span> = <span class="v2">accelerator</span>.<span class="m2">prepare</span><span class="b0">(</span><span class="m1">model</span>, <span class="v4">optimizer</span>, <span class="v3">dl</span><span class="b0">)</span>
+
+<span class="k">for</span> <span class="v6">batch</span> <span class="k">in</span> <span class="v3">dl</span>:
+    <span class="k">with</span> <span class="v2">accelerator</span>.<span class="m2">accumulate</span><span class="b0">(</span><span class="m1">model</span><span class="b0">)</span>:
+        <span class="v5">outputs</span> = <span class="m1">model</span><span class="b0">(</span><span class="v6">batch</span><span class="b0">)</span>
+        <span class="v6">loss</span> = <span class="m1">loss_fn</span><span class="b0">(</span><span class="v5">outputs</span>, <span class="v6">batch</span>.<span class="m2">labels</span><span class="b0">)</span>
+        <span class="v2">accelerator</span>.<span class="m2">backward</span><span class="b0">(</span><span class="v6">loss</span><span class="b0">)</span>               <span class="c"># divides loss by 4 automatically</span>
+        <span class="v4">optimizer</span>.<span class="m2">step</span><span class="b0">()</span>                         <span class="c"># a real step only every 4th time</span>
+        <span class="v4">optimizer</span>.<span class="m2">zero_grad</span><span class="b0">()</span></code></pre></div>
+          <p>
+            The context manager consults <code>GradientState</code> to decide whether
+            this microbatch is a sync step, meaning the last in a group of four or the
+            end of the dataloader. On the three non-sync microbatches it enters
+            <code>model.no_sync()</code>, so DDP skips the gradient all-reduce and the
+            gradients just accumulate locally. On the sync microbatch it lets the
+            all-reduce happen. Meanwhile <code>accelerator.backward</code> divides the
+            loss by four so the accumulated gradient is a mean, and the
+            <code>AcceleratedOptimizer</code>'s <code>step</code> checks the same sync
+            flag and only performs the real update on the fourth microbatch, treating
+            the other three as no-ops. <mark>The elegance is that the loop is written
+            as if every iteration steps, and the sync gate inside the wrapped
+            optimizer and the context manager quietly turns three out of every four
+            into accumulation.</mark> The subtle correctness win is the end-of-loader
+            handling. If the dataset does not divide evenly into groups of four, the
+            final short group still triggers a sync and a step, because
+            <code>GradientState</code> knows the dataloader has ended, so you do not
+            silently drop the last few batches of gradients.
+          </p>
+
+          <h3>Deep dive: mixed precision and the scaler</h3>
+          <p>
+            Mixed precision is set once, with
+            <code>Accelerator(mixed_precision="bf16")</code> or on the launch
+            command, and it changes three things without a line in your loop. First,
+            <code>prepare_model</code> wraps the model's forward in
+            <code>torch.autocast</code> so the matmuls run in the low-precision type
+            while accumulations stay in fp32, and it casts outputs back to fp32 so
+            your loss code sees normal numbers. Second, for fp16 specifically the
+            <code>Accelerator</code> builds a <code>GradScaler</code>, because fp16
+            gradients underflow to zero without
+            <a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noreferrer">loss scaling</a>, and
+            <code>accelerator.backward</code> scales the loss up before backward while
+            the <code>AcceleratedOptimizer</code> unscales and steps through the
+            scaler, skipping the step when it sees an inf or NaN. Third, bf16 needs no
+            scaler at all because its exponent range matches fp32, so the scaler is
+            simply never created. There is also an fp8 path, driven by an
+            <code>FP8RecipeKwargs</code> handler over backends like
+            Transformer Engine, for hardware that supports it.
+          </p>
+          <p>
+            The one operation you must route through Accelerate is gradient clipping.
+            If you clip the raw gradients while an fp16 scaler is active, you clip the
+            scaled values and get the wrong norm, so you call
+            <code>accelerator.clip_grad_norm_(model.parameters(), max_norm)</code>,
+            which unscales first and, under FSDP, reduces the norm across shards
+            correctly. For manual regions where you want autocast around code that is
+            not the model forward, there is
+            <code>with accelerator.autocast():</code>. Everything else about mixed
+            precision is invisible, which is the intended experience, you ask for a
+            precision at construction and the numerics are handled.
+          </p>
+
+          <h3>Deep dive: big model inference, the other half of the repo</h3>
+          <p>
+            Accelerate has a second pillar that the training story rarely mentions
+            but which powers a feature everyone has used, the
+            <code>device_map="auto"</code> that lets Transformers load a model too
+            large for one GPU. This lives in
+            <code>src/accelerate/big_modeling.py</code> and
+            <code>src/accelerate/utils/modeling.py</code>. The entry points are
+            <code>init_empty_weights()</code>, a context manager that builds the model
+            on the meta device so it has shapes but no allocated storage,
+            <code>infer_auto_device_map()</code>, which decides which layers land on
+            which GPU, on CPU, or on disk given the available memory, and
+            <code>load_checkpoint_and_dispatch()</code>, which streams the checkpoint
+            shard by shard onto those devices. The runtime trick is in
+            <code>src/accelerate/hooks.py</code>, where forward pre-hooks move each
+            submodule's inputs to wherever that submodule's weights live and post-hooks
+            move outputs back, so a forward pass can flow through layers scattered
+            across a GPU, system RAM, and an NVMe disk as if they were one device.
+            <mark>The same meta-device-then-dispatch idea that lets torchtitan
+            initialize a 405B model without it fitting on one host is what lets
+            Accelerate run inference on a model that does not fit either, and both
+            rest on PyTorch's meta device.</mark> It is worth knowing this exists,
+            because a large fraction of Accelerate's real-world usage is this
+            inference path rather than the training loop.
+          </p>
+
+          <h3>Deep dive: accelerate launch, config, and notebook_launcher</h3>
+          <p>
+            The launch machinery is a small, readable command layer under
+            <code>src/accelerate/commands/</code>. <code>config/</code> implements the
+            wizard that writes the YAML, <code>launch.py</code> implements the
+            launcher that reads it and spawns processes, and there are utility
+            commands like <code>env</code>, <code>test</code>, and
+            <code>estimate-memory</code> for sizing a model against your hardware. The
+            config YAML is the single source of truth for a machine's setup, and its
+            core fields are worth recognizing.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="c"># a typical multi-GPU default_config.yaml</span>
+<span class="m1">compute_environment:</span> <span class="s">LOCAL_MACHINE</span>
+<span class="m1">distributed_type:</span> <span class="s">MULTI_GPU</span>        <span class="c"># or NO, FSDP, DEEPSPEED, XLA</span>
+<span class="m1">mixed_precision:</span> <span class="s">bf16</span>              <span class="c"># no, fp16, bf16, fp8</span>
+<span class="m1">num_processes:</span> <span class="s">4</span>                   <span class="c"># total processes across all machines</span>
+<span class="m1">num_machines:</span> <span class="s">1</span>
+<span class="m1">machine_rank:</span> <span class="s">0</span>
+<span class="m1">main_process_ip:</span> <span class="s">null</span>              <span class="c"># set for multi-node</span>
+<span class="m1">main_process_port:</span> <span class="s">null</span>
+<span class="m1">gpu_ids:</span> <span class="s">all</span></code></pre></div>
+          <p>
+            For multi-node training you run <code>accelerate launch</code> on each
+            machine with the same config but a different <code>machine_rank</code>,
+            and the launcher wires the ranks into one world through
+            <code>main_process_ip</code> and <code>main_process_port</code>. Any field
+            can be overridden on the command line, so
+            <code>accelerate launch --num_processes 8 --mixed_precision fp16 train.py</code>
+            beats the file without editing it, which is convenient in job scripts.
+          </p>
+          <p>
+            The <code>notebook_launcher</code>, in
+            <code>src/accelerate/launchers.py</code>, solves a different launch
+            problem. In a Jupyter or Colab notebook there is no shell to run
+            <code>accelerate launch</code>, so you wrap your whole training function
+            and hand it to the launcher, which spawns the processes for you.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">accelerate</span> <span class="k">import</span> <span class="m1">notebook_launcher</span>
+
+<span class="k">def</span> <span class="m1">training_function</span><span class="b0">(</span><span class="v2">args</span><span class="b0">)</span>:
+    <span class="v2">accelerator</span> = <span class="m1">Accelerator</span><span class="b0">()</span>
+    <span class="c"># build model, data, optimizer, prepare, and run the loop entirely in here</span>
+    ...
+
+<span class="m1">notebook_launcher</span><span class="b0">(</span><span class="m1">training_function</span>, <span class="v2">args</span>=<span class="b1">(</span><span class="v4">config</span>,<span class="b1">)</span>, <span class="v5">num_processes</span>=<span class="n">2</span><span class="b0">)</span></code></pre></div>
+          <p>
+            Under the hood it spawns processes with PyTorch's multiprocessing start
+            in fork mode for multi-GPU, and routes through the XLA spawn on a TPU,
+            which is how a single Colab TPU notebook trains across eight cores. There
+            is one rule that trips up everyone the first time. <mark>You must not have
+            initialized CUDA in the notebook before calling
+            <code>notebook_launcher</code>, which means no tensor may have touched a
+            GPU in the parent process, which is why the entire model, data, and loop
+            must be built inside the training function rather than in notebook
+            cells above it.</mark> Fork a process that already holds a CUDA context
+            and the children inherit a broken one, and the run fails in a confusing
+            way. Build everything inside the function and it works.
+          </p>
+
+          <h2>Part VI: Reading the repository</h2>
+          <p>
+            The repository is compact for what it does, and it rewards reading in a
+            particular order that follows the data rather than the file listing. All
+            paths are under <code>src/accelerate/</code> and reflect the layout in
+            mid 2026, and a couple of the utility files are large, so read for the
+            shape rather than every line.
+          </p>
+          <p>
+            <strong>Stage 0, orientation.</strong> Read the top-level
+            <code>README.md</code> and the two-file example it shows, then open
+            <code>examples/</code> in the repo and read
+            <code>nlp_example.py</code> or <code>complete_nlp_example.py</code>. These
+            are the canonical minimal loops and they anchor everything else.
+            Question to hold, which four lines change between a single-device loop
+            and an Accelerate loop, and why is <code>prepare</code> called on all the
+            objects at once.
+          </p>
+          <p>
+            <strong>Stage 1, the facade.</strong> Read
+            <code>accelerator.py</code> with three methods as the destination,
+            <code>prepare</code>, <code>backward</code>, and
+            <code>prepare_model</code>. Do not try to read the whole file, it is long
+            because it absorbs every backend's quirks. Follow just those three.
+            Questions, how does <code>prepare</code> decide what each argument is,
+            what are the three jobs <code>backward</code> does beyond calling
+            <code>loss.backward</code>, and where in <code>prepare_model</code> does
+            the DDP versus FSDP versus DeepSpeed decision happen.
+          </p>
+          <p>
+            <strong>Stage 2, the state.</strong> Read <code>state.py</code> and meet
+            <code>PartialState</code>, <code>AcceleratorState</code>, and
+            <code>GradientState</code>. Questions, why is the state a shared
+            singleton, what does <code>PartialState</code> hold that
+            <code>AcceleratorState</code> does not care about, and what two flags does
+            <code>GradientState</code> track that make gradient accumulation correct.
+          </p>
+          <p>
+            <strong>Stage 3, the wrapped objects.</strong> Read
+            <code>optimizer.py</code> and <code>scheduler.py</code>, which are short,
+            then <code>data_loader.py</code>, which is not. Questions, when does
+            <code>AcceleratedOptimizer.step</code> actually step, why does the
+            scheduler need to know the process count, and what is the difference
+            between <code>DataLoaderShard</code> and <code>DataLoaderDispatcher</code>
+            in one sentence each.
+          </p>
+          <p>
+            <strong>Stage 4, the plugins.</strong> Read the plugin dataclasses in
+            <code>utils/dataclasses.py</code>, at least
+            <code>FullyShardedDataParallelPlugin</code>,
+            <code>DeepSpeedPlugin</code>, and the kwargs handlers like
+            <code>DistributedDataParallelKwargs</code> and
+            <code>GradScalerKwargs</code>. Then skim <code>utils/operations.py</code>
+            for <code>gather</code>, <code>reduce</code>, <code>pad_across_processes</code>,
+            and <code>send_to_device</code>, which are the collective helpers the rest
+            of the library calls. Questions, how does a plugin field become a wrapping
+            decision in <code>prepare_model</code>, and where does the padding that
+            <code>gather_for_metrics</code> removes get added.
+          </p>
+          <p>
+            <strong>Stage 5, launch and big models.</strong> Read
+            <code>commands/launch.py</code> for how a config becomes spawned
+            processes, <code>launchers.py</code> for <code>notebook_launcher</code>,
+            and then, if you use it, the big-model path across
+            <code>big_modeling.py</code>, <code>utils/modeling.py</code>, and
+            <code>hooks.py</code>. Questions, how does the launcher choose between the
+            elastic launch and the XLA spawn, and how does a forward pass flow through
+            layers that live on different devices.
+          </p>
+          <p>
+            Where not to start. The <code>test_utils/</code> tree and the enormous
+            matrix of hardware-specific branches, XPU, MLU, NPU, MPS, are important
+            for the library's portability but are noise on a first read, and the
+            Megatron-LM integration is a niche path you should meet only after DDP,
+            FSDP, and DeepSpeed are solid.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            Lab 1 needs nothing but a CPU. Labs 2 through 5 want two or more GPUs, or
+            a single GPU to at least see the setup path. Log formats vary across
+            versions.
+          </p>
+          <p><strong>Lab 1: the same script three ways.</strong> Concept: the environment carries the distribution, not the code.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="c"># write the minimal loop from Part II as train.py, then run it three ways:</span>
+<span class="m1">python</span> <span class="s">train.py</span>                                   <span class="c"># 1 process, whatever device exists</span>
+<span class="m1">accelerate</span> <span class="s">launch</span> <span class="s">--cpu</span> <span class="s">--num_processes</span> <span class="s">1</span> <span class="s">train.py</span>
+<span class="m1">accelerate</span> <span class="s">launch</span> <span class="s">--num_processes</span> <span class="s">2</span> <span class="s">train.py</span>      <span class="c"># needs 2 devices, or use --cpu on a big machine</span></code></pre></div>
+          <p>
+            Observe that the script is byte-for-byte identical across the three runs
+            and only the launch command changes. Add
+            <code>accelerator.print(f"rank {accelerator.process_index} of {accelerator.num_processes} on {accelerator.device}")</code>
+            at the top of the loop and watch the numbers change with the launcher.
+          </p>
+          <p><strong>Lab 2: build a config and inspect it.</strong> Concept: the launch config as the single source of truth.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">accelerate</span> <span class="s">config</span>              <span class="c"># answer the questions for your machine</span>
+<span class="m1">accelerate</span> <span class="s">env</span>                 <span class="c"># see the resolved config and environment</span>
+<span class="m1">accelerate</span> <span class="s">test</span>                <span class="c"># run the built-in setup smoke test</span>
+<span class="m1">cat</span> <span class="s">~/.cache/huggingface/accelerate/default_config.yaml</span></code></pre></div>
+          <p>
+            Read the YAML field by field against the deep dive in Part V. Then rerun
+            <code>accelerate launch</code> with <code>--mixed_precision bf16</code>
+            overriding the file and confirm from your logs that the override won.
+          </p>
+          <p><strong>Lab 3: gather, and gather_for_metrics.</strong> Concept: honest metrics under even_batches padding.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="c"># inside a prepared eval loop over a dataset whose length is not divisible by world size</span>
+<span class="v4">preds</span> = <span class="m1">model</span><span class="b0">(</span><span class="v6">batch</span><span class="b0">)</span>.<span class="m2">argmax</span><span class="b0">(</span><span class="v5">dim</span>=-<span class="n">1</span><span class="b0">)</span>
+<span class="c"># wrong for a final metric, includes padding duplicates:</span>
+<span class="v0">all_preds_raw</span> = <span class="v2">accelerator</span>.<span class="m2">gather</span><span class="b0">(</span><span class="v4">preds</span><span class="b0">)</span>
+<span class="c"># right, drops the padding the dataloader added:</span>
+<span class="v1">all_preds</span> = <span class="v2">accelerator</span>.<span class="m2">gather_for_metrics</span><span class="b0">(</span><span class="v4">preds</span><span class="b0">)</span>
+<span class="k">if</span> <span class="v2">accelerator</span>.<span class="m2">is_main_process</span>:
+    <span class="v2">accelerator</span>.<span class="m2">print</span><span class="b0">(</span><span class="m1">len</span><span class="b1">(</span><span class="v0">all_preds_raw</span><span class="b1">)</span>, <span class="m1">len</span><span class="b1">(</span><span class="v1">all_preds</span><span class="b1">)</span><span class="b0">)</span>   <span class="c"># raw is larger</span></code></pre></div>
+          <p>
+            Run it on two processes with a dataset length that is odd relative to the
+            world size and watch the two lengths differ by exactly the padding count.
+            That gap is the double counting <code>gather_for_metrics</code> removes.
+          </p>
+          <p><strong>Lab 4: gradient accumulation, checked against a big batch.</strong> Concept: N microbatches equal one large batch.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="v6">acc</span> = <span class="m1">Accelerator</span><span class="b0">(</span><span class="v3">gradient_accumulation_steps</span>=<span class="n">4</span><span class="b0">)</span>
+<span class="c"># ... prepare, then:</span>
+<span class="k">for</span> <span class="v6">batch</span> <span class="k">in</span> <span class="v3">dl</span>:
+    <span class="k">with</span> <span class="v6">acc</span>.<span class="m2">accumulate</span><span class="b0">(</span><span class="m1">model</span><span class="b0">)</span>:
+        <span class="v6">loss</span> = <span class="m1">loss_fn</span><span class="b0">(</span><span class="m1">model</span><span class="b1">(</span><span class="v6">batch</span><span class="b1">)</span>, <span class="v6">batch</span>.<span class="m2">labels</span><span class="b0">)</span>
+        <span class="v6">acc</span>.<span class="m2">backward</span><span class="b0">(</span><span class="v6">loss</span><span class="b0">)</span>
+        <span class="v1">opt</span>.<span class="m2">step</span><span class="b0">()</span>; <span class="v1">sched</span>.<span class="m2">step</span><span class="b0">()</span>; <span class="v1">opt</span>.<span class="m2">zero_grad</span><span class="b0">()</span></code></pre></div>
+          <p>
+            Train once with batch size 8 and accumulation 4, then once with batch
+            size 32 and accumulation 1, with the same seed and learning rate. The
+            loss curves should track closely, which demonstrates that accumulation is
+            simulating the larger batch. Print
+            <code>acc.sync_gradients</code> inside the context and watch it be true
+            only every fourth step.
+          </p>
+          <p><strong>Lab 5: switch backends without touching the loop.</strong> Concept: prepare is the seam.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">accelerate</span> <span class="s">launch</span> <span class="s">--multi_gpu</span> <span class="s">train.py</span>                       <span class="c"># DDP</span>
+<span class="c"># reconfigure with `accelerate config` choosing FSDP, or:</span>
+<span class="m1">accelerate</span> <span class="s">launch</span> <span class="s">--use_fsdp</span> <span class="s">--num_processes</span> <span class="s">2</span> <span class="s">train.py</span>      <span class="c"># FSDP, same train.py</span>
+<span class="c"># with the deepspeed extra installed and a config:</span>
+<span class="m1">accelerate</span> <span class="s">launch</span> <span class="s">--use_deepspeed</span> <span class="s">--num_processes</span> <span class="s">2</span> <span class="s">train.py</span> <span class="c"># DeepSpeed, same train.py</span></code></pre></div>
+          <p>
+            Confirm that <code>train.py</code> is unchanged across all three and that
+            per-GPU peak memory drops as you move from DDP to FSDP or DeepSpeed ZeRO,
+            because the model state is now sharded. This is Part IV Stage 4 made
+            visible, the same loop, a different wrapper chosen at launch.
+          </p>
+
+          <h2>Part VIII: Questions and model answers</h2>
+          <p>Understanding checks. Answer aloud before reading.</p>
+          <p><strong>1. What is Accelerate, in one sentence?</strong></p>
+          <p>
+            A thin PyTorch layer that makes the distribution strategy a property of
+            the launch environment rather than the training code, so one loop runs
+            unchanged on CPU, one GPU, many GPUs, or TPU by wrapping the model,
+            optimizer, dataloader, and scheduler through <code>prepare()</code>.
+          </p>
+          <p><strong>2. What are the four kinds of change to a single-device loop?</strong></p>
+          <p>
+            Construct one <code>Accelerator</code>, pass model, optimizer,
+            dataloader, and scheduler through <code>prepare()</code> and reassign the
+            results, drop the manual <code>.to(device)</code> calls because the
+            prepared dataloader places batches for you, and replace
+            <code>loss.backward()</code> with
+            <code>accelerator.backward(loss)</code>.
+          </p>
+          <p><strong>3. Why must you reassign the output of prepare()?</strong></p>
+          <p>
+            <code>prepare()</code> returns wrapped objects, the DDP or FSDP model, the
+            sharded dataloader, the accelerated optimizer, and the originals are now
+            stale. If you ignore the return value your loop uses the unwrapped model
+            and an unsharded dataloader, so ranks train on duplicated data or the run
+            crashes.
+          </p>
+          <p><strong>4. Why is everything prepared in one call rather than separately?</strong></p>
+          <p>
+            Because the wrappers reference each other. The optimizer wrapper needs the
+            gradient scaler and gradient state, the scheduler wrapper needs the
+            process count, and under DeepSpeed the model, optimizer, and scheduler are
+            initialized together into one engine. Preparing them as a set lets the
+            references be wired correctly.
+          </p>
+          <p><strong>5. Where do DDP, FSDP, and DeepSpeed diverge?</strong></p>
+          <p>
+            Inside <code>prepare_model</code> and the DeepSpeed init path. DDP wraps
+            the model in <code>DistributedDataParallel</code> and replicates it, FSDP
+            wraps it in <code>FullyShardedDataParallel</code> and shards parameters,
+            gradients, and optimizer state, and DeepSpeed is initialized as an engine
+            that owns all three and implements ZeRO. Above that seam your loop is
+            identical.
+          </p>
+          <p><strong>6. What three jobs does accelerator.backward do?</strong></p>
+          <p>
+            It divides the loss by the gradient accumulation steps so accumulated
+            gradients are a mean, it scales the loss through the fp16
+            <code>GradScaler</code> when one is active, and under DeepSpeed it routes
+            to the engine's own backward. For bf16 with no accumulation it is close to
+            a plain backward.
+          </p>
+          <p><strong>7. How does gradient accumulation avoid wasted communication?</strong></p>
+          <p>
+            The <code>accumulate</code> context manager reads
+            <code>GradientState</code>, and on non-sync microbatches it enters
+            <code>model.no_sync()</code> so DDP skips the gradient all-reduce, letting
+            gradients accumulate locally. The all-reduce and the real optimizer step
+            happen only on the last microbatch of each group or at the end of the
+            dataloader.
+          </p>
+          <p><strong>8. What is the difference between gather and gather_for_metrics?</strong></p>
+          <p>
+            <code>gather</code> concatenates a tensor across all processes.
+            <code>gather_for_metrics</code> does the same and then drops the duplicate
+            samples that <code>even_batches</code> added to make every process run the
+            same number of iterations, so a metric computed over the result is not
+            biased by double counting.
+          </p>
+          <p><strong>9. What does mixed_precision change without a line in the loop?</strong></p>
+          <p>
+            <code>prepare_model</code> runs the forward under autocast and casts
+            outputs back to fp32, for fp16 the <code>Accelerator</code> builds a
+            <code>GradScaler</code> that <code>backward</code> and the accelerated
+            optimizer use for loss scaling and inf handling, and for bf16 no scaler is
+            created because its range matches fp32.
+          </p>
+          <p><strong>10. Why clip gradients through accelerator.clip_grad_norm_?</strong></p>
+          <p>
+            Because with an fp16 scaler active the raw gradients are scaled, so
+            clipping them directly uses the wrong norm. The Accelerate method unscales
+            first and, under FSDP, reduces the norm across shards, giving the correct
+            clip.
+          </p>
+          <p><strong>11. Why is the state a shared singleton?</strong></p>
+          <p>
+            So that constructing an <code>Accelerator</code> is cheap and idempotent,
+            and so that your code and a library like the Transformers
+            <code>Trainer</code> can each create one without initializing the
+            distributed world twice or disagreeing about the device and rank.
+          </p>
+          <p><strong>12. What is the one rule for notebook_launcher?</strong></p>
+          <p>
+            CUDA must not be initialized in the parent process before the call, so no
+            tensor may have touched a GPU in a notebook cell above it. Build the
+            model, data, optimizer, and loop entirely inside the training function
+            you hand to the launcher, otherwise the forked children inherit a broken
+            CUDA context.
+          </p>
+          <p><strong>13. When would you pick Lightning or torchtitan over Accelerate?</strong></p>
+          <p>
+            Lightning when you want the framework to own the loop with callbacks,
+            logging, and checkpointing built in.
+            <a href="/oss/torchtitan">torchtitan</a> when you are pretraining large
+            transformers and want a platform that composes FSDP2, tensor, pipeline,
+            and context parallelism over DTensor. Accelerate when you want to keep
+            your own loop and only abstract the device and backend.
+          </p>
+          <p><strong>14. Accelerate loads a model too large for one GPU with device_map=auto. How?</strong></p>
+          <p>
+            Through the big-model path. The model is built on the meta device with
+            <code>init_empty_weights</code>, <code>infer_auto_device_map</code>
+            assigns layers to GPUs, CPU, or disk by available memory,
+            <code>load_checkpoint_and_dispatch</code> streams the weights onto them,
+            and hooks move each layer's inputs and outputs to wherever its weights
+            live so one forward flows across all of them.
+          </p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Abstract the environment, not the loop.</strong> The single best
+            decision in Accelerate is refusing to own your training loop. It abstracts
+            the thing that genuinely varies across machines, the device and the
+            distribution backend, and leaves the thing you actually want to control,
+            the loop, in your hands. Wherever a library is tempted to take over your
+            control flow to hide a concern, ask whether it can hide the concern behind
+            an object instead, the way <code>prepare()</code> does.
+          </p>
+          <p>
+            <strong>Make one function the seam.</strong> Every backend difference is
+            funneled through <code>prepare</code> and <code>prepare_model</code>, so
+            there is exactly one place where CPU, DDP, FSDP, and DeepSpeed diverge and
+            the entire rest of the codebase is backend-agnostic. Centralizing the
+            variation in one audited seam is the same instinct as a single factory or
+            a single dependency-injection root, and it is why adding a new hardware
+            backend does not ripple through the loop.
+          </p>
+          <p>
+            <strong>Put shared truth in a singleton, deliberately.</strong> The world
+            has one rank, one device, one process count, and Accelerate models that as
+            a shared state rather than passing it through every constructor. A
+            singleton is usually a smell, but for genuinely process-global facts it is
+            the honest representation, and separating <code>PartialState</code> from
+            <code>AcceleratorState</code> keeps the who-am-I facts apart from the
+            training configuration.
+          </p>
+          <p>
+            <strong>Hide correctness debts and pay them automatically.</strong>
+            <code>even_batches</code> introduces duplicated samples to keep the
+            collectives from deadlocking, which is a correctness debt, and
+            <code>gather_for_metrics</code> pays it back by dropping exactly those
+            duplicates. Good abstractions do not just hide a mechanism, they remember
+            the debt the mechanism created and settle it so the user never sees a
+            wrong number.
+          </p>
+          <p>
+            <strong>Configuration belongs to the machine, code belongs to the
+            author.</strong> The distribution strategy lives in a YAML tied to the
+            machine, and the training logic lives in a script tied to the problem, so
+            the same script runs on a laptop and a cluster with a different config.
+            Keeping environment configuration out of source code is the same
+            separation that twelve-factor apps make for deployment, and it is why one
+            file can serve every backend.
+          </p>
+          <p>
+            <strong>Reuse the platform, do not reimplement it.</strong> Accelerate
+            wraps DDP, FSDP, and DeepSpeed rather than writing its own sharding, and it
+            leans on PyTorch's meta device for big models rather than inventing a lazy
+            loader. It adds a normalizing surface over powerful lower layers, which is
+            a smaller and more durable contribution than a competing implementation
+            would have been.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            The one-sentence summary. <mark>Accelerate reads the launch environment
+            into a shared state singleton, adapts your model, optimizer, dataloader,
+            and scheduler to the current backend through one polymorphic
+            <code>prepare()</code>, and lets an ordinary training loop run unchanged
+            on CPU, one GPU, many GPUs, or TPU, with device placement, data sharding,
+            gradient accumulation, and mixed precision handled inside the wrapped
+            objects.</mark>
+          </p>
+          <pre class="flow">accelerate launch -&gt; torch.distributed.run -&gt; num_processes ranks (env set)
+  -&gt; Accelerator() -&gt; PartialState / AcceleratorState / GradientState (singletons)
+  -&gt; prepare(model, opt, dl, sched)
+       model -&gt; device + DDP / FSDP / DeepSpeed + autocast   (prepare_model)
+       dl    -&gt; DataLoaderShard or DataLoaderDispatcher       (data_loader.py)
+       opt   -&gt; AcceleratedOptimizer (scaler + sync gate)     (optimizer.py)
+       sched -&gt; AcceleratedScheduler                          (scheduler.py)
+  -&gt; loop: model(x) -&gt; accelerator.backward(loss) -&gt; opt.step() -&gt; sched.step()
+  -&gt; gather_for_metrics, save_model(unwrap_model(model))</pre>
+          <p>The chain mapped to source, under <code>src/accelerate/</code>:</p>
+          <pre class="flow">launch            commands/launch.py, commands/config/
+facade            accelerator.py (prepare, backward, prepare_model)
+state             state.py (PartialState, AcceleratorState, GradientState)
+wrapped objects   optimizer.py, scheduler.py, data_loader.py
+plugins + ops     utils/dataclasses.py, utils/operations.py
+notebook launch   launchers.py (notebook_launcher)
+big models        big_modeling.py, utils/modeling.py, hooks.py</pre>
+          <p>Memorize these blocks:</p>
+          <ul>
+            <li><strong>Four changes:</strong> one <code>Accelerator</code>, <code>prepare()</code> everything and reassign, drop <code>.to(device)</code>, use <code>accelerator.backward(loss)</code>.</li>
+            <li><strong>prepare dispatch:</strong> model to <code>prepare_model</code>, optimizer to <code>AcceleratedOptimizer</code>, dataloader to a shard or dispatch loader, scheduler to <code>AcceleratedScheduler</code>, anything else passed through.</li>
+            <li><strong>Backends:</strong> DDP replicates, FSDP shards params, grads, and optimizer state, DeepSpeed is a ZeRO engine that owns all three. All chosen at launch, none in the loop.</li>
+            <li><strong>Accumulation:</strong> <code>accumulate</code> skips the DDP all-reduce on non-sync steps via <code>no_sync</code>, <code>backward</code> divides the loss by the steps, the wrapped optimizer steps only on the sync step.</li>
+            <li><strong>Mixed precision:</strong> autocast on the forward, a <code>GradScaler</code> for fp16 only, clip through <code>accelerator.clip_grad_norm_</code>, gather metrics with <code>gather_for_metrics</code>.</li>
+            <li><strong>notebook_launcher rule:</strong> no CUDA before the call, build everything inside the training function.</li>
+          </ul>
+
+          <h2>Part XI: Papers and further reading</h2>
+          <p>
+            Accelerate is a normalizing layer over systems that each have a paper
+            behind them, and reading those papers is how the wrappers stop looking
+            like magic. Where this site develops the same idea in depth, the
+            companion link points there.
+          </p>
+          <ol class="refs">
+            <li>Li et al., <a href="https://arxiv.org/abs/2006.15704" target="_blank" rel="noreferrer">PyTorch Distributed, Experiences on Accelerating Data Parallel Training</a>, VLDB 2020. The DDP design that <code>prepare_model</code> applies for a plain multi-GPU run, including the bucketed all-reduce in backward and the <code>no_sync</code> path that gradient accumulation leans on.</li>
+            <li>Zhao et al., <a href="https://arxiv.org/abs/2304.11277" target="_blank" rel="noreferrer">PyTorch FSDP, Experiences on Scaling Fully Sharded Data Parallel</a>, VLDB 2023. The sharded backend behind the <code>FullyShardedDataParallelPlugin</code>, and it explains the communication-for-memory trade that Part V describes. The parallelism vocabulary is developed in the <a href="/classes/parallel-computing">parallel computing class</a> on this site.</li>
+            <li>Rajbhandari et al., <a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noreferrer">ZeRO, Memory Optimizations Toward Training Trillion Parameter Models</a>, 2019. The partitioning arithmetic behind the DeepSpeed engine's stages, derived in the <a href="/oss/deepspeed">DeepSpeed walkthrough</a> on this site.</li>
+            <li>Ren et al., <a href="https://arxiv.org/abs/2101.06840" target="_blank" rel="noreferrer">ZeRO-Offload, Democratizing Billion-Scale Model Training</a>, USENIX ATC 2021. The CPU offload strategy that surfaces as offload fields on both the FSDP and DeepSpeed plugins.</li>
+            <li>Shoeybi et al., <a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noreferrer">Megatron-LM, Training Multi-Billion Parameter Language Models Using Model Parallelism</a>, 2019. The tensor-parallel world that Accelerate's niche Megatron integration connects to, covered in the <a href="/oss/megatron-lm">Megatron-LM walkthrough</a>.</li>
+            <li>Micikevicius et al., <a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noreferrer">Mixed Precision Training</a>, ICLR 2018. The fp32 master weights and loss scaling that the <code>GradScaler</code> implements, worked through in the <a href="/ml/mixed-precision">mixed precision note</a> on this site.</li>
+            <li>Micikevicius et al., <a href="https://arxiv.org/abs/2209.05433" target="_blank" rel="noreferrer">FP8 Formats for Deep Learning</a>, 2022. The E4M3 and E5M2 encodings behind the fp8 path that <code>FP8RecipeKwargs</code> drives through backends like Transformer Engine.</li>
+            <li>Goyal et al., <a href="https://arxiv.org/abs/1706.02677" target="_blank" rel="noreferrer">Accurate, Large Minibatch SGD, Training ImageNet in 1 Hour</a>, 2017. The linear scaling rule and warmup for large effective batches, which is the arithmetic to remember when <code>num_processes</code> and accumulation steps multiply your batch size.</li>
+            <li>Paszke et al., <a href="https://arxiv.org/abs/1912.01703" target="_blank" rel="noreferrer">PyTorch, An Imperative Style, High-Performance Deep Learning Library</a>, NeurIPS 2019. The library whose surface Accelerate adapts rather than replaces, covered in the <a href="/oss/pytorch">PyTorch walkthrough</a>.</li>
+          </ol>
+
+          <h2>Part XII: Final takeaway</h2>
+          <p>
+            If the single-device PyTorch that Accelerate assumes is the gap, the
+            <a href="/ml">ML implementations section</a> builds those loops from
+            scratch, and the parallelism vocabulary that FSDP and DeepSpeed use is
+            developed in the <a href="/classes/parallel-computing">parallel computing
+            class notes</a> and shown composed at scale in the
+            <a href="/oss/torchtitan">torchtitan chapter</a>. The natural next step up
+            is <a href="/oss/transformers">Transformers</a>, whose
+            <code>Trainer</code> is a full training framework built on exactly the
+            Accelerate machinery in this chapter. Read <code>accelerator.py</code>
+            once more after all of that, follow just <code>prepare</code>,
+            <code>backward</code>, and <code>prepare_model</code>, and the library
+            will read like a careful set of adapters over PyTorch, which is the whole
+            point.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> Accelerate proves that scaling a training
+            loop across CPU, GPU, many GPUs, and TPU does not require rewriting the
+            loop or surrendering it to a framework. Make the distribution strategy a
+            property of the launch environment, funnel every backend difference
+            through one polymorphic <code>prepare()</code>, keep the shared world in a
+            state singleton, and the same file you debugged on a laptop runs on a
+            cluster with DDP, FSDP, or DeepSpeed underneath and mixed precision on,
+            all chosen at launch and none of it visible in the code you wrote.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/code-copy.js"></script>
+      <script defer src="/theme.js"></script>
+  </body>
+</html>

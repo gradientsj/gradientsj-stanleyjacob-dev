@@ -1,0 +1,1082 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Diffusers walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A full chapter on huggingface/diffusers: the DiffusionPipeline abstraction and the model, scheduler, pipeline separation, a practical quickstart, the complete life of one text-to-image call from from_pretrained through the denoising loop to the decoded image, deep dives on the config and model mixins, the scheduler zoo from DDPM to flow matching, UNet and DiT backbones, and adapters like ControlNet and LoRA, a staged reading plan, labs, and understanding checks." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%232B2621'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+      <script>(function(){try{var t=localStorage.getItem("theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>Diffusers</h1>
+        <p class="lead">
+          <a href="https://github.com/huggingface/diffusers" target="_blank" rel="noreferrer">huggingface/diffusers</a>
+          is the standard library for diffusion models, the place where a new
+          sampler, backbone, or adapter usually lands first and where the
+          whole zoo of Stable Diffusion, SDXL, DiT, and Flux systems share one
+          set of interfaces. Its load-bearing idea is a three-way separation.
+          A <em>model</em> is a plain neural network that denoises, a
+          <em>scheduler</em> is the pure math that turns denoiser outputs into
+          the next sample, and a <em>pipeline</em> is the recipe that wires
+          them to a text encoder and a VAE and runs the loop. This chapter is
+          three things at once, a practical tutorial for generating and
+          training, a walkthrough that follows one text-to-image call from
+          <code>from_pretrained</code> down through the denoising loop and back
+          up to a decoded image, and a staged guide to reading the repository.
+          It pairs with the derivations in the
+          <a href="/classes/diffusion-and-large-vision-models">diffusion and large vision models</a>
+          class and ends with runnable labs, understanding checks with model
+          answers, and a compact framework for keeping the whole design in
+          your head.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">DiffusionPipeline.from_pretrained("stabilityai/stable-diffusion-xl-base-1.0")
+      |                       reads model_index.json, loads each subfolder
+      v
+components assembled          tokenizer + text_encoder   (from transformers)
+      |                       vae (AutoencoderKL)
+      |                       unet / transformer  = the MODEL (denoiser)
+      |                       scheduler           = the MATH (sampler)
+      v
+pipe(prompt, num_inference_steps=30, guidance_scale=7.5)   __call__ = the RECIPE
+      |
+      v
+encode prompt                text embeddings, uncond + cond for guidance
+      |
+      v
+prepare latents              random Gaussian noise in VAE latent space
+      |
+      |   denoising loop over scheduler.timesteps
+      v
+for t:  noise_pred = unet(x_t, t, encoder_hidden_states=text)
+        noise_pred = combine(uncond, cond) via classifier-free guidance
+        x_next     = scheduler.step(noise_pred, t, x_t).prev_sample
+      |
+      v
+vae.decode(latents / scaling_factor)     latent grid -&gt; pixels
+      |
+      v
+postprocess -&gt; PIL image</pre>
+          <p>
+            The one-sentence identity: <mark>Diffusers factors every diffusion
+            system into a denoising model, a scheduler that is pure sampling
+            math, and a pipeline that orchestrates them, so that a backbone, a
+            sampler, and a task recipe can each be swapped independently
+            without touching the other two.</mark> A research codebase usually
+            fuses these. The network, the noise schedule, the guidance trick,
+            and the sampling loop all live tangled in one training script, and
+            changing the sampler means editing the model file. Diffusers pulls
+            them apart. The <code>UNet2DConditionModel</code> or a <a href="https://arxiv.org/abs/2212.09748" target="_blank" rel="noreferrer">DiT</a> knows
+            only how to predict noise from a noisy latent and a timestep. The
+            <code>DDIMScheduler</code> or <code>DPMSolverMultistepScheduler</code>
+            knows only how to turn that prediction into the previous sample. The
+            <code>StableDiffusionXLPipeline</code> knows how to encode a prompt,
+            seed the latents, run the loop, and decode. Each is a separate,
+            serializable object.
+          </p>
+          <p>
+            Two consequences follow. First, samplers become interchangeable at
+            runtime. Because a scheduler is a self-contained numerical method
+            configured by the same handful of fields (the number of training
+            timesteps, the beta schedule, the prediction type), you can replace
+            one with another by reading the old config and building the new one,
+            <code>pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)</code>,
+            and the loop keeps working. Second, the repository doubles as an
+            executable map of the field. Nearly every published scheduler,
+            guidance method, and adapter has a faithful implementation here
+            under one API, so reading Diffusers is the shortest path from the
+            equations in the
+            <a href="/classes/diffusion-and-large-vision-models">diffusion class</a>
+            to code you can step through. The details below are checked against
+            a recent main branch in mid 2026. The library moves quickly and the
+            model subpackages have been reorganized more than once, so where an
+            exact file path is likely to have shifted I name the component by
+            its role and say so.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <p>
+            Diffusers is a pip install and runs anywhere PyTorch does, CPU,
+            CUDA, ROCm, or Apple Silicon (MPS), though anything beyond toy
+            resolutions wants a GPU. A pipeline almost always needs two
+            companion libraries, <a href="/oss/transformers">transformers</a>
+            for the CLIP or T5 text encoders and <code>accelerate</code> for
+            device placement and offloading, plus <code>safetensors</code> for
+            weights.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">pip</span> <span class="s">install</span> <span class="s">diffusers</span> <span class="s">transformers</span> <span class="s">accelerate</span> <span class="s">safetensors</span>
+<span class="c"># for the latest features, install from source:</span>
+<span class="m1">pip</span> <span class="s">install</span> <span class="s">git+https://github.com/huggingface/diffusers</span></code></pre></div>
+          <p>
+            The canonical first program is four lines. Load a pipeline by its
+            Hub id, move it to the GPU, and call it with a prompt.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">torch</span>
+<span class="k">from</span> <span class="m1">diffusers</span> <span class="k">import</span> <span class="m1">DiffusionPipeline</span>
+
+<span class="m1">pipe</span> = <span class="m1">DiffusionPipeline</span>.<span class="m2">from_pretrained</span><span class="b0">(</span>
+    <span class="s">"stabilityai/stable-diffusion-xl-base-1.0"</span>,
+    <span class="v3">torch_dtype</span>=<span class="m1">torch</span>.<span class="m2">float16</span>,
+    <span class="v1">variant</span>=<span class="s">"fp16"</span>,
+<span class="b0">)</span>
+<span class="m1">pipe</span> = <span class="m1">pipe</span>.<span class="m2">to</span><span class="b0">(</span><span class="s">"cuda"</span><span class="b0">)</span>
+
+<span class="v5">image</span> = <span class="m1">pipe</span><span class="b0">(</span>
+    <span class="s">"a red panda astronaut floating in a nebula, cinematic lighting"</span>,
+    <span class="v6">num_inference_steps</span>=<span class="n">30</span>,
+    <span class="v5">guidance_scale</span>=<span class="n">7.0</span>,
+<span class="b0">)</span>.<span class="m2">images</span><span class="b0">[</span><span class="n">0</span><span class="b0">]</span>
+<span class="v5">image</span>.<span class="m2">save</span><span class="b0">(</span><span class="s">"out.png"</span><span class="b0">)</span></code></pre></div>
+          <p>
+            A few things are worth noticing. <code>DiffusionPipeline</code> is a
+            base class that reads the repo's <code>model_index.json</code>, sees
+            it describes an SDXL pipeline, and returns a
+            <code>StableDiffusionXLPipeline</code> instance. You did not have to
+            know the concrete class. The call returns an output object whose
+            <code>.images</code> is a list of PIL images. And <code>torch_dtype</code>
+            plus <code>variant="fp16"</code> load half-precision weights, which
+            roughly halves memory. If a full model still does not fit, offloading
+            trades speed for VRAM.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="v4">pipe</span>.<span class="m2">enable_model_cpu_offload</span><span class="b0">()</span>     <span class="c"># keep idle submodules on the CPU</span>
+<span class="v4">pipe</span>.<span class="m2">enable_vae_slicing</span><span class="b0">()</span>           <span class="c"># decode the VAE in chunks</span>
+<span class="v4">pipe</span>.<span class="m2">enable_attention_slicing</span><span class="b0">()</span>     <span class="c"># split attention to cap peak memory</span></code></pre></div>
+          <p>
+            Swapping the sampler is the move that shows off the design. Every
+            scheduler is compatible with the same pipeline as long as the model
+            was trained under a matching prediction target, so you rebuild it
+            from the existing config and reassign.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">diffusers</span> <span class="k">import</span> <span class="m1">DPMSolverMultistepScheduler</span>, <span class="m1">EulerAncestralDiscreteScheduler</span>
+
+<span class="c"># a fast deterministic ODE solver, good results in ~20 steps</span>
+<span class="v4">pipe</span>.<span class="m2">scheduler</span> = <span class="m1">DPMSolverMultistepScheduler</span>.<span class="m2">from_config</span><span class="b0">(</span><span class="v4">pipe</span>.<span class="m2">scheduler</span>.<span class="m2">config</span><span class="b0">)</span>
+
+<span class="c"># or a stochastic ancestral sampler with a different texture</span>
+<span class="v4">pipe</span>.<span class="m2">scheduler</span> = <span class="m1">EulerAncestralDiscreteScheduler</span>.<span class="m2">from_config</span><span class="b0">(</span><span class="v4">pipe</span>.<span class="m2">scheduler</span>.<span class="m2">config</span><span class="b0">)</span></code></pre></div>
+          <p>
+            Now the mistakes beginners make. First, forgetting <code>.to("cuda")</code>
+            and then wondering why generation takes minutes, because the whole
+            thing ran on CPU. Second, mixing dtypes, passing
+            <code>torch_dtype=torch.float16</code> but then handing in a
+            float32 latent or a float32 ControlNet, which raises a dtype
+            mismatch deep in a matmul. Third, expecting a fixed seed alone to
+            reproduce an image. Determinism also needs a fixed sampler, step
+            count, and guidance scale, and you pass the seed as a generator,
+            <code>generator=torch.Generator("cuda").manual_seed(0)</code>, not
+            as a global. Fourth, and most conceptual: raising
+            <code>guidance_scale</code> does not simply mean better. Past a
+            point it oversaturates colors and burns out detail, which is the
+            <a href="https://arxiv.org/abs/2207.12598" target="_blank" rel="noreferrer">classifier-free guidance</a> failure mode derived in the class. Fifth,
+            some modern pipelines are guidance-distilled. FLUX.1-schnell wants
+            <code>guidance_scale=0.0</code> and about four steps, and copying an
+            SDXL call with 30 steps and scale 7 onto it produces worse images,
+            not better.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="c"># a flow-matching, timestep-distilled model: few steps, no CFG</span>
+<span class="k">from</span> <span class="m1">diffusers</span> <span class="k">import</span> <span class="m1">FluxPipeline</span>
+<span class="m1">pipe</span> = <span class="m1">FluxPipeline</span>.<span class="m2">from_pretrained</span><span class="b0">(</span>
+    <span class="s">"black-forest-labs/FLUX.1-schnell"</span>, <span class="v3">torch_dtype</span>=<span class="m1">torch</span>.<span class="m2">bfloat16</span>
+<span class="b0">)</span>.<span class="m2">to</span><span class="b0">(</span><span class="s">"cuda"</span><span class="b0">)</span>
+<span class="v5">image</span> = <span class="m1">pipe</span><span class="b0">(</span><span class="s">"a lighthouse at dusk"</span>, <span class="v6">num_inference_steps</span>=<span class="n">4</span>, <span class="v5">guidance_scale</span>=<span class="n">0.0</span><span class="b0">)</span>.<span class="m2">images</span><span class="b0">[</span><span class="n">0</span><span class="b0">]</span></code></pre></div>
+
+          <h2>Part III: When it is the right tool</h2>
+          <p>
+            Diffusers is the right tool when you want programmatic, composable
+            access to diffusion models in Python, when you are building a
+            service or a research pipeline, fine-tuning a model, training a
+            LoRA or a ControlNet, or reading a faithful implementation of a
+            paper. It is the library the ecosystem standardizes on, so weights
+            on the Hub ship in its layout, new architectures arrive here early,
+            and the same code path serves images, video, and audio diffusion.
+            It is also the most honest reference for the sampler and adapter
+            zoo, because each method is a small self-contained file you can
+            read against the math.
+          </p>
+          <p>
+            The honest cases for alternatives. If your work is interactive
+            image making with a node graph and a huge plugin community,
+            <a href="https://github.com/comfyanonymous/ComfyUI" target="_blank" rel="noreferrer">ComfyUI</a>
+            or the classic
+            <a href="https://github.com/AUTOMATIC1111/stable-diffusion-webui" target="_blank" rel="noreferrer">AUTOMATIC1111 web UI</a>
+            are where artists live, and Diffusers is the library underneath much
+            of that world rather than a competitor to the UI itself. If you want
+            the smallest possible one-file catalog of samplers to study,
+            <a href="https://github.com/crowsonkb/k-diffusion" target="_blank" rel="noreferrer">crowsonkb/k-diffusion</a>
+            packs Euler, Heun, and the DPM-Solver family into a single sampling
+            module, and several Diffusers schedulers trace their lineage to it.
+            If you want a paper exactly as its authors released it, the original
+            research repos (CompVis latent diffusion, Stability's
+            generative-models for SDXL and SVD, the DiT and Flux repositories)
+            are the ground truth, and Diffusers is the port that unifies them.
+            For LoRA and DreamBooth training specifically, community trainers
+            like kohya-ss and OneTrainer add convenience and presets on top,
+            while Diffusers ships the reference training scripts those tools
+            grew from. And for serving large language models rather than
+            diffusion, this is the wrong library entirely, that is
+            <a href="/oss/vllm">vLLM</a> territory.
+          </p>
+          <p>
+            The architecture-shaped warning is about the split between latent
+            space and pixel space. Almost every modern model is a
+            <a href="https://arxiv.org/abs/2112.10752" target="_blank" rel="noreferrer"><em>latent</em> diffusion model</a>. The UNet or transformer denoises
+            inside a compressed VAE latent, and only at the very end does the
+            VAE decode to pixels. A recurring beginner failure is to reason
+            about the denoising loop as if it operated on the image directly.
+          </p>
+          <pre class="flow">wrong mental model:  loop runs on pixels
+   noise image (512x512x3) -&gt; denoise -&gt; clean image
+
+right mental model:  loop runs in latent space, decode once at the end
+   noise latent (64x64x4) --[ N denoising steps ]--&gt; clean latent (64x64x4)
+                                                          |
+                                                     vae.decode  (x8 upsample)
+                                                          v
+                                                   image (512x512x3)</pre>
+          <p>
+            The VAE downsamples by a factor of eight, so an SDXL 1024-pixel
+            image is a 128x128 latent grid with four channels, and the
+            <code>scaling_factor</code> in the VAE config (about 0.18 for SD1.x,
+            0.13 for SDXL) is a fixed constant that keeps the latent's variance
+            near one. Skipping that scale, or decoding without dividing it back
+            out, produces washed-out or blown-out images with no error raised,
+            which is exactly the kind of silent correctness detail a reference
+            library exists to get right for you.
+          </p>
+
+          <h2>Part IV: The full life of one text-to-image call</h2>
+          <p>
+            The specimen: one call to an SDXL-style text-to-image pipeline,
+            <code>pipe("a photo of ...", num_inference_steps=30, guidance_scale=7.5)</code>.
+            The path below is the common shape of nearly every
+            <code>__call__</code> in <code>src/diffusers/pipelines/</code>. The
+            details differ across models but the skeleton is remarkably stable.
+          </p>
+
+          <h3>Stage 1: from_pretrained assembles the components</h3>
+          <p>
+            Before any generation, <code>DiffusionPipeline.from_pretrained</code>
+            (in <code>src/diffusers/pipelines/pipeline_utils.py</code>) reads
+            <code>model_index.json</code> at the repo root. That file names the
+            concrete pipeline class and, for each component, a
+            <code>[library, class]</code> pair, for example
+            <code>"unet": ["diffusers", "UNet2DConditionModel"]</code>,
+            <code>"scheduler": ["diffusers", "EulerDiscreteScheduler"]</code>,
+            and <code>"text_encoder": ["transformers", "CLIPTextModel"]</code>.
+            The base class imports each named class, calls its own
+            <code>from_pretrained</code> on the matching subfolder, and hands the
+            finished objects to the pipeline constructor, which stores them and
+            calls <code>register_modules</code> so the pipeline knows its parts.
+            The result is a plain Python object with attributes
+            <code>pipe.unet</code>, <code>pipe.vae</code>,
+            <code>pipe.text_encoder</code>, <code>pipe.tokenizer</code>, and
+            <code>pipe.scheduler</code>. Nothing about diffusion has happened
+            yet. This is just serialization done well, and it is why any folder
+            in the standard layout loads with one call.
+          </p>
+
+          <h3>Stage 2: encode the prompt</h3>
+          <p>
+            Inside <code>__call__</code> the first real work is
+            <code>encode_prompt</code>. The tokenizer turns the string into
+            token ids, the text encoder (CLIP for SD and SDXL, with SDXL using
+            two text encoders concatenated, and T5 joining CLIP for SD3 and
+            Flux) produces a sequence of hidden states, and those become the
+            <code>encoder_hidden_states</code> the denoiser will cross-attend to.
+            Crucially the pipeline encodes the prompt <em>twice</em>, once for
+            the real text and once for an empty or negative prompt, because
+            classifier-free guidance needs both a conditioned and an
+            unconditioned prediction. The two are concatenated along the batch
+            dimension so a single forward pass computes both. SDXL additionally
+            builds pooled embeddings and a small vector of size and crop
+            conditioning, its "micro-conditioning," which is a genuine
+            architectural difference from SD1.x and a common source of confusion
+            when porting code between them.
+          </p>
+
+          <h3>Stage 3: prepare the initial latents</h3>
+          <p>
+            <code>prepare_latents</code> draws Gaussian noise shaped like the
+            VAE latent, <code>(batch, 4, height/8, width/8)</code> for the SD
+            family, using the passed <code>generator</code> so seeds are
+            reproducible. It then multiplies by the scheduler's
+            <code>init_noise_sigma</code>. This matters. Continuous-time
+            schedulers such as the Euler and DPM families begin at a large sigma
+            rather than at variance one, so the starting latent must be scaled to
+            sit at the top of the noise schedule. The scheduler also fixes the
+            discrete step grid here with <code>set_timesteps(num_inference_steps)</code>,
+            which selects, say, 30 timesteps out of the 1000 the model was
+            trained on and stores them in <code>scheduler.timesteps</code>.
+          </p>
+
+          <h3>Stage 4: the denoising loop</h3>
+          <p>
+            This is the heart of the operation, and it is short enough to hold
+            in your head. For each timestep the pipeline duplicates the latent
+            for the two guidance branches, lets the scheduler scale the input,
+            runs the denoiser, recombines the two predictions, and asks the
+            scheduler for the next latent.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">for</span> <span class="v0">t</span> <span class="k">in</span> <span class="k">self</span>.<span class="m2">scheduler</span>.<span class="m2">timesteps</span>:
+    <span class="c"># 1. duplicate for the unconditional and conditional branches</span>
+    <span class="v4">latent_model_input</span> = <span class="m1">torch</span>.<span class="m2">cat</span><span class="b0">(</span><span class="b1">[</span><span class="v2">latents</span><span class="b1">]</span> * <span class="n">2</span><span class="b0">)</span>
+    <span class="c"># 2. some schedulers rescale the input by the current sigma</span>
+    <span class="v4">latent_model_input</span> = <span class="k">self</span>.<span class="m2">scheduler</span>.<span class="m2">scale_model_input</span><span class="b0">(</span><span class="v4">latent_model_input</span>, <span class="v0">t</span><span class="b0">)</span>
+
+    <span class="c"># 3. the model predicts the noise (or velocity) at this step</span>
+    <span class="v2">noise_pred</span> = <span class="k">self</span>.<span class="m2">unet</span><span class="b0">(</span>
+        <span class="v4">latent_model_input</span>, <span class="v0">t</span>, <span class="v1">encoder_hidden_states</span>=<span class="v3">prompt_embeds</span>
+    <span class="b0">)</span>.<span class="m2">sample</span>
+
+    <span class="c"># 4. classifier-free guidance: push away from the unconditional</span>
+    <span class="v2">noise_uncond</span>, <span class="v1">noise_text</span> = <span class="v2">noise_pred</span>.<span class="m2">chunk</span><span class="b0">(</span><span class="n">2</span><span class="b0">)</span>
+    <span class="v2">noise_pred</span> = <span class="v2">noise_uncond</span> + <span class="v5">guidance_scale</span> * <span class="b0">(</span><span class="v1">noise_text</span> - <span class="v2">noise_uncond</span><span class="b0">)</span>
+
+    <span class="c"># 5. the scheduler turns a prediction into the previous sample</span>
+    <span class="v2">latents</span> = <span class="k">self</span>.<span class="m2">scheduler</span>.<span class="m2">step</span><span class="b0">(</span><span class="v2">noise_pred</span>, <span class="v0">t</span>, <span class="v2">latents</span><span class="b0">)</span>.<span class="m2">prev_sample</span></code></pre></div>
+          <p>
+            Read those five steps as the concrete boundary between the three
+            abstractions. Step 3 is the whole of what the <em>model</em> does,
+            one denoiser forward, no knowledge of guidance or sampling. Step 4
+            is the <em>pipeline's</em> guidance policy, a linear extrapolation
+            away from the unconditional prediction, and its strength is the
+            <code>guidance_scale</code> knob. Step 5 is the whole of what the
+            <em>scheduler</em> does, and the only place the noise schedule and
+            the numerical integrator live. The model never sees the scheduler
+            and the scheduler never sees the model, they meet only through the
+            tensor <code>noise_pred</code>. Swapping any one of the three leaves
+            the other two untouched, which is the entire payoff of the design
+            made mechanical.
+          </p>
+
+          <h3>Stage 5: what scheduler.step actually computes</h3>
+          <p>
+            <code>scheduler.step(model_output, timestep, sample)</code> returns
+            an output object whose <code>.prev_sample</code> is the next, less
+            noisy latent, and (for many schedulers) a
+            <code>.pred_original_sample</code>, the model's current best guess
+            of the fully denoised latent. What happens inside depends entirely
+            on the scheduler. <code>DDPMScheduler</code> follows the ancestral
+            posterior of the training process and adds fresh noise at each step,
+            so it is stochastic and needs all thousand steps.
+            <code>DDIMScheduler</code> uses the deterministic non-Markovian
+            update that lets you skip steps. <code>DPMSolverMultistepScheduler</code>
+            treats the reverse process as an ODE and applies a high-order
+            exponential integrator that reuses previous model outputs to reach
+            good samples in twenty steps or fewer. The pipeline code above does
+            not change one character across these choices, because the interface
+            is fixed and the differences are sealed inside <code>step</code>.
+            This is the concrete meaning of "the scheduler is the math."
+          </p>
+
+          <h3>Stage 6: decode and postprocess</h3>
+          <p>
+            After the loop the latent is a clean point in VAE latent space.
+            The pipeline divides out the <code>scaling_factor</code> and calls
+            <code>vae.decode</code>, which upsamples the 4-channel latent grid
+            back to a 3-channel image at eight times the resolution. An image
+            processor denormalizes from the model's [-1, 1] range to [0, 1],
+            converts to a PIL image (or a numpy array or tensor if you asked),
+            and, for the safety-checked SD pipelines, an optional classifier can
+            blank flagged outputs. The result is wrapped in the pipeline's output
+            dataclass and returned, so <code>.images[0]</code> is your picture.
+            That closes the loop of one call, prompt in, noise seeded, denoised
+            across the scheduler's steps, pixels out.
+          </p>
+
+          <h2>Part V: Internals deep dives</h2>
+
+          <h3>Deep dive: the three mixins that make everything loadable</h3>
+          <p>
+            The separation from Part I is enforced by three small base classes,
+            and understanding them explains why the whole ecosystem
+            interoperates. <code>ConfigMixin</code> (in
+            <code>src/diffusers/configuration_utils.py</code>) gives an object a
+            JSON-serializable config. A class decorates its <code>__init__</code>
+            with <code>@register_to_config</code>, which captures the
+            constructor arguments into <code>self.config</code>, and gains
+            <code>save_config</code> and <code>from_config</code>. This is why
+            <code>DPMSolverMultistepScheduler.from_config(old.config)</code>
+            works, the config is just a dictionary of numeric hyperparameters
+            that every scheduler shares.
+          </p>
+          <p>
+            <code>ModelMixin</code> (the base for
+            <code>UNet2DConditionModel</code>, <code>AutoencoderKL</code>, the
+            transformers, and <code>ControlNetModel</code>) is a
+            <code>torch.nn.Module</code> that also mixes in <code>ConfigMixin</code>,
+            adding <code>save_pretrained</code> and <code>from_pretrained</code>
+            that write a <code>config.json</code> plus a
+            <code>safetensors</code> weight file, and helpers for dtype and
+            device movement and gradient checkpointing.
+            <code>SchedulerMixin</code> is the parallel base for schedulers,
+            <code>ConfigMixin</code> without the parameters, since a scheduler
+            has no weights, only math and state. Finally
+            <code>DiffusionPipeline</code> is the composition layer that knows
+            how to save and load a whole tree of these objects via
+            <code>model_index.json</code>. The elegance is that all four use the
+            same load-and-save contract, so <mark>a model, a scheduler, and a
+            pipeline are the same kind of thing from the filesystem's point of
+            view, a config plus optional weights, which is what lets an
+            arbitrary combination round-trip through the Hub.</mark>
+          </p>
+
+          <h3>Deep dive: the scheduler zoo</h3>
+          <p>
+            Schedulers are the intellectual center of the library, and they come
+            in two families that trip people up if conflated. The first family
+            is the classical <a href="https://arxiv.org/abs/2006.11239" target="_blank" rel="noreferrer">DDPM</a>-style schedulers indexed by integer training
+            timesteps. The second is the continuous, sigma-parameterized,
+            k-diffusion-lineage schedulers that require
+            <code>scale_model_input</code> and carry a <code>sigmas</code> array.
+            A third, newer family is <a href="https://arxiv.org/abs/2210.02747" target="_blank" rel="noreferrer">flow matching</a>. All share the
+            <code>set_timesteps</code> then <code>step</code> interface, but
+            their internal state and the meaning of the <code>timestep</code>
+            argument differ.
+          </p>
+          <table>
+            <tr><th>Scheduler</th><th>Idea</th><th>Deterministic</th><th>Typical steps</th></tr>
+            <tr><td>DDPMScheduler</td><td>ancestral reverse of the training SDE</td><td>no (adds noise)</td><td>~1000</td></tr>
+            <tr><td>DDIMScheduler</td><td>non-Markovian, skippable</td><td>yes (eta=0)</td><td>50</td></tr>
+            <tr><td>PNDMScheduler</td><td>pseudo-linear multistep</td><td>yes</td><td>50</td></tr>
+            <tr><td>EulerDiscreteScheduler</td><td>Euler on the probability-flow ODE</td><td>yes</td><td>30</td></tr>
+            <tr><td>DPMSolverMultistepScheduler</td><td>high-order exponential integrator</td><td>yes</td><td>20</td></tr>
+            <tr><td>UniPCMultistepScheduler</td><td>predictor-corrector solver</td><td>yes</td><td>15 to 20</td></tr>
+            <tr><td>FlowMatchEulerDiscreteScheduler</td><td>rectified flow velocity field</td><td>yes</td><td>4 to 30</td></tr>
+          </table>
+          <p>
+            The key configuration field they share is
+            <code>prediction_type</code>, and getting it wrong is the classic
+            silent failure. A model is trained to predict one specific target,
+            the noise (<code>"epsilon"</code>), the velocity
+            (<code>"v_prediction"</code>), or the clean sample
+            (<code>"sample"</code>), and the scheduler must be told which,
+            because its update algebra inverts that exact target. Pair an
+            epsilon scheduler with a v-prediction model and you get noise, not an
+            error. Two DDPM subtleties are worth internalizing from the source.
+            The forward marginals are precomputed as
+            <code>alphas_cumprod</code>, the running product of
+            <code>1 - beta_t</code>, so any timestep's noise level is a lookup
+            rather than a loop. And <code>step</code> internally recovers the
+            predicted clean sample first, then forms the posterior mean of the
+            previous step from it, which is exactly the "complete the square"
+            posterior derived in the
+            <a href="/classes/diffusion-and-large-vision-models">class</a>. Read
+            <code>scheduling_ddpm.py</code> and <code>scheduling_ddim.py</code>
+            side by side and the difference between stochastic ancestral
+            sampling and deterministic skippable sampling is a dozen lines.
+          </p>
+          <p>
+            Flow matching deserves its own note because it is the current
+            frontier and its scheduler looks different.
+            <code>FlowMatchEulerDiscreteScheduler</code>, used by SD3 and Flux,
+            does not think in betas at all. The forward path is a straight line
+            that interpolates between data and noise, the model predicts a
+            velocity along that line, and sampling is a plain Euler integration
+            of an ODE from sigma one down to zero. There is no
+            <code>alphas_cumprod</code> and the <code>step</code> update is close
+            to <code>x = x + (sigma_next - sigma) * velocity</code>. That
+            simplicity, plus straighter trajectories, is why these models sample
+            well in very few steps.
+          </p>
+
+          <h3>Deep dive: UNet and DiT backbones</h3>
+          <p>
+            The denoiser has two dominant shapes in the library. The older and
+            still ubiquitous one is the convolutional UNet,
+            <code>UNet2DConditionModel</code>, an encoder-decoder with skip
+            connections. Its input is a noisy latent, a timestep, and the text
+            embeddings. The timestep is turned into a sinusoidal embedding and an
+            MLP, then injected into every residual block, and the text enters
+            through cross-attention layers interleaved with the convolutions. The
+            block vocabulary (<code>CrossAttnDownBlock2D</code>,
+            <code>DownBlock2D</code>, a <code>UNetMidBlock2DCrossAttn</code>, and
+            their up-sampling mirrors) is configured entirely from
+            <code>config.json</code>, which is why one class serves SD1.5, SD2,
+            and SDXL at different widths and depths. SDXL is a larger UNet with
+            more attention at lower resolutions plus the size-and-crop
+            micro-conditioning fed alongside the timestep.
+          </p>
+          <p>
+            The newer shape is the diffusion transformer, a DiT. Here the latent
+            is cut into patches and flattened into a sequence of tokens, and a
+            stack of transformer blocks does the work, with the timestep and
+            other conditioning injected through adaptive layer norm, the
+            adaLN-zero scheme, rather than by concatenation. Diffusers carries a
+            family of these, a generic <code>Transformer2DModel</code>, the
+            paper-faithful <code>DiTTransformer2DModel</code>, and the modern
+            multimodal variants <code>SD3Transformer2DModel</code> and
+            <code>FluxTransformer2DModel</code> that use joint or "MMDiT"
+            attention, where image and text tokens attend to each other in shared
+            layers. On current main these live under
+            <code>src/diffusers/models/transformers/</code>, the UNets under
+            <code>models/unets/</code>, and the VAEs under
+            <code>models/autoencoders/</code>, though this subfoldering has been
+            reorganized before, so search by class name if a path has moved. The
+            point that survives the reshuffling is that <mark>backbone shape is
+            just another swappable component, a DiT and a UNet expose the same
+            denoiser contract, so the schedulers, the pipeline loop, and the
+            adapters do not care which one they are driving.</mark> The attention
+            math inside both, and why memory-efficient kernels matter at high
+            resolution, is the tiling story told in the
+            <a href="/oss/flash-attention">FlashAttention chapter</a>.
+          </p>
+
+          <h3>Deep dive: adapters, ControlNet and LoRA</h3>
+          <p>
+            Adapters are how Diffusers adds control and style without retraining
+            the base model, and they attach at two different seams. ControlNet
+            (<code>ControlNetModel</code>, driven by pipelines like
+            <code>StableDiffusionControlNetPipeline</code>) is a trainable copy
+            of the UNet's encoder that takes a spatial conditioning image, a
+            Canny edge map, a depth map, a pose skeleton, and produces a set of
+            residual tensors. Those residuals are added into the frozen UNet's
+            skip connections and mid block. The connections start as
+            zero-initialized convolutions, the famous "zero convs," so at the
+            start of training ControlNet is a no-op and the base model is
+            undisturbed, and it learns to nudge from there. In the pipeline the
+            two networks run in lockstep each step.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="c"># inside a ControlNet pipeline's denoising loop</span>
+<span class="v1">down_res</span>, <span class="v6">mid_res</span> = <span class="k">self</span>.<span class="m2">controlnet</span><span class="b0">(</span>
+    <span class="v4">latent_model_input</span>, <span class="v0">t</span>,
+    <span class="v1">encoder_hidden_states</span>=<span class="v3">prompt_embeds</span>,
+    <span class="v1">controlnet_cond</span>=<span class="v6">control_image</span>,
+    <span class="v4">conditioning_scale</span>=<span class="v6">controlnet_conditioning_scale</span>,
+    <span class="v0">return_dict</span>=<span class="k">False</span>,
+<span class="b0">)</span>
+<span class="v2">noise_pred</span> = <span class="k">self</span>.<span class="m2">unet</span><span class="b0">(</span>
+    <span class="v4">latent_model_input</span>, <span class="v0">t</span>,
+    <span class="v1">encoder_hidden_states</span>=<span class="v3">prompt_embeds</span>,
+    <span class="v5">down_block_additional_residuals</span>=<span class="v1">down_res</span>,
+    <span class="v4">mid_block_additional_residual</span>=<span class="v6">mid_res</span>,
+<span class="b0">)</span>.<span class="m2">sample</span></code></pre></div>
+          <p>
+            LoRA attaches at a different seam. Instead of a parallel network it
+            injects low-rank <code>A</code> and <code>B</code> matrices into the
+            existing linear layers of the UNet or transformer (and often the
+            text encoder), adding a small learned <code>B @ A</code> update to
+            each frozen weight. Diffusers handles this through the
+            <code>loaders/</code> package and, under the hood, the
+            <a href="/oss/peft">PEFT</a> library, which is the shared engine for
+            adapters across the Hugging Face stack. Loading is one call, and
+            because multiple adapters can coexist you can name, weight, and
+            combine them.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="v4">pipe</span>.<span class="m2">load_lora_weights</span><span class="b0">(</span><span class="s">"path/or/hub-id"</span>, <span class="v0">weight_name</span>=<span class="s">"style.safetensors"</span>,
+                       <span class="v5">adapter_name</span>=<span class="s">"style"</span><span class="b0">)</span>
+<span class="v4">pipe</span>.<span class="m2">load_lora_weights</span><span class="b0">(</span><span class="s">"other-id"</span>, <span class="v5">adapter_name</span>=<span class="s">"character"</span><span class="b0">)</span>
+<span class="v4">pipe</span>.<span class="m2">set_adapters</span><span class="b0">(</span><span class="b1">[</span><span class="s">"style"</span>, <span class="s">"character"</span><span class="b1">]</span>, <span class="v2">adapter_weights</span>=<span class="b1">[</span><span class="n">0.8</span>, <span class="n">1.0</span><span class="b1">]</span><span class="b0">)</span>
+
+<span class="c"># fold the adapters into the base weights for faster inference</span>
+<span class="v4">pipe</span>.<span class="m2">fuse_lora</span><span class="b0">()</span>
+<span class="c"># ... or drop them entirely</span>
+<span class="v4">pipe</span>.<span class="m2">unload_lora_weights</span><span class="b0">()</span></code></pre></div>
+          <p>
+            One more extensibility seam ties these together, the attention
+            processor. <code>src/diffusers/models/attention_processor.py</code>
+            defines pluggable objects that implement a block's attention, and
+            <code>unet.set_attn_processor(...)</code> swaps them. The default
+            <code>AttnProcessor2_0</code> routes to PyTorch's
+            <code>scaled_dot_product_attention</code> for fused, memory-efficient
+            attention, and IP-Adapter (image prompting) injects its image
+            features through a custom processor at exactly this point. The lesson
+            is that <mark>control is added by composition, a ControlNet is a
+            side network, a LoRA is a low-rank delta, an IP-Adapter is an
+            attention processor, and none of them fork the base model.</mark>
+            That is the same keep-the-core-plain instinct that
+            <a href="/oss/torchtitan">torchtitan</a> applies to parallelism.
+          </p>
+
+          <h3>Deep dive: the training scripts</h3>
+          <p>
+            The <code>examples/</code> tree is not an afterthought, it is where
+            the objective becomes concrete, and the scripts are meant to be
+            forked. The core training loop for a latent diffusion model is only a
+            few lines of real math, and it exercises the scheduler from the other
+            direction, as a noise <em>adder</em> rather than a remover.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="c"># the essence of examples/text_to_image/train_text_to_image.py</span>
+<span class="v2">latents</span> = <span class="v0">vae</span>.<span class="m2">encode</span><span class="b0">(</span><span class="v0">pixel_values</span><span class="b0">)</span>.<span class="m2">latent_dist</span>.<span class="m2">sample</span><span class="b0">()</span> * <span class="v0">vae</span>.<span class="m2">config</span>.<span class="m2">scaling_factor</span>
+<span class="v3">noise</span> = <span class="m1">torch</span>.<span class="m2">randn_like</span><span class="b0">(</span><span class="v2">latents</span><span class="b0">)</span>
+<span class="v2">timesteps</span> = <span class="m1">torch</span>.<span class="m2">randint</span><span class="b0">(</span><span class="n">0</span>, <span class="v0">noise_scheduler</span>.<span class="m2">config</span>.<span class="m2">num_train_timesteps</span>, <span class="b1">(</span><span class="v0">bsz</span>,<span class="b1">)</span><span class="b0">)</span>
+
+<span class="c"># forward process: the scheduler noises the clean latent at each timestep</span>
+<span class="v1">noisy_latents</span> = <span class="v0">noise_scheduler</span>.<span class="m2">add_noise</span><span class="b0">(</span><span class="v2">latents</span>, <span class="v3">noise</span>, <span class="v2">timesteps</span><span class="b0">)</span>
+
+<span class="v5">model_pred</span> = <span class="m1">unet</span><span class="b0">(</span><span class="v1">noisy_latents</span>, <span class="v2">timesteps</span>, <span class="v1">encoder_hidden_states</span><span class="b0">)</span>.<span class="m2">sample</span>
+
+<span class="c"># the target depends on prediction_type</span>
+<span class="k">if</span> <span class="v0">noise_scheduler</span>.<span class="m2">config</span>.<span class="m2">prediction_type</span> == <span class="s">"epsilon"</span>:
+    <span class="v4">target</span> = <span class="v3">noise</span>
+<span class="k">elif</span> <span class="v0">noise_scheduler</span>.<span class="m2">config</span>.<span class="m2">prediction_type</span> == <span class="s">"v_prediction"</span>:
+    <span class="v4">target</span> = <span class="v0">noise_scheduler</span>.<span class="m2">get_velocity</span><span class="b0">(</span><span class="v2">latents</span>, <span class="v3">noise</span>, <span class="v2">timesteps</span><span class="b0">)</span>
+
+<span class="v6">loss</span> = <span class="m1">F</span>.<span class="m2">mse_loss</span><span class="b0">(</span><span class="v5">model_pred</span>.<span class="m2">float</span><span class="b1">()</span>, <span class="v4">target</span>.<span class="m2">float</span><span class="b1">()</span><span class="b0">)</span>
+<span class="v6">loss</span>.<span class="m2">backward</span><span class="b0">()</span></code></pre></div>
+          <p>
+            Two observations. First, the same <code>add_noise</code> and the
+            same <code>prediction_type</code> that govern sampling govern
+            training, which is why a scheduler is a coherent object and not just
+            a sampler. Second, the scripts lean on
+            <code>accelerate</code> for device placement, mixed precision, and
+            multi-GPU, so scaling a training run is largely a matter of the
+            <code>accelerate</code> config rather than changes to the loop. The
+            repository ships focused variants, <code>train_dreambooth.py</code>,
+            the LoRA trainers, and a <code>controlnet</code> trainer, each a
+            small edit away from this skeleton.
+          </p>
+
+          <h2>Part VI: Reading the repository</h2>
+          <p>
+            The tree is large, but the load-bearing parts are a small, readable
+            core. Paths reflect a recent main branch, and the model subpackages
+            in particular have moved before, so navigate by class name when a
+            path does not resolve.
+          </p>
+          <p>
+            <strong>Stage 0, orientation.</strong> Skim the top-level
+            <code>README.md</code> and the docs quicktour, then open one
+            pipeline's <code>__call__</code>, for instance
+            <code>src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion.py</code>.
+            Questions to hold: where does the prompt get encoded, where is the
+            denoising loop, and which lines are guidance versus which lines are
+            the scheduler?
+          </p>
+          <p>
+            <strong>Stage 1, the abstractions.</strong> Read
+            <code>configuration_utils.py</code> for <code>ConfigMixin</code> and
+            <code>register_to_config</code>, then <code>models/modeling_utils.py</code>
+            for <code>ModelMixin</code>, then <code>pipeline_utils.py</code> for
+            <code>DiffusionPipeline</code>. Questions: what does
+            <code>from_pretrained</code> read, how does
+            <code>model_index.json</code> map to component classes, and why can
+            any scheduler be rebuilt from any other's config?
+          </p>
+          <p>
+            <strong>Stage 2, one scheduler end to end.</strong> Read
+            <code>schedulers/scheduling_ddpm.py</code> against the DDPM
+            derivation, then <code>scheduling_ddim.py</code> for the
+            deterministic skip, then <code>scheduling_dpmsolver_multistep.py</code>
+            with the exponential-integrator section of the class in hand.
+            Questions: what does <code>set_timesteps</code> precompute, what does
+            <code>step</code> return, and where does <code>prediction_type</code>
+            change the algebra?
+          </p>
+          <p>
+            <strong>Stage 3, one backbone.</strong> Read
+            <code>models/unets/unet_2d_condition.py</code> for how timestep and
+            text conditioning enter, then a transformer such as
+            <code>models/transformers/transformer_2d.py</code> or an MMDiT
+            variant. Questions: where do the cross-attention layers live, how is
+            the timestep embedded, and what in the forward signature is the
+            fixed denoiser contract every scheduler relies on?
+          </p>
+          <p>
+            <strong>Stage 4, the adapters.</strong>
+            <code>models/controlnet</code> (the <code>ControlNetModel</code>) and
+            its pipeline for the side-network pattern, then the
+            <code>loaders/</code> package for LoRA and single-file loading, and
+            <code>models/attention_processor.py</code> for the attention seam.
+            Questions: how do ControlNet residuals reach the UNet, what does
+            <code>load_lora_weights</code> actually mutate, and where does PEFT
+            take over?
+          </p>
+          <p>
+            <strong>Stage 5, training and the frontier.</strong> Read one
+            <code>examples/</code> training script top to bottom, then browse the
+            newest pipelines (SD3, Flux, and the video and audio models) to see
+            the same skeleton adapt. The <code>experiments</code>-flavored and
+            community pipelines are by nature less stable, interesting later.
+          </p>
+          <p>
+            Where not to start. Do not begin in the sprawl of concrete pipeline
+            classes, there are hundreds and they share a skeleton you learn once.
+            Do not start with the mixin metaprogramming for lazy imports and
+            dummy objects, it is plumbing that obscures the ideas. And do not try
+            to read every scheduler, read three across the two families and the
+            rest are variations on the same interface.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            Labs 1 through 3 run on a single modest GPU (or slowly on CPU for the
+            smallest models), labs 4 and 5 want a GPU with enough memory for
+            SDXL or a ControlNet. Log and API details drift with the library's
+            pace, so read errors as guidance rather than gospel.
+          </p>
+          <p><strong>Lab 1: swap the sampler, hold everything else.</strong> Concept: the model, scheduler, pipeline separation of Part I.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">torch</span>
+<span class="k">from</span> <span class="m1">diffusers</span> <span class="k">import</span> <span class="b0">(</span><span class="m1">StableDiffusionPipeline</span>, <span class="m1">DDIMScheduler</span>,
+                       <span class="v3">DPMSolverMultistepScheduler</span>, <span class="v3">EulerAncestralDiscreteScheduler</span><span class="b0">)</span>
+
+<span class="m1">pipe</span> = <span class="m1">StableDiffusionPipeline</span>.<span class="m2">from_pretrained</span><span class="b0">(</span>
+    <span class="s">"stable-diffusion-v1-5/stable-diffusion-v1-5"</span>, <span class="v3">torch_dtype</span>=<span class="m1">torch</span>.<span class="m2">float16</span><span class="b0">)</span>.<span class="m2">to</span><span class="b0">(</span><span class="s">"cuda"</span><span class="b0">)</span>
+<span class="v5">prompt</span> = <span class="s">"a cozy bookshop, warm light"</span>
+<span class="m1">g</span> = <span class="k">lambda</span>: <span class="m1">torch</span>.<span class="m2">Generator</span><span class="b0">(</span><span class="s">"cuda"</span><span class="b0">)</span>.<span class="m2">manual_seed</span><span class="b0">(</span><span class="n">0</span><span class="b0">)</span>
+
+<span class="k">for</span> <span class="v2">name</span>, <span class="v1">sched</span> <span class="k">in</span> <span class="b0">[</span>
+    <span class="b1">(</span><span class="s">"ddim"</span>, <span class="m1">DDIMScheduler</span><span class="b1">)</span>,
+    <span class="b1">(</span><span class="s">"dpm"</span>,  <span class="v3">DPMSolverMultistepScheduler</span><span class="b1">)</span>,
+    <span class="b1">(</span><span class="s">"euler_a"</span>, <span class="v3">EulerAncestralDiscreteScheduler</span><span class="b1">)</span>,
+<span class="b0">]</span>:
+    <span class="m1">pipe</span>.<span class="m2">scheduler</span> = <span class="v1">sched</span>.<span class="m2">from_config</span><span class="b0">(</span><span class="m1">pipe</span>.<span class="m2">scheduler</span>.<span class="m2">config</span><span class="b0">)</span>
+    <span class="m1">pipe</span><span class="b0">(</span><span class="v5">prompt</span>, <span class="v6">num_inference_steps</span>=<span class="n">20</span>, <span class="v1">generator</span>=<span class="m1">g</span><span class="b1">()</span><span class="b0">)</span>.<span class="m2">images</span><span class="b0">[</span><span class="n">0</span><span class="b0">]</span>.<span class="m2">save</span><span class="b0">(</span><span class="s">f"{</span><span class="v2">name</span><span class="s">}.png"</span><span class="b0">)</span></code></pre></div>
+          <p>
+            Compare the three images at a fixed 20 steps and the same seed. DDIM
+            and DPM should look similar and clean, the ancestral sampler will
+            have a different texture because it injects noise. The lesson made
+            visible: you changed only the math, not the model.
+          </p>
+          <p><strong>Lab 2: watch the latent denoise.</strong> Concept: the loop runs in latent space (Part III).</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="v4">preds</span> = <span class="b0">[]</span>
+<span class="k">def</span> <span class="m1">grab</span><span class="b0">(</span><span class="m1">pipe</span>, <span class="v6">step</span>, <span class="v0">t</span>, <span class="v5">kwargs</span><span class="b0">)</span>:
+    <span class="v4">preds</span>.<span class="m2">append</span><span class="b0">(</span><span class="v5">kwargs</span><span class="b1">[</span><span class="s">"latents"</span><span class="b1">]</span><span class="b0">)</span>
+    <span class="k">return</span> <span class="v5">kwargs</span>
+
+<span class="m1">pipe</span><span class="b0">(</span><span class="s">"a mountain lake"</span>, <span class="v6">num_inference_steps</span>=<span class="n">15</span>,
+     <span class="v6">callback_on_step_end</span>=<span class="m1">grab</span><span class="b0">)</span>.<span class="m2">images</span><span class="b0">[</span><span class="n">0</span><span class="b0">]</span>
+<span class="c"># decode a few intermediate latents to see the image emerge from noise</span>
+<span class="k">for</span> <span class="v3">i</span> <span class="k">in</span> <span class="b0">(</span><span class="n">0</span>, <span class="n">5</span>, <span class="n">10</span>, <span class="n">14</span><span class="b0">)</span>:
+    <span class="v4">img</span> = <span class="m1">pipe</span>.<span class="m2">vae</span>.<span class="m2">decode</span><span class="b0">(</span><span class="v4">preds</span><span class="b1">[</span><span class="v3">i</span><span class="b1">]</span> / <span class="m1">pipe</span>.<span class="m2">vae</span>.<span class="m2">config</span>.<span class="m2">scaling_factor</span><span class="b0">)</span>.<span class="m2">sample</span>
+    <span class="c"># denormalize and save img[0] ...</span></code></pre></div>
+          <p>
+            Observe the early latents decode to noisy blobs and the late ones to
+            a coherent scene. Then remove the division by
+            <code>scaling_factor</code> and see the colors blow out, which makes
+            the constant's job concrete.
+          </p>
+          <p><strong>Lab 3: build a pipeline from bare components.</strong> Concept: a pipeline is just wiring (Stages 1 to 6).</p>
+          <p>
+            Load a <code>UNet2DConditionModel</code>, an <code>AutoencoderKL</code>,
+            a CLIP text encoder and tokenizer from <code>transformers</code>, and
+            a <code>DDIMScheduler</code>, each with its own
+            <code>from_pretrained</code> on the SD subfolders, then write the six
+            stages of Part IV by hand. Encode the prompt, seed latents, run the
+            loop calling <code>unet</code> and <code>scheduler.step</code>,
+            decode. When your loop produces the same image the pipeline does, you
+            have proven to yourself that the pipeline holds no secret math.
+          </p>
+          <p><strong>Lab 4: condition with ControlNet.</strong> Concept: the side-network adapter (Part V).</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">diffusers</span> <span class="k">import</span> <span class="m1">StableDiffusionControlNetPipeline</span>, <span class="m1">ControlNetModel</span>
+<span class="v3">controlnet</span> = <span class="m1">ControlNetModel</span>.<span class="m2">from_pretrained</span><span class="b0">(</span>
+    <span class="s">"lllyasviel/sd-controlnet-canny"</span>, <span class="v3">torch_dtype</span>=<span class="m1">torch</span>.<span class="m2">float16</span><span class="b0">)</span>
+<span class="m1">pipe</span> = <span class="m1">StableDiffusionControlNetPipeline</span>.<span class="m2">from_pretrained</span><span class="b0">(</span>
+    <span class="s">"stable-diffusion-v1-5/stable-diffusion-v1-5"</span>,
+    <span class="v3">controlnet</span>=<span class="v3">controlnet</span>, <span class="v3">torch_dtype</span>=<span class="m1">torch</span>.<span class="m2">float16</span><span class="b0">)</span>.<span class="m2">to</span><span class="b0">(</span><span class="s">"cuda"</span><span class="b0">)</span>
+<span class="c"># pass a Canny edge map as the conditioning image</span>
+<span class="v5">image</span> = <span class="m1">pipe</span><span class="b0">(</span><span class="s">"a stained glass window"</span>, <span class="v5">image</span>=<span class="v6">canny_map</span>,
+             <span class="v6">controlnet_conditioning_scale</span>=<span class="n">1.0</span><span class="b0">)</span>.<span class="m2">images</span><span class="b0">[</span><span class="n">0</span><span class="b0">]</span></code></pre></div>
+          <p>
+            Vary <code>controlnet_conditioning_scale</code> from 0.4 to 1.4 and
+            watch structure adherence trade against prompt freedom. Set it to
+            zero and confirm the output collapses back to an unconditioned
+            generation, the "zero conv" idea made visible.
+          </p>
+          <p><strong>Lab 5: load and blend LoRAs.</strong> Concept: low-rank deltas and PEFT (Part V).</p>
+          <p>
+            Load two style LoRAs onto an SDXL pipeline with
+            <code>load_lora_weights</code> and distinct <code>adapter_name</code>s,
+            then sweep <code>set_adapters([...], adapter_weights=[a, b])</code>
+            across a grid of weights and read the interpolation between styles.
+            Call <code>fuse_lora</code> and time a generation against the unfused
+            path, then <code>unload_lora_weights</code> and confirm you are back
+            to the base model. You are watching a rank-16 update ride on top of a
+            frozen network without ever forking it.
+          </p>
+
+          <h2>Part VIII: Questions and model answers</h2>
+          <p>Understanding checks. Answer aloud before reading.</p>
+          <p><strong>1. What is Diffusers, in one sentence?</strong></p>
+          <p>
+            The standard library for diffusion models, which factors every
+            system into a denoising model, a scheduler that is pure sampling
+            math, and a pipeline that orchestrates them with a text encoder and
+            a VAE, so each part can be swapped independently.
+          </p>
+          <p><strong>2. What is the difference between a model, a scheduler, and a pipeline?</strong></p>
+          <p>
+            The model is a neural network that predicts noise (or velocity) from
+            a noisy latent, a timestep, and conditioning, and knows nothing about
+            sampling. The scheduler is a weightless numerical method that turns a
+            model prediction into the next, less noisy sample, and holds the
+            noise schedule. The pipeline is the recipe that encodes the prompt,
+            seeds the latents, runs the loop, applies guidance, and decodes.
+          </p>
+          <p><strong>3. Why can you swap schedulers with from_config?</strong></p>
+          <p>
+            Because a scheduler carries no weights, only a config of shared
+            numeric hyperparameters (training timesteps, beta schedule,
+            prediction type), and every scheduler mixes in <code>ConfigMixin</code>.
+            Rebuilding a new scheduler from the old one's config preserves the
+            settings the model was trained under, and the pipeline loop calls the
+            same <code>set_timesteps</code> and <code>step</code> interface
+            regardless.
+          </p>
+          <p><strong>4. What does the model output and what does the scheduler do with it?</strong></p>
+          <p>
+            The model outputs a prediction of the training target at the current
+            timestep, usually the added noise (epsilon), sometimes the velocity
+            or the clean sample. The scheduler inverts that target, recovering an
+            estimate of the clean latent and forming the previous step from it,
+            and returns <code>prev_sample</code>. They communicate only through
+            that one tensor.
+          </p>
+          <p><strong>5. Why does the loop run in latent space, and what is the scaling_factor for?</strong></p>
+          <p>
+            Because a latent diffusion model denoises inside a VAE-compressed
+            space that is eight times smaller per side, which is what makes
+            high-resolution generation tractable. The VAE decodes to pixels only
+            at the end. The <code>scaling_factor</code> is a fixed constant that
+            normalizes the latent's variance to roughly one so the model sees a
+            well-scaled input, and it must be divided back out before decoding.
+          </p>
+          <p><strong>6. What is classifier-free guidance in the pipeline code?</strong></p>
+          <p>
+            The pipeline encodes both the real prompt and an empty or negative
+            prompt, runs the denoiser on both (batched together), and combines
+            the two predictions as
+            <code>uncond + scale * (cond - uncond)</code>, extrapolating away
+            from the unconditional direction. The <code>guidance_scale</code>
+            controls the strength, and setting it too high oversaturates and
+            degrades detail.
+          </p>
+          <p><strong>7. What breaks if prediction_type is wrong?</strong></p>
+          <p>
+            Nothing raises, and the output is garbage. The scheduler's update
+            algebra assumes the model predicted a specific target, so pairing an
+            epsilon model with a v-prediction scheduler makes <code>step</code>
+            invert the wrong quantity and the samples never converge to an image.
+            It is a silent correctness bug the library guards against by matching
+            configs.
+          </p>
+          <p><strong>8. How does ControlNet attach to a UNet without retraining it?</strong></p>
+          <p>
+            ControlNet is a trainable copy of the UNet's encoder that consumes a
+            spatial conditioning image and emits residual tensors added into the
+            frozen UNet's skip connections and mid block. The connections are
+            zero-initialized convolutions, so training starts as a no-op on the
+            base model and learns to steer from there. Both networks run each
+            denoising step.
+          </p>
+          <p><strong>9. How does LoRA differ from ControlNet as an adapter?</strong></p>
+          <p>
+            LoRA is not a side network. It injects low-rank matrices into the
+            existing linear layers of the backbone (and often the text encoder),
+            adding a small learned delta to each frozen weight, and Diffusers
+            manages it through the <code>loaders</code> package on top of PEFT.
+            ControlNet adds spatial structure through a parallel network, LoRA
+            adds style or a concept through a weight-space update, and multiple
+            LoRAs can be named, weighted, and blended.
+          </p>
+          <p><strong>10. What is different about flow-matching models like SD3 and Flux?</strong></p>
+          <p>
+            Their scheduler is <code>FlowMatchEulerDiscreteScheduler</code>,
+            which drops betas and <code>alphas_cumprod</code> for a straight-line
+            interpolation between data and noise. The model predicts a velocity
+            and sampling is a plain Euler integration of an ODE from high sigma to
+            zero, which is why they need few steps. Their backbones are MMDiT
+            transformers, and Flux variants are guidance-distilled, so they want
+            <code>guidance_scale</code> near zero rather than the CFG of SD.
+          </p>
+          <p><strong>11. When would you reach for ComfyUI or k-diffusion instead?</strong></p>
+          <p>
+            ComfyUI or a web UI when the job is interactive image making with a
+            node graph and a plugin ecosystem, where Diffusers is often the
+            engine underneath rather than a rival. k-diffusion when you want the
+            tightest one-file catalog of samplers to study. The original research
+            repos when you need a paper exactly as released. Diffusers when you
+            want a programmatic, composable, faithful library to build on or read.
+          </p>
+          <p><strong>12. Images come out slightly wrong with no error. Name three suspects from this chapter.</strong></p>
+          <p>
+            A scheduler and model mismatched on <code>prediction_type</code>, a
+            missing or doubled <code>scaling_factor</code> around the VAE, or a
+            guidance scale set for the wrong model family (high CFG on a
+            guidance-distilled Flux, or a negative prompt fed to a model that
+            ignores it). All three produce plausible-looking but degraded output
+            rather than a crash.
+          </p>
+          <p><strong>13. How does a training step relate to a sampling step?</strong></p>
+          <p>
+            They share the scheduler from opposite ends. Training calls
+            <code>add_noise</code> to run the forward process, noising a clean
+            latent to a random timestep, then trains the model to predict the
+            target, with the loss an MSE against noise or velocity. Sampling
+            calls <code>step</code> to run the reverse process. The same noise
+            schedule and prediction type govern both, which is why the scheduler
+            is a single coherent object.
+          </p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Separate mechanism from policy along the natural seams.</strong>
+            The model does forward passes, the scheduler does the sampling math,
+            the pipeline does orchestration, and the seam between them is a single
+            tensor. Because the seams follow the real structure of the problem,
+            swapping any component is a local change. This is the same instinct as
+            keeping business logic free of persistence code.
+          </p>
+          <p>
+            <strong>Make the config the interface.</strong> A model, a scheduler,
+            and a pipeline are all "a config plus optional weights" on disk, and
+            one <code>from_pretrained</code> contract loads any of them. That
+            uniformity is what lets arbitrary combinations round-trip through the
+            Hub, and it is why <code>from_config</code> can rebuild a sibling
+            scheduler for free. Represent the invariant as serializable data and
+            interoperability follows.
+          </p>
+          <p>
+            <strong>Add capability by composition, not by forking.</strong>
+            ControlNet is a side network, LoRA is a low-rank delta, IP-Adapter is
+            an attention processor, and none of them edit the base model. Keeping
+            the core plain and attaching features from outside is the same
+            discipline <a href="/oss/torchtitan">torchtitan</a> uses for
+            parallelism and PEFT uses for fine-tuning, and it is why adapters
+            compose instead of colliding.
+          </p>
+          <p>
+            <strong>Ship the reference, not just the abstraction.</strong> Every
+            sampler and adapter is a small, readable file that matches its paper,
+            and the training scripts in <code>examples/</code> are meant to be
+            forked. A library that is also a faithful catalog becomes the place
+            new methods land first, which compounds into ecosystem gravity.
+          </p>
+          <p>
+            <strong>Guard the silent failure at the boundary.</strong> The
+            <code>prediction_type</code> and <code>scaling_factor</code> are the
+            settings that fail quietly rather than loudly, so the library carries
+            them in configs and threads them through both training and sampling.
+            Where a mismatch produces bad output instead of an exception, the
+            right move is to make the correct pairing the default.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            The one-sentence summary: <mark>Diffusers loads a denoising model, a
+            weightless scheduler, and a pipeline from one from_pretrained
+            contract, runs a short loop that calls the model for a noise
+            prediction, applies classifier-free guidance, and asks the scheduler
+            for the next latent, then decodes through the VAE, and every
+            component, backbone, sampler, and adapter, is swappable in
+            isolation.</mark>
+          </p>
+          <pre class="flow">from_pretrained (model_index.json) -&gt; text_encoder + vae + unet/dit + scheduler
+  -&gt; encode_prompt (uncond + cond for CFG)
+  -&gt; prepare_latents (Gaussian * init_noise_sigma)
+  -&gt; for t in scheduler.timesteps:
+       noise_pred = model(x_t, t, text)
+       noise_pred = uncond + scale * (cond - uncond)
+       x_t = scheduler.step(noise_pred, t, x_t).prev_sample
+  -&gt; vae.decode(x / scaling_factor) -&gt; PIL image</pre>
+          <p>The pieces mapped to the source tree:</p>
+          <pre class="flow">abstractions   configuration_utils.py (ConfigMixin), models/modeling_utils.py
+               (ModelMixin), schedulers/scheduling_utils.py (SchedulerMixin),
+               pipelines/pipeline_utils.py (DiffusionPipeline)
+models         models/unets/, models/transformers/, models/autoencoders/,
+               models/controlnet, models/attention_processor.py
+schedulers     schedulers/scheduling_{ddpm,ddim,dpmsolver_multistep,
+               euler_discrete,flow_match_euler_discrete}.py
+pipelines      pipelines/stable_diffusion/, stable_diffusion_xl/, flux/, ...
+adapters       loaders/ (LoRA, single-file) + PEFT integration
+training       examples/text_to_image, dreambooth, controlnet (+ accelerate)</pre>
+          <p>Memorize these blocks:</p>
+          <ul>
+            <li><strong>The trinity:</strong> model denoises, scheduler does the math, pipeline orchestrates, and they meet only through the <code>noise_pred</code> tensor.</li>
+            <li><strong>Scheduler families:</strong> integer-timestep DDPM lineage, continuous sigma-parameterized k-diffusion lineage (needs <code>scale_model_input</code>), and flow matching for SD3 and Flux.</li>
+            <li><strong>prediction_type:</strong> epsilon, v_prediction, or sample, and the model and scheduler must agree or output silently breaks.</li>
+            <li><strong>Latent space:</strong> the loop runs on a VAE latent eight times smaller per side, decode once at the end, mind the <code>scaling_factor</code>.</li>
+            <li><strong>Adapters:</strong> ControlNet is a side network with zero convs, LoRA is a low-rank delta via PEFT, IP-Adapter is an attention processor, none fork the base model.</li>
+          </ul>
+
+          <h2>Part XI: Papers and further reading</h2>
+          <p>
+            The ideas in this walkthrough come from a short list of papers, and
+            each one rewards a direct read. Where this site derives the same
+            idea in depth, the companion link points there.
+          </p>
+          <ol class="refs">
+            <li>Ho et al., <a href="https://arxiv.org/abs/2006.11239" target="_blank" rel="noreferrer">Denoising Diffusion Probabilistic Models</a>, 2020. The training objective and the ancestral sampler behind <code>DDPMScheduler</code>, the baseline every other scheduler is measured against. The forward process and the posterior are derived in the <a href="/ml/diffusion">diffusion note</a> and the <a href="/classes/diffusion-and-large-vision-models">diffusion and large vision models class</a> on this site.</li>
+            <li>Song et al., <a href="https://arxiv.org/abs/2010.02502" target="_blank" rel="noreferrer">Denoising Diffusion Implicit Models</a>, 2020. The deterministic non-Markovian update behind <code>DDIMScheduler</code>, and the reason a thousand-step model can sample in fifty.</li>
+            <li>Rombach et al., <a href="https://arxiv.org/abs/2112.10752" target="_blank" rel="noreferrer">High-Resolution Image Synthesis with Latent Diffusion Models</a>, 2021. The move into VAE latent space that Stable Diffusion and nearly every pipeline in the library assume. The autoencoder side is worked through in the <a href="/ml/vae">VAE note</a>.</li>
+            <li>Ho and Salimans, <a href="https://arxiv.org/abs/2207.12598" target="_blank" rel="noreferrer">Classifier-Free Diffusion Guidance</a>, 2022. The two-branch prediction and the extrapolation that every <code>__call__</code> applies under the <code>guidance_scale</code> knob.</li>
+            <li>Lu et al., <a href="https://arxiv.org/abs/2206.00927" target="_blank" rel="noreferrer">DPM-Solver, A Fast ODE Solver for Diffusion Probabilistic Model Sampling in Around 10 Steps</a>, 2022. The high-order exponential integrator inside <code>DPMSolverMultistepScheduler</code>.</li>
+            <li>Karras et al., <a href="https://arxiv.org/abs/2206.00364" target="_blank" rel="noreferrer">Elucidating the Design Space of Diffusion-Based Generative Models</a>, 2022. The sigma parameterization behind the k-diffusion lineage of schedulers and their <code>scale_model_input</code> step.</li>
+            <li>Lipman et al., <a href="https://arxiv.org/abs/2210.02747" target="_blank" rel="noreferrer">Flow Matching for Generative Modeling</a>, 2022. The straight-line forward path and velocity objective behind <code>FlowMatchEulerDiscreteScheduler</code>. The surrounding family of generative models is treated in the <a href="/classes/deep-generative-models">deep generative models class</a>.</li>
+            <li>Peebles and Xie, <a href="https://arxiv.org/abs/2212.09748" target="_blank" rel="noreferrer">Scalable Diffusion Models with Transformers</a>, 2022. The DiT backbone and the adaLN-zero conditioning that SD3 and Flux descend from.</li>
+            <li>Zhang et al., <a href="https://arxiv.org/abs/2302.05543" target="_blank" rel="noreferrer">Adding Conditional Control to Text-to-Image Diffusion Models</a>, 2023. The ControlNet side network and its zero convolutions. Its everyday use in node graphs is covered in the <a href="/oss/comfyui">ComfyUI walkthrough</a>.</li>
+            <li>Hu et al., <a href="https://arxiv.org/abs/2106.09685" target="_blank" rel="noreferrer">LoRA, Low-Rank Adaptation of Large Language Models</a>, 2021. The low-rank delta the <code>loaders</code> package injects, through the engine described in the <a href="/oss/peft">PEFT walkthrough</a>.</li>
+            <li>Podell et al., <a href="https://arxiv.org/abs/2307.01952" target="_blank" rel="noreferrer">SDXL, Improving Latent Diffusion Models for High-Resolution Image Synthesis</a>, 2023. The larger UNet, the two text encoders, and the size-and-crop micro-conditioning that Part IV traces.</li>
+            <li>Esser et al., <a href="https://arxiv.org/abs/2403.03206" target="_blank" rel="noreferrer">Scaling Rectified Flow Transformers for High-Resolution Image Synthesis</a>, 2024. The SD3 report, rectified flow training plus the MMDiT joint attention over image and text tokens.</li>
+          </ol>
+
+          <h2>Part XII: Final takeaway</h2>
+          <p>
+            If the equations behind any of this are the gap, the
+            <a href="/classes/diffusion-and-large-vision-models">diffusion and large vision models</a>
+            class derives the forward process, the posterior, DDIM and the
+            higher-order solvers, guidance, and flow matching end to end, and
+            reading a scheduler file next to those derivations is the fastest way
+            to make both click. Then come back and open one pipeline's
+            <code>__call__</code> once more. It will read like a short, honest
+            loop, which is the entire point.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> Diffusers shows that a sprawling,
+            fast-moving field fits behind three small interfaces. Make the model
+            a plain denoiser, make the scheduler the pure sampling math, make the
+            pipeline the recipe that wires them together, load every one of them
+            through the same config-plus-weights contract, and add control by
+            composition rather than by forking, and one library can carry Stable
+            Diffusion, SDXL, DiT, and Flux, images and video and audio, sampling
+            and training, without any single piece having to know about the rest.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/code-copy.js"></script>
+      <script defer src="/theme.js"></script>
+  </body>
+</html>

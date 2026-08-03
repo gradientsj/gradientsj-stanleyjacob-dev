@@ -1,0 +1,1042 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Triton walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A full chapter on triton-lang/triton: the Python DSL that makes GPU kernels writable without CUDA C++. The block/tile programming model (program_id, tl.load/store, tl.dot, block pointers), autotuning, and the MLIR compiler lowering to LLVM and PTX. Worked vector-add and softmax kernels, the full life of one kernel launch from @triton.jit to cubin, internals deep dives, a staged reading plan, labs, and understanding checks." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%232B2621'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+      <script>(function(){try{var t=localStorage.getItem("theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>Triton</h1>
+        <p class="lead">
+          <a href="https://github.com/triton-lang/triton" target="_blank" rel="noreferrer">Triton</a>
+          is the Python DSL and compiler that made high-performance GPU
+          kernels writable without CUDA C++. You write an ordinary-looking
+          Python function, decorate it with <code>@triton.jit</code>, and
+          operate on whole tiles of data with <code>tl.load</code>,
+          <code>tl.store</code>, and <code>tl.dot</code>, while the compiler
+          takes over everything CUDA makes you do by hand, thread mapping,
+          memory coalescing, shared-memory staging, and synchronization.
+          This chapter is three things at once, a practical tutorial that
+          builds a vector-add and a fused softmax kernel from nothing, a
+          compiler walkthrough that follows one kernel launch from
+          <code>@triton.jit</code> through Triton IR, Triton GPU IR, LLVM,
+          and PTX down to a launched grid on the device, and a staged guide
+          to reading the repository. It ends with runnable labs, understanding
+          checks with model answers, and a compact framework for keeping the
+          whole system in your head. It pairs naturally with the
+          <a href="/classes/parallel-computing">parallel computing class</a>,
+          which teaches the GPU execution model this abstraction rests on.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">CUDA (SIMT):  you write per-thread code
+   threadIdx, blockIdx, blockDim         you index individual threads
+   __shared__ float tile[...];           you declare scratchpad memory
+   __syncthreads();                      you place the barriers
+   you also own: coalescing, vectorization, bank conflicts, register use
+
+Triton (per-block SPMD):  you write per-tile code
+   pid = tl.program_id(0)                which block of work am I
+   offs = pid*BLOCK + tl.arange(0,BLOCK) a whole tile of indices at once
+   x = tl.load(ptr + offs, mask=offs&lt;n) load the tile, masked at the edge
+   tl.store(out + offs, x + y, mask=...) store the tile
+   the compiler owns: thread mapping, coalescing, shared memory, sync</pre>
+          <p>
+            The one-sentence identity. <mark>Triton is a block-level
+            programming model for GPUs, where you write a single program that
+            operates on tiles and the compiler lowers those tile operations
+            into correct, coalesced, synchronized thread-level code, so you
+            keep control of the parallel decomposition and hand away the
+            per-thread bookkeeping.</mark> CUDA exposes the GPU as thousands
+            of scalar threads (the SIMT model) and asks you to manage the
+            memory hierarchy yourself. Triton raises the unit of programming
+            from the thread to the tile, a small multi-dimensional block of
+            values that the compiler treats as a first-class object. You
+            still decide how the problem is cut into blocks and how big each
+            tile is, because that is where the algorithmic insight lives, but
+            you never write <code>threadIdx</code>, never allocate shared
+            memory, and never place a <code>__syncthreads</code>.
+          </p>
+          <p>
+            Two consequences follow. First, the code you write is close to
+            the math. A softmax kernel loads a row, subtracts its max,
+            exponentiates, sums, and divides, in about ten lines that read
+            like NumPy over a block, and the compiler is responsible for
+            making that block-level program run well on real hardware.
+            Second, one kernel is portable across GPUs. Because you never
+            hard-coded a warp count or a shared-memory layout, the same
+            <code>@triton.jit</code> function compiles for different NVIDIA
+            generations and for AMD GPUs, with the tile-to-hardware mapping
+            decided per target by the compiler. The productivity jump is
+            large enough that Triton became the code-generation backend for
+            PyTorch 2's <code>torch.compile</code>, which means an enormous
+            fraction of the Triton kernels running in the world today were
+            written by a compiler, not a human.
+          </p>
+          <pre class="flow">@triton.jit add_kernel        Python source captured as an AST
+      |
+      v
+add_kernel[grid](...)          JITFunction: specialize on arg dtypes + alignment,
+      |                        build a cache key, compile once per signature
+      v
+code generator                walk the AST, emit Triton IR (tt dialect, MLIR)
+      |
+      v
+Triton IR (TTIR)              hardware-agnostic tile program
+      |                        passes: coalesce, layout, pipeline, accel-matmul
+      v
+Triton GPU IR (TTGIR)         adds #blocked / #mma / #shared layouts, warps per CTA
+      |
+      v
+LLVM IR (llir)                tt / ttg ops lowered to the LLVM dialect, then LLVM IR
+      |
+      v
+PTX  -&gt;  cubin                NVPTX backend emits PTX, ptxas assembles it (NVIDIA)
+      |
+      v
+driver.launch(grid)           load cubin, launch a grid of programs on the GPU</pre>
+          <p>
+            Everything in this chapter is verified against the project as of
+            July 2026. Triton moves fast and its compiler was rebuilt on
+            <a href="https://mlir.llvm.org/" target="_blank" rel="noreferrer">MLIR</a>
+            a few years ago, so where an exact pass name or file path is
+            likely to have shifted I say so and stay at the level of the
+            concept. The lineage worth knowing, Triton began as Philippe
+            Tillet's research language (the
+            <a href="https://doi.org/10.1145/3315508.3329973" target="_blank" rel="noreferrer">2019 MAPL paper</a>
+            on tiled computations), matured under OpenAI, and now lives as the
+            community project <code>triton-lang/triton</code> with first-class
+            NVIDIA and AMD backends.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <p>
+            Triton is a Linux-and-GPU project. On a machine with a recent
+            NVIDIA (Volta or newer) or AMD ROCm GPU the fastest way in is the
+            wheel.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">pip</span> <span class="s">install</span> <span class="s">triton</span>
+<span class="c"># triton also ships bundled inside recent PyTorch builds, so if you already</span>
+<span class="c"># have a CUDA-enabled torch, `import triton` may already work.</span>
+<span class="m1">python</span> <span class="s">-c</span> <span class="s">"import triton, triton.language as tl; print(triton.__version__)"</span></code></pre></div>
+          <p>
+            Building from source is only needed if you are working on the
+            compiler itself. It is heavy, because the build compiles a pinned
+            LLVM and MLIR, so most kernel authors should stay on the wheel.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">git</span> <span class="s">clone</span> <span class="s">https://github.com/triton-lang/triton</span>
+<span class="m1">cd</span> <span class="s">triton</span>
+<span class="m1">pip</span> <span class="s">install</span> <span class="s">-e</span> <span class="s">.</span>        <span class="c"># compiles bundled LLVM/MLIR, takes a while the first time</span></code></pre></div>
+          <p>
+            On macOS Triton installs and is pleasant to read and step
+            through, but there is no local GPU to run on. The honest macOS
+            workflow is reading the code and the tutorials locally and
+            running kernels on a Linux GPU box.
+          </p>
+
+          <h3>Worked example: vector-add</h3>
+          <p>
+            The canonical first kernel adds two vectors. It shows the whole
+            programming model in one screen, <code>program_id</code>, a tile
+            of offsets, a boundary mask, <code>tl.load</code> and
+            <code>tl.store</code>, and a launch grid.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">torch</span>
+<span class="k">import</span> <span class="m1">triton</span>
+<span class="k">import</span> <span class="m1">triton</span>.<span class="m2">language</span> <span class="k">as</span> <span class="m1">tl</span>
+
+<span class="m1">@triton.jit</span>
+<span class="k">def</span> <span class="m1">add_kernel</span><span class="b0">(</span><span class="v5">x_ptr</span>, <span class="v1">y_ptr</span>, <span class="v3">out_ptr</span>, <span class="v5">n_elements</span>, <span class="v1">BLOCK_SIZE</span>: <span class="m1">tl</span>.<span class="m2">constexpr</span><span class="b0">)</span>:
+    <span class="v5">pid</span> = <span class="m1">tl</span>.<span class="m2">program_id</span><span class="b0">(</span><span class="v4">axis</span>=<span class="n">0</span><span class="b0">)</span>              <span class="c"># which block of BLOCK_SIZE elements</span>
+    <span class="v6">block_start</span> = <span class="v5">pid</span> * <span class="v1">BLOCK_SIZE</span>
+    <span class="v4">offsets</span> = <span class="v6">block_start</span> + <span class="m1">tl</span>.<span class="m2">arange</span><span class="b0">(</span><span class="n">0</span>, <span class="v1">BLOCK_SIZE</span><span class="b0">)</span>
+    <span class="v3">mask</span> = <span class="v4">offsets</span> &lt; <span class="v5">n_elements</span>              <span class="c"># guard the ragged last block</span>
+    <span class="v4">x</span> = <span class="m1">tl</span>.<span class="m2">load</span><span class="b0">(</span><span class="v5">x_ptr</span> + <span class="v4">offsets</span>, <span class="v3">mask</span>=<span class="v3">mask</span><span class="b0">)</span>  <span class="c"># load a whole tile from DRAM</span>
+    <span class="v6">y</span> = <span class="m1">tl</span>.<span class="m2">load</span><span class="b0">(</span><span class="v1">y_ptr</span> + <span class="v4">offsets</span>, <span class="v3">mask</span>=<span class="v3">mask</span><span class="b0">)</span>
+    <span class="m1">tl</span>.<span class="m2">store</span><span class="b0">(</span><span class="v3">out_ptr</span> + <span class="v4">offsets</span>, <span class="v4">x</span> + <span class="v6">y</span>, <span class="v3">mask</span>=<span class="v3">mask</span><span class="b0">)</span>
+
+<span class="k">def</span> <span class="m1">add</span><span class="b0">(</span><span class="v4">x</span>: <span class="m1">torch</span>.<span class="m2">Tensor</span>, <span class="v6">y</span>: <span class="m1">torch</span>.<span class="m2">Tensor</span><span class="b0">)</span> -&gt; <span class="m1">torch</span>.<span class="m2">Tensor</span>:
+    <span class="v2">out</span> = <span class="m1">torch</span>.<span class="m2">empty_like</span><span class="b0">(</span><span class="v4">x</span><span class="b0">)</span>
+    <span class="v5">n_elements</span> = <span class="v2">out</span>.<span class="m2">numel</span><span class="b0">()</span>
+    <span class="c"># grid is a function of the meta-parameters; ceil-div covers the tail</span>
+    <span class="v1">grid</span> = <span class="k">lambda</span> <span class="v5">meta</span>: <span class="b0">(</span><span class="m1">triton</span>.<span class="m2">cdiv</span><span class="b1">(</span><span class="v5">n_elements</span>, <span class="v5">meta</span><span class="b2">[</span><span class="s">"BLOCK_SIZE"</span><span class="b2">]</span><span class="b1">)</span>,<span class="b0">)</span>
+    <span class="m1">add_kernel</span><span class="b0">[</span><span class="v1">grid</span><span class="b0">](</span><span class="v4">x</span>, <span class="v6">y</span>, <span class="v2">out</span>, <span class="v5">n_elements</span>, <span class="v1">BLOCK_SIZE</span>=<span class="n">1024</span><span class="b0">)</span>
+    <span class="k">return</span> <span class="v2">out</span>
+
+<span class="v4">x</span> = <span class="m1">torch</span>.<span class="m2">rand</span><span class="b0">(</span><span class="n">98_432</span>, <span class="v6">device</span>=<span class="s">"cuda"</span><span class="b0">)</span>
+<span class="v6">y</span> = <span class="m1">torch</span>.<span class="m2">rand</span><span class="b0">(</span><span class="n">98_432</span>, <span class="v6">device</span>=<span class="s">"cuda"</span><span class="b0">)</span>
+<span class="m1">torch</span>.<span class="m2">testing</span>.<span class="m2">assert_close</span><span class="b0">(</span><span class="m1">add</span><span class="b1">(</span><span class="v4">x</span>, <span class="v6">y</span><span class="b1">)</span>, <span class="v4">x</span> + <span class="v6">y</span><span class="b0">)</span></code></pre></div>
+          <p>
+            Read it as follows. Torch tensors are passed straight in and
+            Triton treats each as a pointer to its first element plus the
+            metadata it needs. <code>tl.program_id(axis=0)</code> returns this
+            program's index along the first grid axis, the analog of CUDA's
+            <code>blockIdx.x</code>. <code>tl.arange(0, BLOCK_SIZE)</code>
+            materializes a compile-time-sized tile of indices, so
+            <code>offsets</code> is a whole block of positions rather than one
+            scalar. The <code>mask</code> makes the last, partial block safe,
+            masked-out lanes are simply not loaded or stored. Note that
+            <code>BLOCK_SIZE</code> is marked <code>tl.constexpr</code>, which
+            means it is a compile-time constant baked into the generated
+            kernel, and <code>tl.arange</code> requires its length to be a
+            power of two. The launch <code>add_kernel[grid](...)</code> uses
+            the square-bracket grid syntax, where <code>grid</code> is a
+            callable that receives the meta-parameters and returns the number
+            of program instances to spawn. Here that is
+            <code>ceil(n_elements / BLOCK_SIZE)</code>, one program per tile.
+          </p>
+
+          <h3>Worked example: fused softmax</h3>
+          <p>
+            The second tutorial kernel is a fused softmax over the rows of a
+            2D tensor, and it is the example that first shows Triton earning
+            its keep. A naive PyTorch softmax reads the input, writes the
+            max, reads again for the exponentials, writes them, reads to sum,
+            and writes the normalized result, several passes over DRAM. A
+            fused Triton kernel loads each row once into fast on-chip memory,
+            does all the arithmetic there, and writes the answer once.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="m1">@triton.jit</span>
+<span class="k">def</span> <span class="m1">softmax_kernel</span><span class="b0">(</span><span class="v3">out_ptr</span>, <span class="v5">in_ptr</span>, <span class="v4">in_row_stride</span>, <span class="v6">out_row_stride</span>,
+                   <span class="v1">n_cols</span>, <span class="v1">BLOCK_SIZE</span>: <span class="m1">tl</span>.<span class="m2">constexpr</span><span class="b0">)</span>:
+    <span class="v6">row</span> = <span class="m1">tl</span>.<span class="m2">program_id</span><span class="b0">(</span><span class="n">0</span><span class="b0">)</span>                       <span class="c"># one program per row</span>
+    <span class="v3">row_start</span> = <span class="v5">in_ptr</span> + <span class="v6">row</span> * <span class="v4">in_row_stride</span>
+    <span class="v2">col_offsets</span> = <span class="m1">tl</span>.<span class="m2">arange</span><span class="b0">(</span><span class="n">0</span>, <span class="v1">BLOCK_SIZE</span><span class="b0">)</span>       <span class="c"># BLOCK_SIZE &gt;= n_cols</span>
+    <span class="v1">ptrs</span> = <span class="v3">row_start</span> + <span class="v2">col_offsets</span>
+    <span class="v3">mask</span> = <span class="v2">col_offsets</span> &lt; <span class="v1">n_cols</span>
+    <span class="c"># load the row; padded lanes get -inf so they never win the max or add mass</span>
+    <span class="v4">x</span> = <span class="m1">tl</span>.<span class="m2">load</span><span class="b0">(</span><span class="v1">ptrs</span>, <span class="v3">mask</span>=<span class="v3">mask</span>, <span class="v6">other</span>=-<span class="m1">float</span><span class="b1">(</span><span class="s">"inf"</span><span class="b1">)</span><span class="b0">)</span>
+    <span class="v4">x</span> = <span class="v4">x</span> - <span class="m1">tl</span>.<span class="m2">max</span><span class="b0">(</span><span class="v4">x</span>, <span class="v4">axis</span>=<span class="n">0</span><span class="b0">)</span>                    <span class="c"># numerically stable shift</span>
+    <span class="v2">num</span> = <span class="m1">tl</span>.<span class="m2">exp</span><span class="b0">(</span><span class="v4">x</span><span class="b0">)</span>
+    <span class="v4">denom</span> = <span class="m1">tl</span>.<span class="m2">sum</span><span class="b0">(</span><span class="v2">num</span>, <span class="v4">axis</span>=<span class="n">0</span><span class="b0">)</span>                  <span class="c"># reduction stays on-chip</span>
+    <span class="v6">y</span> = <span class="v2">num</span> / <span class="v4">denom</span>
+    <span class="v2">out_row</span> = <span class="v3">out_ptr</span> + <span class="v6">row</span> * <span class="v6">out_row_stride</span>
+    <span class="m1">tl</span>.<span class="m2">store</span><span class="b0">(</span><span class="v2">out_row</span> + <span class="v2">col_offsets</span>, <span class="v6">y</span>, <span class="v3">mask</span>=<span class="v3">mask</span><span class="b0">)</span>
+
+<span class="k">def</span> <span class="m1">softmax</span><span class="b0">(</span><span class="v4">x</span>: <span class="m1">torch</span>.<span class="m2">Tensor</span><span class="b0">)</span> -&gt; <span class="m1">torch</span>.<span class="m2">Tensor</span>:
+    <span class="v3">n_rows</span>, <span class="v1">n_cols</span> = <span class="v4">x</span>.<span class="m2">shape</span>
+    <span class="v1">BLOCK_SIZE</span> = <span class="m1">triton</span>.<span class="m2">next_power_of_2</span><span class="b0">(</span><span class="v1">n_cols</span><span class="b0">)</span>  <span class="c"># one tile spans the whole row</span>
+    <span class="v2">out</span> = <span class="m1">torch</span>.<span class="m2">empty_like</span><span class="b0">(</span><span class="v4">x</span><span class="b0">)</span>
+    <span class="m1">softmax_kernel</span><span class="b0">[</span><span class="b1">(</span><span class="v3">n_rows</span>,<span class="b1">)</span><span class="b0">](</span>
+        <span class="v2">out</span>, <span class="v4">x</span>, <span class="v4">x</span>.<span class="m2">stride</span><span class="b1">(</span><span class="n">0</span><span class="b1">)</span>, <span class="v2">out</span>.<span class="m2">stride</span><span class="b1">(</span><span class="n">0</span><span class="b1">)</span>, <span class="v1">n_cols</span>, <span class="v1">BLOCK_SIZE</span>=<span class="v1">BLOCK_SIZE</span>,
+    <span class="b0">)</span>
+    <span class="k">return</span> <span class="v2">out</span></code></pre></div>
+          <p>
+            The load-once, compute-on-chip, store-once shape is the whole
+            point, and it is the same memory-traffic argument that makes
+            fused attention fast, told at row scale here and at tile scale in
+            the <a href="/oss/flash-attention">FlashAttention chapter</a>.
+            The <code>tl.max</code> and <code>tl.sum</code> calls are tile
+            reductions along <code>axis=0</code>, lowered by the compiler into
+            an efficient in-register and shared-memory reduction tree that you
+            never have to write. The stable shift by the row max is the same
+            trick derived on the <a href="/ml/softmax">softmax page</a>, and
+            padding the tail with <code>-inf</code> keeps it correct when
+            <code>BLOCK_SIZE</code> is rounded up past <code>n_cols</code>.
+            The tutorial version goes one step further into a persistent
+            kernel, where the grid is capped at the number of resident
+            programs the GPU can hold and each program strides over multiple
+            rows in a loop, which amortizes launch overhead. It also picks
+            <code>num_warps</code> from the tile size. The idea to keep is the
+            fusion, not the exact persistent bookkeeping.
+          </p>
+
+          <h3>Common beginner mistakes</h3>
+          <p>
+            First, forgetting the mask. Without <code>mask=</code> on a load
+            or store, a partial final block reads and writes out of bounds,
+            which corrupts memory or faults. Every ragged dimension needs a
+            mask. Second, non-power-of-two tiles. <code>tl.arange</code> and
+            most tile shapes must be powers of two, so you size the block up
+            with <code>triton.next_power_of_2</code> and rely on masks for the
+            remainder. Third, treating a tile like a Python list. A Triton
+            tile is a compiler value, not a runtime array, so you cannot index
+            it with a data-dependent scalar or take its Python
+            <code>len</code>. You express selection with <code>tl.where</code>
+            and masks. Fourth, expecting print debugging. The kernel body runs
+            on the GPU after compilation, so ordinary <code>print</code> does
+            nothing useful, and you reach instead for <code>tl.device_print</code>,
+            or you shrink to one block and compare against a torch reference,
+            or you dump the generated IR (Part VII).
+          </p>
+
+          <h2>Part III: When it is the right tool</h2>
+          <p>
+            Triton is the right tool when a standard library kernel does not
+            exist for what you need and you want good performance quickly and
+            portably. Custom fused elementwise-plus-reduction kernels, novel
+            attention variants, quantized or mixed-dtype matmuls, and fused
+            epilogues are its sweet spot, and it is also the shortest path for
+            a researcher who wants a kernel that is fast enough without a month
+            of CUDA. It is the code-generation target of PyTorch's
+            <a href="/oss/pytorch">TorchInductor</a>, so many people ship
+            Triton without writing it, and it underpins hand-written kernels
+            in modern inference and training stacks. When you do want to read
+            a serious hand-written Triton kernel in the wild, the attention
+            kernels inside serving systems such as
+            <a href="/oss/vllm">vLLM</a> and
+            <a href="/oss/sglang">SGLang</a> are good specimens.
+          </p>
+          <p>
+            The honest cases for alternatives. NVIDIA's cuBLAS and cuDNN, and
+            the <a href="https://github.com/NVIDIA/cutlass" target="_blank" rel="noreferrer">CUTLASS</a>
+            template library, still win the last few percent of
+            peak on a fixed shape and a single GPU generation, which is why
+            production GEMM and convolution often call the vendor library
+            rather than a Triton kernel. Hand-written CUDA C++ gives total
+            control over every instruction and remains the answer when you
+            need warp-level primitives or hardware features that the DSL has
+            not yet surfaced. Numba's CUDA support puts you in Python but
+            keeps the per-thread SIMT model, so you still think in
+            <code>threadIdx</code> rather than tiles. JAX's
+            <a href="https://docs.jax.dev/en/latest/pallas/index.html" target="_blank" rel="noreferrer">Pallas</a>
+            is a kernel
+            DSL that actually lowers to Triton on GPU (and to Mosaic on TPU),
+            so it is a sibling and sometimes a front-end rather than a
+            competitor. Graph-level tensor compilers such as
+            <a href="https://arxiv.org/abs/1802.04799" target="_blank" rel="noreferrer">TVM</a> and
+            <a href="https://doi.org/10.1145/2491956.2462176" target="_blank" rel="noreferrer">Halide</a>
+            solve a different, whole-model problem. The tradeoff to state
+            plainly is that <mark>Triton trades a slice of peak performance
+            for a large gain in productivity and portability, and its job is
+            to get you most of the way to hand-tuned speed with a fraction of
+            the effort, on more than one vendor's hardware.</mark>
+          </p>
+          <p>
+            The architecture-shaped warning is about block size. The tile
+            dimensions and the resulting register and shared-memory footprint
+            decide how many program instances fit on each streaming
+            multiprocessor at once, which is the occupancy that hides memory
+            latency. Tiles too small waste memory bandwidth and launch
+            overhead, tiles too large spill registers or exhaust shared memory
+            and quietly serialize, and the best choice depends on the shape,
+            the dtype, and the GPU. This is exactly the parameter Triton does
+            not want you to guess, which is why autotuning exists.
+          </p>
+
+          <h2>Part IV: The full life of one kernel launch</h2>
+          <p>
+            The specimen is the vector-add above. Follow one call to
+            <code>add_kernel[grid](x, y, out, n_elements, BLOCK_SIZE=1024)</code>
+            from Python all the way to threads running on the device. The
+            same path runs for softmax, matmul, or any other
+            <code>@triton.jit</code> function.
+          </p>
+
+          <h3>Stage 1: the decorator and the JITFunction</h3>
+          <p>
+            <code>@triton.jit</code> does not compile anything. It wraps the
+            Python function in a <code>JITFunction</code> object (in the
+            runtime, historically <code>triton/runtime/jit.py</code>) and
+            captures the function's source and its abstract syntax tree.
+            Nothing about the GPU is decided yet, because the same source can
+            compile to many different kernels depending on the argument types
+            and the constexpr values it is eventually called with.
+          </p>
+
+          <h3>Stage 2: launch, specialization, and the cache key</h3>
+          <p>
+            The <code>[grid]</code> subscript plus the call is where work
+            begins. The runtime inspects the actual arguments and builds a
+            <em>specialization signature</em>. It records the element dtype of
+            each pointer argument, the types of the scalars, and the value of
+            every <code>tl.constexpr</code> argument, which is baked into the
+            kernel so a different <code>BLOCK_SIZE</code> is a different
+            kernel. It also records alignment facts, most importantly whether
+            each pointer is divisible by 16 bytes, which lets the compiler
+            emit wider vectorized loads, and whether certain integer arguments
+            are divisible by 16 or equal to 1. Those facts, plus the target
+            description (compute capability, warp size) and the Triton
+            version, form a cache key. If a compiled kernel already exists for
+            that key, in the in-process cache or on disk under
+            <code>~/.triton/cache</code>, the runtime skips straight to
+            launch. Otherwise it compiles once and stores the result. This is
+            why the first call to a kernel with a new signature is slow and
+            every later call is nearly free.
+          </p>
+
+          <h3>Stage 3: code generation to Triton IR</h3>
+          <p>
+            On a cache miss the code generator (in the compiler package)
+            walks the captured AST and emits <strong>Triton IR</strong>, the
+            <code>tt</code> dialect of MLIR, sometimes written TTIR. This is a
+            hardware-agnostic representation of the tile program. Loads and
+            stores become <code>tt.load</code> and <code>tt.store</code> over
+            tensor-of-pointer values, <code>tl.arange</code> becomes a range
+            op, the addition becomes an <code>arith</code> op over a tensor
+            value, reductions become <code>tt.reduce</code>, and a matmul
+            would become <code>tt.dot</code>. There is still no notion of
+            warps, threads, or shared memory. The IR describes tiles and the
+            operations over them, and its types carry tile shapes.
+          </p>
+
+          <h3>Stage 4: lowering to Triton GPU IR and choosing layouts</h3>
+          <p>
+            The pivotal stage converts Triton IR into <strong>Triton GPU
+            IR</strong>, the <code>ttg</code> dialect (TTGIR). This is where
+            the abstract tiles acquire <em>layouts</em>, attributes that say
+            exactly how the elements of a tile are distributed across the
+            warps and threads of a program instance and through shared memory.
+            The main ones are a blocked layout (<code>#blocked</code>, giving
+            each thread a small contiguous run of elements so that loads
+            coalesce), a shared-memory layout (<code>#shared</code>, often
+            swizzled to avoid bank conflicts), and, for tensor-core matmuls,
+            an MMA layout (<code>#mma</code>) for the accumulator plus
+            operand layouts for the inputs of <code>tt.dot</code>. A sequence
+            of MLIR passes runs over TTGIR, and while exact names drift, their
+            roles are stable, a coalescing pass picks blocked layouts that
+            make global memory access contiguous, a matmul-acceleration pass
+            rewrites <code>tt.dot</code> onto tensor-core MMA layouts, a
+            software-pipelining pass restructures loops so that loads for
+            future iterations are issued ahead of the compute that consumes
+            them (using asynchronous copies on hardware that supports them), a
+            layout-conversion cleanup removes redundant re-layouts, and a
+            shared-memory allocation pass plus a barrier-insertion pass place
+            the buffers and the synchronization you never wrote. For the
+            humble vector-add there is no dot and no loop, so this mostly
+            settles on a coalesced blocked layout and how many warps to use.
+          </p>
+
+          <h3>Stage 5: LLVM, PTX, and the binary</h3>
+          <p>
+            TTGIR is lowered to the LLVM dialect and then to ordinary LLVM IR
+            (the <code>llir</code> stage), at which point tile operations have
+            become per-thread instructions, shared-memory accesses, and
+            barriers. The NVIDIA backend runs LLVM's NVPTX target to produce
+            <strong>PTX</strong>, then invokes <code>ptxas</code> to assemble
+            PTX into a <strong>cubin</strong>, the actual machine code for the
+            target SM. The AMD backend follows the parallel road to AMDGCN
+            through the ROCm toolchain. The backends live under
+            <code>third_party/nvidia</code> and <code>third_party/amd</code>,
+            and the architecture is deliberately pluggable so a new accelerator
+            can register a backend that consumes TTGIR. The compiled result
+            keeps every intermediate around, reachable from Python through the
+            compiled kernel's <code>asm</code> dictionary under keys such as
+            <code>ttir</code>, <code>ttgir</code>, <code>llir</code>, and
+            <code>ptx</code>, which is exactly what you inspect in the labs.
+          </p>
+
+          <h3>Stage 6: the grid, the launcher, and execution</h3>
+          <p>
+            Back on the host, the grid callable is evaluated with the
+            meta-parameters to get the number of programs, here
+            <code>ceil(98432 / 1024) = 97</code>. A generated C launcher
+            stub unpacks the Python arguments into the kernel's ABI, and the
+            driver (the CUDA or HIP driver behind
+            <code>triton.runtime.driver</code>) loads the cubin and launches a
+            grid of 97 program instances, each a thread block of
+            <code>num_warps * 32</code> threads. Every program computes its
+            own <code>program_id</code>, its tile of offsets, its mask, and
+            does its two loads, one add, and one store. The masked-off lanes
+            in program 96 quietly do nothing. That closes the loop, Python
+            call in, one lazily compiled and forever cached cubin, a grid of
+            tiles out, and the sum sitting in <code>out</code>.
+          </p>
+
+          <h2>Part V: Internals deep dives</h2>
+
+          <h3>Deep dive: the language, tiles, and block pointers</h3>
+          <p>
+            The user-facing language is <code>triton.language</code>,
+            conventionally imported as <code>tl</code>. Its core is a small,
+            deliberate vocabulary over tiles. Index construction with
+            <code>tl.program_id</code>, <code>tl.num_programs</code>, and
+            <code>tl.arange</code>. Memory with <code>tl.load</code> and
+            <code>tl.store</code>, each taking a tile of pointers plus an
+            optional <code>mask</code> and, for loads, an <code>other</code>
+            fill value. Construction with <code>tl.zeros</code>,
+            <code>tl.full</code>, and broadcasting. Elementwise math and
+            <code>tl.where</code> for data-dependent selection. Reductions
+            such as <code>tl.sum</code>, <code>tl.max</code>,
+            <code>tl.min</code>, and scans such as <code>tl.cumsum</code>, all
+            along a named <code>axis</code>. Atomics such as
+            <code>tl.atomic_add</code> for cross-program accumulation. And the
+            matmul primitive <code>tl.dot(a, b)</code>, which multiplies two
+            tiles on the tensor cores and accumulates in fp32, subject to
+            minimum tile sizes and a precision knob (tf32 versus full
+            precision). The mental discipline is that everything is a tile
+            whose shape is known at compile time, so control flow that depends
+            on tile <em>data</em> is expressed with masks and
+            <code>tl.where</code>, not with Python branching over values.
+          </p>
+          <p>
+            Raw pointer arithmetic like <code>x_ptr + offsets</code> is fine
+            for one-dimensional access, but for tiled traversal of a matrix it
+            gets error-prone, so Triton offers <strong>block pointers</strong>.
+            <code>tl.make_block_ptr(base, shape, strides, offsets,
+            block_shape, order)</code> builds a structured pointer into a
+            tensor that knows the full tensor shape, the per-dimension strides,
+            the current block offsets, the tile shape, and the memory order of
+            the dimensions. You then <code>tl.load(bptr,
+            boundary_check=(0, 1), padding_option="zero")</code> to load a tile
+            with automatic edge handling, and <code>tl.advance(bptr, (0,
+            BLOCK_K))</code> to slide the window along a dimension. Block
+            pointers move the index bookkeeping into the compiler, and on
+            newer hardware they map onto bulk tensor-memory transfers, so a
+            matmul main loop reads as advance, load A tile, load B tile,
+            accumulate with <code>tl.dot</code>, repeat. The illustrative
+            skeleton, with the boilerplate elided.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="v5">a_bp</span> = <span class="m1">tl</span>.<span class="m2">make_block_ptr</span><span class="b0">(</span><span class="v0">a_ptr</span>, <span class="b1">(</span><span class="v5">M</span>, <span class="v0">K</span><span class="b1">)</span>, <span class="b1">(</span><span class="v1">stride_am</span>, <span class="v3">stride_ak</span><span class="b1">)</span>,
+                         <span class="b1">(</span><span class="v3">pid_m</span> * <span class="v4">BLOCK_M</span>, <span class="n">0</span><span class="b1">)</span>, <span class="b1">(</span><span class="v4">BLOCK_M</span>, <span class="v0">BLOCK_K</span><span class="b1">)</span>, <span class="v5">order</span>=<span class="b1">(</span><span class="n">1</span>, <span class="n">0</span><span class="b1">)</span><span class="b0">)</span>
+<span class="v3">b_bp</span> = <span class="m1">tl</span>.<span class="m2">make_block_ptr</span><span class="b0">(</span><span class="v4">b_ptr</span>, <span class="b1">(</span><span class="v0">K</span>, <span class="v6">N</span><span class="b1">)</span>, <span class="b1">(</span><span class="v3">stride_bk</span>, <span class="v2">stride_bn</span><span class="b1">)</span>,
+                         <span class="b1">(</span><span class="n">0</span>, <span class="v5">pid_n</span> * <span class="v6">BLOCK_N</span><span class="b1">)</span>, <span class="b1">(</span><span class="v0">BLOCK_K</span>, <span class="v6">BLOCK_N</span><span class="b1">)</span>, <span class="v5">order</span>=<span class="b1">(</span><span class="n">1</span>, <span class="n">0</span><span class="b1">)</span><span class="b0">)</span>
+<span class="v6">acc</span> = <span class="m1">tl</span>.<span class="m2">zeros</span><span class="b0">(</span><span class="b1">(</span><span class="v4">BLOCK_M</span>, <span class="v6">BLOCK_N</span><span class="b1">)</span>, <span class="v3">dtype</span>=<span class="m1">tl</span>.<span class="m2">float32</span><span class="b0">)</span>
+<span class="k">for</span> <span class="v6">k</span> <span class="k">in</span> <span class="m1">range</span><span class="b0">(</span><span class="n">0</span>, <span class="v0">K</span>, <span class="v0">BLOCK_K</span><span class="b0">)</span>:
+    <span class="v5">a</span> = <span class="m1">tl</span>.<span class="m2">load</span><span class="b0">(</span><span class="v5">a_bp</span>, <span class="v1">boundary_check</span>=<span class="b1">(</span><span class="n">0</span>, <span class="n">1</span><span class="b1">)</span>, <span class="v6">padding_option</span>=<span class="s">"zero"</span><span class="b0">)</span>
+    <span class="v6">b</span> = <span class="m1">tl</span>.<span class="m2">load</span><span class="b0">(</span><span class="v3">b_bp</span>, <span class="v1">boundary_check</span>=<span class="b1">(</span><span class="n">0</span>, <span class="n">1</span><span class="b1">)</span>, <span class="v6">padding_option</span>=<span class="s">"zero"</span><span class="b0">)</span>
+    <span class="v6">acc</span> += <span class="m1">tl</span>.<span class="m2">dot</span><span class="b0">(</span><span class="v5">a</span>, <span class="v6">b</span><span class="b0">)</span>                 <span class="c"># tensor-core matmul, fp32 accumulate</span>
+    <span class="v5">a_bp</span> = <span class="m1">tl</span>.<span class="m2">advance</span><span class="b0">(</span><span class="v5">a_bp</span>, <span class="b1">(</span><span class="n">0</span>, <span class="v0">BLOCK_K</span><span class="b1">)</span><span class="b0">)</span>
+    <span class="v3">b_bp</span> = <span class="m1">tl</span>.<span class="m2">advance</span><span class="b0">(</span><span class="v3">b_bp</span>, <span class="b1">(</span><span class="v0">BLOCK_K</span>, <span class="n">0</span><span class="b1">)</span><span class="b0">)</span>
+<span class="v1">c</span> = <span class="v6">acc</span>.<span class="m2">to</span><span class="b0">(</span><span class="m1">tl</span>.<span class="m2">float16</span><span class="b0">)</span></code></pre></div>
+          <p>
+            The <code>order</code> argument names which dimension is
+            contiguous in memory, which the compiler needs to choose a
+            coalesced layout, and it is a frequent source of confusion because
+            getting it wrong is correct but slow.
+          </p>
+
+          <h3>Deep dive: autotuning</h3>
+          <p>
+            The best tile sizes and the best <code>num_warps</code> and
+            <code>num_stages</code> depend on the problem shape and the GPU,
+            and Triton's answer is to search. The <code>@triton.autotune</code>
+            decorator takes a list of candidate <code>triton.Config</code>
+            objects and a <code>key</code> list of argument names. On the first
+            call for a given set of key values, the autotuner benchmarks every
+            config and caches the winner, and it re-searches only when a key
+            value changes.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="m1">@triton.autotune</span><span class="b0">(</span>
+    <span class="v4">configs</span>=<span class="b1">[</span>
+        <span class="m1">triton</span>.<span class="m2">Config</span><span class="b2">(</span><span class="b0">{</span><span class="s">"BLOCK_M"</span>: <span class="n">128</span>, <span class="s">"BLOCK_N"</span>: <span class="n">256</span>, <span class="s">"BLOCK_K"</span>: <span class="n">64</span>, <span class="s">"GROUP_M"</span>: <span class="n">8</span><span class="b0">}</span>,
+                      <span class="v6">num_warps</span>=<span class="n">8</span>, <span class="v0">num_stages</span>=<span class="n">3</span><span class="b2">)</span>,
+        <span class="m1">triton</span>.<span class="m2">Config</span><span class="b2">(</span><span class="b0">{</span><span class="s">"BLOCK_M"</span>: <span class="n">64</span>,  <span class="s">"BLOCK_N"</span>: <span class="n">64</span>,  <span class="s">"BLOCK_K"</span>: <span class="n">32</span>, <span class="s">"GROUP_M"</span>: <span class="n">8</span><span class="b0">}</span>,
+                      <span class="v6">num_warps</span>=<span class="n">4</span>, <span class="v0">num_stages</span>=<span class="n">4</span><span class="b2">)</span>,
+        <span class="c"># ... more candidates ...</span>
+    <span class="b1">]</span>,
+    <span class="v4">key</span>=<span class="b1">[</span><span class="s">"M"</span>, <span class="s">"N"</span>, <span class="s">"K"</span><span class="b1">]</span>,           <span class="c"># re-tune only when these change</span>
+<span class="b0">)</span>
+<span class="m1">@triton.jit</span>
+<span class="k">def</span> <span class="m1">matmul_kernel</span><span class="b0">(</span><span class="v0">a_ptr</span>, <span class="v4">b_ptr</span>, <span class="v5">c_ptr</span>, <span class="v5">M</span>, <span class="v6">N</span>, <span class="v0">K</span>, ...<span class="b0">)</span>: ...</code></pre></div>
+          <p>
+            Two knobs deserve names. <code>num_warps</code> is how many warps
+            of 32 threads execute one program instance, so it sets the thread
+            block size and trades parallelism for register pressure, with 4 a
+            common default. <code>num_stages</code> is the depth of software
+            pipelining for loops that feed <code>tl.dot</code>, that is how
+            many iterations ahead the compiler prefetches operand tiles into
+            shared memory to overlap memory with compute, at the cost of more
+            shared memory. A companion decorator, <code>@triton.heuristics</code>,
+            computes a meta-parameter from the arguments at launch time, for
+            instance setting an <code>EVEN_K</code> flag when
+            <code>K % BLOCK_K == 0</code> so the compiler can drop the masked
+            tail of the K loop. The trap worth stating, autotuning benchmarks
+            real launches, so the very first call to a freshly keyed kernel
+            pays for the whole search, which is why libraries pre-warm their
+            kernels and why an autotuned kernel feels slow exactly once.
+          </p>
+
+          <h3>Deep dive: the MLIR compiler stack and layouts</h3>
+          <p>
+            The reason Triton can be both simple to write and fast is that the
+            hard decisions live in the compiler, and since the MLIR rebuild
+            those decisions are explicit passes over typed IR rather than
+            hidden inside a monolith. The two dialects that matter most are
+            <code>tt</code> (Triton IR, hardware-agnostic tiles) and
+            <code>ttg</code> (Triton GPU IR, tiles plus layouts), with an
+            additional NVIDIA-specific dialect for features such as the
+            Hopper tensor-memory-accelerator path and warp specialization.
+            The load-bearing concept is the <em>layout attribute</em>. A
+            blocked layout is defined by how many elements each thread holds,
+            how threads fill a warp, and how warps fill the program instance,
+            plus an order, and choosing it well is what makes a global load
+            coalesce into a few wide transactions instead of many scattered
+            ones. An MMA layout describes the peculiar element distribution
+            that the tensor-core instructions produce, and much of the
+            compiler's cleverness is inserting the minimum number of
+            layout conversions (which cost shared-memory round trips) to move
+            data between the layout a load prefers and the layout a
+            <code>tl.dot</code> requires.
+          </p>
+          <p>
+            <mark>Once data layout is an explicit, typed attribute on every
+            tile value, the compiler can reason about coalescing, tensor-core
+            operand formats, and shared-memory staging as ordinary rewrites,
+            and the programmer is freed from all of it while keeping control
+            of the one thing that needs human judgment, the block
+            decomposition.</mark> This is the same move that
+            <a href="/oss/torchtitan">torchtitan</a> makes at the cluster
+            scale with DTensor placements, layout is metadata the system
+            reasons over, told here at the granularity of threads within one
+            GPU rather than GPUs within a cluster.
+          </p>
+
+          <h3>Deep dive: specialization, caching, and the driver</h3>
+          <p>
+            The runtime is what turns a Python function into a fast, reusable
+            binary. The <code>JITFunction</code> owns the specialization logic
+            from Stage 2, and its correctness rests on a subtle point, the
+            alignment and divisibility facts are assumptions the compiler is
+            allowed to bake in, so a kernel compiled under the assumption that
+            a pointer is 16-byte aligned must never be launched on an
+            unaligned pointer. The specializer therefore encodes those facts
+            into the cache key, and you can opt a given argument out with
+            <code>do_not_specialize</code> when the assumption would be unsafe
+            or would cause needless recompilation. Compiled kernels are cached
+            both in memory on the <code>JITFunction</code> and on disk under
+            <code>~/.triton/cache</code> (relocatable with
+            <code>TRITON_CACHE_DIR</code>), keyed by the signature and target,
+            so the compile cost is paid once per machine, not once per
+            process. The driver layer abstracts CUDA and HIP behind a common
+            interface for allocation, module loading, and launch, which is how
+            one launch path serves both vendors. The practical upshot is that
+            a Triton kernel behaves like a normal Python function after its
+            first call, and the cost model in your head should be, compile
+            once per new signature, then a cheap cache lookup and a driver
+            launch every time after.
+          </p>
+
+          <h2>Part VI: Reading the repository</h2>
+          <p>
+            The project splits cleanly into a Python front-end and runtime, a
+            C++ MLIR compiler core, and per-vendor backends. Read it in that
+            order. All locations described by role, since exact paths shift
+            between releases.
+          </p>
+          <p>
+            <strong>Stage 0, the tutorials.</strong> Start in the
+            <code>tutorials</code> directory (under the Python package). Read
+            <code>01-vector-add</code>, then <code>02-fused-softmax</code>,
+            then <code>03-matrix-multiplication</code>, then
+            <code>06-fused-attention</code>. These are the intended
+            curriculum, each is runnable and benchmarked with
+            <code>triton.testing</code>, and they introduce program ids and
+            masks, then reductions and fusion, then <code>tl.dot</code>,
+            autotuning, and the L2-cache grouping trick, then a full
+            FlashAttention-style kernel. Question, at each step, which line
+            decides the block decomposition and which lines are pure tile
+            arithmetic the compiler will lower.
+          </p>
+          <p>
+            <strong>Stage 1, the language surface.</strong> Read the
+            <code>triton/language</code> package, especially the core module
+            that defines tiles, <code>load</code>, <code>store</code>,
+            <code>dot</code>, and the reductions, and the standard-library
+            module built on top of them. Question, which operations are
+            primitive (they lower directly to <code>tt</code> ops) versus
+            composed in Python from other tile ops?
+          </p>
+          <p>
+            <strong>Stage 2, the runtime.</strong> Read the JIT and autotuner
+            modules in <code>triton/runtime</code>. The <code>JITFunction</code>
+            is where specialization, the cache key, and the launch path live,
+            and the autotuner is short and readable, it is little more than
+            benchmark every config, remember the best per key. Question, what
+            exactly goes into the specialization signature, and where does the
+            divisibility-by-16 assumption enter?
+          </p>
+          <p>
+            <strong>Stage 3, the compiler driver.</strong> Read the compiler
+            package (<code>triton/compiler</code>), the code generator that
+            walks the AST into Triton IR and the top-level
+            <code>compile</code> function that sequences the pass pipeline down
+            to a binary. Question, in what order do the TTIR and TTGIR passes
+            run, and where is the target backend selected?
+          </p>
+          <p>
+            <strong>Stage 4, the MLIR core.</strong> Drop into C++. The
+            dialect definitions live under the include tree
+            (<code>include/triton</code>) and the passes under
+            <code>lib</code>. Read one pass end to end, the coalescing pass or
+            the matmul-acceleration pass are the most instructive, against the
+            dialect ops they rewrite. Question, how does a pass decide a
+            blocked layout, and what makes a layout conversion necessary?
+          </p>
+          <p>
+            <strong>Stage 5, the backends.</strong> The vendor backends live
+            under <code>third_party/nvidia</code> and
+            <code>third_party/amd</code>, each lowering TTGIR to LLVM and then
+            to PTX or AMDGCN and driving the assembler. Skim these to see the
+            pluggable seam, then stop, they are the deepest and most
+            hardware-specific part of the tree.
+          </p>
+          <p>
+            Where <em>not</em> to start. The Hopper-specific machinery (tensor
+            memory accelerator paths, warp specialization, cluster launch) is
+            fascinating but a distraction on a first read, and the C++ pass
+            internals only make sense once you have watched the IR change in
+            the labs. Read the IR before you read the pass that produced it.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            Labs 1 through 4 need one GPU. Lab 5 needs none beyond reading. Log
+            and IR formats vary with the fast pace of the project.
+          </p>
+          <p><strong>Lab 1: vector-add and verify.</strong> Concept: the launch grid and masking.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="c"># run the Part II add() and check it</span>
+<span class="k">import</span> <span class="m1">torch</span>, <span class="m1">triton</span>
+<span class="v4">x</span> = <span class="m1">torch</span>.<span class="m2">rand</span><span class="b0">(</span><span class="n">100_000</span>, <span class="v6">device</span>=<span class="s">"cuda"</span><span class="b0">)</span>; <span class="v6">y</span> = <span class="m1">torch</span>.<span class="m2">rand</span><span class="b0">(</span><span class="n">100_000</span>, <span class="v6">device</span>=<span class="s">"cuda"</span><span class="b0">)</span>
+<span class="m1">torch</span>.<span class="m2">testing</span>.<span class="m2">assert_close</span><span class="b0">(</span><span class="m1">add</span><span class="b1">(</span><span class="v4">x</span>, <span class="v6">y</span><span class="b1">)</span>, <span class="v4">x</span> + <span class="v6">y</span><span class="b0">)</span>
+<span class="c"># now break it on purpose: drop the mask in add_kernel and rerun.</span>
+<span class="c"># on a size that is not a multiple of BLOCK_SIZE, watch it fault or corrupt.</span></code></pre></div>
+          <p>
+            Observe that the correct version passes and the mask-free version
+            fails only for sizes that are not a multiple of
+            <code>BLOCK_SIZE</code>, which is exactly the ragged final block.
+          </p>
+          <p><strong>Lab 2: see the compiler's output.</strong> Concept: the TTIR to PTX pipeline of Part IV.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="c"># dump every IR stage to disk for any kernel you launch</span>
+<span class="v6">TRITON_KERNEL_DUMP</span>=<span class="s">1</span> <span class="v5">TRITON_DUMP_DIR</span>=<span class="s">./dump</span> <span class="m1">python</span> <span class="s">your_kernel.py</span>
+<span class="c"># or dump the MLIR after each pass to stderr</span>
+<span class="v4">MLIR_ENABLE_DUMP</span>=<span class="s">1</span> <span class="m1">python</span> <span class="s">your_kernel.py</span> 2&gt; <span class="s">passes.log</span></code></pre></div>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="c"># or reach the strings directly from a compiled kernel</span>
+<span class="v6">k</span> = <span class="v2">add_kernel</span>.<span class="m2">warmup</span><span class="b0">(</span><span class="v4">x</span>, <span class="v6">y</span>, <span class="v2">out</span>, <span class="v4">x</span>.<span class="m2">numel</span><span class="b1">()</span>, <span class="v1">BLOCK_SIZE</span>=<span class="n">1024</span>, <span class="v1">grid</span>=<span class="b1">(</span><span class="n">1</span>,<span class="b1">)</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="v6">k</span>.<span class="m2">asm</span><span class="b1">[</span><span class="s">"ttir"</span><span class="b1">][</span>:<span class="n">800</span><span class="b1">]</span><span class="b0">)</span>     <span class="c"># hardware-agnostic tile IR</span>
+<span class="m1">print</span><span class="b0">(</span><span class="v6">k</span>.<span class="m2">asm</span><span class="b1">[</span><span class="s">"ttgir"</span><span class="b1">][</span>:<span class="n">800</span><span class="b1">]</span><span class="b0">)</span>    <span class="c"># note the #blocked layout attributes</span>
+<span class="m1">print</span><span class="b0">(</span><span class="v6">k</span>.<span class="m2">asm</span><span class="b1">[</span><span class="s">"ptx"</span><span class="b1">][</span>:<span class="n">800</span><span class="b1">]</span><span class="b0">)</span>      <span class="c"># the assembly ptxas turns into a cubin</span></code></pre></div>
+          <p>
+            Read the TTIR and find <code>tt.load</code>, <code>tt.store</code>,
+            and the range. Then read the TTGIR and find the
+            <code>#blocked</code> layout the coalescing pass chose. Then skim
+            the PTX and see the tile become per-thread loads. This single lab
+            makes Part IV concrete.
+          </p>
+          <p><strong>Lab 3: fuse a softmax and benchmark it.</strong> Concept: memory traffic and fusion.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">torch</span>, <span class="m1">triton</span>
+<span class="v4">x</span> = <span class="m1">torch</span>.<span class="m2">randn</span><span class="b0">(</span><span class="n">4096</span>, <span class="n">4096</span>, <span class="v6">device</span>=<span class="s">"cuda"</span><span class="b0">)</span>
+<span class="v6">ref</span> = <span class="m1">torch</span>.<span class="m2">softmax</span><span class="b0">(</span><span class="v4">x</span>, <span class="v5">dim</span>=<span class="n">1</span><span class="b0">)</span>
+<span class="m1">torch</span>.<span class="m2">testing</span>.<span class="m2">assert_close</span><span class="b0">(</span><span class="m1">softmax</span><span class="b1">(</span><span class="v4">x</span><span class="b1">)</span>, <span class="v6">ref</span>, <span class="v2">atol</span>=<span class="n">1e-3</span>, <span class="v4">rtol</span>=<span class="n">1e-3</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="m1">triton</span>.<span class="m2">testing</span>.<span class="m2">do_bench</span><span class="b1">(</span><span class="k">lambda</span>: <span class="m1">softmax</span><span class="b2">(</span><span class="v4">x</span><span class="b2">)</span><span class="b1">)</span><span class="b0">)</span>          <span class="c"># your kernel, ms</span>
+<span class="m1">print</span><span class="b0">(</span><span class="m1">triton</span>.<span class="m2">testing</span>.<span class="m2">do_bench</span><span class="b1">(</span><span class="k">lambda</span>: <span class="m1">torch</span>.<span class="m2">softmax</span><span class="b2">(</span><span class="v4">x</span>, <span class="n">1</span><span class="b2">)</span><span class="b1">)</span><span class="b0">)</span> <span class="c"># torch reference</span></code></pre></div>
+          <p>
+            Observe that the fused kernel moves the input across DRAM far
+            fewer times than an unfused sequence would, and compare the
+            timings. Then shrink the number of columns and watch the chosen
+            <code>BLOCK_SIZE</code> follow <code>next_power_of_2</code>.
+          </p>
+          <p><strong>Lab 4: autotune a matmul.</strong> Concept: the tile-size search of Part V.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="c"># start from tutorial 03, then vary the config list and the key.</span>
+<span class="c"># 1) time a fixed (M, N, K) with the default configs.</span>
+<span class="c"># 2) remove all but one config and compare; feel the search cost on call one.</span>
+<span class="c"># 3) add num_stages=2 vs 4 variants and see which the tuner keeps.</span>
+<span class="c"># TRITON_PRINT_AUTOTUNING=1 makes the autotuner announce its winner.</span></code></pre></div>
+          <p>
+            Observe that the first call for a new <code>(M, N, K)</code> is
+            slow because it benchmarks every config, and later calls with the
+            same key are fast. This is the pre-warm behavior real libraries
+            rely on.
+          </p>
+          <p><strong>Lab 5: read a real kernel.</strong> Concept: block pointers and <code>tl.dot</code> at production scale.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="c"># open the fused-attention tutorial (06) and read it against the</span>
+<span class="c"># FlashAttention writeup on this site. map every tl.load/tl.dot to a tile</span>
+<span class="c"># in the flash-attention algorithm, and find where the online-softmax</span>
+<span class="c"># running max and sum are carried across the K/V loop.</span></code></pre></div>
+          <p>
+            Observe that the same tiling and online-softmax structure derived
+            in the <a href="/oss/flash-attention">FlashAttention chapter</a>
+            and the <a href="/ml/attention">attention page</a> appears here as
+            a loop over key/value blocks that never materializes the full
+            score matrix. Triton is the language that makes that algorithm a
+            few dozen readable lines.
+          </p>
+
+          <h2>Part VIII: Questions and model answers</h2>
+          <p>Understanding checks. Answer aloud before reading.</p>
+          <p><strong>1. What is Triton, in one sentence?</strong></p>
+          <p>
+            A Python-embedded DSL and MLIR-based compiler for GPU kernels, in
+            which you write a single program over tiles and the compiler
+            lowers the tile operations into coalesced, synchronized
+            thread-level code, so you own the block decomposition and hand the
+            per-thread details to the compiler.
+          </p>
+          <p><strong>2. How does the Triton programming model differ from CUDA's?</strong></p>
+          <p>
+            CUDA is SIMT, you write per-thread code and manage
+            <code>threadIdx</code>, shared memory, coalescing, and barriers by
+            hand. Triton is block-level SPMD, you write per-tile code indexed
+            by <code>program_id</code>, and the compiler decides the
+            thread mapping, allocates shared memory, coalesces loads, and
+            inserts synchronization. You keep control of grid and tile sizes
+            because that is the algorithmic choice.
+          </p>
+          <p><strong>3. Walk the vector-add kernel line by line.</strong></p>
+          <p>
+            <code>program_id</code> selects this block, multiplying by
+            <code>BLOCK_SIZE</code> and adding <code>tl.arange</code> builds a
+            tile of offsets, the mask <code>offsets &lt; n_elements</code>
+            guards the ragged last block, two masked <code>tl.load</code>s
+            bring tiles of x and y on-chip, they are added as tiles, and a
+            masked <code>tl.store</code> writes the result. The grid launches
+            <code>ceil(n / BLOCK_SIZE)</code> programs, one per tile.
+          </p>
+          <p><strong>4. Why is the fused softmax faster than a naive PyTorch softmax?</strong></p>
+          <p>
+            Softmax is memory-bound, and the naive version makes several
+            passes over DRAM, one to find the max, one for the exponentials,
+            one for the sum, one to normalize. The fused kernel loads each row
+            once into on-chip memory, does the max, exp, sum, and divide there
+            with tile reductions, and writes the row once, so it moves far
+            fewer bytes across the slow memory.
+          </p>
+          <p><strong>5. What is a tile, and why is it the unit of the language?</strong></p>
+          <p>
+            A tile is a small multi-dimensional block of values with a shape
+            known at compile time, treated as a first-class value. Making it
+            the unit lets the programmer express the algorithm at block
+            granularity while giving the compiler a whole tile to map onto
+            threads, shared memory, and tensor cores, which is where the
+            optimization lives.
+          </p>
+          <p><strong>6. What are the four IR stages a kernel passes through?</strong></p>
+          <p>
+            Triton IR (the <code>tt</code> dialect, hardware-agnostic tiles),
+            Triton GPU IR (the <code>ttg</code> dialect, tiles plus layouts
+            and warp counts), LLVM IR, and finally PTX assembled into a cubin
+            on NVIDIA (or AMDGCN on AMD). The pivotal stage is TTGIR, where
+            layouts are chosen.
+          </p>
+          <p><strong>7. What is a layout in Triton GPU IR and why does it matter?</strong></p>
+          <p>
+            A layout is a typed attribute on a tile value that says exactly
+            how the tile's elements are distributed across threads, warps, and
+            shared memory. It matters because coalescing, tensor-core operand
+            formats, and shared-memory staging all depend on it, and the
+            compiler's job is largely choosing good layouts and inserting the
+            fewest conversions between them.
+          </p>
+          <p><strong>8. What do num_warps and num_stages control?</strong></p>
+          <p>
+            <code>num_warps</code> is how many 32-thread warps run one program
+            instance, setting the thread block size and trading parallelism
+            against register pressure. <code>num_stages</code> is the depth of
+            software pipelining for loops feeding <code>tl.dot</code>, how many
+            iterations of operand tiles are prefetched into shared memory to
+            overlap memory with compute, at the cost of more shared memory.
+          </p>
+          <p><strong>9. What does autotuning actually do, and what is its cost?</strong></p>
+          <p>
+            <code>@triton.autotune</code> benchmarks a list of candidate
+            configs on the real hardware and caches the fastest per distinct
+            value of the <code>key</code> arguments. The cost is that the first
+            call for a new key runs every config, so that one call is slow,
+            which is why libraries pre-warm autotuned kernels.
+          </p>
+          <p><strong>10. Why is the first call to a kernel slow and later calls fast?</strong></p>
+          <p>
+            The first call with a new specialization signature triggers full
+            compilation, AST to TTIR to TTGIR to LLVM to PTX to cubin. The
+            result is cached in memory and on disk under
+            <code>~/.triton/cache</code>, keyed by argument types, constexpr
+            values, alignment facts, and target, so every later call with the
+            same signature is a cache lookup and a driver launch.
+          </p>
+          <p><strong>11. When would you reach for CUTLASS or hand-written CUDA instead of Triton?</strong></p>
+          <p>
+            When you need the last few percent of peak on a fixed shape and a
+            single GPU generation, or a hardware feature the DSL has not
+            surfaced. Vendor libraries and CUTLASS win top-end GEMM and
+            convolution, and raw CUDA gives instruction-level control.
+            Triton's advantage is custom fused kernels written fast and run on
+            more than one vendor.
+          </p>
+          <p><strong>12. Why do block pointers exist when raw pointer arithmetic already works?</strong></p>
+          <p>
+            Raw arithmetic is fine in one dimension but error-prone for tiled
+            matrix traversal. <code>tl.make_block_ptr</code> carries the tensor
+            shape, strides, offsets, tile shape, and memory order, gives
+            automatic boundary checking on load, and slides with
+            <code>tl.advance</code>. It also maps onto bulk tensor-memory
+            transfers on newer hardware, so a matmul loop becomes advance,
+            load, <code>tl.dot</code>, repeat.
+          </p>
+          <p><strong>13. Where does the divisibility-by-16 assumption come from and why guard it?</strong></p>
+          <p>
+            The specializer records whether pointers are 16-byte aligned so
+            the compiler can emit wider vectorized loads. Because that
+            assumption is baked into the compiled kernel, it becomes part of
+            the cache key, and a kernel compiled for aligned pointers must
+            never be launched on an unaligned one, which is why alignment is a
+            specialization axis rather than a runtime branch.
+          </p>
+          <p><strong>14. Why can print debugging not work inside a kernel?</strong></p>
+          <p>
+            The kernel body is compiled and executed on the GPU across a grid
+            of programs, so a host-side Python <code>print</code> in the body
+            runs only at trace time, not per program. You use
+            <code>tl.device_print</code>, shrink to a single block and compare
+            against a torch reference, or dump the generated IR to reason
+            about what actually ran.
+          </p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Raise the unit of programming, keep the strategic
+            choice.</strong> Triton moves the programmer from the thread to
+            the tile, automating the tedious and error-prone per-thread work
+            while leaving the one decision that needs human judgment, the
+            block decomposition, in human hands. Good abstractions hide the
+            mechanism and expose the policy, the same instinct as a query
+            planner that owns execution while you own the schema.
+          </p>
+          <p>
+            <strong>Make layout an explicit type.</strong> Encoding data
+            distribution as layout attributes on tile values turns coalescing,
+            tensor-core formats, and shared-memory staging into ordinary
+            rewrites over typed IR. Represent the invariant in the data and
+            composition becomes checkable, which is exactly why
+            <a href="/oss/torchtitan">torchtitan</a> makes cluster-scale
+            sharding a DTensor placement rather than model code.
+          </p>
+          <p>
+            <strong>Compile lazily, cache aggressively, specialize
+            honestly.</strong> A kernel compiles on first use per signature
+            and is then cached in memory and on disk, so the abstraction is
+            free after the first call, and the assumptions the compiler bakes
+            in (alignment, constexpr values) are encoded into the cache key so
+            they can never be silently violated. Caching is only safe when the
+            key captures every assumption.
+          </p>
+          <p>
+            <strong>Search the parameters you cannot reason about.</strong>
+            The best tile size and pipeline depth depend on shape and
+            hardware in ways no simple formula captures, so autotuning
+            measures instead of guessing and caches the winner. When the cost
+            model is too complex to model, benchmark, and remember.
+          </p>
+          <p>
+            <strong>Keep the seams pluggable.</strong> The MLIR dialects and
+            the vendor backends under <code>third_party</code> let a new
+            accelerator consume Triton GPU IR without touching the front-end,
+            which is how one language reaches NVIDIA and AMD and why Pallas can
+            sit on top. A stable IR in the middle is what lets the ends move
+            independently.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            The one-sentence summary. <mark>Triton lets you write a GPU kernel
+            as a single program over compile-time-sized tiles, indexed by
+            <code>program_id</code> and moved with <code>tl.load</code>,
+            <code>tl.store</code>, and <code>tl.dot</code>, and its MLIR
+            compiler lowers those tiles through Triton IR and Triton GPU IR
+            (where layouts are chosen) to LLVM and PTX, caching one cubin per
+            signature, while autotuning searches the block sizes you should not
+            guess.</mark>
+          </p>
+          <pre class="flow">@triton.jit  -&gt;  kernel[grid](args, BLOCK=...)  -&gt;  specialize + cache key
+   -&gt;  code gen  -&gt;  Triton IR (tt)  -&gt;  Triton GPU IR (ttg, layouts)
+   -&gt;  LLVM IR   -&gt;  PTX  -&gt;  cubin (ptxas)  -&gt;  driver launches grid of programs
+each program:  pid = program_id  -&gt;  tile of offsets + mask
+   -&gt;  tl.load  -&gt;  compute (tl.dot / reductions)  -&gt;  tl.store</pre>
+          <p>The chain mapped to the repository.</p>
+          <pre class="flow">language          triton/language/ (tl: program_id, load, store, dot, reduce)
+launch + cache    triton/runtime/ (JITFunction: specialize, cache key, launch)
+autotune          triton/runtime/ (autotune, Config, heuristics)
+code gen + driver triton/compiler/ (AST -&gt; TTIR, then the pass pipeline)
+MLIR passes       lib/ + include/triton/ (tt and ttg dialects, layout passes)
+backends          third_party/nvidia, third_party/amd (TTGIR -&gt; LLVM -&gt; PTX/GCN)
+tutorials         tutorials/ (01 vector-add ... 06 fused-attention)</pre>
+          <p>Memorize these blocks.</p>
+          <ul>
+            <li><strong>Programming model:</strong> per-block SPMD over tiles, <code>program_id</code> picks the block, masks guard the edges, the compiler owns threads, coalescing, shared memory, and sync.</li>
+            <li><strong>Core language:</strong> <code>tl.program_id</code>, <code>tl.arange</code>, <code>tl.load</code>/<code>tl.store</code> with <code>mask</code>/<code>other</code>, <code>tl.dot</code>, reductions <code>tl.sum</code>/<code>tl.max</code>, <code>tl.where</code>, block pointers via <code>tl.make_block_ptr</code>/<code>tl.advance</code>.</li>
+            <li><strong>IR stages:</strong> Triton IR (tt, agnostic) to Triton GPU IR (ttg, layouts and warps) to LLVM IR to PTX/cubin, with TTGIR the pivotal layout-choosing stage.</li>
+            <li><strong>Autotuning:</strong> <code>@triton.autotune</code> benchmarks configs and caches the best per <code>key</code>, <code>num_warps</code> sets thread count, <code>num_stages</code> sets pipeline depth.</li>
+            <li><strong>Cost model:</strong> compile once per signature (types, constexpr, 16-byte alignment, target), cache in memory and under <code>~/.triton/cache</code>, cheap launch forever after.</li>
+          </ul>
+
+          <h2>Part XI: Papers and further reading</h2>
+          <p>
+            The ideas in this chapter trace back to a small set of papers and
+            projects, and each one rewards a direct read. Where this site
+            derives the same idea in depth, the companion link points there.
+          </p>
+          <ol class="refs">
+            <li>Tillet, Kung, and Cox, <a href="https://doi.org/10.1145/3315508.3329973" target="_blank" rel="noreferrer">Triton, An Intermediate Language and Compiler for Tiled Neural Network Computations</a>, MAPL 2019. The original paper, which raises the unit of programming to the tile and sketches the coalescing, shared-memory, and pipelining machinery this chapter walks through.</li>
+            <li>Lattner et al., <a href="https://arxiv.org/abs/2002.11054" target="_blank" rel="noreferrer">MLIR, A Compiler Infrastructure for the End of Moore's Law</a>, 2020. The extensible compiler framework Triton was rebuilt on, whose dialect and pass machinery carries the <code>tt</code> and <code>ttg</code> IRs of Part IV.</li>
+            <li>Lattner and Adve, <a href="https://llvm.org/pubs/2004-01-30-CGO-LLVM.html" target="_blank" rel="noreferrer">LLVM, A Compilation Framework for Lifelong Program Analysis and Transformation</a>, CGO 2004. The substrate underneath everything here, since every Triton kernel becomes LLVM IR on its way to PTX or AMDGCN.</li>
+            <li>Dao et al., <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noreferrer">FlashAttention, Fast and Memory-Efficient Exact Attention with IO-Awareness</a>, 2022. The flagship algorithm for hand-written Triton kernels, derived in the <a href="/oss/flash-attention">FlashAttention chapter</a>, and the <a href="/oss/unsloth">Unsloth walkthrough</a> shows kernels in that style at production scale.</li>
+            <li>Milakov and Gimelshein, <a href="https://arxiv.org/abs/1805.02867" target="_blank" rel="noreferrer">Online Normalizer Calculation for Softmax</a>, 2018. The one-pass softmax trick that the fused-attention tutorial carries across its key and value loop, worked on the <a href="/ml/softmax">softmax page</a>.</li>
+            <li>Williams, Waterman, and Patterson, <a href="https://doi.org/10.1145/1498765.1498785" target="_blank" rel="noreferrer">Roofline, An Insightful Visual Performance Model for Multicore Architectures</a>, CACM 2009. The model that explains why fusion wins, since kernels like softmax sit on the memory-bound side of the roof, and the <a href="/classes/parallel-computing">parallel computing class</a> builds on it.</li>
+            <li>Ansel et al., <a href="https://doi.org/10.1145/3620665.3640366" target="_blank" rel="noreferrer">PyTorch 2, Faster Machine Learning Through Dynamic Python Bytecode Transformation and Graph Compilation</a>, ASPLOS 2024. Describes TorchDynamo and TorchInductor, the compiler that emits most of the world's Triton kernels, covered in the <a href="/oss/pytorch">PyTorch walkthrough</a>.</li>
+            <li>Ragan-Kelley et al., <a href="https://doi.org/10.1145/2491956.2462176" target="_blank" rel="noreferrer">Halide, A Language and Compiler for Optimizing Parallelism, Locality, and Recomputation in Image Processing Pipelines</a>, PLDI 2013. The paper that separated the algorithm from the schedule, the ancestor idea behind every kernel DSL including this one.</li>
+            <li>Chen et al., <a href="https://arxiv.org/abs/1802.04799" target="_blank" rel="noreferrer">TVM, An Automated End-to-End Optimizing Compiler for Deep Learning</a>, 2018. A graph-level tensor compiler for whole models, a useful contrast with Triton's single-kernel scope.</li>
+            <li>NVIDIA, <a href="https://github.com/NVIDIA/cutlass" target="_blank" rel="noreferrer">CUTLASS</a>. The template-metaprogramming route to peak GEMM that Part III weighs against Triton, covered in the <a href="/oss/cutlass">CUTLASS walkthrough</a>.</li>
+            <li>The JAX team, <a href="https://docs.jax.dev/en/latest/pallas/index.html" target="_blank" rel="noreferrer">Pallas, a JAX Kernel Language</a>. A sibling DSL that lowers to Triton on GPU, living proof of the pluggable seam praised in Part IX.</li>
+          </ol>
+
+          <h2>Part XII: Final takeaway</h2>
+          <p>
+            If the GPU execution model underneath, warps, memory coalescing,
+            shared memory, and occupancy, is the gap, the
+            <a href="/classes/parallel-computing">parallel computing class</a>
+            builds it from the hardware up, and the algorithm that most
+            rewards a hand-written Triton kernel is derived in the
+            <a href="/oss/flash-attention">FlashAttention chapter</a> and the
+            <a href="/ml/softmax">softmax page</a>. Then come back and read the
+            fused-attention tutorial once more, it will read like tiled NumPy
+            with a couple of loop-carried scalars, which is the entire point.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> Triton shows that fast GPU kernels
+            do not require writing CUDA C++. Raise the unit of programming from
+            the thread to the tile, keep the block decomposition in human
+            hands, and let an MLIR compiler choose layouts, coalesce memory,
+            stage shared memory, and pipeline loops. The result is a kernel you
+            can write in an afternoon, that runs within reach of hand-tuned
+            speed, on more than one vendor's hardware, and that a compiler can
+            even generate for you.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/code-copy.js"></script>
+      <script defer src="/theme.js"></script>
+  </body>
+</html>

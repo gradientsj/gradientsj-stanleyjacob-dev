@@ -1,0 +1,816 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PyTorch in the Wild · Stanley Jacob</title>
+    <meta name="description" content="How real open source projects actually use PyTorch. The shared idioms (nn.Module, autograd, the training-loop contract), then the divergent styles of nanoGPT, torchtitan, Unsloth, vLLM, diffusers, Lightning and torchtune, plus data loading, export paths, and a practical guide to which idiom fits which situation." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%232B2621'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+      <script>(function(){try{var t=localStorage.getItem("theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml" class="active">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/ml">Machine learning</a></div>
+        <h1>PyTorch in the wild</h1>
+        <p class="lead">
+          PyTorch ships one small set of primitives, modules, an autograd
+          tape, optimizers, a data loader, and every serious project bends
+          them into a different shape. nanoGPT keeps an entire GPT training
+          run in one readable file. torchtitan composes parallelism out of
+          sharded tensors. Unsloth rewrites backward passes by hand. vLLM
+          keeps the model and throws away the loop. diffusers splits
+          everything into swappable parts. This page reads those codebases
+          side by side, as a field guide to PyTorch idioms in production,
+          what each one buys, and what each one costs.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <div class="reader" data-reader data-audio="listen.mp3"></div>
+          <h2>The idioms everyone shares</h2>
+          <p>
+            Before the styles diverge, every PyTorch codebase stands on the
+            same five or six load-bearing conventions, and it pays to name
+            them precisely, because the interesting projects are the ones
+            that deliberately break one of them.
+          </p>
+          <p>
+            <strong>Module composition.</strong> <code>nn.Module</code> is a
+            tree, not a graph. Assigning a submodule or an
+            <code>nn.Parameter</code> to an attribute registers it, and that
+            registration is what makes <code>.parameters()</code>,
+            <code>.state_dict()</code>, <code>.to(device)</code>, and every
+            recursive traversal work. The forward pass is ordinary Python,
+            recorded as it runs, so control flow is free and the model you
+            debug is the model you wrote. Calling a module goes through
+            <code>__call__</code> rather than <code>forward</code> directly,
+            and that indirection is where hooks attach, which matters later.
+            The one rule people trip on is that only registered things move
+            and save. A raw tensor stashed on <code>self</code> is invisible
+            to <code>state_dict</code> and stays on the wrong device, and
+            the fix is <code>register_buffer</code>, which is why masks and
+            running statistics live in buffers across every codebase in
+            this survey.
+          </p>
+          <p>
+            <strong>The training-loop contract.</strong> The canonical loop
+            is four calls in a fixed order, zero the gradients, run forward
+            to a scalar loss, call <code>loss.backward()</code>, call
+            <code>optimizer.step()</code>. Everything else in the ecosystem
+            is built against that contract. Gradient accumulation works
+            because <code>backward</code> adds into <code>.grad</code>
+            rather than overwriting it, which is also the reason
+            <code>zero_grad</code> must exist at all. Gradient clipping
+            slots between backward and step because that is the only moment
+            when the full gradient exists and has not been consumed. Mixed
+            precision wraps the same four calls with a scaler. Schedulers
+            step alongside the optimizer, and the scheduler adjusts the
+            learning rate stored inside the optimizer's param groups rather
+            than owning anything itself. The optimizer, in turn, holds live
+            references to the parameters, not copies, which is why you must
+            construct it after moving the model to its device if any
+            transformation replaces parameter tensors.
+          </p>
+          <p>
+            <strong>Autograd's tape.</strong> Every operation on a tensor
+            that requires grad appends a node to a dynamically built graph,
+            and <code>backward</code> walks that graph in reverse, freeing
+            it as it goes by default. The tape is per-iteration and
+            rebuilt from scratch each forward, which is what makes PyTorch
+            feel like Python rather than a compiler, and it is also the
+            thing every performance-oriented project in this survey works
+            around. The memory cost of training is dominated not by
+            parameters but by the activations the tape saves for the
+            backward pass, and that single fact explains activation
+            checkpointing, FlashAttention-style recomputation, and most of
+            what Unsloth does below.
+          </p>
+          <p>
+            <strong>Device movement.</strong> <code>module.to(device)</code>
+            moves in place and returns the same module,
+            <code>tensor.to(device)</code> returns a new tensor, and mixing
+            up the two is a rite of passage. Data transfer overlaps with
+            compute only when the host memory is pinned and the copy passes
+            <code>non_blocking=True</code>, a pairing you will find in the
+            input pipeline of essentially every training repo that cares
+            about throughput.
+          </p>
+          <p>
+            <strong>The escape hatches.</strong> When the standard ops are
+            not enough, PyTorch offers three well-marked exits.
+            <code>torch.autograd.Function</code> lets you define forward
+            and backward by hand, with <code>ctx.save_for_backward</code>
+            controlling exactly what the tape keeps, and it is the seam
+            through which every hand-written kernel enters training.
+            Custom operators, registered through <code>torch.library</code>
+            or bound from C++ and CUDA through the
+            <code>cpp_extension</code> machinery, make foreign kernels look
+            like native ops so the dispatcher and the compiler can see
+            them. And hooks, forward hooks, backward hooks, and
+            per-tensor gradient hooks, let you observe or edit values
+            without touching the model's code, which is how feature
+            extraction, activation statistics, and most interpretability
+            tooling attach to models they do not own. Each project below
+            is, in a real sense, a choice of which escape hatch to live
+            in. My walkthrough of the PyTorch codebase itself, dispatcher
+            and autograd internals included, is at
+            <a href="/oss/pytorch">/oss/pytorch</a>.
+          </p>
+
+          <h2>The clean reference loop, nanoGPT</h2>
+          <p>
+            <a href="https://github.com/karpathy/nanoGPT" target="_blank" rel="noreferrer">karpathy/nanoGPT</a>
+            is the null hypothesis of this survey, the project that uses
+            PyTorch exactly as the tutorials describe and proves how far
+            that gets you. The entire repository that matters is two files.
+            <code>model.py</code> defines GPT-2 in about three hundred
+            lines of plain <code>nn.Module</code> composition, and
+            <code>train.py</code> is the whole training run, data loading,
+            mixed precision, distributed data parallel, gradient
+            accumulation, evaluation, checkpointing, and logging, in about
+            three hundred more. There is no trainer class, no callback
+            system, no configuration framework. Config is a file of
+            module-level variables that a small helper overrides by
+            executing an optional config file and command-line assignments
+            over the globals, which sounds lawless and reads perfectly,
+            because every knob is a named variable you can search for.
+          </p>
+          <p>
+            The idioms inside are worth cataloguing because they are the
+            standard ones executed cleanly. Batches come from a
+            <code>numpy</code> memmap of pre-tokenized data, sliced at
+            random offsets, pinned, and copied to the GPU with
+            <code>non_blocking=True</code>, which means the data pipeline
+            is about ten lines and never becomes the bottleneck at this
+            scale. Evaluation is a function under
+            <code>torch.no_grad</code> that flips the model to
+            <code>eval</code> and back. Mixed precision is one
+            <code>autocast</code> context plus a <code>GradScaler</code>
+            that is a no-op in bfloat16. DDP is a thin wrapper applied only
+            when the script detects a distributed launch, and gradient
+            accumulation cooperates with it by syncing gradients only on
+            the final micro-step. Weight decay is applied to matrices but
+            not to biases and norms, done once at optimizer construction by
+            partitioning parameters into two groups, an idiom that
+            reappears in nearly every LLM codebase.
+          </p>
+          <p>
+            Then there is the line that dates the repo to the
+            <code>torch.compile</code> era, <code>model =
+            torch.compile(model)</code>, guarded by a single flag. On an
+            A100 it is worth tens of percent of throughput and it costs one
+            line and some startup latency, no rewrite, no annotation. The
+            reason it works so well here is the same reason the whole file
+            works, the model is static, the shapes are fixed, the loop is
+            regular, so the compiler sees one graph and optimizes it once.
+            The general lesson is that <code>torch.compile</code> pays best
+            exactly where code is boring.
+          </p>
+          <p>
+            What nanoGPT teaches about abstraction is mostly negative
+            space. Nothing in the file is reusable, and that is the point.
+            Because the loop is flat, every intervention a researcher
+            actually wants, a new logging line, a different schedule, a
+            surgery on the model between steps, is a direct edit at the
+            obvious place, with no framework to negotiate with. The file
+            fits in your head, so the cost of change stays proportional to
+            the size of the change. The repo's limits are equally
+            instructive, one node, one model family, no elastic restarts,
+            no tensor parallelism, and the moment those requirements
+            appear, this style stops scaling and the next section's style
+            begins. My annotated walkthrough of the codebase is at
+            <a href="/oss/nanogpt">/oss/nanogpt</a>.
+          </p>
+
+          <h2>Distributed as a first-class design, torchtitan</h2>
+          <p>
+            <a href="https://github.com/pytorch/torchtitan" target="_blank" rel="noreferrer">pytorch/torchtitan</a>
+            is the official demonstration of how PyTorch wants large-scale
+            training written now, and its organizing idea is that
+            parallelism should be composition, not architecture. The model
+            definition is a plain single-device <code>nn.Module</code>,
+            deliberately free of any distributed code. Parallelism is then
+            applied to it from the outside, as a sequence of transformations
+            over a <code>DeviceMesh</code>, an n-dimensional array of ranks
+            with named axes for data, tensor, and pipeline parallelism.
+            Tensor parallelism rewrites attention and MLP projections into
+            column- and row-sharded pairs through a parallelization plan.
+            Pipeline parallelism splits the stack of blocks into stages.
+            Data parallelism arrives last as FSDP2's
+            <code>fully_shard</code>, applied per transformer block and
+            then once over the root.
+          </p>
+          <p>
+            The substrate that makes the composition legal is DTensor. A
+            DTensor is a tensor plus a mesh plus a placement per mesh axis,
+            sharded along some dimension or replicated, and the arithmetic
+            of placements is what lets a parameter be simultaneously
+            sharded by FSDP along data-parallel ranks and by tensor
+            parallelism along model ranks without either wrapper knowing
+            about the other. FSDP2 in particular is a rewrite of the
+            original flat-parameter FSDP into this idiom, each parameter
+            individually becomes a DTensor sharded on dim zero, gathered
+            just in time for compute and freed after, which removes the old
+            design's awkward flattening and makes per-parameter dtypes,
+            frozen subsets, and partial resharding straightforward.
+          </p>
+          <p>
+            Two supporting idioms complete the design. The first is meta
+            device initialization. A 405B-parameter model cannot be
+            materialized on one host, so torchtitan constructs it under
+            <code>torch.device("meta")</code>, where tensors have shapes
+            and dtypes but no storage, applies all the sharding decisions
+            to the skeleton, and only then allocates real memory for each
+            rank's shard and runs the model's own weight init on the
+            materialized pieces. Construction cost stops depending on
+            model size entirely. The second is distributed checkpointing
+            through <code>torch.distributed.checkpoint</code>, where every
+            rank writes its own shards and, crucially, a checkpoint saved
+            on one world size and parallelism layout can be loaded into
+            another, because DTensor metadata records what each shard is
+            rather than which rank wrote it. Saving can proceed
+            asynchronously while training continues, which at cluster
+            scale turns checkpointing from a stop-the-world event into a
+            background task.
+          </p>
+          <p>
+            A minimal sketch of the FSDP2 idiom, meta init included, looks
+            like this. In current releases <code>fully_shard</code> lives
+            in <code>torch.distributed.fsdp</code>, and in slightly older
+            ones it lived in a private composable namespace, so check your
+            version's import path.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">torch</span>
+<span class="k">from</span> <span class="m1">torch</span>.<span class="m2">distributed</span>.<span class="m2">device_mesh</span> <span class="k">import</span> <span class="m1">init_device_mesh</span>
+<span class="k">from</span> <span class="m1">torch</span>.<span class="m2">distributed</span>.<span class="m2">fsdp</span> <span class="k">import</span> <span class="m1">fully_shard</span>, <span class="m1">MixedPrecisionPolicy</span>
+
+<span class="v3">mesh</span> = <span class="m1">init_device_mesh</span><span class="b0">(</span><span class="s">"cuda"</span>, <span class="b1">(</span><span class="v1">world_size</span>,<span class="b1">)</span><span class="b0">)</span>
+
+<span class="k">with</span> <span class="m1">torch</span>.<span class="m2">device</span><span class="b0">(</span><span class="s">"meta"</span><span class="b0">)</span>:
+    <span class="v0">model</span> = <span class="m1">Transformer</span><span class="b0">(</span><span class="v2">cfg</span><span class="b0">)</span>          <span class="c"># shapes only, no storage yet</span>
+
+<span class="v6">mp</span> = <span class="m1">MixedPrecisionPolicy</span><span class="b0">(</span><span class="v0">param_dtype</span>=<span class="m1">torch</span>.<span class="m2">bfloat16</span>,
+                          <span class="v3">reduce_dtype</span>=<span class="m1">torch</span>.<span class="m2">float32</span><span class="b0">)</span>
+<span class="k">for</span> <span class="v0">block</span> <span class="k">in</span> <span class="v0">model</span>.<span class="m2">layers</span>:
+    <span class="m1">fully_shard</span><span class="b0">(</span><span class="v0">block</span>, <span class="v3">mesh</span>=<span class="v3">mesh</span>, <span class="v1">mp_policy</span>=<span class="v6">mp</span><span class="b0">)</span>   <span class="c"># one group per block</span>
+<span class="m1">fully_shard</span><span class="b0">(</span><span class="v0">model</span>, <span class="v3">mesh</span>=<span class="v3">mesh</span>, <span class="v1">mp_policy</span>=<span class="v6">mp</span><span class="b0">)</span>       <span class="c"># root handles the rest</span>
+
+<span class="v0">model</span>.<span class="m2">to_empty</span><span class="b0">(</span><span class="v6">device</span>=<span class="s">"cuda"</span><span class="b0">)</span>         <span class="c"># allocate only this rank's shards</span>
+<span class="v0">model</span>.<span class="m2">init_weights</span><span class="b0">()</span>                  <span class="c"># your own init, now on real memory</span>
+</code></pre></div>
+          <p>
+            The per-block <code>fully_shard</code> calls are not
+            boilerplate, they define the communication schedule, each
+            block's parameters are gathered as a unit just before that
+            block runs, so compute for one block overlaps with the gather
+            for the next. The style's cost is conceptual, you now debug
+            placements and mesh axes instead of tensors, and a shape error
+            can be a sharding error wearing a disguise. I work through the
+            full torchtitan training step, collectives and all, at
+            <a href="/oss/torchtitan">/oss/torchtitan</a>, and the
+            underlying parallelism theory, including why tensor parallel
+            wants the fast intra-node links, in my
+            <a href="/classes/parallel-computing">parallel computing</a>
+            notes.
+          </p>
+
+          <h2>Rewriting the hot path, Unsloth</h2>
+          <p>
+            <a href="https://github.com/unslothai/unsloth" target="_blank" rel="noreferrer">unslothai/unsloth</a>
+            occupies the opposite corner from torchtitan. It targets one
+            situation, fine-tuning open-weight LLMs on one or few GPUs
+            where memory is the binding constraint, and its method is to
+            take models loaded through Hugging Face
+            <code>transformers</code> and monkey-patch their hot paths,
+            swapping stock module forwards for hand-written Triton kernels
+            with hand-written backward passes. RMSNorm, RoPE, the SwiGLU
+            MLP, the cross-entropy over a vocabulary of over a hundred
+            thousand entries, and the LoRA matmuls all get this treatment.
+            The user-visible API is deliberately boring, load the model
+            through Unsloth's wrapper and train with any standard trainer,
+            everything interesting happens in what got replaced underneath.
+          </p>
+          <p>
+            The enabling idiom is the custom <code>autograd.Function</code>
+            wrapped around a fused kernel. Autograd's default is to save
+            whatever intermediates the chain rule of the recorded ops
+            needs, and a chain of small ops saves a lot. A fused kernel
+            replaces the chain with one op, and the hand-written backward
+            gets to choose the minimal set of residuals, often recomputing
+            cheap values instead of storing them, and to exploit
+            mathematical structure the op-by-op chain rule cannot see. The
+            cross-entropy kernel is the clean example, the naive path
+            materializes a full logits-sized softmax for the backward,
+            while the fused path needs only the logits it already has plus
+            one scalar per row, which at LLM vocabulary sizes is gigabytes
+            of difference per batch. The pattern in miniature, with the
+            eager fallback every such wrapper should keep, looks like
+            this. The two <code>fused_*</code> calls stand in for your own
+            Triton launches.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">torch</span>
+
+<span class="k">def</span> <span class="m1">rms_norm_ref</span><span class="b0">(</span><span class="v4">x</span>, <span class="v6">weight</span>, <span class="v3">eps</span>=<span class="n">1e-6</span><span class="b0">)</span>:
+    <span class="c"># Eager reference. Autograd derives the backward on its own,</span>
+    <span class="c"># saving intermediates op by op.</span>
+    <span class="v0">rstd</span> = <span class="m1">torch</span>.<span class="m2">rsqrt</span><span class="b0">(</span><span class="v4">x</span>.<span class="m2">float</span><span class="b1">()</span>.<span class="m2">pow</span><span class="b1">(</span><span class="n">2</span><span class="b1">)</span>.<span class="m2">mean</span><span class="b1">(</span>-<span class="n">1</span>, <span class="v5">keepdim</span>=<span class="k">True</span><span class="b1">)</span> + <span class="v3">eps</span><span class="b0">)</span>
+    <span class="k">return</span> <span class="b0">(</span><span class="v4">x</span>.<span class="m2">float</span><span class="b1">()</span> * <span class="v0">rstd</span><span class="b0">)</span>.<span class="m2">to</span><span class="b0">(</span><span class="v4">x</span>.<span class="m2">dtype</span><span class="b0">)</span> * <span class="v6">weight</span>
+
+<span class="k">class</span> <span class="m1">FusedRMSNorm</span><span class="b0">(</span><span class="m1">torch</span>.<span class="m1">autograd</span>.<span class="m1">Function</span><span class="b0">)</span>:
+    <span class="m1">@staticmethod</span>
+    <span class="k">def</span> <span class="m1">forward</span><span class="b0">(</span><span class="v0">ctx</span>, <span class="v4">x</span>, <span class="v6">weight</span>, <span class="v3">eps</span><span class="b0">)</span>:
+        <span class="v6">y</span>, <span class="v0">rstd</span> = <span class="m1">fused_rmsnorm_fwd</span><span class="b0">(</span><span class="v4">x</span>, <span class="v6">weight</span>, <span class="v3">eps</span><span class="b0">)</span>  <span class="c"># one kernel launch</span>
+        <span class="v0">ctx</span>.<span class="m2">save_for_backward</span><span class="b0">(</span><span class="v4">x</span>, <span class="v6">weight</span>, <span class="v0">rstd</span><span class="b0">)</span>       <span class="c"># residuals we chose</span>
+        <span class="v0">ctx</span>.<span class="m2">eps</span> = <span class="v3">eps</span>
+        <span class="k">return</span> <span class="v6">y</span>
+
+    <span class="m1">@staticmethod</span>
+    <span class="k">def</span> <span class="m1">backward</span><span class="b0">(</span><span class="v0">ctx</span>, <span class="v6">grad_out</span><span class="b0">)</span>:
+        <span class="v4">x</span>, <span class="v6">weight</span>, <span class="v0">rstd</span> = <span class="v0">ctx</span>.<span class="m2">saved_tensors</span>
+        <span class="v1">dx</span>, <span class="v1">dw</span> = <span class="m1">fused_rmsnorm_bwd</span><span class="b0">(</span><span class="v6">grad_out</span>, <span class="v4">x</span>, <span class="v6">weight</span>, <span class="v0">rstd</span><span class="b0">)</span>
+        <span class="k">return</span> <span class="v1">dx</span>, <span class="v1">dw</span>, <span class="k">None</span>                          <span class="c"># one grad per input</span>
+
+<span class="k">def</span> <span class="m1">rms_norm</span><span class="b0">(</span><span class="v4">x</span>, <span class="v6">weight</span>, <span class="v3">eps</span>=<span class="n">1e-6</span><span class="b0">)</span>:
+    <span class="k">if</span> <span class="v4">x</span>.<span class="m2">is_cuda</span> <span class="k">and</span> <span class="m1">fused_kernels_available</span><span class="b0">()</span>:
+        <span class="k">return</span> <span class="m1">FusedRMSNorm</span>.<span class="m2">apply</span><span class="b0">(</span><span class="v4">x</span>, <span class="v6">weight</span>, <span class="v3">eps</span><span class="b0">)</span>
+    <span class="k">return</span> <span class="m1">rms_norm_ref</span><span class="b0">(</span><span class="v4">x</span>, <span class="v6">weight</span>, <span class="v3">eps</span><span class="b0">)</span>              <span class="c"># correctness anchor</span>
+</code></pre></div>
+          <p>
+            The reference implementation is not decoration. It is the
+            oracle the kernel is tested against with
+            <code>torch.autograd.gradcheck</code> in float64, and the
+            fallback that keeps CPU tests and unsupported devices working.
+            Every serious kernel-writing project keeps this pair.
+          </p>
+          <p>
+            The costs of the patching style deserve equal airtime. Unsloth
+            couples itself to the private internals of
+            <code>transformers</code>, so upstream refactors can break it
+            in ways its own test suite only catches after the fact, and
+            supporting each new model family means writing and validating
+            new patches rather than inheriting support for free. Patched
+            code is also invisible at the call site, the model prints like
+            a stock Llama while executing something else, which is
+            excellent for adoption and hostile to debugging. And a
+            hand-written backward is a standing correctness liability,
+            silently wrong gradients train plausibly and fail subtly. The
+            trade is real, though, the memory and speed wins are large and
+            measured, and for the single-GPU fine-tuning population that
+            is the difference between a run fitting or not. My notes on
+            the codebase and its kernel inventory are at
+            <a href="/oss/unsloth">/oss/unsloth</a>.
+          </p>
+
+          <h2>Inference as systems engineering, vLLM</h2>
+          <p>
+            <a href="https://github.com/vllm-project/vllm" target="_blank" rel="noreferrer">vllm-project/vllm</a>
+            demonstrates a third relationship with PyTorch, keep the tensor
+            library, discard the execution model. Training frameworks
+            iterate over a dataset. A serving engine iterates over a
+            changing population of requests, each at a different position
+            in its own sequence, arriving and finishing continuously, and
+            none of PyTorch's loop machinery addresses that. So vLLM's core
+            is a scheduler, written in plain Python, that at every step
+            decides which requests run, admits new ones mid-flight, and
+            preempts old ones under memory pressure, an idiom called
+            continuous batching. PyTorch appears one level down, the models
+            are ordinary <code>nn.Module</code> implementations, maintained
+            in-repo per architecture, loading the same weights as their
+            <code>transformers</code> counterparts but rewritten for
+            inference, fused projections, no dropout, tensor-parallel
+            sharding built in.
+          </p>
+          <p>
+            The famous contribution is memory management. A KV cache
+            allocated contiguously per request must reserve worst-case
+            length, and fragmentation between requests wastes most of the
+            GPU. PagedAttention treats the cache like virtual memory,
+            fixed-size blocks of a few tokens each, a block table per
+            request mapping logical to physical blocks, and an attention
+            kernel that follows the indirection. Waste drops to under a
+            block per sequence, and identical prefixes, the shared system
+            prompt case, can point at the same physical blocks with
+            copy-on-write. None of this is expressible in stock PyTorch
+            tensors, which is exactly why the kernel is custom.
+          </p>
+          <p>
+            The second systems move attacks launch overhead. A decode step
+            does a small amount of math per request, and a model that is a
+            few hundred ops of a few microseconds each spends comparable
+            time in CUDA launch overhead as in compute. vLLM captures the
+            decode pass into CUDA graphs at a set of padded batch sizes,
+            so a whole step replays as one graph launch with new inputs
+            written into fixed buffers. The constraint CUDA graphs impose,
+            fixed shapes and fixed control flow, is the reason the capture
+            happens at bucketed sizes and the reason the model code must
+            stay free of data-dependent branching, a discipline you can
+            see enforced throughout the model implementations. The newer
+            engine leans on <code>torch.compile</code> for the same class
+            of wins with less hand management, compiling the model into
+            fused pieces while custom ops stay opaque to the compiler.
+          </p>
+          <p>
+            The custom kernels themselves, paged attention, fused
+            activation and norm kernels, quantization paths, are C++ and
+            CUDA compiled as an extension and registered as proper torch
+            ops rather than called as raw Python bindings. Registration is
+            what keeps them composable, the dispatcher can route to them,
+            profilers see them by name, and <code>torch.compile</code> can
+            treat them as scheduling units instead of graph breaks. The
+            overall lesson generalizes beyond serving, PyTorch does not
+            mind being demoted to a kernel library under someone else's
+            runtime, and it is good at it. My walkthrough of the engine,
+            scheduler to kernels, is at <a href="/oss/vllm">/oss/vllm</a>.
+          </p>
+
+          <h2>The library of parts, diffusers</h2>
+          <p>
+            <a href="https://github.com/huggingface/diffusers" target="_blank" rel="noreferrer">huggingface/diffusers</a>
+            is the clearest study in API design of the group, because
+            diffusion systems have a natural seam that the library commits
+            to completely. A diffusion system is three different kinds of
+            thing. Models, the UNets, DiTs, and VAEs, are learned
+            <code>nn.Module</code>s with weights. Schedulers, the DDPM,
+            DDIM, Euler, and DPM-Solver samplers, are small numerical
+            steppers with no parameters at all, pure functions of noise
+            levels and predictions plus a little bookkeeping, and the
+            library pointedly does not make them modules. Pipelines are
+            thin orchestration, tokenize the prompt, encode it, loop the
+            scheduler over the model, decode the latents, and hold no
+            logic worth stealing. The separation is what lets research
+            recombine parts, a new sampler is a new scheduler class that
+            drops into every existing pipeline unchanged, and a new model
+            reuses two dozen existing samplers on day one.
+          </p>
+          <p>
+            The mechanism holding it together is config-driven
+            instantiation. Every model and scheduler records its
+            constructor arguments through a registration decorator, and
+            serializes them to a JSON config next to the weights. A saved
+            pipeline is then a directory of named components, each a
+            config plus optional weights, and an index file naming which
+            class implements each slot. <code>from_pretrained</code>
+            rebuilds the whole object graph from that description, and
+            because the description names classes rather than baking in
+            behavior, swapping a component is one line, construct a
+            different scheduler from the old scheduler's config and assign
+            it. Sampler upgrades that halve inference steps ship as pure
+            config swaps, no retraining, no pipeline edits.
+          </p>
+          <p>
+            The style has a shadow side that the maintainers accept
+            openly. Pipelines are copy-pasted per model family rather than
+            abstracted, because the abstraction that would unify them
+            would obscure the per-family differences that researchers come
+            to read, the repo calls this single-file policy out as a
+            design principle inherited from <code>transformers</code>. The
+            cost is enormous duplication and the occasional divergence
+            bug, the benefit is that any one pipeline reads top to bottom
+            without indirection, which for a library whose users fork
+            pipelines daily is the right trade. Component seams, config
+            instantiation, readable orchestration, duplicated leaves, that
+            cluster of choices is the library-of-parts idiom, and it
+            transfers well beyond diffusion. My notes on the codebase are
+            at <a href="/oss/diffusers">/oss/diffusers</a>.
+          </p>
+
+          <h2>Structured loops, Lightning and torchtune</h2>
+          <p>
+            A different lineage decided the raw loop was the problem.
+            PyTorch Lightning asks you to restate your model as a
+            <code>LightningModule</code>, the forward logic in
+            <code>training_step</code>, optimizer construction in
+            <code>configure_optimizers</code>, validation in its own
+            method, and hands the loop itself to a <code>Trainer</code>
+            that owns iteration, device placement, precision, distributed
+            strategy, checkpointing, and logging, with a callback system
+            for everything cross-cutting. This is inversion of control,
+            the framework calls you. When your problem fits the template,
+            supervised training with standard cadence, the deal is
+            excellent, multi-GPU and mixed precision become constructor
+            arguments, and a team's runs all share one operational shape,
+            same checkpoints, same logs, same resume semantics.
+          </p>
+          <p>
+            The deal sours at the edges, and it is worth being specific
+            about which edges. Loops with unusual structure, interleaved
+            optimizers with data-dependent scheduling, RL-style
+            environment interaction, anything where the step boundary is
+            not one batch, force you into manual-optimization mode and a
+            growing pile of overridden hooks, at which point you are
+            writing the raw loop again, but distributed across callback
+            methods and harder to read than the flat version. Stack traces
+            pass through framework frames, and behavior comes from
+            configuration as much as from code, so debugging requires
+            knowing the framework, not just your model. None of this is a
+            flaw exactly, it is the standing price of inversion of
+            control, and the honest question is only whether your loop is
+            standard enough to pay it.
+          </p>
+          <p>
+            <a href="https://github.com/pytorch/torchtune" target="_blank" rel="noreferrer">pytorch/torchtune</a>
+            is the interesting middle position, a post-Lightning answer to
+            the same need. It offers recipes, each a complete, flat,
+            readable training script for one job, LoRA fine-tuning, full
+            fine-tuning, DPO, QAT, driven by a YAML config whose entries
+            name classes and arguments to instantiate, models, tokenizers,
+            datasets, optimizers. The crucial design decision is that
+            recipes are meant to be copied, the CLI has a command that
+            copies a recipe and its config into your project for editing,
+            framework as starting point rather than dependency. You get
+            the operational consistency that makes frameworks attractive,
+            while the loop stays a file you own, nanoGPT's readability
+            with torchtitan-grade distributed pieces underneath, since
+            recipes use FSDP2 and activation checkpointing through plain
+            PyTorch APIs. The cost is duplication across recipes,
+            accepted deliberately, the same trade diffusers makes with
+            pipelines, and it is striking that two ecosystems arrived at
+            it independently. My walkthrough is at
+            <a href="/oss/torchtune">/oss/torchtune</a>.
+          </p>
+
+          <h2>Data loading in practice</h2>
+          <p>
+            Every project above feeds on the same two abstractions, and
+            the choice between them is really a choice about whether your
+            dataset has an index. A map-style <code>Dataset</code> exposes
+            <code>__getitem__</code> and <code>__len__</code>, and the
+            <code>DataLoader</code>'s sampler owns ordering, which makes
+            global shuffling, exact epochs, and resumable iteration
+            trivial, so it is the right default whenever random access is
+            affordable, which in practice means files on local disk or
+            anything memory-mapped. An <code>IterableDataset</code> is
+            just a stream, the right shape for corpora that do not fit,
+            that live behind object storage, or that are generated on the
+            fly, and it moves all responsibility for ordering, sharding,
+            and epoch boundaries onto you.
+          </p>
+          <p>
+            The <code>DataLoader</code>'s workers are processes, not
+            threads, each running a copy of the dataset object, with
+            <code>prefetch_factor</code> batches queued per worker,
+            <code>pin_memory</code> staging output for fast async transfer,
+            and <code>persistent_workers</code> keeping them alive across
+            epochs. For map-style datasets the loader splits work by
+            handing different indices to different workers, and
+            correctness is automatic. For iterable datasets it hands each
+            worker the whole stream, and the classic bug follows, four
+            workers each yielding the full dataset means every sample
+            arrives four times per epoch, and the model trains on
+            duplicated data with no error raised. The fix is explicit
+            sharding inside <code>__iter__</code>, and at scale the
+            webdataset-style layout makes that natural, the corpus lives
+            as a few thousand shard files of a few thousand samples each,
+            written sequentially, so streaming reads are fast on any
+            storage, shuffling happens at two levels, shard order
+            globally and a small in-memory buffer locally, and sharding
+            across ranks and workers is just slicing the shard list.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">glob</span>
+<span class="k">import</span> <span class="m1">torch</span>
+<span class="k">from</span> <span class="m1">torch</span>.<span class="m2">utils</span>.<span class="m2">data</span> <span class="k">import</span> <span class="m1">IterableDataset</span>, <span class="m1">get_worker_info</span>
+
+<span class="k">class</span> <span class="m1">ShardStream</span><span class="b0">(</span><span class="m1">IterableDataset</span><span class="b0">)</span>:
+    <span class="s">"""Each (rank, worker) pair reads a disjoint slice of the shards."""</span>
+
+    <span class="k">def</span> <span class="m1">__init__</span><span class="b0">(</span><span class="k">self</span>, <span class="v1">pattern</span>, <span class="v5">rank</span>=<span class="n">0</span>, <span class="v1">world_size</span>=<span class="n">1</span>, <span class="v1">seed</span>=<span class="n">0</span><span class="b0">)</span>:
+        <span class="k">self</span>.<span class="m2">shards</span> = <span class="m1">sorted</span><span class="b0">(</span><span class="m1">glob</span>.<span class="m2">glob</span><span class="b1">(</span><span class="v1">pattern</span><span class="b1">)</span><span class="b0">)</span>
+        <span class="k">self</span>.<span class="m2">rank</span>, <span class="k">self</span>.<span class="m2">world_size</span>, <span class="k">self</span>.<span class="m2">seed</span> = <span class="v5">rank</span>, <span class="v1">world_size</span>, <span class="v1">seed</span>
+
+    <span class="k">def</span> <span class="m1">__iter__</span><span class="b0">(</span><span class="k">self</span><span class="b0">)</span>:
+        <span class="v2">info</span> = <span class="m1">get_worker_info</span><span class="b0">()</span>             <span class="c"># None in the main process</span>
+        <span class="v1">wid</span> = <span class="v2">info</span>.<span class="m2">id</span> <span class="k">if</span> <span class="v2">info</span> <span class="k">else</span> <span class="n">0</span>
+        <span class="v3">nw</span> = <span class="v2">info</span>.<span class="m2">num_workers</span> <span class="k">if</span> <span class="v2">info</span> <span class="k">else</span> <span class="n">1</span>
+        <span class="v2">g</span> = <span class="m1">torch</span>.<span class="m2">Generator</span><span class="b0">()</span>.<span class="m2">manual_seed</span><span class="b0">(</span><span class="k">self</span>.<span class="m2">seed</span><span class="b0">)</span>
+        <span class="v5">order</span> = <span class="m1">torch</span>.<span class="m2">randperm</span><span class="b0">(</span><span class="m1">len</span><span class="b1">(</span><span class="k">self</span>.<span class="m2">shards</span><span class="b1">)</span>, <span class="v1">generator</span>=<span class="v2">g</span><span class="b0">)</span>.<span class="m2">tolist</span><span class="b0">()</span>
+        <span class="c"># Global worker index strides through the shuffled shard list,</span>
+        <span class="c"># so no shard is read twice and no worker duplicates another.</span>
+        <span class="v4">mine</span> = <span class="v5">order</span><span class="b0">[</span><span class="k">self</span>.<span class="m2">rank</span> * <span class="v3">nw</span> + <span class="v1">wid</span> :: <span class="k">self</span>.<span class="m2">world_size</span> * <span class="v3">nw</span><span class="b0">]</span>
+        <span class="k">for</span> <span class="v4">idx</span> <span class="k">in</span> <span class="v4">mine</span>:
+            <span class="k">yield from</span> <span class="m1">read_shard</span><span class="b0">(</span><span class="k">self</span>.<span class="m2">shards</span><span class="b1">[</span><span class="v4">idx</span><span class="b1">]</span><span class="b0">)</span>  <span class="c"># your tar reader</span>
+</code></pre></div>
+          <p>
+            The last piece is the one most codebases treat as an
+            afterthought and the good ones treat as the real API. The
+            <code>collate_fn</code> is the boundary where per-sample
+            structure becomes batched tensors, and it is where padding
+            policy, attention masks, sequence packing, and any nested
+            batch structure actually live. The default collate stacks
+            same-shaped tensors and recurses into dicts and tuples, which
+            is fine until sequences have different lengths, and from then
+            on the collate function is where your batch format is defined,
+            which makes it the thing to read first in an unfamiliar repo.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">def</span> <span class="m1">collate_padded</span><span class="b0">(</span><span class="v6">batch</span>, <span class="v3">pad_id</span>=<span class="n">0</span><span class="b0">)</span>:
+    <span class="v2">seqs</span> = <span class="b0">[</span><span class="m1">torch</span>.<span class="m2">as_tensor</span><span class="b1">(</span><span class="v4">s</span>, <span class="v3">dtype</span>=<span class="m1">torch</span>.<span class="m2">long</span><span class="b1">)</span> <span class="k">for</span> <span class="v4">s</span> <span class="k">in</span> <span class="v6">batch</span><span class="b0">]</span>
+    <span class="v1">width</span> = <span class="m1">max</span><span class="b0">(</span><span class="v4">s</span>.<span class="m2">numel</span><span class="b1">()</span> <span class="k">for</span> <span class="v4">s</span> <span class="k">in</span> <span class="v2">seqs</span><span class="b0">)</span>
+    <span class="v0">tokens</span> = <span class="m1">torch</span>.<span class="m2">full</span><span class="b0">(</span><span class="b1">(</span><span class="m1">len</span><span class="b2">(</span><span class="v2">seqs</span><span class="b2">)</span>, <span class="v1">width</span><span class="b1">)</span>, <span class="v3">pad_id</span>, <span class="v3">dtype</span>=<span class="m1">torch</span>.<span class="m2">long</span><span class="b0">)</span>
+    <span class="v3">mask</span> = <span class="m1">torch</span>.<span class="m2">zeros</span><span class="b0">(</span><span class="m1">len</span><span class="b1">(</span><span class="v2">seqs</span><span class="b1">)</span>, <span class="v1">width</span>, <span class="v3">dtype</span>=<span class="m1">torch</span>.<span class="m2">bool</span><span class="b0">)</span>
+    <span class="k">for</span> <span class="v3">i</span>, <span class="v4">s</span> <span class="k">in</span> <span class="m1">enumerate</span><span class="b0">(</span><span class="v2">seqs</span><span class="b0">)</span>:
+        <span class="v0">tokens</span><span class="b0">[</span><span class="v3">i</span>, : <span class="v4">s</span>.<span class="m2">numel</span><span class="b1">()</span><span class="b0">]</span> = <span class="v4">s</span>
+        <span class="v3">mask</span><span class="b0">[</span><span class="v3">i</span>, : <span class="v4">s</span>.<span class="m2">numel</span><span class="b1">()</span><span class="b0">]</span> = <span class="k">True</span>
+    <span class="k">return</span> <span class="v0">tokens</span>, <span class="v3">mask</span>                      <span class="c"># the batch format, defined here</span>
+
+<span class="v0">loader</span> = <span class="m1">torch</span>.<span class="m2">utils</span>.<span class="m2">data</span>.<span class="m2">DataLoader</span><span class="b0">(</span>
+    <span class="m1">ShardStream</span><span class="b1">(</span><span class="s">"data/shard-*.tar"</span>, <span class="v5">rank</span>=<span class="v5">rank</span>, <span class="v1">world_size</span>=<span class="v1">world_size</span><span class="b1">)</span>,
+    <span class="v3">batch_size</span>=<span class="n">16</span>, <span class="v2">num_workers</span>=<span class="n">4</span>, <span class="v0">prefetch_factor</span>=<span class="n">4</span>,
+    <span class="v3">pin_memory</span>=<span class="k">True</span>, <span class="v0">persistent_workers</span>=<span class="k">True</span>,
+    <span class="v5">collate_fn</span>=<span class="m1">collate_padded</span><span class="b0">)</span>
+</code></pre></div>
+          <p>
+            Two habits from the wild worth copying. Tokenize and shard
+            offline, as nanoGPT and every pretraining stack do, so the
+            loader's job at train time is I/O and collation rather than
+            compute. And when a run mysteriously starves the GPU, look at
+            worker count and collate cost before touching the model,
+            because a loader that cannot fill <code>prefetch_factor</code>
+            queues shows up as idle GPU with no error anywhere.
+          </p>
+
+          <h2>Interop and the deployment edges</h2>
+          <p>
+            The story of getting a PyTorch model out of Python has been
+            rewritten twice, and reading old codebases requires knowing
+            which era they belong to. TorchScript was the first answer,
+            <code>torch.jit.trace</code> and <code>torch.jit.script</code>
+            compiled models into a serialized graph runnable from C++,
+            and for years it was the deployment path, which is why
+            <code>@torch.jit.script</code> annotations and
+            <code>.pt</code> archives still litter production repos. It is
+            now in maintenance mode, kept working but not developed,
+            because scripting a meaningful subset of Python proved to be a
+            permanent tax on both the language and the library. Treat
+            TorchScript in a new dependency as legacy surface.
+          </p>
+          <p>
+            The present splits the problem in two. For making Python
+            execution fast in place, <code>torch.compile</code> traces
+            your actual running code into graphs, falls back to eager at
+            graph breaks, and hands the graphs to the Inductor backend,
+            which generates Triton kernels for GPU and vectorized C++ for
+            CPU. It is the piece nanoGPT turns on with one line and the
+            piece vLLM builds its newer engine around, and its
+            characteristic failure mode is not wrong answers but
+            recompilation and graph breaks, which you diagnose with the
+            logging tools the compiler stack ships. For leaving Python
+            entirely, <code>torch.export</code> captures a whole model
+            ahead of time into a single graph with explicit dynamic-shape
+            annotations, and that exported program is the shared
+            foundation the other edges consume. The modern ONNX exporter
+            converts through it into the cross-runtime format TensorRT
+            and ONNX Runtime consume. AOTInductor compiles it into a
+            shared library callable without a Python interpreter. And
+            ExecuTorch lowers it for phones and microcontrollers,
+            producing a compact program file whose subgraphs are delegated
+            to hardware backends like XNNPACK or Core ML, which is how
+            on-device PyTorch models actually ship today.
+          </p>
+          <p>
+            The remaining edge runs the other direction, foreign code
+            entering PyTorch. The <code>torch.utils.cpp_extension</code>
+            machinery compiles C++ and CUDA sources against libtorch,
+            either ahead of time in a package build or JIT at import, and
+            is how vLLM, flash-attention, and every kernel-carrying
+            project binds its kernels. The part that has changed recently
+            is registration, the modern habit is to declare bound kernels
+            as custom ops through <code>torch.library</code>, with a fake
+            implementation that gives the compiler shape semantics, so
+            that a custom kernel no longer forces a graph break, which is
+            precisely the detail that lets hand-written kernels and
+            <code>torch.compile</code> coexist in one codebase instead of
+            competing.
+          </p>
+
+          <h2>Which idiom to reach for</h2>
+          <p>
+            The projects in this survey are not stages of enlightenment,
+            they are fitted solutions to different constraints, and the
+            practical skill is matching your constraint to the idiom
+            without romance. The table is the honest summary.
+          </p>
+          <table>
+            <thead>
+              <tr>
+                <th>Situation</th>
+                <th>Idiom</th>
+                <th>Reference example</th>
+                <th>What it costs</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Research or learning, one node</td>
+                <td>Flat train.py, plain modules, torch.compile flag</td>
+                <td><a href="/oss/nanogpt">nanoGPT</a></td>
+                <td>Nothing reusable, rewrite to scale</td>
+              </tr>
+              <tr>
+                <td>Pretraining across many nodes</td>
+                <td>DTensor and FSDP2 composition, meta init, DCP</td>
+                <td><a href="/oss/torchtitan">torchtitan</a></td>
+                <td>Distributed concepts enter every debug session</td>
+              </tr>
+              <tr>
+                <td>Fine-tuning against a memory wall</td>
+                <td>Fused kernels behind custom autograd.Function</td>
+                <td><a href="/oss/unsloth">Unsloth</a></td>
+                <td>Maintenance coupling, gradient correctness risk</td>
+              </tr>
+              <tr>
+                <td>Serving at high throughput</td>
+                <td>Own runtime, paged KV, CUDA graphs, custom ops</td>
+                <td><a href="/oss/vllm">vLLM</a></td>
+                <td>A second codebase per model architecture</td>
+              </tr>
+              <tr>
+                <td>Building a library others recombine</td>
+                <td>Parts with config instantiation, duplicated leaves</td>
+                <td><a href="/oss/diffusers">diffusers</a></td>
+                <td>Duplication, divergence between copies</td>
+              </tr>
+              <tr>
+                <td>Team-standard training jobs</td>
+                <td>Recipes or trainer frameworks</td>
+                <td><a href="/oss/torchtune">torchtune</a>, Lightning</td>
+                <td>Inversion of control when the loop is unusual</td>
+              </tr>
+              <tr>
+                <td>Shipping off the Python server</td>
+                <td>torch.export, then ONNX, AOTInductor, or ExecuTorch</td>
+                <td>ExecuTorch examples</td>
+                <td>Export-compatible model discipline up front</td>
+              </tr>
+            </tbody>
+          </table>
+          <p>
+            A few closing rules of thumb that the survey supports. Start
+            flat, and add structure only when a named constraint forces
+            it, because every style here that abandoned the plain loop did
+            so for a reason it can state in one sentence. Prefer the
+            official composition seams, DTensor, <code>fully_shard</code>,
+            custom op registration, over private-API patching whenever
+            both can work, since the seams are the parts with a
+            compatibility promise. Keep an eager reference implementation
+            next to every hand-written kernel, forever. And when reading
+            an unfamiliar PyTorch codebase, find the three places where it
+            deviates from the vanilla loop, because that is where its
+            actual ideas live, everything else is the shared dialect this
+            page started with.
+          </p>
+
+          <div class="takeaway">
+            <strong>Key takeaway.</strong> PyTorch in production is one
+            shared dialect plus a deliberate deviation. nanoGPT deviates
+            nowhere and wins readability, torchtitan deviates at the
+            tensor layer to compose parallelism, Unsloth deviates inside
+            autograd to buy memory, vLLM deviates at the execution loop to
+            buy throughput, diffusers and torchtune deviate at the
+            packaging layer to buy recombination. Learn the shared
+            idioms once, then read each codebase by asking which contract
+            it broke and what it bought with the pieces.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/code-tabs.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/code-copy.js"></script>
+      <script defer src="/reader.js"></script>
+      <script defer src="/theme.js"></script>
+  </body>
+</html>

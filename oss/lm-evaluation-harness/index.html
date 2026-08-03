@@ -1,0 +1,1251 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>lm-evaluation-harness walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A full chapter on EleutherAI/lm-evaluation-harness: the request/response model abstraction, YAML task configs and the task registry, few-shot construction, metrics and aggregation, the full life of one multiple-choice evaluation traced end to end, a deep dive on why reproducible eval is genuinely hard (prompt formatting, length normalization, contamination), a staged reading plan, labs, and understanding checks. Powers the Open LLM Leaderboard." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%232B2621'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+      <script>(function(){try{var t=localStorage.getItem("theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>lm-evaluation-harness</h1>
+        <p class="lead">
+          <a href="https://github.com/EleutherAI/lm-evaluation-harness" target="_blank" rel="noreferrer">lm-evaluation-harness</a>
+          is EleutherAI's answer to a deceptively simple question, how do you
+          get one number that says how good a language model is, and get it
+          the same way twice. It is the de facto standard for benchmarking
+          language models, the backend behind the Hugging Face Open LLM
+          Leaderboard, and the reference implementation that hundreds of
+          papers cite when they report a score. This chapter is three things
+          at once, a practical tutorial for running real evaluations, a
+          systems-internals walkthrough that follows one multiple-choice
+          question from a YAML file down through the request abstraction to a
+          single loglikelihood forward pass and back up to an aggregated
+          number, and a staged guide to reading the repository. It ends with
+          runnable labs, understanding checks with model answers, and an
+          honest account of why reproducible evaluation is so much harder
+          than it looks.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">lm_eval (CLI)              __main__.py: parse --model, --tasks, --num_fewshot
+      |
+      v
+simple_evaluate()          evaluator.py: build the model, resolve the tasks
+      |
+      v
+get_model("hf")            api/registry.py -&gt; HFLM / VLLM / OpenAI / Anthropic
+      |
+      v
+TaskManager                index every lm_eval/tasks/**/*.yaml
+      |
+      v
+ConfigurableTask           built from one YAML: doc_to_text, doc_to_choice,
+      |                     metric_list, num_fewshot, filters
+      v
+build_all_requests         per doc: few-shot context + Instance(request_type)
+      |
+      v
+lm.loglikelihood(...)      the model fulfils batched requests
+lm.generate_until(...)     (three primitives, nothing task-specific)
+      |
+      v
+filters -&gt; process_results per-doc metrics (acc, exact_match, ...)
+      |
+      v
+aggregation + bootstrap    one number per task, plus a standard error</pre>
+          <p>
+            The one-sentence identity: <mark>lm-evaluation-harness is the
+            reference evaluation platform that separates what a benchmark
+            asks from how a model answers, by reducing every task to three
+            request primitives that any backend can implement, so the same
+            YAML-defined benchmark runs identically against a local Hugging
+            Face model, a vLLM server, or a closed API behind a paywall.</mark>
+            A task never calls a model directly and a model never knows what
+            task it is serving. In between sits a small vocabulary of
+            requests, and that seam is the whole design.
+          </p>
+          <p>
+            Three load-bearing ideas follow from that seam. First, the
+            request/response abstraction. A model backend implements exactly
+            three methods, <code>loglikelihood</code>,
+            <code>loglikelihood_rolling</code>, and
+            <code>generate_until</code>, and every one of the hundreds of
+            tasks in the repository is expressed in terms of those three.
+            Add a new model type and every benchmark works. Add a new
+            benchmark and every model runs it. Second, tasks are data, not
+            code. A benchmark is a YAML file that names a dataset, a prompt
+            template, a set of answer choices, and a list of metrics, so
+            contributing a task is usually writing a config rather than
+            writing Python. Third, and least glamorous but most important,
+            the actual product is reproducibility. Tasks are versioned, the
+            prompt that reached the model is logged, and multiple-choice
+            scoring is a deterministic function of the model weights, so a
+            score reported in a paper can in principle be regenerated
+            byte-for-byte. The rest of this chapter is how those three ideas
+            play out, and where reproducibility quietly breaks.
+          </p>
+          <p>
+            Everything here is written against a recent state of the main
+            branch. The harness moved to a YAML task system and a
+            <code>ConfigurableTask</code> engine in its v0.4 rewrite, and the
+            project keeps evolving, so where a detail is likely to have moved
+            I describe the component by its role rather than pinning an exact
+            file path.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <p>
+            The harness is a pure Python package. It runs anywhere PyTorch
+            and the Hugging Face stack run, including a laptop for the small
+            models. Install from source when you plan to add tasks, or from
+            PyPI when you just want to run them:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">git</span> <span class="s">clone</span> <span class="s">https://github.com/EleutherAI/lm-evaluation-harness</span>
+<span class="m1">cd</span> <span class="s">lm-evaluation-harness</span>
+<span class="m1">pip</span> <span class="s">install</span> <span class="s">-e</span> <span class="s">.</span>
+
+<span class="c"># or, without the source tree</span>
+<span class="m1">pip</span> <span class="s">install</span> <span class="s">lm-eval</span>
+
+<span class="c"># optional backends and helpers are extras</span>
+<span class="m1">pip</span> <span class="s">install</span> <span class="s">-e</span> <span class="s">".[vllm]"</span>     <span class="c"># fast local inference</span>
+<span class="m1">pip</span> <span class="s">install</span> <span class="s">-e</span> <span class="s">".[api]"</span>      <span class="c"># OpenAI / Anthropic / generic API models</span>
+<span class="m1">pip</span> <span class="s">install</span> <span class="s">-e</span> <span class="s">".[math]"</span>     <span class="c"># answer checkers for MATH-style tasks</span></code></pre></div>
+          <p>
+            A first real session should be a tiny model on a couple of quick
+            tasks. The command-line entry point is <code>lm_eval</code>. You
+            pick a model type with <code>--model</code>, pass its constructor
+            arguments as a comma-separated string to
+            <code>--model_args</code>, and name the benchmarks with
+            <code>--tasks</code>:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">lm_eval</span> <span class="s">--model</span> <span class="s">hf</span> <span class="s">\</span>
+  <span class="s">--model_args</span> <span class="s">pretrained=EleutherAI/pythia-160m</span> <span class="s">\</span>
+  <span class="s">--tasks</span> <span class="s">lambada_openai,hellaswag</span> <span class="s">\</span>
+  <span class="s">--device</span> <span class="s">cuda:0</span> <span class="s">\</span>
+  <span class="s">--batch_size</span> <span class="s">8</span></code></pre></div>
+          <p>
+            Expect a burst of setup logging, the datasets downloading, the
+            tasks building their requests, a progress bar per request type,
+            and finally a formatted results table with one row per task and
+            columns for each metric and its standard error.
+            <code>hellaswag</code> reports <code>acc</code> and
+            <code>acc_norm</code>, <code>lambada_openai</code> reports
+            <code>perplexity</code> and <code>acc</code>. On a 160M model the
+            numbers will be modest, which is the point, the mechanics are
+            identical at every scale. The knobs you reach for constantly are
+            few-shot count, batch size, a sample limit for smoke tests, and
+            sample logging to inspect the exact prompt:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">lm_eval</span> <span class="s">--model</span> <span class="s">hf</span> <span class="s">\</span>
+  <span class="s">--model_args</span> <span class="s">pretrained=EleutherAI/pythia-1.4b,dtype=bfloat16</span> <span class="s">\</span>
+  <span class="s">--tasks</span> <span class="s">arc_challenge</span> <span class="s">\</span>
+  <span class="s">--num_fewshot</span> <span class="s">25</span> <span class="s">\</span>
+  <span class="s">--batch_size</span> <span class="s">auto</span> <span class="s">\</span>
+  <span class="s">--limit</span> <span class="s">100</span> <span class="s">\</span>
+  <span class="s">--output_path</span> <span class="s">results/</span> <span class="s">\</span>
+  <span class="s">--log_samples</span></code></pre></div>
+          <p>
+            <code>--batch_size auto</code> probes for the largest batch that
+            fits and is worth using on real hardware.
+            <code>--limit 100</code> evaluates only the first hundred
+            documents, which is for iterating on a config and never for a
+            reported number. <code>--log_samples</code> writes every prompt,
+            the model's response, and the per-document score to disk, and it
+            is the single most useful flag when a score looks wrong, because
+            you can read the literal text the model saw.
+          </p>
+          <p>
+            The same thing from Python, which is how you drive the harness
+            inside a training run or a notebook:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">lm_eval</span> <span class="k">import</span> <span class="m1">evaluator</span>
+
+<span class="v2">results</span> = <span class="m1">evaluator</span>.<span class="m2">simple_evaluate</span><span class="b0">(</span>
+    <span class="v0">model</span>=<span class="s">"hf"</span>,
+    <span class="v5">model_args</span>=<span class="s">"pretrained=EleutherAI/pythia-160m"</span>,
+    <span class="v2">tasks</span>=<span class="b1">[</span><span class="s">"hellaswag"</span>, <span class="s">"arc_easy"</span><span class="b1">]</span>,
+    <span class="v1">num_fewshot</span>=<span class="n">0</span>,
+    <span class="v3">batch_size</span>=<span class="n">8</span>,
+<span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="v2">results</span><span class="b1">[</span><span class="s">"results"</span><span class="b1">][</span><span class="s">"hellaswag"</span><span class="b1">]</span><span class="b0">)</span>
+<span class="c"># {'acc,none': 0.29..., 'acc_stderr,none': 0.004...,</span>
+<span class="c">#  'acc_norm,none': 0.31..., 'acc_norm_stderr,none': 0.004..., ...}</span></code></pre></div>
+          <p>
+            You can also hand <code>simple_evaluate</code> an already
+            constructed model object instead of a string, which avoids
+            reloading weights you already have in memory:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">lm_eval</span>.<span class="m2">models</span>.<span class="m2">huggingface</span> <span class="k">import</span> <span class="m1">HFLM</span>
+
+<span class="v1">lm_obj</span> = <span class="m1">HFLM</span><span class="b0">(</span><span class="v5">pretrained</span>=<span class="s">"EleutherAI/pythia-160m"</span>, <span class="v3">batch_size</span>=<span class="n">16</span><span class="b0">)</span>
+<span class="v2">results</span> = <span class="v0">evaluator</span>.<span class="m2">simple_evaluate</span><span class="b0">(</span><span class="v0">model</span>=<span class="v1">lm_obj</span>, <span class="v2">tasks</span>=<span class="b1">[</span><span class="s">"hellaswag"</span><span class="b1">]</span><span class="b0">)</span></code></pre></div>
+          <p>
+            Now the mistakes people make. First, comparing a chat model
+            scored with <code>--apply_chat_template</code> against a base
+            model scored without it, which changes the prompt entirely and
+            makes the two numbers incomparable. Second, reporting a
+            <code>--limit</code> run, whose subset is not the benchmark.
+            Third, mixing up <code>acc</code> and <code>acc_norm</code>,
+            which can differ by several points on the same task and are not
+            interchangeable. Fourth, and most fundamental, assuming that two
+            frameworks reporting the same benchmark name produce the same
+            number. <mark>The benchmark name is not the benchmark. The prompt
+            template, the few-shot examples, the normalization, and the
+            answer-extraction rule together are the benchmark, and the
+            harness's job is to pin all of them down so a score means
+            something.</mark>
+          </p>
+
+          <h2>Part III: When it is the right tool</h2>
+          <p>
+            lm-evaluation-harness is the right tool when you want a
+            standardized, reproducible score that other people can compare
+            against, when you are evaluating many models against many
+            academic benchmarks, or when you need one backend that speaks to
+            Hugging Face, vLLM, and hosted APIs with the same task
+            definitions. It is the lingua franca. If a paper says a model
+            got some <a href="https://arxiv.org/abs/1905.07830" target="_blank" rel="noreferrer">HellaSwag</a>
+            or <a href="https://arxiv.org/abs/2009.03300" target="_blank" rel="noreferrer">MMLU</a>
+            number, there is a good chance it came
+            from here, and matching the harness's methodology is often the
+            fastest way to be believed. It is also the natural place to add a
+            new academic benchmark, because the YAML task system means a new
+            task is usually a config plus a small preprocessing function.
+          </p>
+          <p>
+            The honest cases for alternatives. Stanford's
+            <a href="https://arxiv.org/abs/2211.09110" target="_blank" rel="noreferrer">HELM</a> aims at
+            holistic, multi-metric evaluation across many scenarios with
+            calibration, bias, and efficiency measured alongside accuracy,
+            and is the better fit when you want breadth of measured
+            properties rather than a single leaderboard number. Hugging
+            Face's lighteval covers similar ground to the harness with a
+            different internal design and is worth knowing if you live in
+            that ecosystem. OpenAI Evals is oriented around their API and is
+            convenient when that is your only backend. For agentic and
+            safety-style evaluations with tool use and multi-step tasks, the
+            UK AISI's Inspect framework is built for that shape and the
+            harness is not. And for pure generation-quality judgments, an
+            LLM-as-judge setup or a purpose-built arena is a different
+            instrument entirely. The harness is deliberately about
+            likelihood-based and constrained-generation benchmarks with
+            exact metrics, not open-ended quality.
+          </p>
+          <p>
+            The shape-of-the-problem warning is about generation cost and
+            determinism. Multiple-choice tasks scored by loglikelihood are
+            cheap and fully deterministic, one forward pass per choice, no
+            sampling, the same answer every time. Generative tasks scored by
+            <code>generate_until</code> are the opposite, they cost a full
+            decode per document, they depend on stop sequences and decoding
+            parameters, and if you sample with a temperature they are not
+            even deterministic run to run. The failure mode that eats a
+            weekend is running a large generative suite with a slow backend
+            and a badly chosen stop sequence, so the model rambles past the
+            answer and the regex extracts nothing:
+          </p>
+          <pre class="flow">cheap and deterministic          expensive and fragile
+  multiple_choice                  generate_until
+  loglikelihood(ctx, choice)       decode until a stop string
+  argmax over choices              regex-extract the answer
+  1 fwd pass per choice            1 full generation per doc
+  same score every run             depends on stop seq + sampling</pre>
+          <p>
+            For the generative half, pairing the harness with a fast serving
+            backend like <a href="/oss/vllm">vLLM</a> or
+            <a href="/oss/sglang">SGLang</a> turns an overnight run into a
+            coffee break, which is exactly why those backends are first-class
+            model types.
+          </p>
+
+          <h2>Part IV: The full life of one evaluation</h2>
+          <p>
+            The specimen: one document of HellaSwag, a four-way
+            multiple-choice task, evaluated zero-shot on a Hugging Face
+            model, launched with
+            <code>lm_eval --model hf --tasks hellaswag</code>. HellaSwag
+            gives a context and four possible endings, exactly one of which
+            is the natural continuation. Follow one question all the way
+            down and back up.
+          </p>
+
+          <h3>Stage 1: the CLI and simple_evaluate</h3>
+          <p>
+            <code>lm_eval/__main__.py</code> parses the arguments and calls
+            <code>cli_evaluate</code>, which is a thin wrapper over
+            <code>evaluator.simple_evaluate</code> in
+            <code>lm_eval/evaluator.py</code>. That function is the front
+            door for both the CLI and library use. It resolves the model,
+            resolves the tasks, sets the random seeds (there are separate
+            seeds for Python, NumPy, and Torch, plus a few-shot sampling
+            seed, all logged for reproducibility), and then hands off to the
+            lower-level <code>evaluate</code>. Everything downstream is
+            SPMD-free ordinary Python, one process orchestrating batched
+            calls to a model.
+          </p>
+
+          <h3>Stage 2: resolving the model through the registry</h3>
+          <p>
+            <code>--model hf</code> is looked up in the model registry in
+            <code>lm_eval/api/registry.py</code>. Model classes register
+            themselves with a <code>@register_model("hf", ...)</code>
+            decorator, so the string <code>hf</code> maps to the
+            <code>HFLM</code> class in
+            <code>lm_eval/models/huggingface.py</code>. The
+            <code>--model_args</code> string is parsed into keyword arguments
+            and passed to its constructor, which loads the tokenizer and
+            weights, figures out the device and dtype, and sets the batching
+            strategy. <code>HFLM</code> is a subclass of
+            <code>TemplateLM</code>, which is itself a subclass of the
+            abstract <code>LM</code> base class in
+            <code>lm_eval/api/model.py</code>. That inheritance is the point.
+            The evaluator only ever sees the <code>LM</code> interface, so
+            <code>hf</code>, <code>vllm</code>,
+            <code>openai-completions</code>, and <code>anthropic</code> are
+            interchangeable at the seam.
+          </p>
+
+          <h3>Stage 3: resolving the task through the TaskManager</h3>
+          <p>
+            <code>--tasks hellaswag</code> is resolved by the
+            <code>TaskManager</code> in the <code>lm_eval/tasks</code>
+            package, which at import time indexes every YAML file under
+            <code>lm_eval/tasks/**</code> and builds a name-to-config map.
+            The <code>hellaswag</code> YAML names its dataset on the Hugging
+            Face Hub, its splits, its prompt template, its choice list, and
+            its metrics. The manager instantiates a
+            <code>ConfigurableTask</code> (<code>lm_eval/api/task.py</code>)
+            from that config. The task's <code>__init__</code> loads the
+            dataset via the <code>datasets</code> library, runs any
+            <code>process_docs</code> preprocessing declared in a sibling
+            <code>utils.py</code>, and stores the evaluation split. Because
+            <code>output_type</code> is <code>multiple_choice</code>, the
+            task knows each document will emit several loglikelihood
+            requests, one per candidate ending.
+          </p>
+
+          <h3>Stage 4: building the request for one document</h3>
+          <p>
+            <code>build_all_requests</code> iterates the evaluation split. For
+            our document it first builds the context. Zero-shot, the context
+            is just the prompt template applied to the doc,
+            <code>doc_to_text(doc)</code>, which for HellaSwag stitches the
+            activity label and the sentence beginning into a single string.
+            Then it reads the candidate endings with
+            <code>doc_to_choice(doc)</code> and the gold index with
+            <code>doc_to_target(doc)</code>. Now
+            <code>construct_requests</code> emits one <code>Instance</code>
+            per choice:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="c"># conceptually, for a 4-way multiple_choice doc</span>
+<span class="v4">requests</span> = <span class="b0">[</span>
+    <span class="m1">Instance</span><span class="b1">(</span>
+        <span class="v3">request_type</span>=<span class="s">"loglikelihood"</span>,
+        <span class="v5">doc</span>=<span class="v5">doc</span>,
+        <span class="v0">arguments</span>=<span class="b2">(</span><span class="v3">context</span>, <span class="s">" "</span> + <span class="v3">ending</span><span class="b2">)</span>,   <span class="c"># note the leading space</span>
+        <span class="v4">idx</span>=<span class="v3">i</span>,
+    <span class="b1">)</span>
+    <span class="k">for</span> <span class="v3">i</span>, <span class="v3">ending</span> <span class="k">in</span> <span class="m1">enumerate</span><span class="b1">(</span><span class="v5">choices</span><span class="b1">)</span>
+<span class="b0">]</span></code></pre></div>
+          <p>
+            Each <code>Instance</code>
+            (<code>lm_eval/api/instance.py</code>) is a small dataclass
+            carrying its request type, the source document, the argument
+            tuple the model will consume, an index, and empty slots for the
+            raw response (<code>resps</code>) and the filtered response
+            (<code>filtered_resps</code>). The argument tuple for a
+            loglikelihood request is <code>(context, continuation)</code>.
+            The leading space on the continuation is not a detail, it is the
+            difference between the model scoring <code>" Paris"</code> and
+            <code>"Paris"</code>, which tokenize differently, and getting it
+            wrong silently shifts every score. This is the sort of thing the
+            harness exists to standardize.
+          </p>
+
+          <h3>Stage 5: the model fulfils the requests</h3>
+          <p>
+            The evaluator collects every request of a given type across all
+            documents and all tasks, then makes one batched call,
+            <code>lm.loglikelihood(all_ll_instances)</code>. Inside
+            <code>HFLM</code>, each <code>(context, continuation)</code> pair
+            is handled by tokenizing the two together, running a single
+            forward pass, and reading off the log-probabilities. For each
+            continuation token the model looks up the log-probability the
+            network assigned to that exact token given everything before it,
+            and sums those over the continuation. The return value per
+            request is a tuple <code>(loglikelihood, is_greedy)</code>, the
+            summed log-probability of the continuation and a boolean saying
+            whether every continuation token was also the argmax at its
+            position. Crucially there is no generation and no sampling. This
+            is a scoring operation, so it is deterministic given the weights,
+            which is why loglikelihood multiple-choice is the reproducible
+            core of the whole harness. The mathematics of turning logits into
+            these per-token log-probabilities is the softmax story built up
+            in the <a href="/ml">ML implementations section</a>.
+          </p>
+          <p>
+            Two efficiency details live here. Requests are sorted by length
+            before batching so that similar-length sequences pack together,
+            then the responses are un-sorted back into the original order, a
+            <code>Collator</code> in the model utilities. And with
+            <code>--use_cache</code> a SQLite cache keyed on the request can
+            return a previously computed loglikelihood, so re-running a task
+            after a code change to an unrelated part costs nothing.
+          </p>
+
+          <h3>Stage 6: filters and process_results</h3>
+          <p>
+            The four loglikelihoods flow back into their Instances'
+            <code>resps</code>. For a multiple-choice task the filter stage
+            is trivial, the raw responses pass straight through. Then the
+            task's <code>process_results(doc, results)</code> runs. It
+            receives the four loglikelihoods, takes the argmax, and compares
+            it to the gold index to produce <code>acc</code>, a 1.0 or 0.0.
+            It also computes <code>acc_norm</code>, the argmax after dividing
+            each loglikelihood by the byte length of its ending, which
+            corrects the model's built-in bias toward shorter continuations.
+            Both land in a per-document dict, <code>{"acc": 1.0,
+            "acc_norm": 0.0}</code> for a document the model got right raw
+            but wrong once length-normalized.
+          </p>
+
+          <h3>Stage 7: aggregation and the standard error</h3>
+          <p>
+            After every document is scored, the per-document values are
+            aggregated. Each metric is paired with an aggregation function
+            in the task config, and for <code>acc</code> and
+            <code>acc_norm</code> that is the mean. The harness also computes
+            a standard error for each metric, a closed-form standard error of
+            the mean for accuracy and a bootstrap resample for metrics
+            without a clean formula, controlled by
+            <code>bootstrap_iters</code>. If <code>hellaswag</code> were part
+            of a group like <code>mmlu</code>, a second aggregation would
+            combine the subtask means into a group score, optionally weighted
+            by subtask size. The result is a nested dictionary keyed by task,
+            then metric, that becomes the printed table. That closes the loop
+            of one evaluation, a YAML file in, one Instance per choice, four
+            forward-pass log-probabilities, an argmax, and a number with an
+            error bar out.
+          </p>
+
+          <h2>Part V: Internals deep dives</h2>
+
+          <h3>Deep dive: the request/response model abstraction</h3>
+          <p>
+            The entire harness pivots on a tiny interface. The abstract
+            <code>LM</code> class in <code>lm_eval/api/model.py</code>
+            declares three request-fulfilling methods, and every model
+            backend implements them:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">class</span> <span class="m1">LM</span><span class="b0">(</span><span class="m1">abc</span>.<span class="m2">ABC</span><span class="b0">)</span>:
+    <span class="m1">@abc.abstractmethod</span>
+    <span class="k">def</span> <span class="m1">loglikelihood</span><span class="b0">(</span><span class="k">self</span>, <span class="v4">requests</span><span class="b0">)</span> -&gt; <span class="v1">list</span><span class="b0">[</span><span class="v3">tuple</span><span class="b1">[</span><span class="m1">float</span>, <span class="m1">bool</span><span class="b1">]</span><span class="b0">]</span>:
+        <span class="s">"""Score a continuation given a context.</span>
+<span class="s">        Each request arg is (context, continuation).</span>
+<span class="s">        Returns (sum log-prob of continuation, is_greedy)."""</span>
+
+    <span class="m1">@abc.abstractmethod</span>
+    <span class="k">def</span> <span class="m1">loglikelihood_rolling</span><span class="b0">(</span><span class="k">self</span>, <span class="v4">requests</span><span class="b0">)</span> -&gt; <span class="v1">list</span><span class="b0">[</span><span class="m1">float</span><span class="b0">]</span>:
+        <span class="s">"""Score a whole string with a sliding window.</span>
+<span class="s">        Each request arg is (string,). Used for perplexity."""</span>
+
+    <span class="m1">@abc.abstractmethod</span>
+    <span class="k">def</span> <span class="m1">generate_until</span><span class="b0">(</span><span class="k">self</span>, <span class="v4">requests</span><span class="b0">)</span> -&gt; <span class="v1">list</span><span class="b0">[</span><span class="m1">str</span><span class="b0">]</span>:
+        <span class="s">"""Generate text until a stop string.</span>
+<span class="s">        Each request arg is (context, gen_kwargs dict)."""</span></code></pre></div>
+          <p>
+            Those three cover every task shape. <code>loglikelihood</code>
+            powers multiple-choice and any task where you score a fixed
+            target string. <code>loglikelihood_rolling</code> powers
+            perplexity over long documents, where the string is windowed to
+            the model's context length and the per-token log-probs are summed
+            across windows. <code>generate_until</code> powers everything
+            open-ended, math word problems, code, free-form question
+            answering, where the model decodes until it emits one of the stop
+            strings and the answer is extracted afterward. There is a fourth
+            task-level output type, <code>multiple_choice</code>, but it is
+            not a fourth model method, it desugars into a batch of
+            <code>loglikelihood</code> requests, one per choice, as we saw in
+            Part IV.
+          </p>
+          <p>
+            <mark>Because a model is defined entirely by how it answers these
+            three questions, adding a backend is a self-contained exercise
+            and every existing benchmark immediately works against it, while
+            adding a benchmark requires knowing nothing about any model.</mark>
+            The intermediate <code>TemplateLM</code> class factors out the
+            common plumbing for language models that expose token-level
+            logits, so a new local backend usually only has to implement
+            token encoding, the low-level <code>_loglikelihood_tokens</code>
+            over token ids, and <code>generate_until</code>. This is why the
+            <code>lm_eval/models</code> directory can hold Hugging Face
+            transformers, vLLM, SGLang, GGUF via llama.cpp, NeMo, Mamba,
+            OpenAI and Anthropic APIs, and more, each a few hundred lines,
+            all interchangeable at the evaluator.
+          </p>
+
+          <h3>Deep dive: tasks as data, the YAML config system</h3>
+          <p>
+            A benchmark is a YAML file consumed by <code>ConfigurableTask</code>.
+            The config is parsed into a <code>TaskConfig</code> dataclass and
+            the fields are the entire contract between a benchmark and the
+            engine. A trimmed multiple-choice task looks like this:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-yaml"><span class="s">task</span>: <span class="s">my_science_qa</span>
+<span class="s">dataset_path</span>: <span class="s">some-org/science-qa</span>     <span class="c"># a Hugging Face dataset</span>
+<span class="s">output_type</span>: <span class="s">multiple_choice</span>
+<span class="s">training_split</span>: <span class="s">train</span>                 <span class="c"># pool for few-shot examples</span>
+<span class="s">validation_split</span>: <span class="s">validation</span>
+<span class="s">test_split</span>: <span class="s">test</span>
+<span class="s">doc_to_text</span>: <span class="s">"Question: {{question}}\nAnswer:"</span>
+<span class="s">doc_to_choice</span>: <span class="s">"{{choices}}"</span>          <span class="c"># a list field on the doc</span>
+<span class="s">doc_to_target</span>: <span class="s">"{{label}}"</span>            <span class="c"># the index of the correct choice</span>
+<span class="s">num_fewshot</span>: <span class="n">0</span>
+<span class="s">metric_list</span>:
+  - <span class="s">metric</span>: <span class="s">acc</span>
+    <span class="s">aggregation</span>: <span class="s">mean</span>
+    <span class="s">higher_is_better</span>: <span class="k">true</span>
+  - <span class="s">metric</span>: <span class="s">acc_norm</span>
+    <span class="s">aggregation</span>: <span class="s">mean</span>
+    <span class="s">higher_is_better</span>: <span class="k">true</span>
+<span class="s">metadata</span>:
+  <span class="s">version</span>: <span class="n">1.0</span></code></pre></div>
+          <p>
+            The three <code>doc_to_*</code> fields are the heart of it. Each
+            can be a plain string, a Jinja2 template rendered against the
+            document (the <code>{{question}}</code> above), or a reference to
+            a Python function in a sibling file via a
+            <code>!function utils.my_fn</code> tag when the formatting is too
+            complex for a template. <code>doc_to_text</code> produces the
+            prompt, <code>doc_to_choice</code> produces the list of candidate
+            answers, and <code>doc_to_target</code> produces the gold answer,
+            as an index into the choices for multiple-choice or as a target
+            string otherwise. The <code>version</code> in
+            <code>metadata</code> is not decoration, it is stamped into the
+            results so a score is tied to the exact task definition that
+            produced it, and it is bumped whenever the prompt or scoring
+            changes in a way that would move numbers.
+          </p>
+          <p>
+            The YAML system has an inheritance mechanism that carries the
+            real weight of the repository. A task can declare
+            <code>include: _default_template_yaml</code> to pull in a shared
+            base config and override a few fields. MMLU is the canonical
+            example, fifty-seven subject subtasks that each include one
+            common template and differ only in their dataset subset name.
+            That is how the <code>lm_eval/tasks</code> tree holds well over a
+            thousand task and subtask YAMLs without a thousand copies of the
+            same prompt. Groups compose on top, a group YAML lists member
+            tasks and an aggregation policy, so <code>mmlu</code> is a group
+            whose members are the fifty-seven subject tasks and whose score
+            is their mean. The harness also distinguishes loose tags, which
+            let you run a bundle of related tasks without producing an
+            aggregate number, from real groups, which do aggregate. Getting
+            that distinction right matters, because averaging across tasks
+            that measure different things with different baselines produces a
+            number that looks meaningful and is not.
+          </p>
+          <p>
+            For a generative task the config swaps the choice fields for a
+            generation and extraction spec. A math-word-problem task in the
+            <a href="https://arxiv.org/abs/2110.14168" target="_blank" rel="noreferrer">GSM8K</a>
+            style looks roughly like this:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-yaml"><span class="s">task</span>: <span class="s">gsm8k_like</span>
+<span class="s">dataset_path</span>: <span class="s">gsm8k</span>
+<span class="s">output_type</span>: <span class="s">generate_until</span>
+<span class="s">doc_to_text</span>: <span class="s">"Question: {{question}}\nAnswer:"</span>
+<span class="s">doc_to_target</span>: <span class="s">"{{answer}}"</span>
+<span class="s">generation_kwargs</span>:
+  <span class="s">until</span>:
+    - <span class="s">"\n\n"</span>          <span class="c"># stop when the model starts a new problem</span>
+  <span class="s">do_sample</span>: <span class="k">false</span>    <span class="c"># greedy decoding for determinism</span>
+<span class="s">filter_list</span>:
+  - <span class="s">name</span>: <span class="s">strict-match</span>
+    <span class="s">filter</span>:
+      - <span class="s">function</span>: <span class="s">regex</span>
+        <span class="s">regex_pattern</span>: <span class="s">"answer is (\\-?[0-9\\.,]+)"</span>
+      - <span class="s">function</span>: <span class="s">take_first</span>
+<span class="s">metric_list</span>:
+  - <span class="s">metric</span>: <span class="s">exact_match</span>
+    <span class="s">aggregation</span>: <span class="s">mean</span>
+    <span class="s">higher_is_better</span>: <span class="k">true</span></code></pre></div>
+          <p>
+            The <code>until</code> list is the set of stop strings, the
+            <code>filter_list</code> is how a free-form generation is turned
+            into a comparable answer, and <code>exact_match</code> compares
+            the extracted answer against the target. That filter pipeline is
+            its own subsystem, covered below.
+          </p>
+
+          <h3>Deep dive: few-shot construction and samplers</h3>
+          <p>
+            Few-shot prompting is where reproducibility either holds or
+            quietly slips, so the harness makes the construction explicit.
+            When <code>num_fewshot</code> is greater than zero, the task asks
+            a <code>Sampler</code> (<code>lm_eval/api/samplers.py</code>) for
+            that many example documents drawn from the few-shot pool, which
+            is the <code>fewshot_split</code> if the config names one,
+            otherwise the training split, otherwise the validation split.
+            Each example is rendered exactly the way a real document would be,
+            <code>doc_to_text(example)</code> then a target delimiter then
+            <code>doc_to_target(example)</code>, and the examples are joined
+            with a few-shot delimiter, by default a blank line. Any task
+            <code>description</code> is prepended, and then the actual
+            question's context is appended. The whole thing is one string
+            that becomes the context of the request.
+          </p>
+          <pre class="flow">context for a 2-shot multiple_choice question:
+
+[description]
+[doc_to_text(ex1)][target_delim][doc_to_target(ex1)]
+[fewshot_delim]
+[doc_to_text(ex2)][target_delim][doc_to_target(ex2)]
+[fewshot_delim]
+[doc_to_text(the actual question)]      &lt;- continuation scored here</pre>
+          <p>
+            The sampler is where determinism is enforced. The default draws a
+            fixed set of examples with a seeded choice, and the seed is
+            logged, so the same few-shot examples appear every run.
+            Alternative samplers are selectable in the config, a first-n
+            sampler, a random sampler, a balanced sampler that spreads
+            examples across labels, and a manual sampler that pins a
+            hand-chosen set. The sampler also guarantees a document never
+            appears as its own few-shot example.
+            <mark>The subtle correctness point is that
+            few-shot choice is part of the benchmark, not a free parameter,
+            so two runs that differ only in which examples were sampled are
+            measuring two different things even though they carry the same
+            task name.</mark>
+          </p>
+          <p>
+            Chat models complicate this. With <code>--apply_chat_template</code>
+            the context is rendered through the model's tokenizer chat
+            template rather than concatenated as plain text, and with
+            <code>--fewshot_as_multiturn</code> each few-shot example becomes
+            a separate user and assistant turn instead of being folded into
+            one block. Both change the literal tokens the model sees, which
+            is why a base-model number and a chat-template number for the
+            same task are not comparable, a trap worth repeating because it
+            is the most common way people accidentally lie with harness
+            numbers.
+          </p>
+
+          <h3>Deep dive: metrics, filters, and aggregation</h3>
+          <p>
+            The scoring pipeline has two stages, a per-document filter and
+            extraction stage, then a metric and aggregation stage. Filters
+            live in <code>lm_eval/filters</code> and are how a raw generation
+            becomes a comparable answer. A <code>filter_list</code> entry
+            names a pipeline of steps, and the common ones are a
+            <code>regex</code> extractor that pulls the first capture group
+            matching a pattern, a <code>take_first</code> selector, a
+            majority-vote selector for self-consistency setups, and various
+            whitespace and formatting transforms. GSM8K famously ships two
+            filter pipelines, a strict one that requires the model to say
+            the answer in a specific phrasing and a flexible one that grabs
+            the last number in the output, and it reports both, which is a
+            neat illustration that answer extraction is a modeling choice
+            with its own score.
+          </p>
+          <p>
+            Metrics live in <code>lm_eval/api/metrics.py</code> and register
+            themselves in the registry alongside an aggregation function and
+            a <code>higher_is_better</code> flag. The vocabulary you will
+            actually meet:
+          </p>
+          <table>
+            <tr><th>Metric</th><th>What it measures</th><th>Typical task shape</th></tr>
+            <tr><td>acc</td><td>argmax loglikelihood equals gold</td><td>multiple_choice</td></tr>
+            <tr><td>acc_norm</td><td>acc after length-normalizing each choice</td><td>multiple_choice</td></tr>
+            <tr><td>perplexity / word_perplexity</td><td>exp of mean negative log-prob per token or word</td><td>loglikelihood_rolling</td></tr>
+            <tr><td>bits_per_byte</td><td>compression view of the same log-probs</td><td>loglikelihood_rolling</td></tr>
+            <tr><td>exact_match</td><td>extracted answer equals target string</td><td>generate_until</td></tr>
+            <tr><td>f1</td><td>token-overlap F1 against a reference</td><td>generate_until</td></tr>
+          </table>
+          <p>
+            Aggregation is per metric, usually the mean, with weighted
+            variants for perplexity that respect token counts. The standard
+            error matters as much as the point estimate. For a mean of
+            zero-one accuracies the harness uses the closed-form standard
+            error of the mean, and for metrics without a clean formula it
+            resamples the per-document scores with replacement,
+            <code>bootstrap_iters</code> times by default a large number, to
+            estimate the spread. Two models whose scores differ by less than
+            the error bars have not been distinguished, and the harness
+            printing the standard error next to every number is a quiet
+            argument against over-reading a leaderboard's third decimal
+            place. Group aggregation stacks on top, combining member-task
+            means either by a simple average or weighted by the number of
+            documents in each member, a choice the group config makes
+            explicit because it changes what the group number means.
+          </p>
+
+          <h3>Deep dive: why reproducible eval is genuinely hard</h3>
+          <p>
+            This is the deep dive the whole chapter has been circling. The
+            harness is elaborate not because scoring a model is intrinsically
+            complex, a single argmax is not, but because every choice around
+            that argmax moves the number, and pinning those choices down is
+            the actual engineering. Here are the ones that bite.
+          </p>
+          <p>
+            <strong>Prompt formatting.</strong> The exact template, the
+            <code>Question:</code> and <code>Answer:</code> labels, the
+            newline placement, the target delimiter, whether the continuation
+            carries a leading space, all shift how the model tokenizes and
+            therefore what probability it assigns. The most cited case is
+            MMLU, which Hugging Face investigated when the Open LLM
+            Leaderboard first launched. The same model evaluated by three
+            faithful implementations, the original Hendrycks code, HELM, and
+            this harness, produced markedly different MMLU scores, differing
+            by more than ten points for some models, purely from prompt
+            format and from whether the score compared generated letters,
+            the loglikelihood of a single letter, or the loglikelihood of the
+            full answer text. None of the three was buggy. They were three
+            different measurements wearing one name.
+          </p>
+          <p>
+            <strong>Normalization.</strong> Language models assign higher
+            total probability to shorter strings, so a raw-loglikelihood
+            argmax over answer choices is biased toward the short ones.
+            <code>acc_norm</code> divides by byte length to counter this, and
+            there is a mutual-information variant that also conditions out
+            the answer's unconditional probability. Which normalization a
+            leaderboard reports is a real decision, and comparing an
+            <code>acc</code> from one source to an <code>acc_norm</code> from
+            another is a category error that happens constantly.
+          </p>
+          <p>
+            <strong>Answer extraction.</strong> For generative tasks the
+            score depends entirely on the regex or checker that turns free
+            text into an answer. A model that computes the right answer but
+            phrases it in a way the strict filter misses scores zero, so the
+            extraction rule is part of the benchmark. This is why generative
+            benchmarks report the filter they used and why two GSM8K numbers
+            can disagree even with identical generations.
+          </p>
+          <p>
+            <strong>Chat templates and system prompts.</strong> Applying a
+            chat template, or a system instruction, or rendering few-shot as
+            turns, all change the literal input. A model can look better or
+            worse by several points depending on whether it was evaluated the
+            way it was trained to be prompted, and there is no single correct
+            answer, only a choice that must be reported.
+          </p>
+          <p>
+            <strong>Tokenization edge cases.</strong> Leading whitespace,
+            byte-pair merges across the context-continuation boundary, and
+            special tokens all interact with how the continuation's
+            log-probs are computed. The harness tokenizes context and
+            continuation together and then splits, precisely to avoid a class
+            of boundary bugs, and this is the kind of correctness detail a
+            reference implementation exists to get right once for everyone.
+          </p>
+          <p>
+            <strong>Contamination.</strong> If the evaluation data leaked
+            into the model's training corpus, the score measures memorization
+            rather than capability. The harness provides hooks,
+            <code>should_decontaminate</code> and a
+            <code>doc_to_decontamination_query</code> in the task config, and
+            an n-gram overlap check that compares evaluation documents
+            against a supplied training corpus. But the hook only helps if
+            you actually have the training data to check against, and for
+            most released models you do not. <mark>Contamination is the one
+            reproducibility problem the harness cannot solve on its own,
+            because it is not a property of the evaluation code, it is a
+            property of data you usually cannot see.</mark> The honest
+            posture is to version tasks, log the exact prompts, report the
+            normalization and the filter, and treat any single benchmark
+            number as one noisy measurement among many.
+          </p>
+
+          <h3>Deep dive: the Open LLM Leaderboard</h3>
+          <p>
+            The clearest demonstration of the harness's value is that Hugging
+            Face built the Open LLM Leaderboard on top of it. Rather than
+            invent scoring, the leaderboard runs the harness on a fixed set
+            of tasks with fixed few-shot counts and pins the harness version,
+            so every submitted model is measured the exact same way. The
+            first leaderboard used a suite of well-known academic benchmarks
+            in the <a href="https://arxiv.org/abs/1803.05457" target="_blank" rel="noreferrer">ARC</a>,
+            HellaSwag, MMLU,
+            <a href="https://arxiv.org/abs/2109.07958" target="_blank" rel="noreferrer">TruthfulQA</a>,
+            Winogrande, and GSM8K
+            family, and a later revision moved to harder and less saturated
+            tasks as models caught up to the old ones, including math,
+            graduate-level reasoning, and instruction-following benchmarks.
+            The exact composition has changed over time and is best checked
+            against the current leaderboard, but the architecture is the
+            durable lesson. <mark>A leaderboard is only as reproducible as the
+            harness under it, and the reason thousands of models can be
+            ranked on one page is that a versioned task plus a versioned
+            harness plus logged prompts makes each score a regenerable
+            artifact rather than a claim.</mark>
+          </p>
+
+          <h2>Part VI: Reading the repository</h2>
+          <p>
+            The harness is larger than it looks because most of the size is
+            the task library, hundreds of YAML files that you read on demand,
+            not front to back. The engine itself is small and worth reading
+            completely.
+          </p>
+          <p>
+            <strong>Stage 0, orientation.</strong> Read the top-level
+            <code>README.md</code> and the docs on the task interface, then
+            run one small evaluation with <code>--log_samples</code> and open
+            the written sample file. Seeing the literal prompt a model
+            received, next to its response and score, orients you faster than
+            any amount of code reading. Questions to hold, what string did the
+            model actually see, and where did each piece of it come from.
+          </p>
+          <p>
+            <strong>Stage 1, the evaluator.</strong> Read
+            <code>lm_eval/__main__.py</code> then
+            <code>lm_eval/evaluator.py</code>, following
+            <code>simple_evaluate</code> into <code>evaluate</code>.
+            Questions, where are the tasks turned into requests, where are
+            requests of the same type collected across tasks, and where do
+            responses get routed back to their Instances.
+          </p>
+          <p>
+            <strong>Stage 2, the abstractions.</strong> Read
+            <code>lm_eval/api/model.py</code> for the three primitives and
+            <code>TemplateLM</code>, <code>lm_eval/api/instance.py</code> for
+            the request object, and <code>lm_eval/api/task.py</code> for
+            <code>ConfigurableTask</code> and <code>TaskConfig</code>. This
+            trio is the conceptual core. Questions, what exactly is in an
+            Instance, how does <code>construct_requests</code> differ across
+            output types, and how does a multiple-choice task become
+            loglikelihood requests.
+          </p>
+          <p>
+            <strong>Stage 3, one model backend.</strong> Read
+            <code>lm_eval/models/huggingface.py</code> end to end, in
+            particular the loglikelihood path that tokenizes a pair, runs a
+            forward pass, and reads per-token log-probs, and the batching and
+            <code>Collator</code> logic in the model utilities. Then skim the
+            <code>vllm</code> and an API model to see the same interface met
+            three different ways. Questions, how is <code>is_greedy</code>
+            computed, and how does the pair get tokenized to avoid boundary
+            bugs.
+          </p>
+          <p>
+            <strong>Stage 4, one task family end to end.</strong> Pick a
+            multiple-choice task like <code>hellaswag</code> and a generative
+            task like <code>gsm8k</code>, and read their YAML plus any
+            sibling <code>utils.py</code>. Then read the MMLU directory to see
+            the <code>include</code> inheritance and the group config.
+            Questions, what does <code>doc_to_text</code> render to, which
+            filters run on the generation, and how do the subtasks aggregate
+            into a group.
+          </p>
+          <p>
+            <strong>Stage 5, scoring and sampling.</strong> Read
+            <code>lm_eval/api/metrics.py</code>,
+            <code>lm_eval/api/samplers.py</code>, and the
+            <code>lm_eval/filters</code> package. Questions, which metrics use
+            a bootstrap standard error and which use a closed form, how does
+            the default sampler stay deterministic, and what does a filter
+            pipeline look like as objects.
+          </p>
+          <p>
+            <strong>Where not to start.</strong> Do not begin in the task
+            library, the hundreds of YAMLs are a reference you consult once
+            you know the engine, not a tutorial. The decontamination module
+            is important conceptually and lightly used in practice, so meet it
+            after the core. And the many model backends are variations on one
+            interface, so read one deeply rather than all shallowly.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            Labs 1 through 4 run on a single small GPU or even CPU with a tiny
+            model. Labs 5 and 6 are about reading behavior, not scale. Log
+            formats and default numbers shift with the fast pace of main.
+          </p>
+          <p><strong>Lab 1: a first score with the samples logged.</strong> Concept: the evaluation lifecycle of Part IV.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">lm_eval</span> <span class="s">--model</span> <span class="s">hf</span> <span class="s">\</span>
+  <span class="s">--model_args</span> <span class="s">pretrained=EleutherAI/pythia-160m</span> <span class="s">\</span>
+  <span class="s">--tasks</span> <span class="s">hellaswag</span> <span class="s">\</span>
+  <span class="s">--limit</span> <span class="s">50</span> <span class="s">\</span>
+  <span class="s">--log_samples</span> <span class="s">\</span>
+  <span class="s">--output_path</span> <span class="s">out/</span></code></pre></div>
+          <p>
+            Open the sample file under <code>out/</code> and find one
+            document. Read the exact context string, the four continuations,
+            the four loglikelihoods, and the resulting <code>acc</code> and
+            <code>acc_norm</code>. Confirm by hand that <code>acc</code> is
+            the argmax of the raw loglikelihoods and <code>acc_norm</code> is
+            the argmax after dividing by the length of each ending. Find one
+            document where the two disagree.
+          </p>
+          <p><strong>Lab 2: few-shot changes the prompt.</strong> Concept: few-shot construction and samplers.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">lm_eval</span> <span class="s">--model</span> <span class="s">hf</span> <span class="s">--model_args</span> <span class="s">pretrained=EleutherAI/pythia-410m</span> <span class="s">\</span>
+  <span class="s">--tasks</span> <span class="s">arc_easy</span> <span class="s">--num_fewshot</span> <span class="s">0</span> <span class="s">--limit</span> <span class="s">100</span> <span class="s">--log_samples</span> <span class="s">--output_path</span> <span class="s">out0/</span>
+<span class="m1">lm_eval</span> <span class="s">--model</span> <span class="s">hf</span> <span class="s">--model_args</span> <span class="s">pretrained=EleutherAI/pythia-410m</span> <span class="s">\</span>
+  <span class="s">--tasks</span> <span class="s">arc_easy</span> <span class="s">--num_fewshot</span> <span class="s">5</span> <span class="s">--limit</span> <span class="s">100</span> <span class="s">--log_samples</span> <span class="s">--output_path</span> <span class="s">out5/</span></code></pre></div>
+          <p>
+            Diff a single document's context between the two sample files and
+            watch five formatted examples appear before the question. Note the
+            few-shot delimiter and the target delimiter in the literal text.
+            Then re-run the five-shot command a second time and confirm the
+            few-shot examples are identical, which is the seeded sampler doing
+            its job.
+          </p>
+          <p><strong>Lab 3: loglikelihood by hand.</strong> Concept: the scoring primitive with no task around it.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="c"># ll_lab.py</span>
+<span class="k">from</span> <span class="m1">lm_eval</span>.<span class="m2">models</span>.<span class="m2">huggingface</span> <span class="k">import</span> <span class="m1">HFLM</span>
+<span class="k">from</span> <span class="m1">lm_eval</span>.<span class="m2">api</span>.<span class="m2">instance</span> <span class="k">import</span> <span class="m1">Instance</span>
+
+<span class="v0">lm</span> = <span class="m1">HFLM</span><span class="b0">(</span><span class="v5">pretrained</span>=<span class="s">"EleutherAI/pythia-160m"</span><span class="b0">)</span>
+<span class="v6">reqs</span> = <span class="b0">[</span>
+    <span class="m1">Instance</span><span class="b1">(</span><span class="s">"loglikelihood"</span>, <span class="b2">{}</span>, <span class="b2">(</span><span class="s">"The capital of France is"</span>, <span class="s">" Paris"</span><span class="b2">)</span>, <span class="n">0</span><span class="b1">)</span>,
+    <span class="m1">Instance</span><span class="b1">(</span><span class="s">"loglikelihood"</span>, <span class="b2">{}</span>, <span class="b2">(</span><span class="s">"The capital of France is"</span>, <span class="s">" London"</span><span class="b2">)</span>, <span class="n">1</span><span class="b1">)</span>,
+<span class="b0">]</span>
+<span class="k">for</span> <span class="v2">r</span>, <span class="b0">(</span><span class="v5">ll</span>, <span class="v6">greedy</span><span class="b0">)</span> <span class="k">in</span> <span class="m1">zip</span><span class="b0">(</span><span class="v6">reqs</span>, <span class="v0">lm</span>.<span class="m2">loglikelihood</span><span class="b1">(</span><span class="v6">reqs</span><span class="b1">)</span><span class="b0">)</span>:
+    <span class="m1">print</span><span class="b0">(</span><span class="v2">r</span>.<span class="m2">arguments</span><span class="b1">[</span><span class="n">1</span><span class="b1">]</span>, <span class="s">"-&gt;"</span>, <span class="m1">round</span><span class="b1">(</span><span class="v5">ll</span>, <span class="n">3</span><span class="b1">)</span>, <span class="s">"is_greedy:"</span>, <span class="v6">greedy</span><span class="b0">)</span></code></pre></div>
+          <p>
+            The correct continuation should have the higher (less negative)
+            loglikelihood and likely <code>is_greedy=True</code>. This is
+            exactly what a multiple-choice task does per choice, with the
+            task machinery stripped away. Change the continuations and predict
+            the ordering before running.
+          </p>
+          <p><strong>Lab 4: a generative task and its filter.</strong> Concept: generate_until plus answer extraction.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">lm_eval</span> <span class="s">--model</span> <span class="s">hf</span> <span class="s">--model_args</span> <span class="s">pretrained=EleutherAI/pythia-1.4b</span> <span class="s">\</span>
+  <span class="s">--tasks</span> <span class="s">gsm8k</span> <span class="s">--num_fewshot</span> <span class="s">5</span> <span class="s">--limit</span> <span class="s">20</span> <span class="s">--log_samples</span> <span class="s">--output_path</span> <span class="s">outg/</span></code></pre></div>
+          <p>
+            Read the generations. Find one where the model reached the right
+            answer but the strict filter failed to extract it, and one where
+            the flexible filter succeeded. This is the answer-extraction
+            problem of Part V made concrete, and it explains why GSM8K reports
+            two numbers.
+          </p>
+          <p><strong>Lab 5: acc versus acc_norm as a story.</strong> Concept: length normalization.</p>
+          <p>
+            Take the HellaSwag sample file from Lab 1 and sort documents by
+            the length spread of their four endings. Confirm that
+            <code>acc</code> and <code>acc_norm</code> diverge most on
+            documents where the endings differ a lot in length, and agree on
+            documents where they are similar. You have just rediscovered why
+            the normalization exists, the raw score rewards short endings.
+          </p>
+          <p><strong>Lab 6: the same task, two backends.</strong> Concept: the model abstraction is real.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="c"># scored via Hugging Face transformers</span>
+<span class="m1">lm_eval</span> <span class="s">--model</span> <span class="s">hf</span> <span class="s">--model_args</span> <span class="s">pretrained=EleutherAI/pythia-410m</span> <span class="s">\</span>
+  <span class="s">--tasks</span> <span class="s">hellaswag</span> <span class="s">--limit</span> <span class="s">200</span> <span class="s">--output_path</span> <span class="s">hf/</span>
+<span class="c"># scored via vLLM, same weights, same task (needs the vllm extra)</span>
+<span class="m1">lm_eval</span> <span class="s">--model</span> <span class="s">vllm</span> <span class="s">--model_args</span> <span class="s">pretrained=EleutherAI/pythia-410m</span> <span class="s">\</span>
+  <span class="s">--tasks</span> <span class="s">hellaswag</span> <span class="s">--limit</span> <span class="s">200</span> <span class="s">--output_path</span> <span class="s">vllm/</span></code></pre></div>
+          <p>
+            The two <code>acc</code> numbers should match to within tiny
+            numerical noise, because both backends implement the same
+            loglikelihood primitive over the same weights. When they do not
+            match, the difference is a real bug in one backend's scoring, and
+            catching exactly that is one reason the abstraction is drawn where
+            it is.
+          </p>
+
+          <h2>Part VIII: Questions and model answers</h2>
+          <p>Understanding checks. Answer aloud before reading.</p>
+          <p><strong>1. What is lm-evaluation-harness, in one sentence?</strong></p>
+          <p>
+            The de facto standard evaluation platform that separates
+            benchmarks from models by reducing every task to three request
+            primitives, loglikelihood, loglikelihood_rolling, and
+            generate_until, so YAML-defined tasks run identically against any
+            backend, and it is the engine behind the Open LLM Leaderboard.
+          </p>
+          <p><strong>2. What are the three request primitives and what does each power?</strong></p>
+          <p>
+            <code>loglikelihood</code> scores a continuation given a context
+            and powers multiple-choice and fixed-target tasks.
+            <code>loglikelihood_rolling</code> scores a whole string with a
+            sliding window and powers perplexity.
+            <code>generate_until</code> decodes until a stop string and
+            powers open-ended tasks whose answers are extracted afterward.
+          </p>
+          <p><strong>3. If multiple_choice is an output type, why is it not a fourth model method?</strong></p>
+          <p>
+            Because a multiple-choice document desugars into one
+            loglikelihood request per candidate answer, and the task picks
+            the argmax over the returned loglikelihoods. The model only ever
+            answers the three primitives, so it never needs to know a task
+            was multiple-choice.
+          </p>
+          <p><strong>4. Why is loglikelihood scoring deterministic while generate_until may not be?</strong></p>
+          <p>
+            Loglikelihood is a single forward pass that reads off the model's
+            assigned probability for a fixed continuation, no sampling
+            involved, so it returns the same value every run given the
+            weights. <code>generate_until</code> decodes tokens, and if it
+            samples with a temperature the output and therefore the score can
+            vary run to run.
+          </p>
+          <p><strong>5. What is the difference between acc and acc_norm, and why does acc_norm exist?</strong></p>
+          <p>
+            <code>acc</code> is the argmax over raw continuation
+            loglikelihoods. <code>acc_norm</code> divides each loglikelihood
+            by the byte length of its choice before the argmax. It exists
+            because models assign higher total probability to shorter
+            strings, so raw loglikelihood is biased toward short answers and
+            length normalization removes that bias.
+          </p>
+          <p><strong>6. A task is a YAML file. Name the fields that define its behavior.</strong></p>
+          <p>
+            The dataset path and splits, the output type,
+            <code>doc_to_text</code> for the prompt,
+            <code>doc_to_choice</code> for the candidates,
+            <code>doc_to_target</code> for the gold answer,
+            <code>num_fewshot</code>, a <code>metric_list</code> with
+            aggregations, an optional <code>filter_list</code> for extraction,
+            and a <code>metadata</code> version. Templates are Jinja2 or
+            Python functions via a <code>!function</code> tag.
+          </p>
+          <p><strong>7. Why is few-shot example choice part of the benchmark rather than a free parameter?</strong></p>
+          <p>
+            Because different few-shot examples produce different prompts and
+            therefore different scores, so a run is only comparable to another
+            if the sampled examples match. The harness enforces this with a
+            seeded sampler whose seed is logged, and by excluding a document
+            from being its own example.
+          </p>
+          <p><strong>8. Why did three faithful MMLU implementations produce different scores for the same model?</strong></p>
+          <p>
+            Because they differed in prompt format and in what they scored,
+            one generated a letter and compared it, one compared the
+            loglikelihood of a single letter, and one compared the
+            loglikelihood of the full answer text. None was buggy, they were
+            three different measurements, which is exactly why the harness
+            standardizes and versions the prompt and the scoring.
+          </p>
+          <p><strong>9. What does a filter pipeline do, and why does GSM8K report two numbers?</strong></p>
+          <p>
+            A filter pipeline turns a free-form generation into a comparable
+            answer, typically a regex extraction followed by a selection like
+            take-first. GSM8K ships a strict pipeline that requires a specific
+            phrasing and a flexible one that grabs the last number, and
+            because answer extraction is itself a modeling choice, the two
+            pipelines can score the same generations differently, so both are
+            reported.
+          </p>
+          <p><strong>10. Why does the harness print a standard error next to every score?</strong></p>
+          <p>
+            Because a benchmark score is an estimate from a finite sample, and
+            two models whose scores differ by less than their error bars have
+            not actually been distinguished. Accuracy uses a closed-form
+            standard error of the mean, and metrics without a clean formula
+            use a bootstrap over the per-document scores.
+          </p>
+          <p><strong>11. Why can the harness not fully solve the contamination problem?</strong></p>
+          <p>
+            Because contamination is a property of the model's training data,
+            not of the evaluation code. The harness offers n-gram overlap
+            hooks, but they only work if you can supply the training corpus to
+            check against, and for most released models that data is not
+            available.
+          </p>
+          <p><strong>12. Adding a new model backend versus adding a new benchmark, what does each require?</strong></p>
+          <p>
+            A new backend implements the three primitives (often just token
+            encoding, low-level token loglikelihood, and generate_until via
+            <code>TemplateLM</code>) and then every existing task works. A new
+            benchmark is usually a YAML config plus a small preprocessing
+            function and needs to know nothing about any model. The seam
+            between them is the whole design.
+          </p>
+          <p><strong>13. When would you reach for HELM, lighteval, or Inspect instead?</strong></p>
+          <p>
+            HELM when you want holistic multi-metric evaluation across many
+            scenarios rather than a single number. lighteval when you are in
+            the Hugging Face ecosystem and prefer its design. Inspect when you
+            need agentic, tool-using, multi-step safety-style evaluations,
+            which are a different shape than the harness's likelihood and
+            constrained-generation benchmarks.
+          </p>
+          <p><strong>14. Two backends give different acc on the same task and weights. What does that mean?</strong></p>
+          <p>
+            It means one backend's loglikelihood computation is wrong, because
+            scoring a fixed continuation under fixed weights should be
+            backend-independent up to tiny numerical noise. The shared
+            interface is precisely what makes that discrepancy a detectable
+            bug rather than an unexplained mystery.
+          </p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Put the seam between task and model in one small
+            interface.</strong> Three request primitives is the entire
+            contract, and everything else, hundreds of tasks and a dozen
+            backends, hangs off it independently. This is dependency
+            inversion at its cleanest, the same instinct as a database driver
+            interface or a filesystem abstraction, define the narrow thing
+            both sides agree on and let each side grow without the other.
+          </p>
+          <p>
+            <strong>Make the benchmark data, not code.</strong> A task is a
+            YAML config, so contributing one is filling in fields rather than
+            writing a program, and the config can be diffed, versioned, and
+            inherited. The lesson generalizes to any place where the variety
+            lives in configuration and the logic is shared, express the
+            variety as data and write the engine once.
+          </p>
+          <p>
+            <strong>Version the thing that produces the number.</strong> A
+            task carries a version stamped into every result, so a score is
+            tied to the exact prompt and scoring that made it. Wherever a
+            reported measurement can drift silently, benchmark suites, data
+            pipelines, API contracts, versioning the producer turns an
+            irreproducible claim into a regenerable artifact.
+          </p>
+          <p>
+            <strong>Standardize the details that quietly move the
+            answer.</strong> Leading spaces, tokenization boundaries, length
+            normalization, stop strings, the harness gets each right once so a
+            thousand downstream users do not each get them wrong differently.
+            A reference implementation earns its status by absorbing exactly
+            the tedious correctness details nobody wants to rediscover.
+          </p>
+          <p>
+            <strong>Report the uncertainty, not just the point.</strong> A
+            standard error next to every score is a structural argument
+            against over-reading a leaderboard. Systems that surface their own
+            confidence get trusted correctly, and the ones that print a bare
+            number invite false precision.
+          </p>
+          <p>
+            <strong>Name the limits you cannot fix.</strong> Contamination is
+            outside the code's reach, and the honest move is to provide the
+            hooks, document the gap, and treat any single number as one noisy
+            measurement. A tool that is candid about what it cannot guarantee
+            is more useful than one that pretends completeness.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            The one-sentence summary: <mark>lm-evaluation-harness resolves a
+            model to three request primitives and a benchmark to a YAML task,
+            turns each document into loglikelihood or generate_until requests
+            built on a seeded few-shot context, batches them through the
+            model, filters and scores the responses per document, and
+            aggregates into one versioned number with a standard error.</mark>
+          </p>
+          <pre class="flow">lm_eval CLI -&gt; simple_evaluate -&gt; get_model + TaskManager
+  -&gt; ConfigurableTask from YAML (doc_to_text / choice / target)
+  -&gt; build_all_requests: few-shot ctx + Instance(request_type)
+  -&gt; lm.loglikelihood / lm.generate_until  (batched, three primitives)
+  -&gt; filters -&gt; process_results (acc / acc_norm / exact_match)
+  -&gt; aggregation + bootstrap stderr -&gt; results table</pre>
+          <p>The chain mapped to source:</p>
+          <pre class="flow">entry            lm_eval/__main__.py, lm_eval/evaluator.py
+model registry   lm_eval/api/registry.py -&gt; lm_eval/models/*.py
+model interface  lm_eval/api/model.py (LM, TemplateLM)
+request object   lm_eval/api/instance.py (Instance)
+task engine      lm_eval/api/task.py (ConfigurableTask, TaskConfig)
+task library     lm_eval/tasks/**/*.yaml (+ sibling utils.py)
+few-shot         lm_eval/api/samplers.py
+scoring          lm_eval/api/metrics.py, lm_eval/filters/</pre>
+          <p>Memorize these blocks:</p>
+          <ul>
+            <li><strong>Three primitives:</strong> loglikelihood (score a continuation, multiple-choice), loglikelihood_rolling (windowed perplexity), generate_until (decode to a stop string, extract the answer).</li>
+            <li><strong>multiple_choice desugars:</strong> one loglikelihood request per choice, then argmax for acc and length-normalized argmax for acc_norm.</li>
+            <li><strong>Task is YAML:</strong> dataset, splits, doc_to_text / doc_to_choice / doc_to_target, num_fewshot, metric_list, filter_list, version.</li>
+            <li><strong>Few-shot is seeded:</strong> examples drawn deterministically from the few-shot pool, excluding the document itself, so runs are comparable.</li>
+            <li><strong>Reproducibility breaks at:</strong> prompt format, normalization (acc vs acc_norm), answer extraction, chat templates, tokenization boundaries, and contamination, which is the one the code cannot fix.</li>
+          </ul>
+
+          <h2>Part XI: Papers and further reading</h2>
+          <p>
+            The benchmarks and the methodology in this walkthrough each trace
+            back to a paper, and every one rewards a direct read. Where this
+            site treats the same idea in depth, the companion link points
+            there.
+          </p>
+          <ol class="refs">
+            <li>Gao et al., <a href="https://zenodo.org/records/10256836" target="_blank" rel="noreferrer">A framework for few-shot language model evaluation</a>, Zenodo, 2023. The harness's own citable record, the reference hundreds of papers point at when they report a score.</li>
+            <li>Biderman et al., <a href="https://arxiv.org/abs/2405.14782" target="_blank" rel="noreferrer">Lessons from the Trenches on Reproducible Evaluation of Language Models</a>, 2024. The maintainers' account of where evaluation breaks and how the harness's design answers each failure, essentially Part V of this chapter in paper form. The statistics of comparing noisy scores are worked through in the <a href="/classes/data-pipelines-and-evaluation">data pipelines and evaluation class</a> on this site.</li>
+            <li>Brown et al., <a href="https://arxiv.org/abs/2005.14165" target="_blank" rel="noreferrer">Language Models are Few-Shot Learners</a>, 2020. The GPT-3 paper that defined the few-shot prompting setting the harness's seeded sampler machinery standardizes.</li>
+            <li>Hendrycks et al., <a href="https://arxiv.org/abs/2009.03300" target="_blank" rel="noreferrer">Measuring Massive Multitask Language Understanding</a>, 2020. The MMLU benchmark, fifty-seven subjects that became the canonical example of both YAML inheritance and prompt-format divergence.</li>
+            <li>Zellers et al., <a href="https://arxiv.org/abs/1905.07830" target="_blank" rel="noreferrer">HellaSwag, Can a Machine Really Finish Your Sentence?</a>, 2019. The four-way completion task this chapter traces end to end in Part IV.</li>
+            <li>Clark et al., <a href="https://arxiv.org/abs/1803.05457" target="_blank" rel="noreferrer">Think you have Solved Question Answering? Try ARC, the AI2 Reasoning Challenge</a>, 2018. The grade-school science benchmark behind <code>arc_easy</code> and <code>arc_challenge</code>.</li>
+            <li>Cobbe et al., <a href="https://arxiv.org/abs/2110.14168" target="_blank" rel="noreferrer">Training Verifiers to Solve Math Word Problems</a>, 2021. The GSM8K dataset whose strict and flexible filters made answer extraction visible as a modeling choice, and the same dataset drives the RL runs in the <a href="/oss/verl">verl walkthrough</a>.</li>
+            <li>Lin et al., <a href="https://arxiv.org/abs/2109.07958" target="_blank" rel="noreferrer">TruthfulQA, Measuring How Models Mimic Human Falsehoods</a>, 2021. The falsehood-mimicry benchmark from the first Open LLM Leaderboard suite.</li>
+            <li>Liang et al., <a href="https://arxiv.org/abs/2211.09110" target="_blank" rel="noreferrer">Holistic Evaluation of Language Models</a>, 2022. Stanford's HELM, the breadth-first alternative whose MMLU numbers famously disagreed with the harness's for the same models.</li>
+            <li>Sclar et al., <a href="https://arxiv.org/abs/2310.11324" target="_blank" rel="noreferrer">Quantifying Language Models' Sensitivity to Spurious Features in Prompt Design</a>, 2023. Measures accuracy swings of tens of points from formatting changes alone, the quantified case for pinning the prompt.</li>
+            <li>Oren et al., <a href="https://arxiv.org/abs/2310.17623" target="_blank" rel="noreferrer">Proving Test Set Contamination in Black Box Language Models</a>, 2023. A statistical test for contamination that needs no access to the training corpus, aimed at exactly the gap the harness's n-gram hooks cannot close.</li>
+          </ol>
+
+          <h2>Part XII: Final takeaway</h2>
+          <p>
+            If the single-model pieces this repository scores are the gap, the
+            <a href="/ml">ML implementations section</a> builds the softmax
+            and log-probability machinery the loglikelihood path depends on,
+            and the serving backends that make generative evaluation fast are
+            the subject of the <a href="/oss/vllm">vLLM</a> and
+            <a href="/oss/sglang">SGLang</a> chapters. Then come back and read
+            <code>evaluator.py</code> once more. It will read like a plain
+            loop that asks a model three kinds of question and counts the
+            answers, which is the entire point.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> lm-evaluation-harness shows that a
+            trustworthy benchmark number is not an argmax, it is everything
+            around the argmax pinned down. Reduce every model to three request
+            primitives and every benchmark to a versioned YAML task, log the
+            exact prompt, standardize the tokenization and normalization, and
+            report the standard error, and a score stops being a claim and
+            becomes a regenerable artifact, which is why one harness can rank
+            a thousand models on one page.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/code-copy.js"></script>
+      <script defer src="/theme.js"></script>
+  </body>
+</html>

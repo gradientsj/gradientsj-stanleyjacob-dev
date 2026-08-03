@@ -1,0 +1,1060 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LangGraph walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A full chapter on langchain-ai/langgraph: agents as explicit stateful graphs. The mental model of nodes, edges, and typed-state channels, a practical quickstart, the full life of one invoke traced through the Pregel super-step loop, deep dives on the checkpointer, streaming, human-in-the-loop interrupts, the Send API, and the functional API, a staged reading path, labs, and understanding checks. Contrasts a graph with LangChain's implicit agent loop." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%232B2621'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+      <script>(function(){try{var t=localStorage.getItem("theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>LangGraph</h1>
+        <p class="lead">
+          <a href="https://github.com/langchain-ai/langgraph" target="_blank" rel="noreferrer">LangGraph</a>
+          is LangChain's runtime for building agents as explicit stateful
+          graphs instead of implicit loops. You declare a typed shared
+          state, wire nodes and edges over it, and compile the result into
+          a runtime that executes one graph step at a time, snapshots the
+          state after every step, and lets you stream it, pause it for a
+          human, and rewind it. This chapter is three things at once, a
+          practical tutorial that stands up a real agent in a few lines, a
+          runtime walkthrough that follows one <code>invoke</code> through
+          the <a href="https://doi.org/10.1145/1807167.1807184" target="_blank" rel="noreferrer">Pregel</a> super-step loop from compiled channels to a durable
+          checkpoint, and a staged guide to reading the repository. It ends
+          with hands-on labs, understanding checks with model answers, and
+          a compact framework for keeping the whole system in your head.
+          Throughout it argues one thing, that a graph beats a hidden agent
+          loop precisely because control flow becomes data you can inspect,
+          persist, and change.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">StateGraph(State)         a typed state schema (TypedDict / Pydantic / dataclass)
+      |
+      v
+add_node / add_edge       nodes are functions  state -&gt; partial-state update
+add_conditional_edges     a router function chooses the next node at run time
+      |
+      v
+graph.compile(            lower the builder into a Pregel runtime (a Runnable)
+   checkpointer=...,
+   interrupt_before=...)
+      |
+      v
+app.invoke / app.stream   run one super-step at a time (Pregel / bulk-synchronous)
+   config={thread_id}
+      |
+      v
+channels + reducers       each state key is a channel, writes merge via a reducer
+      |
+      v
+checkpointer.put()        after every super-step, snapshot the state to the thread
+      |
+      v
+interrupt() / get_state   pause for a human, inspect, time-travel, resume</pre>
+          <p>
+            The one-sentence identity. <mark>LangGraph makes an agent an
+            explicit stateful graph, nodes that read and write a typed
+            shared state, edges both fixed and conditional that decide what
+            runs next, executed as a sequence of Pregel super-steps whose
+            every boundary can be checkpointed, streamed, interrupted, and
+            resumed.</mark> The classic way to build an agent is an implicit
+            loop, call the model, if it asked for a tool run the tool, feed
+            the result back, repeat until it stops. That loop lives inside a
+            class where you cannot see it, cannot pause it, and cannot
+            persist it. LangGraph turns the loop inside out. The control
+            flow becomes a value you construct, draw, and modify, and the
+            agent's memory becomes a schema rather than a pile of local
+            variables.
+          </p>
+          <p>
+            Two ideas carry the whole design. First, <strong>state is a set
+            of typed channels with reducers</strong>. Each key in the state
+            schema is a channel. A node does not mutate state, it returns a
+            small dict naming the keys it wants to change, and each channel's
+            reducer decides how that write merges with what is already there.
+            A plain key keeps only the last write, a key annotated with a
+            reducer accumulates. This is what makes message history,
+            parallel branches, and map-reduce first-class rather than
+            hand-rolled. Second, <strong>execution is a series of super-steps
+            and every super-step boundary is a durable checkpoint</strong>.
+            Because the state lives in channels and each step end is a
+            snapshot keyed by a thread, persistence, time-travel, and
+            human-in-the-loop are not features bolted on top, they are the
+            same mechanism looked at from three angles.
+          </p>
+          <p>
+            Everything here is verified against the <code>main</code> branch
+            in July 2026. LangGraph moves quickly and the repository is a
+            monorepo of several packages, so where an exact file path is
+            likely to shift I name the component by its role and say so.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <p>
+            LangGraph is a pure-Python library and installs anywhere Python
+            runs, including macOS, because the graph itself does no GPU work,
+            it orchestrates calls to models that live behind an API or a
+            local server. The core package plus the pieces you usually want
+            look like this.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">pip</span> <span class="s">install</span> <span class="s">langgraph</span>
+<span class="c"># checkpointers for real persistence live in separate packages</span>
+<span class="m1">pip</span> <span class="s">install</span> <span class="s">langgraph-checkpoint-sqlite</span>
+<span class="m1">pip</span> <span class="s">install</span> <span class="s">langgraph-checkpoint-postgres</span>
+<span class="c"># a model provider through a langchain integration</span>
+<span class="m1">pip</span> <span class="s">install</span> <span class="s">langchain-openai</span>
+<span class="c"># the local dev server and Studio (in-memory backend)</span>
+<span class="m1">pip</span> <span class="s">install</span> <span class="s">"langgraph-cli[inmem]"</span></code></pre></div>
+          <p>
+            The smallest useful graph is a chatbot with memory. Note the
+            reducer on <code>messages</code> and the checkpointer passed at
+            compile time, they are what make the second turn remember the
+            first.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">typing</span> <span class="k">import</span> <span class="m1">Annotated</span>
+<span class="k">from</span> <span class="m1">typing_extensions</span> <span class="k">import</span> <span class="m1">TypedDict</span>
+<span class="k">from</span> <span class="m1">langgraph</span>.<span class="m2">graph</span> <span class="k">import</span> <span class="m1">StateGraph</span>, <span class="m1">START</span>, <span class="m1">END</span>
+<span class="k">from</span> <span class="m1">langgraph</span>.<span class="m2">graph</span>.<span class="m2">message</span> <span class="k">import</span> <span class="m1">add_messages</span>
+<span class="k">from</span> <span class="m1">langgraph</span>.<span class="m2">checkpoint</span>.<span class="m2">memory</span> <span class="k">import</span> <span class="m1">InMemorySaver</span>  <span class="c"># MemorySaver is the legacy alias</span>
+<span class="k">from</span> <span class="m1">langchain_openai</span> <span class="k">import</span> <span class="m1">ChatOpenAI</span>
+
+<span class="k">class</span> <span class="m1">State</span><span class="b0">(</span><span class="m1">TypedDict</span><span class="b0">)</span>:
+    <span class="v1">messages</span>: <span class="m1">Annotated</span><span class="b0">[</span><span class="m1">list</span>, <span class="m1">add_messages</span><span class="b0">]</span>   <span class="c"># the reducer appends and merges by id</span>
+
+<span class="v6">llm</span> = <span class="m1">ChatOpenAI</span><span class="b0">(</span><span class="v0">model</span>=<span class="s">"gpt-4o-mini"</span><span class="b0">)</span>
+
+<span class="k">def</span> <span class="m1">chatbot</span><span class="b0">(</span><span class="v6">state</span>: <span class="m1">State</span><span class="b0">)</span> -&gt; <span class="m1">dict</span>:
+    <span class="c"># return only the keys you change, not the whole state</span>
+    <span class="k">return</span> <span class="b0">{</span><span class="s">"messages"</span>: <span class="b1">[</span><span class="v6">llm</span>.<span class="m2">invoke</span><span class="b2">(</span><span class="v6">state</span><span class="b0">[</span><span class="s">"messages"</span><span class="b0">]</span><span class="b2">)</span><span class="b1">]</span><span class="b0">}</span>
+
+<span class="v5">builder</span> = <span class="m1">StateGraph</span><span class="b0">(</span><span class="m1">State</span><span class="b0">)</span>
+<span class="v5">builder</span>.<span class="m2">add_node</span><span class="b0">(</span><span class="s">"chatbot"</span>, <span class="m1">chatbot</span><span class="b0">)</span>
+<span class="v5">builder</span>.<span class="m2">add_edge</span><span class="b0">(</span><span class="m1">START</span>, <span class="s">"chatbot"</span><span class="b0">)</span>
+<span class="v5">builder</span>.<span class="m2">add_edge</span><span class="b0">(</span><span class="s">"chatbot"</span>, <span class="m1">END</span><span class="b0">)</span>
+
+<span class="v6">app</span> = <span class="v5">builder</span>.<span class="m2">compile</span><span class="b0">(</span><span class="v3">checkpointer</span>=<span class="m1">InMemorySaver</span><span class="b1">()</span><span class="b0">)</span>
+
+<span class="v4">config</span> = <span class="b0">{</span><span class="s">"configurable"</span>: <span class="b1">{</span><span class="s">"thread_id"</span>: <span class="s">"user-1"</span><span class="b1">}</span><span class="b0">}</span>
+<span class="v6">app</span>.<span class="m2">invoke</span><span class="b0">(</span><span class="b1">{</span><span class="s">"messages"</span>: <span class="b2">[</span><span class="b0">(</span><span class="s">"user"</span>, <span class="s">"hi, I am Sam"</span><span class="b0">)</span><span class="b2">]</span><span class="b1">}</span>, <span class="v4">config</span><span class="b0">)</span>
+<span class="v6">app</span>.<span class="m2">invoke</span><span class="b0">(</span><span class="b1">{</span><span class="s">"messages"</span>: <span class="b2">[</span><span class="b0">(</span><span class="s">"user"</span>, <span class="s">"what is my name?"</span><span class="b0">)</span><span class="b2">]</span><span class="b1">}</span>, <span class="v4">config</span><span class="b0">)</span>  <span class="c"># answers "Sam"</span></code></pre></div>
+          <p>
+            Two <code>invoke</code> calls share one <code>thread_id</code>,
+            so the checkpointer loads the first turn's messages before the
+            second turn runs. Give a new <code>thread_id</code> and the
+            memory resets, which is exactly how one server holds thousands of
+            independent conversations.
+          </p>
+          <p>
+            Now make it an agent by adding a tool and a cycle. This is the
+            <a href="https://arxiv.org/abs/2210.03629" target="_blank" rel="noreferrer">ReAct</a>
+            loop drawn out by hand, which is the thing LangGraph exists
+            to make visible.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">langgraph</span>.<span class="m2">prebuilt</span> <span class="k">import</span> <span class="m1">ToolNode</span>, <span class="m1">tools_condition</span>
+<span class="k">from</span> <span class="m1">langchain_core</span>.<span class="m2">tools</span> <span class="k">import</span> <span class="m1">tool</span>
+
+<span class="m1">@tool</span>
+<span class="k">def</span> <span class="m1">get_weather</span><span class="b0">(</span><span class="v0">city</span>: <span class="m1">str</span><span class="b0">)</span> -&gt; <span class="m1">str</span>:
+    <span class="s">"""Return the weather for a city."""</span>
+    <span class="k">return</span> <span class="s">f"It is sunny in {</span><span class="v0">city</span><span class="s">}."</span>
+
+<span class="v2">llm_with_tools</span> = <span class="v6">llm</span>.<span class="m2">bind_tools</span><span class="b0">(</span><span class="b1">[</span><span class="m1">get_weather</span><span class="b1">]</span><span class="b0">)</span>
+
+<span class="k">def</span> <span class="m1">agent</span><span class="b0">(</span><span class="v6">state</span>: <span class="v5">State</span><span class="b0">)</span> -&gt; <span class="m1">dict</span>:
+    <span class="k">return</span> <span class="b0">{</span><span class="s">"messages"</span>: <span class="b1">[</span><span class="v2">llm_with_tools</span>.<span class="m2">invoke</span><span class="b2">(</span><span class="v6">state</span><span class="b0">[</span><span class="s">"messages"</span><span class="b0">]</span><span class="b2">)</span><span class="b1">]</span><span class="b0">}</span>
+
+<span class="v5">builder</span> = <span class="m1">StateGraph</span><span class="b0">(</span><span class="v5">State</span><span class="b0">)</span>
+<span class="v5">builder</span>.<span class="m2">add_node</span><span class="b0">(</span><span class="s">"agent"</span>, <span class="m1">agent</span><span class="b0">)</span>
+<span class="v5">builder</span>.<span class="m2">add_node</span><span class="b0">(</span><span class="s">"tools"</span>, <span class="m1">ToolNode</span><span class="b1">(</span><span class="b2">[</span><span class="m1">get_weather</span><span class="b2">]</span><span class="b1">)</span><span class="b0">)</span>
+<span class="v5">builder</span>.<span class="m2">add_edge</span><span class="b0">(</span><span class="v0">START</span>, <span class="s">"agent"</span><span class="b0">)</span>
+<span class="v5">builder</span>.<span class="m2">add_conditional_edges</span><span class="b0">(</span><span class="s">"agent"</span>, <span class="m1">tools_condition</span><span class="b0">)</span>  <span class="c"># -&gt; "tools" or END</span>
+<span class="v5">builder</span>.<span class="m2">add_edge</span><span class="b0">(</span><span class="s">"tools"</span>, <span class="s">"agent"</span><span class="b0">)</span>                       <span class="c"># the cycle that makes it ReAct</span>
+<span class="v6">app</span> = <span class="v5">builder</span>.<span class="m2">compile</span><span class="b0">()</span></code></pre></div>
+          <p>
+            <code>tools_condition</code> reads the last message. If the model
+            emitted a tool call it routes to <code>tools</code>, otherwise to
+            <code>END</code>. The edge from <code>tools</code> back to
+            <code>agent</code> is the loop, and it is a line you can see and
+            change rather than a hidden <code>while</code>. If you want that
+            exact graph in one line, the prebuilt does it,
+            <code>create_react_agent(llm, [get_weather],
+            checkpointer=InMemorySaver())</code>, and it compiles down to the
+            same nodes and edges you just wrote. That constructor is now
+            deprecated in favor of <code>create_agent</code> in the
+            <code>langchain</code> package, which wraps the identical runtime
+            with a middleware system, so the graph underneath is unchanged.
+          </p>
+          <p>
+            The mistakes newcomers make, in rough order of frequency. First,
+            <strong>forgetting the reducer</strong>. Declare
+            <code>messages: list</code> without <code>Annotated[list,
+            add_messages]</code> and each write replaces the list instead of
+            appending, and two nodes writing it in one step raise
+            <code>InvalidUpdateError</code>. Second, <strong>forgetting
+            <code>thread_id</code></strong>. With a checkpointer set but no
+            <code>thread_id</code> in the config there is no thread to
+            persist to, and memory, resume, and interrupts silently do
+            nothing. Third, <strong>returning the whole state</strong> from a
+            node instead of a partial update, which fights the reducers.
+            Fourth, <strong>mutating the incoming state in place</strong>,
+            which the runtime does not expect, always return new values.
+            Fifth, <strong>infinite loops</strong>, a cyclic graph with no
+            terminating branch trips the recursion limit (25 super-steps by
+            default) and raises <code>GraphRecursionError</code>, raise the
+            limit only when the loop genuinely needs more steps.
+          </p>
+
+          <h2>Part III: When it is the right tool</h2>
+          <p>
+            The first comparison is with plain LangChain, because the two are
+            constantly confused and they sit at different layers. LangChain
+            proper is a component library, model wrappers, prompt templates,
+            output parsers, retrievers, and LCEL, which pipes Runnables into
+            a directed acyclic chain like <code>prompt | model | parser</code>.
+            LCEL is the right tool for straight-through pipelines with no
+            loops and no durable state. LangChain's legacy
+            <code>AgentExecutor</code> is the implicit loop described above,
+            correct but opaque. LangGraph is the orchestration layer for
+            anything stateful, cyclic, or controllable. As of the langchain
+            1.0 line the recommended agent constructor,
+            <code>create_agent</code>, is built on LangGraph, and
+            <code>create_react_agent</code> in <code>langgraph.prebuilt</code>
+            is the transitional form. LangGraph did not replace LangChain, it
+            became the runtime underneath LangChain's agents.
+          </p>
+          <p>
+            Why a graph beats an implicit loop, which is the load-bearing
+            argument of this chapter. You can <em>see</em> the control flow,
+            <code>app.get_graph().draw_mermaid()</code> prints it. Every
+            super-step is a checkpoint, so persistence, resume-after-crash,
+            and time-travel come for free. You can interrupt before a
+            sensitive node for human approval and then resume. You can stream
+            the state after each node or the tokens as they generate. You can
+            add branches, run nodes in parallel by fanning out, and nest a
+            whole graph as a single node, without rewriting a monolith. And
+            you get fault tolerance inside a step, if one node fails the
+            completed nodes' writes are saved as pending writes so a retry
+            does not recompute them. None of this is available when the loop
+            is a private method.
+          </p>
+          <p>
+            The honest cases for something else. If you have one linear
+            tool-call loop with no persistence, no human step, and no
+            streaming need, LangGraph is overhead, write the
+            <code>while</code> loop against the model SDK directly.
+            <strong>LlamaIndex Workflows</strong> offers an event-driven,
+            step-function model, a strong choice inside a retrieval-heavy
+            stack. <strong>CrewAI</strong> is higher-level and role-and-task
+            oriented, faster to stand up and more opinionated, with less
+            control over the exact state machine. <strong>Microsoft
+            <a href="/oss/autogen">AutoGen</a></strong> centers on multi-agent conversation. The
+            <strong>OpenAI Agents SDK</strong>, successor to Swarm, is a
+            lightweight handoff model flavored toward one provider.
+            <strong>Temporal</strong> and similar durable-execution engines
+            win when your real need is durability and retries of long
+            workflows rather than LLM-specific state, though LangGraph's
+            checkpointer covers much of that within the LLM domain. The rule
+            of thumb, LangGraph earns its complexity when you need durable,
+            inspectable, human-supervised, or multi-actor control, and for a
+            single deterministic prompt-to-answer call an LCEL chain or a raw
+            model call is cleaner.
+          </p>
+          <p>
+            One architecture note. The models a graph calls have to be served
+            somewhere, and in production those endpoints are frequently
+            high-throughput inference servers like
+            <a href="/oss/vllm">vLLM</a> or <a href="/oss/sglang">SGLang</a>.
+            LangGraph is agnostic to which, a node simply calls a chat-model
+            Runnable, so the orchestration and the serving are cleanly
+            separated concerns. If the agent ideas here are the draw, the
+            <a href="/classes/self-improving-agents">self-improving agents</a>
+            and <a href="/classes/applied-generative-ai">applied generative
+            AI</a> classes cover the surrounding design space.
+          </p>
+
+          <h2>Part IV: The full life of one invoke</h2>
+          <p>
+            The specimen. One call
+            <code>app.invoke({"messages": [("user", "...")]},
+            {"configurable": {"thread_id": "t1"}})</code> on the ReAct graph
+            from Part II, compiled with a checkpointer. I follow it from
+            compilation through the super-steps to the checkpoint on disk.
+          </p>
+
+          <h3>Stage 1: compile lowers the builder to a Pregel graph</h3>
+          <p>
+            <code>builder.compile()</code> walks the nodes and edges and
+            lowers them into a <code>Pregel</code> object. Each state key
+            becomes a channel, a <code>LastValue</code> channel by default,
+            or a <code>BinaryOperatorAggregate</code>-style channel when the
+            key carries a reducer like <code>add_messages</code>. Each node
+            becomes a <code>PregelNode</code> that subscribes to (reads)
+            certain channels and writes to others. Edges become trigger
+            channels, <code>add_edge("a", "b")</code> arranges for
+            <code>b</code> to fire when <code>a</code> writes, and a
+            conditional edge compiles to a branch that runs your router and
+            writes to the chosen node's trigger. <code>START</code> and
+            <code>END</code> are sentinel endpoints. The compiled graph is a
+            Runnable, so it exposes <code>invoke</code>, <code>stream</code>,
+            <code>batch</code>, and their async twins, and can itself be used
+            as a node inside a larger graph.
+          </p>
+
+          <h3>Stage 2: enter the loop and load the checkpoint</h3>
+          <p>
+            <code>invoke</code> opens the Pregel loop (conceptually
+            <code>langgraph/pregel/loop.py</code>). It reads
+            <code>thread_id</code> and <code>checkpoint_ns</code> from the
+            config, asks the checkpointer for the latest
+            <code>CheckpointTuple</code> on that thread, and rebuilds channel
+            values from it, or starts empty for a new thread. The input dict
+            is then applied as writes to the input channels, which for a
+            messages graph runs the <code>add_messages</code> reducer to seed
+            <code>state["messages"]</code> with the user turn.
+          </p>
+
+          <h3>Stage 3: the super-step loop, plan then execute then update</h3>
+          <p>
+            The loop repeats a three-phase cycle borrowed from
+            <a href="https://doi.org/10.1145/79173.79181" target="_blank" rel="noreferrer">bulk-synchronous
+            parallel</a> computing.
+          </p>
+          <pre class="flow">plan     which nodes are triggered by channels updated last step?
+execute  run those nodes concurrently, each on a read-only state snapshot
+         (writes are buffered, nodes cannot see each other this step)
+update   at the barrier, apply all buffered writes through the reducers,
+         bump each channel's version
+save     checkpointer.put() the new values + versions + metadata to the thread,
+         put_writes() records pending writes for fault tolerance
+stream   emit to the caller per stream_mode (values / updates / messages ...)
+advance  newly updated channels trigger the next nodes; END or none -&gt; stop</pre>
+          <p>
+            For the ReAct specimen the steps read cleanly. Step one runs
+            <code>agent</code>, the model returns an <code>AIMessage</code>
+            with a tool call, and <code>tools_condition</code> routes to
+            <code>tools</code>. Step two runs the <code>ToolNode</code>,
+            which executes <code>get_weather</code> and appends a
+            <code>ToolMessage</code>, and the edge back to <code>agent</code>
+            re-triggers it. Step three runs <code>agent</code> again, this
+            time the model answers in plain text,
+            <code>tools_condition</code> routes to <code>END</code>, and the
+            loop halts. The important discipline is that nodes never talk to
+            each other directly, they only write channels, and the reducer at
+            the barrier is the only place writes combine. That is what makes
+            two parallel writers to a reducer channel well-defined and two
+            parallel writers to a plain channel an error.
+          </p>
+
+          <h3>Stage 4: interrupts, if any</h3>
+          <p>
+            If a node calls <code>interrupt(payload)</code>, or the graph was
+            compiled with <code>interrupt_before=["tools"]</code>, the loop
+            stops at that boundary, writes the interrupt into the checkpoint,
+            and returns control carrying an <code>__interrupt__</code> marker
+            instead of a final answer. The thread's checkpoint now has a
+            non-empty <code>next</code>, which is precisely what "paused"
+            means. The run can sit there for milliseconds or for days. A
+            later <code>invoke</code> with <code>Command(resume=value)</code>
+            reloads that checkpoint and continues.
+          </p>
+
+          <h3>Stage 5: return</h3>
+          <p>
+            With no pending interrupt and <code>END</code> reached, the loop
+            reads the final channel values and returns them as the output
+            state. The whole trace, in one breath, input written to channels,
+            a handful of super-steps each snapshotted to the thread,
+            communication between nodes only ever through channel writes
+            merged by reducers, and a durable history you can list, inspect,
+            and replay.
+          </p>
+
+          <h2>Part V: Internals deep dives</h2>
+
+          <h3>Deep dive: StateGraph, channels, and reducers</h3>
+          <p>
+            The state schema can be a <code>TypedDict</code> (the common
+            case), a Pydantic <code>BaseModel</code> when you want node
+            outputs validated at run time, or a dataclass. Whatever the form,
+            each key becomes a channel, and the channel type is chosen by
+            whether the key is annotated with a reducer. A bare key is a
+            <code>LastValue</code> channel, it keeps only the most recent
+            write and raises if two nodes write it in the same super-step. An
+            <code>Annotated[T, reducer]</code> key becomes an accumulating
+            channel whose reducer combines each write with the running value.
+            <code>operator.add</code> concatenates lists,
+            <code>add_messages</code> appends messages and merges them by id,
+            supports a <code>RemoveMessage</code> sentinel to delete, and
+            coerces <code>(role, content)</code> tuples into proper Message
+            objects. The channel implementations live in
+            <code>langgraph/channels/</code>, and beyond the two staples there
+            are <code>Topic</code> (a pub/sub list), <code>EphemeralValue</code>
+            (visible only to the next step, not carried forward), and managed
+            values such as <code>IsLastStep</code> and
+            <code>RemainingSteps</code> in <code>langgraph/managed/</code>
+            that the runtime maintains for you.
+          </p>
+          <p>
+            Two conveniences follow. <code>MessagesState</code> is a prebuilt
+            <code>TypedDict</code> that is nothing but
+            <code>messages: Annotated[list, add_messages]</code>, so most chat
+            graphs subclass it and add their own keys. And a graph can declare
+            separate input, output, and internal schemas, so private working
+            state never leaks into the public output.
+            <mark>Because layout of memory is a typed schema and merging is a
+            reducer, the graph's state is composable in the same way a
+            well-typed data structure is, which is what lets parallel branches
+            and map-reduce have a defined meaning.</mark>
+          </p>
+
+          <h3>Deep dive: the Pregel runtime</h3>
+          <p>
+            The runtime is named after Google's Pregel graph-processing
+            system, and it inherits Pregel's bulk-synchronous model.
+            Computation is a series of super-steps separated by barriers.
+            Inside a step the active nodes run in parallel and cannot see one
+            another's writes. Between steps every write is applied and the
+            next step's nodes are selected. This is not an implementation
+            detail you can ignore, it is the semantics, and it is why a
+            fan-out of parallel branches all observe the same consistent
+            snapshot and their results land together at the barrier rather
+            than racing. A <code>PregelNode</code> is a bundle of channel
+            subscriptions (its triggers and reads), a bound function, and a
+            set of channel writes. The loop machinery (conceptually
+            <code>pregel/loop.py</code> and <code>pregel/algo.py</code>)
+            computes the next tasks, an executor runs them on a thread pool or
+            the async event loop, and the algorithm applies the writes and
+            bumps versions. The recursion limit, 25 super-steps by default,
+            caps how long a cyclic graph may run before
+            <code>GraphRecursionError</code>, which is the guardrail against
+            an agent that never decides to stop.
+          </p>
+
+          <h3>Deep dive: the checkpointer, persistence, and time travel</h3>
+          <p>
+            <code>BaseCheckpointSaver</code> (in the
+            <code>langgraph-checkpoint</code> package under
+            <code>langgraph/checkpoint/base.py</code>) defines the contract,
+            <code>put</code>, <code>put_writes</code>, <code>get_tuple</code>,
+            <code>list</code>, and their async forms. A <code>Checkpoint</code>
+            is a versioned snapshot of every channel value. A
+            <code>CheckpointTuple</code> bundles the config, the checkpoint,
+            metadata, the parent config, and any pending writes. A checkpoint
+            is addressed by <code>thread_id</code>, a
+            <code>checkpoint_ns</code> for subgraphs, and a monotonically
+            increasing <code>checkpoint_id</code>, and a thread is just the
+            linear history of one run. Implementations range from
+            <code>InMemorySaver</code> for development to
+            <code>SqliteSaver</code> and <code>AsyncSqliteSaver</code>
+            (<code>langgraph-checkpoint-sqlite</code>) and
+            <code>PostgresSaver</code> and <code>AsyncPostgresSaver</code>
+            (<code>langgraph-checkpoint-postgres</code>) for production.
+            Serialization runs through a <code>SerializerProtocol</code>,
+            default <code>JsonPlusSerializer</code>, which knows how to encode
+            LangChain messages and common Python types.
+          </p>
+          <p>
+            The <code>pending_writes</code> field is the fault-tolerance
+            trick. If a super-step has three nodes and the second raises, the
+            first node's completed writes are already stored, so on retry only
+            the failed node and the not-yet-run node execute, and no
+            successful work is repeated. Node-level retries are governed by a
+            <code>RetryPolicy</code>. On the inspection side,
+            <code>get_state(config)</code> returns a
+            <code>StateSnapshot</code> with <code>values</code>,
+            <code>next</code> (the nodes queued to run), <code>config</code>,
+            <code>metadata</code>, <code>created_at</code>,
+            <code>parent_config</code>, and <code>tasks</code>, and
+            <code>get_state_history(config)</code> yields every snapshot for
+            the thread, newest first, each carrying its own
+            <code>checkpoint_id</code> in its config.
+          </p>
+          <p>
+            Time travel falls straight out of that. Pass a past snapshot's
+            config back into <code>invoke</code> or <code>stream</code> and
+            the graph replays from that point.
+            <code>update_state(config, values, as_node=...)</code> writes new
+            values as if a named node had produced them, which forks a new
+            branch of history from the chosen checkpoint. Together they give
+            you inspect, edit, and rewind.
+            <mark>Because durable state is addressed by thread and logical
+            checkpoint id rather than by a live process, you can crash, move
+            machines, and resume, and you can branch the past to explore a
+            different continuation, which an implicit loop simply cannot
+            do.</mark>
+          </p>
+
+          <h3>Deep dive: streaming</h3>
+          <p>
+            <code>stream</code> and <code>astream</code> take a
+            <code>stream_mode</code>. The modes that matter,
+            <code>"values"</code> emits the entire state after each step,
+            <code>"updates"</code> emits just the <code>{node: update}</code>
+            delta from each node, <code>"messages"</code> emits LLM token
+            chunks as <code>(chunk, metadata)</code> tuples for
+            token-by-token UIs, <code>"custom"</code> emits whatever a node
+            chooses to push, and <code>"debug"</code> emits verbose
+            step events. Pass a list of modes and you receive
+            <code>(mode, data)</code> tuples so you can drive several
+            consumers at once.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">for</span> <span class="v3">chunk</span> <span class="k">in</span> <span class="v6">app</span>.<span class="m2">stream</span><span class="b0">(</span><span class="b1">{</span><span class="s">"messages"</span>: <span class="b2">[</span><span class="b0">(</span><span class="s">"user"</span>, <span class="s">"weather in Paris?"</span><span class="b0">)</span><span class="b2">]</span><span class="b1">}</span>,
+                        <span class="v4">config</span>, <span class="v1">stream_mode</span>=<span class="s">"updates"</span><span class="b0">)</span>:
+    <span class="m1">print</span><span class="b0">(</span><span class="v3">chunk</span><span class="b0">)</span>   <span class="c"># {'agent': {...}} then {'tools': {...}} then {'agent': {...}}</span></code></pre></div>
+          <p>
+            To surface progress from inside a node, accept a
+            <code>StreamWriter</code> parameter or call
+            <code>get_stream_writer()</code> and push events that appear under
+            <code>stream_mode="custom"</code>. For deep instrumentation
+            <code>astream_events</code> gives the fine-grained Runnable event
+            stream, <code>on_chat_model_stream</code>,
+            <code>on_chain_start</code>, and the rest, at the cost of volume.
+            The tidy part is that streaming reads the same channel state the
+            checkpointer snapshots, so what you show a user and what you
+            persist are one source of truth.
+          </p>
+
+          <h3>Deep dive: human-in-the-loop and interrupts</h3>
+          <p>
+            There are two mechanisms. The static one,
+            <code>compile(interrupt_before=[...], interrupt_after=[...])</code>,
+            pauses at fixed nodes, which is the natural way to place a review
+            gate right before a tool runs. The dynamic one,
+            <code>interrupt(payload)</code> called inside a node, pauses
+            anywhere and hands <code>payload</code> back to the caller. Both
+            require a checkpointer, because a pause is nothing more than a
+            checkpoint whose <code>next</code> is non-empty. The run returns
+            with an <code>__interrupt__</code> value carrying the payload, and
+            the thread sits durably paused.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">langgraph</span>.<span class="m2">types</span> <span class="k">import</span> <span class="m1">interrupt</span>, <span class="m1">Command</span>
+
+<span class="k">def</span> <span class="m1">review</span><span class="b0">(</span><span class="v6">state</span>: <span class="v5">State</span><span class="b0">)</span> -&gt; <span class="m1">dict</span>:
+    <span class="v6">decision</span> = <span class="m1">interrupt</span><span class="b0">(</span><span class="b1">{</span><span class="s">"proposed"</span>: <span class="v6">state</span><span class="b2">[</span><span class="s">"draft"</span><span class="b2">]</span><span class="b1">}</span><span class="b0">)</span>   <span class="c"># pauses here</span>
+    <span class="k">return</span> <span class="b0">{</span><span class="s">"approved"</span>: <span class="v6">decision</span> == <span class="s">"yes"</span><span class="b0">}</span>
+
+<span class="c"># ... run until it pauses, inspect, then resume:</span>
+<span class="v6">app</span>.<span class="m2">invoke</span><span class="b0">(</span><span class="m1">Command</span><span class="b1">(</span><span class="v0">resume</span>=<span class="s">"yes"</span><span class="b1">)</span>, <span class="v4">config</span><span class="b0">)</span></code></pre></div>
+          <p>
+            Resuming with <code>Command(resume=value)</code> reloads the
+            checkpoint and continues. On resume the interrupting node
+            re-executes from its start, but <code>interrupt()</code> returns
+            the supplied value instead of pausing again, using the stored
+            resume value so an already-answered interrupt does not fire twice.
+            The practical corollary, any side effect that sits before an
+            <code>interrupt()</code> in the same node runs a second time on
+            resume, so keep interrupts early in a node. Common patterns are
+            approve or reject a tool call, edit the proposed arguments before
+            it runs, or ask the human a clarifying question mid-run, and
+            because you can also <code>update_state</code> before resuming, a
+            reviewer can correct the agent's plan and let it proceed.
+          </p>
+
+          <h3>Deep dive: routing, Command, and the Send API</h3>
+          <p>
+            Conditional edges are the everyday router,
+            <code>add_conditional_edges(source, router, path_map)</code> where
+            <code>router(state)</code> returns the next node's name, a list of
+            names to fan out, or <code>END</code>, and the optional
+            <code>path_map</code> makes the diagram and the intent readable. A
+            node can also skip the separate edge and return a
+            <code>Command</code>, <code>Command(update={...}, goto="next")</code>
+            both updates state and routes in one move,
+            <code>Command(goto=Send(...))</code> fans out, and
+            <code>Command(graph=Command.PARENT, goto=...)</code> steps from a
+            subgraph up into its parent.
+          </p>
+          <p>
+            The <code>Send</code> API is how map-reduce works. A router
+            returns a list of <code>Send</code> objects, one per subtask, each
+            carrying its own private input, and each spawns the target node as
+            its own task in the same super-step.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">langgraph</span>.<span class="m2">types</span> <span class="k">import</span> <span class="m1">Send</span>
+
+<span class="k">def</span> <span class="m1">fan_out</span><span class="b0">(</span><span class="v6">state</span><span class="b0">)</span> -&gt; <span class="m1">list</span>:
+    <span class="c"># invoke "summarize" once per document, each with its own input</span>
+    <span class="k">return</span> <span class="b0">[</span><span class="m1">Send</span><span class="b1">(</span><span class="s">"summarize"</span>, <span class="b2">{</span><span class="s">"doc"</span>: <span class="v4">d</span><span class="b2">}</span><span class="b1">)</span> <span class="k">for</span> <span class="v4">d</span> <span class="k">in</span> <span class="v6">state</span><span class="b1">[</span><span class="s">"docs"</span><span class="b1">]</span><span class="b0">]</span>
+
+<span class="v5">builder</span>.<span class="m2">add_conditional_edges</span><span class="b0">(</span><span class="s">"split"</span>, <span class="m1">fan_out</span>, <span class="b1">[</span><span class="s">"summarize"</span><span class="b1">]</span><span class="b0">)</span></code></pre></div>
+          <p>
+            All those <code>summarize</code> tasks run in parallel and their
+            writes fan back into a reducer channel at the barrier, so you map
+            a variable-length list of subtasks over one node and gather the
+            results without touching a thread pool yourself. This is the
+            payoff of the bulk-synchronous model, fan-out and fan-in have a
+            precise meaning because the barrier defines when results combine.
+          </p>
+
+          <h3>Deep dive: prebuilt and the functional API</h3>
+          <p>
+            The <code>langgraph.prebuilt</code> package ships the shortcuts.
+            <code>create_react_agent</code> builds a ready ReAct graph, an
+            agent node plus a <code>ToolNode</code> wired by
+            <code>tools_condition</code>. <code>ToolNode</code> executes the
+            tool calls found in the last <code>AIMessage</code> and appends
+            the resulting <code>ToolMessage</code>s, with error handling.
+            <code>tools_condition</code> is the standard route-to-tools-or-end
+            branch. <code>InjectedState</code> and <code>InjectedStore</code>
+            let a tool receive the live graph state or the long-term store
+            without the model having to supply them as arguments. As noted,
+            <code>create_react_agent</code> is deprecated in favor of
+            <code>create_agent</code> in <code>langchain</code>, which is the
+            same runtime with a middleware layer, so it stays a good thing to
+            read even as the entry point moves.
+          </p>
+          <p>
+            For teams that prefer imperative code to a graph object,
+            <code>langgraph.func</code> offers the functional API.
+            <code>@task</code> marks a unit of work that is checkpointed and
+            retryable, and <code>@entrypoint(checkpointer=...)</code> marks
+            the top-level function, inside which you call tasks, receive
+            futures, and use <code>interrupt()</code> exactly as in the graph
+            API. It trades the explicit graph for plain Python control flow
+            while keeping persistence, streaming, and human-in-the-loop,
+            because under the hood it still compiles to Pregel. Separately,
+            long-term memory that outlives any single thread lives in a
+            <code>BaseStore</code> (<code>InMemoryStore</code>, or a
+            Postgres-backed store), which holds namespaced key-value memory
+            with <code>put</code>, <code>get</code>, and <code>search</code>,
+            optionally with embeddings for semantic recall. Pass
+            <code>store=...</code> to <code>compile()</code> and a node or a
+            tool can read and write user-level memory across threads.
+          </p>
+
+          <h2>Part VI: Reading the repository</h2>
+          <p>
+            LangGraph is a monorepo of packages under <code>libs/</code>,
+            <code>langgraph</code> (the core), <code>checkpoint</code> (base
+            saver interfaces plus the in-memory saver and the store),
+            <code>checkpoint-sqlite</code>, <code>checkpoint-postgres</code>,
+            <code>prebuilt</code>, <code>cli</code>, and the SDKs
+            (<code>sdk-py</code>, <code>sdk-js</code>). All paths below
+            verified on <code>main</code> in July 2026 and may drift as the
+            monorepo evolves.
+          </p>
+          <p>
+            <strong>Stage 0, orientation.</strong> Read the top-level
+            <code>README</code>, then the concept docs on the low-level graph
+            API, persistence, streaming, and human-in-the-loop, and run one
+            example against the local dev server with <code>langgraph dev</code>.
+            Questions to hold, what is a channel, what is a thread, and what
+            does <code>compile()</code> return.
+          </p>
+          <p>
+            <strong>Stage 1, the graph builder.</strong>
+            <code>libs/langgraph/langgraph/graph/</code>, the state builder
+            (<code>state.py</code>, where schema keys are lowered to channels),
+            the message helpers (<code>message.py</code>, <code>add_messages</code>
+            and <code>MessagesState</code>), and the base graph and branch
+            (<code>graph.py</code>). Questions, how does a state key become a
+            channel, and how does <code>add_conditional_edges</code> compile
+            to a branch that writes a trigger channel.
+          </p>
+          <p>
+            <strong>Stage 2, the runtime.</strong>
+            <code>libs/langgraph/langgraph/pregel/</code>, the
+            <code>Pregel</code> class and the loop, read side by side with
+            <code>langgraph/channels/</code> (<code>LastValue</code>,
+            the binary-operator aggregate, <code>Topic</code>,
+            <code>EphemeralValue</code>) and
+            <code>constants.py</code> and <code>types.py</code>
+            (<code>START</code>, <code>END</code>, <code>Send</code>,
+            <code>Command</code>, <code>interrupt</code>,
+            <code>StateSnapshot</code>). Questions, what selects the next
+            tasks, where are writes applied, and where is the checkpoint
+            written.
+          </p>
+          <p>
+            <strong>Stage 3, persistence.</strong>
+            <code>libs/checkpoint/langgraph/checkpoint/</code>,
+            <code>base.py</code> (<code>BaseCheckpointSaver</code>,
+            <code>Checkpoint</code>, <code>CheckpointTuple</code>), the
+            serializer, and the in-memory saver, then
+            <code>libs/checkpoint-sqlite</code> and
+            <code>libs/checkpoint-postgres</code> for the real backends, and
+            <code>langgraph/store/</code> for long-term memory. Questions,
+            what exactly is in a <code>Checkpoint</code>, and how do
+            <code>pending_writes</code> make resume-after-failure correct.
+          </p>
+          <p>
+            <strong>Stage 4, streaming and interrupts.</strong> The streaming
+            path in <code>langgraph/pregel/</code> and the
+            <code>langgraph/stream/</code> package, plus how
+            <code>interrupt()</code> raises, how the loop catches it and
+            writes it into the checkpoint, and how <code>Command(resume=...)</code>
+            feeds it back.
+          </p>
+          <p>
+            <strong>Stage 5, prebuilt and functional.</strong>
+            <code>libs/prebuilt</code> (<code>create_react_agent</code>,
+            <code>ToolNode</code>, <code>tools_condition</code>) and
+            <code>libs/langgraph/langgraph/func</code> (the
+            <code>@entrypoint</code> and <code>@task</code> decorators).
+          </p>
+          <p>
+            Where not to start, the LangGraph Platform server, the SDKs, and
+            the CLI are deployment surface and read best after the runtime is
+            clear, and the managed-value and cache machinery is worth meeting
+            only once the plain channel story is solid.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            None of these need a GPU, only an API key for a chat model (or a
+            local model behind an OpenAI-compatible endpoint). Log and output
+            shapes vary with the fast pace of <code>main</code>.
+          </p>
+          <p><strong>Lab 1: memory across turns.</strong> Concept, threads and checkpoints.</p>
+          <p>
+            Build the two-line chatbot from Part II with an
+            <code>InMemorySaver</code>. Invoke twice on one
+            <code>thread_id</code> and confirm the second turn remembers the
+            first. Invoke a third time on a fresh <code>thread_id</code> and
+            watch the memory reset. Then call
+            <code>app.get_state(config)</code> and read the
+            <code>StateSnapshot</code>.
+          </p>
+          <p><strong>Lab 2: hand-built ReAct versus prebuilt.</strong> Concept, the explicit loop.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="m1">print</span><span class="b0">(</span><span class="v6">app</span>.<span class="m2">get_graph</span><span class="b1">()</span>.<span class="m2">draw_mermaid</span><span class="b1">()</span><span class="b0">)</span>   <span class="c"># the agent/tools/tools_condition cycle</span>
+<span class="c"># now swap in the prebuilt and compare the drawing:</span>
+<span class="k">from</span> <span class="m1">langgraph</span>.<span class="m2">prebuilt</span> <span class="k">import</span> <span class="m1">create_react_agent</span>
+<span class="v5">agent</span> = <span class="m1">create_react_agent</span><span class="b0">(</span><span class="v6">llm</span>, <span class="b1">[</span><span class="v4">get_weather</span><span class="b1">]</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="v5">agent</span>.<span class="m2">get_graph</span><span class="b1">()</span>.<span class="m2">draw_mermaid</span><span class="b1">()</span><span class="b0">)</span></code></pre></div>
+          <p>
+            Confirm the two graphs behave identically on the same input, and
+            notice that the prebuilt is the same nodes and edges you wrote by
+            hand. This is the whole thesis in one lab, the shortcut lowers to
+            a graph you could have drawn.
+          </p>
+          <p><strong>Lab 3: time travel.</strong> Concept, checkpoints as history.</p>
+          <p>
+            Run a multi-step graph, then iterate
+            <code>app.get_state_history(config)</code> and print each
+            snapshot's <code>next</code> and <code>checkpoint_id</code>. Pick
+            an earlier snapshot's config and pass it back to
+            <code>invoke</code> to replay from there. Then call
+            <code>update_state</code> to edit one value and resume, and watch
+            the run take a different path from the fork.
+          </p>
+          <p><strong>Lab 4: a human approval gate.</strong> Concept, static interrupts.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="v6">app</span> = <span class="v5">builder</span>.<span class="m2">compile</span><span class="b0">(</span><span class="v3">checkpointer</span>=<span class="m1">InMemorySaver</span><span class="b1">()</span>,
+                      <span class="v4">interrupt_before</span>=<span class="b1">[</span><span class="s">"tools"</span><span class="b1">]</span><span class="b0">)</span>
+<span class="v6">app</span>.<span class="m2">invoke</span><span class="b0">(</span><span class="b1">{</span><span class="s">"messages"</span>: <span class="b2">[</span><span class="b0">(</span><span class="s">"user"</span>, <span class="s">"delete all files"</span><span class="b0">)</span><span class="b2">]</span><span class="b1">}</span>, <span class="v4">config</span><span class="b0">)</span>
+<span class="c"># returns with __interrupt__ before the tool runs</span>
+<span class="m1">print</span><span class="b0">(</span><span class="v6">app</span>.<span class="m2">get_state</span><span class="b1">(</span><span class="v4">config</span><span class="b1">)</span>.<span class="m2">next</span><span class="b0">)</span>      <span class="c"># ('tools',)  -- paused</span>
+<span class="v6">app</span>.<span class="m2">invoke</span><span class="b0">(</span><span class="k">None</span>, <span class="v4">config</span><span class="b0">)</span>               <span class="c"># approve and continue</span></code></pre></div>
+          <p>
+            Inspect the proposed tool call through <code>get_state</code>,
+            then either resume with <code>invoke(None, config)</code> to
+            approve, or <code>update_state</code> to edit the arguments first
+            and only then resume.
+          </p>
+          <p><strong>Lab 5: dynamic interrupt and resume.</strong> Concept, interrupt/resume.</p>
+          <p>
+            Put <code>value = interrupt({"question": "confirm?"})</code>
+            inside a node, run until it pauses, read the payload from the
+            returned <code>__interrupt__</code>, and resume with
+            <code>app.invoke(Command(resume="yes"), config)</code>. Add a
+            <code>print</code> before the <code>interrupt()</code> and observe
+            it fire twice, which teaches why side effects belong after the
+            interrupt.
+          </p>
+          <p><strong>Lab 6: streaming modes.</strong> Concept, what to show a user.</p>
+          <p>
+            Stream the ReAct graph with <code>stream_mode="updates"</code>,
+            then <code>"values"</code>, then <code>"messages"</code>, and
+            compare what each yields. Add a <code>StreamWriter</code> progress
+            event inside a node and read it back under
+            <code>stream_mode="custom"</code>.
+          </p>
+          <p><strong>Lab 7: map-reduce with Send.</strong> Concept, fan-out and fan-in.</p>
+          <p>
+            Give the state a <code>docs</code> list and a
+            <code>summaries: Annotated[list, operator.add]</code> channel.
+            Write a router that returns one <code>Send("summarize", {"doc":
+            d})</code> per document, and confirm all summaries arrive gathered
+            in <code>summaries</code> after a single super-step.
+          </p>
+
+          <h2>Part VIII: Questions and model answers</h2>
+          <p>Understanding checks. Answer aloud before reading.</p>
+          <p><strong>1. What is LangGraph in one sentence?</strong></p>
+          <p>
+            A runtime that models an agent as an explicit stateful graph,
+            nodes that read and write a typed shared state over fixed and
+            conditional edges, executed as bulk-synchronous Pregel
+            super-steps whose every boundary can be checkpointed, streamed,
+            interrupted, and resumed.
+          </p>
+          <p><strong>2. How is the graph's state actually stored, and what does a reducer do?</strong></p>
+          <p>
+            Each key of the state schema is a channel. A plain key is a
+            <code>LastValue</code> channel that keeps the most recent write, a
+            key annotated with a reducer becomes an accumulating channel. A
+            node returns a partial dict of the keys it changes, and at the
+            super-step barrier each channel's reducer merges the writes, so
+            <code>add_messages</code> appends messages while a bare key would
+            overwrite.
+          </p>
+          <p><strong>3. Why does a graph beat an implicit agent loop?</strong></p>
+          <p>
+            Because control flow becomes data. You can draw it, checkpoint
+            every step for persistence and time-travel, pause it for a human
+            and resume, stream intermediate state, fan out and nest subgraphs,
+            and recover from a mid-step failure using pending writes. A loop
+            hidden inside a class offers none of these.
+          </p>
+          <p><strong>4. What is a super-step, and why does the barrier matter?</strong></p>
+          <p>
+            A super-step is one plan-execute-update cycle. The nodes selected
+            in the plan phase run in parallel on a consistent snapshot and
+            cannot see each other's writes, and only at the barrier are all
+            writes applied through reducers and a checkpoint taken. The
+            barrier is what gives fan-out and fan-in a precise meaning and
+            makes each step a durable, resumable unit.
+          </p>
+          <p><strong>5. What is in a checkpoint, and why can a run resume on another machine?</strong></p>
+          <p>
+            A checkpoint is a versioned snapshot of every channel value plus
+            metadata, addressed by <code>thread_id</code>,
+            <code>checkpoint_ns</code>, and <code>checkpoint_id</code>.
+            Because durable state is keyed by thread and logical id rather
+            than by a live process, any machine with access to the
+            checkpointer can load the latest tuple and continue.
+          </p>
+          <p><strong>6. How does human-in-the-loop work, and what does it require?</strong></p>
+          <p>
+            A pause is a checkpoint whose <code>next</code> is non-empty.
+            Either compile with <code>interrupt_before</code> or
+            <code>interrupt_after</code>, or call <code>interrupt(payload)</code>
+            inside a node. The run returns with <code>__interrupt__</code> and
+            sits durably paused, and <code>Command(resume=value)</code>
+            continues it. Both require a checkpointer, since there is nowhere
+            to pause without one.
+          </p>
+          <p><strong>7. On resume, why can a side effect run twice?</strong></p>
+          <p>
+            The interrupting node re-executes from its start on resume, and
+            <code>interrupt()</code> returns the stored resume value instead
+            of pausing. Any code before the interrupt therefore runs a second
+            time, so side effects should sit after the interrupt or be made
+            idempotent.
+          </p>
+          <p><strong>8. What are the main streaming modes?</strong></p>
+          <p>
+            <code>"values"</code> for the full state after each step,
+            <code>"updates"</code> for per-node deltas, <code>"messages"</code>
+            for LLM token chunks with metadata, <code>"custom"</code> for data
+            a node pushes through a <code>StreamWriter</code>, and
+            <code>"debug"</code> for verbose events. A list of modes yields
+            <code>(mode, data)</code> tuples.
+          </p>
+          <p><strong>9. What does the Send API give you that a conditional edge does not?</strong></p>
+          <p>
+            A conditional edge routes to one of a fixed set of nodes. A router
+            returning a list of <code>Send</code> objects invokes the same
+            node many times in one super-step, each with its own private
+            input, which is map-reduce. The results fan back into a reducer
+            channel at the barrier.
+          </p>
+          <p><strong>10. How do LangGraph and LangChain relate now?</strong></p>
+          <p>
+            LangChain is the component library and LCEL for acyclic pipelines,
+            LangGraph is the stateful, cyclic orchestration runtime. In the
+            current langchain line the recommended agent constructor
+            <code>create_agent</code> is built on LangGraph, so LangGraph
+            became the runtime underneath LangChain's agents rather than a
+            competitor to them.
+          </p>
+          <p><strong>11. When is LangGraph the wrong tool?</strong></p>
+          <p>
+            For a single deterministic prompt-to-answer call, where an LCEL
+            chain or a raw model call is cleaner, and for a lone linear
+            tool-call loop with no persistence, no human step, and no
+            streaming, where a plain <code>while</code> loop is less
+            machinery. LangGraph earns its weight only when you need durable,
+            inspectable, supervised, or multi-actor control.
+          </p>
+          <p><strong>12. A cyclic agent runs forever. What stops it, and what should you check?</strong></p>
+          <p>
+            The recursion limit, 25 super-steps by default, raises
+            <code>GraphRecursionError</code>. The real fix is a terminating
+            branch, a <code>tools_condition</code>-style router that routes to
+            <code>END</code> once the model stops asking for tools, rather
+            than simply raising the limit.
+          </p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Make control flow data, not code.</strong> An agent's loop
+            is a graph you build, draw, and edit, not a private
+            <code>while</code>. Once the flow is a value, you can inspect it,
+            version it, and change it at run time, which is the same move as
+            representing a workflow as a DAG in a scheduler or a state machine
+            as a table rather than nested conditionals.
+          </p>
+          <p>
+            <strong>Represent shared memory as a typed schema with reducers.</strong>
+            Turning state into channels with merge rules makes concurrency,
+            accumulation, and map-reduce well-defined instead of ad hoc. This
+            is the same win as
+            <a href="https://doi.org/10.1007/978-3-642-24550-3_29" target="_blank" rel="noreferrer">CRDTs</a>
+            in collaborative editing and reducers in
+            a front-end store, put the merge rule next to the data and
+            composition becomes checkable.
+          </p>
+          <p>
+            <strong>One barrier, one checkpoint.</strong> Because every
+            super-step ends in a durable snapshot, persistence,
+            resume-after-crash, and time-travel are one mechanism rather than
+            three subsystems. Systems that make their unit of progress durable
+            by construction, write-ahead logs and event-sourced aggregates
+            among them, get recovery almost for free.
+          </p>
+          <p>
+            <strong>Address state by thread and logical id, not by process.</strong>
+            A checkpoint keyed by thread and checkpoint id can be loaded
+            anywhere, so a run survives a crash or a migration and can even be
+            forked to explore an alternate past. Never let the running process
+            become the only home of important state.
+          </p>
+          <p>
+            <strong>Unify persistence, streaming, and human-in-the-loop.</strong>
+            All three read the same channel state at the same step boundaries,
+            so they are three views of one truth rather than three features
+            that can disagree. Designing one mechanism to serve several needs
+            beats three mechanisms that must be kept consistent.
+          </p>
+          <p>
+            <strong>Prebuilt is a shortcut, not a ceiling.</strong>
+            <code>create_react_agent</code> lowers to a graph you could have
+            written by hand, so the easy path and the fully custom path are
+            the same substrate. Good frameworks make the convenient thing a
+            thin layer over the general thing, so you never hit a wall when
+            you outgrow the default.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            The one-sentence summary. <mark>LangGraph compiles a typed
+            state schema into channels and a set of nodes into a Pregel graph,
+            runs it one bulk-synchronous super-step at a time, merges each
+            step's writes through reducers, and checkpoints the result to a
+            thread, and out of that single mechanism fall streaming,
+            time-travel, human-in-the-loop, and fault tolerance.</mark>
+          </p>
+          <pre class="flow">StateGraph(State) -&gt; add_node / add_edge / add_conditional_edges
+  -&gt; compile(checkpointer, interrupt_before) -&gt; a Pregel Runnable
+  -&gt; invoke/stream(config={thread_id})
+  -&gt; super-step: plan -&gt; execute (parallel) -&gt; update (reducers) -&gt; checkpoint
+  -&gt; interrupt() pauses, Command(resume=...) continues
+  -&gt; END: read channels, return state</pre>
+          <p>The chain mapped to source:</p>
+          <pre class="flow">builder           libs/langgraph/langgraph/graph/ (state.py, message.py, graph.py)
+channels          libs/langgraph/langgraph/channels/ (LastValue, aggregate, Topic)
+runtime           libs/langgraph/langgraph/pregel/ (the Pregel loop, super-steps)
+types/constants   langgraph/types.py, constants.py (Send, Command, interrupt, START/END)
+checkpoint        libs/checkpoint/langgraph/checkpoint/ (BaseCheckpointSaver, Checkpoint)
+store             libs/checkpoint/langgraph/store/ (BaseStore, long-term memory)
+prebuilt          libs/prebuilt (create_react_agent, ToolNode, tools_condition)
+functional        libs/langgraph/langgraph/func (@entrypoint, @task)</pre>
+          <p>Memorize these blocks:</p>
+          <ul>
+            <li><strong>State is channels:</strong> each schema key is a channel, plain keys keep the last write, <code>Annotated[T, reducer]</code> keys accumulate, nodes return partial updates that merge at the barrier.</li>
+            <li><strong>Execution is super-steps:</strong> plan the triggered nodes, execute them in parallel on a snapshot, update all channels through reducers at the barrier, checkpoint, advance. Recursion limit 25 by default.</li>
+            <li><strong>A checkpoint is a thread snapshot:</strong> versioned channel values keyed by <code>thread_id</code> and <code>checkpoint_id</code>, with <code>pending_writes</code> for resume-after-failure, which is why runs resume anywhere and history can be replayed and forked.</li>
+            <li><strong>Interrupts need a checkpointer:</strong> static <code>interrupt_before/after</code> or dynamic <code>interrupt()</code>, resume with <code>Command(resume=...)</code>, and side effects before an interrupt run twice.</li>
+            <li><strong>Prebuilt lowers to a graph:</strong> <code>create_react_agent</code> is an agent node plus a <code>ToolNode</code> wired by <code>tools_condition</code>, now transitional toward langchain's <code>create_agent</code>.</li>
+          </ul>
+
+          <h2>Part XI: Papers and further reading</h2>
+          <p>
+            The ideas in this walkthrough trace back to a short list of papers,
+            and each one rewards a direct read. Where this site covers the same
+            ground in depth, the companion link points there.
+          </p>
+          <ol class="refs">
+            <li>Yao et al., <a href="https://arxiv.org/abs/2210.03629" target="_blank" rel="noreferrer">ReAct, Synergizing Reasoning and Acting in Language Models</a>, 2022. The reason-act-observe cycle that the agent-tools graph of Part II draws out as explicit nodes and edges.</li>
+            <li>Malewicz et al., <a href="https://doi.org/10.1145/1807167.1807184" target="_blank" rel="noreferrer">Pregel, A System for Large-Scale Graph Processing</a>, SIGMOD 2010. The graph-processing system the runtime is named after, vertices computing in super-steps and communicating only between them.</li>
+            <li>Valiant, <a href="https://doi.org/10.1145/79173.79181" target="_blank" rel="noreferrer">A Bridging Model for Parallel Computation</a>, 1990. The bulk-synchronous parallel model behind the plan-execute-update loop and its barrier.</li>
+            <li>Schick et al., <a href="https://arxiv.org/abs/2302.04761" target="_blank" rel="noreferrer">Toolformer, Language Models Can Teach Themselves to Use Tools</a>, 2023. An early demonstration that a model can decide when to call a tool, the ability <code>tools_condition</code> routes on.</li>
+            <li>Shinn et al., <a href="https://arxiv.org/abs/2303.11366" target="_blank" rel="noreferrer">Reflexion, Language Agents with Verbal Reinforcement Learning</a>, 2023. Agents that critique their own attempts across retries, a pattern that leans on exactly the durable per-thread state the checkpointer provides. The <a href="/classes/self-improving-agents">self-improving agents class</a> on this site surveys this line.</li>
+            <li>Wang et al., <a href="https://arxiv.org/abs/2305.04091" target="_blank" rel="noreferrer">Plan-and-Solve Prompting, Improving Zero-Shot Chain-of-Thought Reasoning by Large Language Models</a>, 2023. A root of the plan-then-execute agent shape that planner and executor graphs implement, and the <a href="/oss/gpt-researcher">GPT Researcher walkthrough</a> reads a working planner-executor agent end to end.</li>
+            <li>Wu et al., <a href="https://arxiv.org/abs/2308.08155" target="_blank" rel="noreferrer">AutoGen, Enabling Next-Gen LLM Applications via Multi-Agent Conversation</a>, 2023. The conversation-centered alternative weighed in Part III, covered in the <a href="/oss/autogen">AutoGen walkthrough</a>.</li>
+            <li>Shapiro et al., <a href="https://doi.org/10.1007/978-3-642-24550-3_29" target="_blank" rel="noreferrer">Conflict-Free Replicated Data Types</a>, 2011. The formal version of putting the merge rule next to the data, which is the design lesson the reducer channels echo.</li>
+          </ol>
+
+          <h2>Part XII: Final takeaway</h2>
+          <p>
+            If the model-calling and tool-calling pieces underneath a node are
+            the gap, the <a href="/classes/applied-generative-ai">applied
+            generative AI</a> and
+            <a href="/classes/self-improving-agents">self-improving agents</a>
+            classes build them up, and the serving layer a production node
+            talks to is the subject of the <a href="/oss/vllm">vLLM</a> and
+            <a href="/oss/sglang">SGLang</a> chapters. Then come back and read
+            one compiled graph again, watch a single <code>invoke</code> take
+            a few super-steps, checkpoint each one, and pause for a human, and
+            the agent will stop feeling like a mysterious loop and start
+            reading like the state machine it always was.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> LangGraph's bet is that an agent is
+            better expressed as an explicit graph over a typed state than as a
+            hidden loop. Make the control flow data, make the memory a schema
+            of channels with reducers, and run it as bulk-synchronous
+            super-steps that checkpoint after every step, and persistence,
+            streaming, time-travel, and human-in-the-loop stop being separate
+            features and become the same mechanism, which is exactly the
+            control an implicit agent loop can never give you.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/code-copy.js"></script>
+      <script defer src="/theme.js"></script>
+  </body>
+</html>

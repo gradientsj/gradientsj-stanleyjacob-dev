@@ -1,0 +1,1156 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ollama walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A full chapter on ollama/ollama: the Go server that made running LLMs locally trivial. A practical quickstart, the complete life of one ollama run request from the cmd CLI through server/routes, the scheduler, and the llm runner subprocess into llama.cpp, deep dives on the Modelfile format, content-addressable model storage, pull mechanics, memory-aware loading and keep-alive, and the OpenAI-compatible REST API and embeddings, a staged reading plan, labs, and understanding checks." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%232B2621'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+      <script>(function(){try{var t=localStorage.getItem("theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>Ollama</h1>
+        <p class="lead">
+          <a href="https://github.com/ollama/ollama" target="_blank" rel="noreferrer">Ollama</a>
+          is the tool that made running large language models on your own
+          machine a single command. Underneath the friendly
+          <code>ollama run llama3.2</code> is a small Go server that wraps a
+          <a href="/oss/llama-cpp">llama.cpp</a> and GGML inference backend,
+          packages models the way Docker packages images, pulls them from a
+          content-addressable registry, and exposes both a native REST API
+          and an OpenAI-compatible one on <code>localhost:11434</code>. This
+          chapter is three things at once. A practical quickstart that gets
+          you from install to a running model and a Python client, a
+          systems-internals walkthrough that follows one
+          <code>ollama run</code> request from the <code>cmd</code> CLI down
+          through <code>server/routes</code>, the scheduler, and the runner
+          subprocess into the backend and back up as streamed tokens, and a
+          staged guide to reading the repository. It ends with hands-on labs,
+          understanding checks with model answers, and a compact framework
+          for keeping the whole system in your head.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">ollama run llama3.2 "..."      cmd/cmd.go        cobra CLI, one binary
+      |
+      v
+api client  --HTTP--&gt;  server   api/client.go talks to 127.0.0.1:11434
+      |
+      v
+server/routes.go                gin router: /api/chat /api/generate /api/embed /v1/*
+      |
+      v
+Scheduler   server/sched.go     is this model loaded? estimate VRAM, evict, keep-alive
+      |
+      v
+LlamaServer  llm/server.go      spawn a subprocess:  ollama runner --model ...
+      |
+      v
+runner subprocess               loads the GGUF, serves /completion on a private port
+      |  cgo
+      v
+llama.cpp / GGML  (llama/)      tokenize -&gt; decode loop -&gt; sample -&gt; detokenize
+      |
+      v
+tokens stream back up           runner -&gt; server -&gt; api client -&gt; your terminal</pre>
+          <p>
+            The one-sentence identity: <mark>Ollama is a small, opinionated
+            Go server that turns a model name into a running local LLM, by
+            packaging models like container images, pulling them from a
+            content-addressable registry, and supervising a llama.cpp/GGML
+            runner subprocess through a memory-aware scheduler behind a plain
+            REST API.</mark> Everything friendly about Ollama is a thin layer
+            over that idea. You never see a Python environment, a weights
+            file path, a GPU-offload flag, or a tokenizer. You type a name,
+            and a daemon downloads the right artifacts, works out how much of
+            the model fits in your VRAM, launches the engine, and streams
+            tokens back.
+          </p>
+          <p>
+            Two load-bearing ideas carry the whole design. First,
+            <strong>models are packaged and distributed like Docker
+            images.</strong> A <a href="https://github.com/ollama/ollama/blob/main/docs/modelfile.mdx" target="_blank" rel="noreferrer"><code>Modelfile</code></a> is compiled into a set
+            of layers, each a content-addressable blob keyed by its SHA-256
+            digest, gathered under a manifest, and served over the standard
+            <a href="https://github.com/opencontainers/distribution-spec" target="_blank" rel="noreferrer">OCI/Docker registry protocol</a>. Pulling <code>llama3.2</code> is
+            pulling a manifest and its blobs, and two models that share a base
+            share that base's bytes on disk. Second, <strong>inference runs
+            in a supervised subprocess, not in the server process.</strong>
+            The server never links the model into its own address space.
+            Instead a scheduler decides when to load a model, estimates how
+            many layers fit on each GPU, spawns a separate
+            <code>ollama runner</code> process that owns the weights, proxies
+            completion requests to it, and unloads it after an idle timeout.
+            That is the keep-alive mechanism, and it is why the second
+            <code>ollama run</code> of the day is instant and the first one
+            after lunch pauses to reload.
+          </p>
+          <p>
+            Keep those two ideas in view and the repository stops being a
+            maze. The <code>parser</code>, <code>server/images.go</code>, and
+            <code>server/download.go</code> exist to serve the packaging idea.
+            The <code>server/sched.go</code>, <code>llm/</code>, and runner
+            packages exist to serve the subprocess idea. The
+            <code>api</code>, <code>server/routes.go</code>, and
+            <code>openai</code> packages are the front door over both.
+            Everything here is described against the project as it stands in
+            2026. Ollama moves fast and has been migrating from a pure
+            llama.cpp backend toward its own Go-native inference engine, so
+            where an exact path is likely to have shifted I name the
+            component by its role and say so.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <p>
+            Ollama ships as a single self-contained binary for macOS, Linux,
+            and Windows, with the GPU backends bundled. The install script is
+            the usual one-liner on Linux, and there are native app installers
+            for macOS and Windows.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="c"># linux</span>
+<span class="m1">curl</span> <span class="s">-fsSL</span> <span class="s">https://ollama.com/install.sh</span> | <span class="m1">sh</span>
+
+<span class="c"># then, in one command, pull and chat with a small model</span>
+<span class="m1">ollama</span> <span class="s">run</span> <span class="s">llama3.2</span>
+
+<span class="c"># non-interactive: prompt on the command line, answer to stdout</span>
+<span class="m1">ollama</span> <span class="s">run</span> <span class="s">llama3.2</span> <span class="s">"explain a bloom filter in two sentences"</span></code></pre></div>
+          <p>
+            The first <code>run</code> of a model you do not have pulls it
+            first, then drops you into an interactive REPL. Under the hood
+            <code>ollama run</code> needs a server. On the desktop apps the
+            server is already running as a background service. From a raw
+            binary you start it yourself, and it listens on
+            <code>127.0.0.1:11434</code> by default.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="c"># start the daemon (the desktop apps do this for you)</span>
+<span class="m1">ollama</span> <span class="s">serve</span>
+
+<span class="c"># in another shell, the everyday commands</span>
+<span class="m1">ollama</span> <span class="s">pull</span> <span class="s">nomic-embed-text</span>     <span class="c"># download a model without running it</span>
+<span class="m1">ollama</span> <span class="s">list</span>                      <span class="c"># what is on disk</span>
+<span class="m1">ollama</span> <span class="s">ps</span>                        <span class="c"># what is loaded in memory right now</span>
+<span class="m1">ollama</span> <span class="s">show</span> <span class="s">llama3.2</span>             <span class="c"># the Modelfile, params, template, and license</span>
+<span class="m1">ollama</span> <span class="s">rm</span>  <span class="s">llama3.2</span>              <span class="c"># delete a model from disk</span>
+<span class="m1">ollama</span> <span class="s">cp</span>  <span class="s">llama3.2</span> <span class="s">my-llama</span>     <span class="c"># copy under a new name</span></code></pre></div>
+          <p>
+            The daemon is the whole product. Every CLI verb above is a thin
+            wrapper that makes an HTTP call to it. Once it is running you can
+            drive it directly, and this is where Ollama earns its place in an
+            application. The native chat endpoint streams newline-delimited
+            JSON objects.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">curl</span> <span class="s">http://localhost:11434/api/chat</span> <span class="s">-d</span> <span class="s">'{</span>
+<span class="s">  "model": "llama3.2",</span>
+<span class="s">  "messages": [</span>
+<span class="s">    { "role": "user", "content": "name three sort algorithms" }</span>
+<span class="s">  ],</span>
+<span class="s">  "stream": true</span>
+<span class="s">}'</span></code></pre></div>
+          <p>
+            The genuinely useful trick is that the same daemon speaks the
+            OpenAI wire format under <code>/v1</code>. Any code written for
+            the OpenAI SDK runs against a local model by changing the base URL
+            and passing any non-empty API key.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">openai</span> <span class="k">import</span> <span class="m1">OpenAI</span>
+
+<span class="c"># point the standard client at the local Ollama server</span>
+<span class="v4">client</span> = <span class="m1">OpenAI</span><span class="b0">(</span><span class="v3">base_url</span>=<span class="s">"http://localhost:11434/v1"</span>, <span class="v6">api_key</span>=<span class="s">"ollama"</span><span class="b0">)</span>
+
+<span class="v0">resp</span> = <span class="v4">client</span>.<span class="m2">chat</span>.<span class="m2">completions</span>.<span class="m2">create</span><span class="b0">(</span>
+    <span class="v0">model</span>=<span class="s">"llama3.2"</span>,
+    <span class="v1">messages</span>=<span class="b1">[</span><span class="b2">{</span><span class="s">"role"</span>: <span class="s">"user"</span>, <span class="s">"content"</span>: <span class="s">"one line: what is keep-alive?"</span><span class="b2">}</span><span class="b1">]</span>,
+<span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="v0">resp</span>.<span class="m2">choices</span><span class="b1">[</span><span class="n">0</span><span class="b1">]</span>.<span class="m2">message</span>.<span class="m2">content</span><span class="b0">)</span></code></pre></div>
+          <p>
+            There is also a first-party Python and JavaScript client that
+            speaks the native API, which exposes things the OpenAI shape does
+            not, such as raw prompts, per-request model options, and the
+            <code>keep_alive</code> control.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">ollama</span>
+
+<span class="v0">resp</span> = <span class="m1">ollama</span>.<span class="m2">chat</span><span class="b0">(</span>
+    <span class="v0">model</span>=<span class="s">"llama3.2"</span>,
+    <span class="v1">messages</span>=<span class="b1">[</span><span class="b2">{</span><span class="s">"role"</span>: <span class="s">"user"</span>, <span class="s">"content"</span>: <span class="s">"hello"</span><span class="b2">}</span><span class="b1">]</span>,
+    <span class="v6">options</span>=<span class="b1">{</span><span class="s">"temperature"</span>: <span class="n">0.2</span>, <span class="s">"num_ctx"</span>: <span class="n">8192</span><span class="b1">}</span>,
+    <span class="v0">keep_alive</span>=<span class="s">"30m"</span>,          <span class="c"># keep the model resident for half an hour</span>
+<span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="v0">resp</span><span class="b1">[</span><span class="s">"message"</span><span class="b1">][</span><span class="s">"content"</span><span class="b1">]</span><span class="b0">)</span></code></pre></div>
+          <p>
+            Embeddings are a first-class endpoint, which is what makes Ollama
+            a reasonable local backend for retrieval and semantic search. The
+            newer <code>/api/embed</code> takes a single string or a batch and
+            returns a list of vectors.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">curl</span> <span class="s">http://localhost:11434/api/embed</span> <span class="s">-d</span> <span class="s">'{</span>
+<span class="s">  "model": "nomic-embed-text",</span>
+<span class="s">  "input": ["the quick brown fox", "lorem ipsum dolor"]</span>
+<span class="s">}'</span>
+<span class="c"># -&gt; { "embeddings": [[0.01, -0.02, ...], [...]], "model": "nomic-embed-text", ... }</span></code></pre></div>
+          <p>
+            To make a model your own, write a <code>Modelfile</code>. It is
+            deliberately Dockerfile-shaped. <code>FROM</code> names a base,
+            <code>PARAMETER</code> sets default runtime options,
+            <code>SYSTEM</code> bakes in a system prompt, and
+            <code>TEMPLATE</code> defines how messages are rendered into the
+            prompt using Go template syntax.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="c"># Modelfile</span>
+<span class="m1">FROM</span> <span class="s">llama3.2</span>
+
+<span class="m1">PARAMETER</span> <span class="s">temperature</span> <span class="s">0.2</span>
+<span class="m1">PARAMETER</span> <span class="s">num_ctx</span> <span class="s">8192</span>
+<span class="m1">PARAMETER</span> <span class="s">stop</span> <span class="s">"&lt;|eot_id|&gt;"</span>
+
+<span class="m1">SYSTEM</span> <span class="s">"""</span>
+<span class="s">You are a terse assistant. Answer in a single sentence.</span>
+<span class="s">"""</span></code></pre></div>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">ollama</span> <span class="s">create</span> <span class="s">terse-llama</span> <span class="s">-f</span> <span class="s">Modelfile</span>      <span class="c"># compiles the Modelfile into layers</span>
+<span class="m1">ollama</span> <span class="s">run</span>    <span class="s">terse-llama</span> <span class="s">"what is a raft quorum?"</span></code></pre></div>
+          <p>
+            Now the mistakes newcomers make. First, expecting the
+            <code>run</code> command and the <code>serve</code> daemon to be
+            separate programs. They are the same binary, and every command
+            needs the daemon reachable at <code>OLLAMA_HOST</code>. Second,
+            over-reading the model tag. <code>llama3.2</code> is
+            <code>llama3.2:latest</code>, which is a specific quantization the
+            registry chose for you, usually a 4-bit one. If you want a
+            particular size or precision, name the tag, for example
+            <code>llama3.1:8b-instruct-q8_0</code>. Third, assuming
+            <code>num_ctx</code> is free. The context length you request sizes
+            the KV cache, which competes with the weights for VRAM, so a large
+            context can push layers off the GPU and onto the CPU and quietly
+            halve your throughput. Fourth, <mark>forgetting that the model is
+            resident. Ollama keeps a model loaded for five minutes after the
+            last request by default, so it holds VRAM long after your script
+            exits, which surprises everyone the first time
+            <code>ollama ps</code> shows a model still parked in memory.</mark>
+            That behavior is a feature, and the next parts explain exactly how
+            it works.
+          </p>
+
+          <h2>Part III: When it is the right tool</h2>
+          <p>
+            Ollama is the right tool when you want a local model running with
+            the least possible ceremony. A developer prototyping against an
+            LLM without an API key, a desktop or CLI app that wants to embed a
+            model without asking users to manage weights, a privacy-sensitive
+            workflow that must keep text on the machine, and anyone who wants
+            an OpenAI-shaped endpoint they fully control. Its whole reason to
+            exist is that it hides the parts of local inference that are
+            genuinely annoying, namely finding weights, converting and
+            quantizing them, choosing GPU offload, and wiring up a server.
+          </p>
+          <p>
+            The honest cases for alternatives start with the engine Ollama
+            sits on. <a href="/oss/llama-cpp">llama.cpp</a> itself, with
+            <code>llama-server</code> and <code>llama-cli</code>, gives you
+            every knob directly and the newest backend features first, at the
+            cost of managing GGUF files and flags by hand. Reach for it when
+            you need control Ollama abstracts away. For serving many
+            concurrent users at high throughput on a GPU box,
+            <a href="/oss/vllm">vLLM</a>, <a href="/oss/sglang">SGLang</a>,
+            and <a href="/oss/tensorrt-llm">TensorRT-LLM</a> are built for
+            that regime with <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noreferrer">PagedAttention</a> and continuous batching, and they
+            outclass Ollama on aggregate tokens per second under load. Ollama
+            is tuned for the single-user or few-user local case, not for
+            saturating an H100. Among the local-first tools, LM Studio offers
+            a polished GUI over a similar llama.cpp core, and Jan and GPT4All
+            occupy the same desktop niche. Ollama's distinguishing bet is the
+            registry and Modelfile packaging model plus a clean API, which is
+            why so many local apps target its endpoint specifically.
+          </p>
+          <p>
+            The architecture-shaped warning is about memory and the CPU
+            cliff. Local inference is bound by memory bandwidth, and the
+            single biggest performance decision is how many transformer layers
+            live on the GPU versus the CPU. When a model plus its KV cache
+            fits in VRAM, generation runs at the GPU's memory bandwidth. When
+            it does not, the layers that spill to system RAM run at an order
+            of magnitude less bandwidth, and a run that was fast becomes a
+            crawl with no error at all.
+          </p>
+          <pre class="flow">fits in VRAM:     all N layers on GPU     -&gt;  fast, GPU memory bandwidth
+partial offload:  K of N on GPU, N-K CPU -&gt;  each token waits on the CPU layers
+                  the model still "works", just many times slower
+
+lever:  smaller quant (q4 vs q8), smaller num_ctx, or a smaller model
+        all three free up VRAM so more layers stay on the GPU</pre>
+          <p>
+            Ollama estimates the split for you and prints it, but it cannot
+            invent VRAM. The three levers that keep layers on the GPU are a
+            smaller quantization, a smaller context window, and a smaller
+            model, and knowing that turns a mysteriously slow local model into
+            a solvable problem. This is the local mirror of the interconnect
+            warning in the <a href="/oss/torchtitan">torchtitan chapter</a>,
+            where the wrong mapping of work to hardware is slow rather than
+            wrong.
+          </p>
+
+          <h2>Part IV: The full life of one request</h2>
+          <p>
+            The specimen: <code>ollama run llama3.2 "name three sort
+            algorithms"</code> on a machine where the model is already pulled
+            and the daemon is running. Most of the machinery below is the same
+            whether the caller is the CLI, a <code>curl</code>, or the OpenAI
+            client, because they all converge on the same handler.
+          </p>
+
+          <h3>Stage 1: the cmd CLI</h3>
+          <p>
+            The binary's <code>main</code> hands off to the <code>cmd</code>
+            package, which is a <a href="https://github.com/spf13/cobra"
+            target="_blank" rel="noreferrer">cobra</a> command tree. The
+            <code>run</code> command in <code>cmd/cmd.go</code> builds an
+            <code>api.Client</code> from <code>OLLAMA_HOST</code> and does
+            three things in order. It checks that the model exists locally by
+            calling <code>ShowHandler</code>, and if it does not, it streams a
+            pull first. It sends a load request, which is a generate or chat
+            call with an empty prompt whose only job is to make the scheduler
+            resident the model. Then it enters the interactive loop, or, given
+            a prompt argument, sends exactly one chat request and prints the
+            streamed reply. Everything the CLI does is an HTTP call. There is
+            no in-process inference in the <code>run</code> command at all,
+            which is the first sign that the daemon is the real program.
+          </p>
+
+          <h3>Stage 2: the api client and the wire</h3>
+          <p>
+            <code>api/client.go</code> is a small typed HTTP client, and
+            <code>api/types.go</code> is the shared vocabulary of the whole
+            system: <code>GenerateRequest</code>, <code>ChatRequest</code>,
+            <code>Message</code>, <code>Options</code>,
+            <code>EmbedRequest</code>, and their response types. The client
+            POSTs the <code>ChatRequest</code> as JSON to
+            <code>/api/chat</code> and, because <code>stream</code> defaults
+            to true, reads the response body as a sequence of newline
+            delimited JSON objects, invoking a callback for each. This request
+            and response vocabulary is worth internalizing early, because the
+            CLI, the Go client, the Python and JS libraries, and the OpenAI
+            shim all ultimately construct these same structs.
+          </p>
+
+          <h3>Stage 3: server/routes.go dispatches</h3>
+          <p>
+            The daemon's HTTP surface is built in
+            <code>server/routes.go</code>, where a method on the
+            <code>Server</code> constructs a gin router and registers every
+            route. The native API lives under <code>/api</code> with handlers
+            such as <code>ChatHandler</code>, <code>GenerateHandler</code>,
+            <code>EmbedHandler</code>, <code>PullHandler</code>,
+            <code>CreateHandler</code>, <code>ListHandler</code>,
+            <code>ShowHandler</code>, <code>PsHandler</code>, and
+            <code>DeleteHandler</code>. The OpenAI-compatible routes live
+            under <code>/v1</code> and pass through translation middleware
+            from the <code>openai</code> package before reaching the same
+            handlers. Our request lands in <code>ChatHandler</code>, which
+            validates the body, resolves the model name to a local manifest,
+            and assembles the model's baked-in <code>SYSTEM</code>,
+            <code>TEMPLATE</code>, and default <code>PARAMETER</code> values
+            with the request's own messages and options. Then, crucially, it
+            does not run the model. It asks the scheduler for a runner.
+          </p>
+
+          <h3>Stage 4: the scheduler decides</h3>
+          <p>
+            <code>server/sched.go</code> is the heart of Ollama's runtime. The
+            handler calls into the scheduler with the model, the merged
+            options (context length matters here because it sizes memory), and
+            the keep-alive duration, and receives back a reference to a
+            running runner over a channel. Inside, the scheduler asks one
+            question. Is a runner for this exact model and configuration
+            already loaded? If yes, it returns the existing reference and
+            increments a refcount. If no, it must load one, and loading is
+            where the memory-aware machinery runs, described in the deep dive
+            below. It estimates VRAM, decides GPU-layer offload, evicts
+            another model if there is not enough room and policy allows, then
+            spawns the runner and waits for it to report healthy. The handler
+            blocks on that channel, so from the caller's point of view a chat
+            request against a cold model simply takes a few seconds longer
+            while the daemon quietly loads it.
+          </p>
+
+          <h3>Stage 5: the runner subprocess and the backend</h3>
+          <p>
+            The loaded runner is a separate operating-system process. The
+            <code>llm</code> package, in what is effectively
+            <code>llm/server.go</code>, builds a command line that re-invokes
+            the same <code>ollama</code> binary as a hidden
+            <code>runner</code> subcommand, pointed at the model's
+            <a href="https://github.com/ggml-org/ggml/blob/master/docs/gguf.md" target="_blank" rel="noreferrer">GGUF</a> blob,
+            told how many layers to place on the GPU, the context size, the
+            parallelism, and the port to listen on. That subprocess loads the
+            weights through cgo bindings to llama.cpp and GGML and serves a
+            small private HTTP API, with a <code>/health</code> endpoint the
+            scheduler polls until the model is ready and a
+            <code>/completion</code> endpoint for generation. The parent
+            server proxies the actual prompt to that private port. This
+            isolation is deliberate. A crash in native inference code takes
+            down a child process rather than the daemon, the weights never sit
+            in the server's heap, and multiple models are just multiple child
+            processes.
+          </p>
+
+          <h3>Stage 6: tokenize, decode, sample, stream</h3>
+          <p>
+            Inside the runner the request becomes the classic autoregressive
+            loop. The prompt is tokenized, the prefill pass populates the KV
+            cache, and then each step runs a forward pass over the resident
+            layers, samples the next token under the temperature, top-k,
+            top-p, and repeat-penalty settings carried in the options, appends
+            it to the KV cache, and detokenizes the piece back into text. Each
+            piece is written to the runner's HTTP response as it is produced.
+            If a JSON schema or <code>format</code> was requested, a grammar
+            constrains sampling so the output is guaranteed to parse. The loop
+            stops on an end-of-sequence token, a configured stop string, or
+            the predicted-token budget.
+          </p>
+
+          <h3>Stage 7: back up the stack, then keep-alive</h3>
+          <p>
+            Each generated piece travels back up the same path in reverse. The
+            runner streams it to the server, <code>ChatHandler</code> wraps it
+            in a <code>ChatResponse</code> object and writes it to the client
+            as one line of JSON, the api client's callback fires, and the CLI
+            prints it. When generation ends, the final response object carries
+            <code>done: true</code> along with timing and token-count metrics.
+            Now the important part. The handler releases its reference to the
+            runner, which drops the refcount to zero. The scheduler does not
+            unload immediately. It arms an expiry timer for the keep-alive
+            duration, five minutes by default. If another request arrives
+            first, the timer is cancelled and the model stays hot. If the
+            timer fires, the scheduler kills the runner subprocess and its
+            VRAM is freed. That closes the loop of one request. A name in,
+            weights loaded once and reused, tokens streamed out, and a model
+            left warm for the next call.
+          </p>
+
+          <h2>Part V: Internals deep dives</h2>
+
+          <h3>Deep dive: the Modelfile and content-addressable storage</h3>
+          <p>
+            A model in Ollama is not a file. It is a manifest that references
+            a set of layers, exactly like a container image, and the
+            <code>Modelfile</code> is its build recipe. The
+            <code>parser</code> package reads a Modelfile into a list of
+            commands, and <code>CreateModel</code> in
+            <code>server/images.go</code> turns those commands into layers.
+            Each instruction becomes its own blob with its own media type.
+          </p>
+          <table>
+            <tr><th>Instruction</th><th>Becomes a layer of type</th><th>Holds</th></tr>
+            <tr><td>FROM</td><td>image.model (plus projector for vision)</td><td>the GGUF weights blob</td></tr>
+            <tr><td>TEMPLATE</td><td>image.template</td><td>the Go prompt template</td></tr>
+            <tr><td>SYSTEM</td><td>image.system</td><td>the system prompt text</td></tr>
+            <tr><td>PARAMETER</td><td>image.params</td><td>default options as JSON</td></tr>
+            <tr><td>ADAPTER</td><td>image.adapter</td><td>a <a href="https://arxiv.org/abs/2106.09685" target="_blank" rel="noreferrer">LoRA</a> adapter</td></tr>
+            <tr><td>LICENSE</td><td>image.license</td><td>license text</td></tr>
+          </table>
+          <p>
+            Every blob is named by the SHA-256 digest of its own bytes and
+            stored under the models directory as
+            <code>blobs/sha256-&lt;hex&gt;</code>, with a dash rather than a
+            colon so it is a valid filename. A manifest, stored under
+            <code>manifests/&lt;registry&gt;/&lt;namespace&gt;/&lt;name&gt;/&lt;tag&gt;</code>,
+            is a Docker v2 manifest JSON that lists the layer digests and
+            media types plus a config blob. The default fully qualified name
+            of <code>llama3.2</code> is
+            <code>registry.ollama.ai/library/llama3.2:latest</code>, and the
+            <code>library</code> namespace is Ollama's curated catalog.
+          </p>
+          <pre class="flow">~/.ollama/models/
+  manifests/registry.ollama.ai/library/llama3.2/latest   (JSON manifest)
+      |  references by digest
+      v
+  blobs/
+    sha256-a1b2...   image.model     (the GGUF weights, the big one)
+    sha256-c3d4...   image.template  (Go template)
+    sha256-e5f6...   image.params    (default options)
+    sha256-0718...   image.license
+
+two models FROM the same base share the sha256-a1b2 blob on disk</pre>
+          <p>
+            <mark>The payoff of content addressing is deduplication and
+            integrity for free. Because a blob's name is its content hash, two
+            models built on the same base weights point at the same physical
+            blob, a corrupted download is detectable by rehashing, and
+            re-pulling a model you already have is a no-op after the manifest
+            check.</mark> The trap for newcomers is expecting a portable
+            single file. To move a model you export and re-import through the
+            registry or a Modelfile, not by copying one path, and the
+            <code>image.model</code> blob is a standard GGUF that llama.cpp can
+            read directly if you find it by digest.
+          </p>
+
+          <h3>Deep dive: pull mechanics and the registry protocol</h3>
+          <p>
+            Because models are OCI-style images, pulling one is speaking the
+            standard Docker registry v2 protocol, and Ollama did not have to
+            invent a distribution format. <code>PullHandler</code> resolves
+            the name, then <code>server/download.go</code> does the work.
+            First a GET of the manifest by tag, then, for each layer the
+            manifest lists that is not already present as a blob, a GET of
+            that blob by digest. Downloads are chunked and run several parts
+            in parallel, they use HTTP range requests so an interrupted pull
+            resumes rather than restarts, and each completed blob is verified
+            against its digest before it is committed into the blob store. The
+            progress bars you watch during <code>ollama pull</code> are
+            per-blob byte counters.
+          </p>
+          <pre class="flow">ollama pull llama3.2
+  GET /v2/library/llama3.2/manifests/latest        -&gt; manifest JSON (list of digests)
+  for each digest not already in blobs/:
+    GET /v2/library/llama3.2/blobs/sha256-a1b2...   -&gt; chunked, ranged, resumable
+    verify sha256(bytes) == digest                  -&gt; then commit to blobs/
+  write the manifest last                           -&gt; the model now "exists"</pre>
+          <p>
+            The manifest is written last on purpose, so a half-finished pull
+            never presents as an installed model. Pushing your own model with
+            <code>ollama push</code> is the mirror image against the same
+            protocol, uploading blobs the registry does not already have and
+            then the manifest, which is why sharing a fine-tune is cheap when
+            it shares a base. The subtlety to know is the tag. A tag is
+            mutable and points at whatever manifest was published for it,
+            while a digest is immutable, so pinning
+            <code>llama3.1:8b-instruct-q4_0</code> or an explicit digest is
+            how you get reproducibility rather than the moving
+            <code>latest</code>.
+          </p>
+
+          <h3>Deep dive: the scheduler, memory estimation, and keep-alive</h3>
+          <p>
+            <code>server/sched.go</code> is the piece of Ollama most worth
+            reading, because it is where the product's hardest promises live.
+            Load the right model, on the right devices, without running out of
+            memory, and get out of the way when idle. The scheduler runs a
+            loop over channels of pending requests, finished requests, and
+            expired runners, and it owns the set of currently loaded runners.
+          </p>
+          <p>
+            When a request needs a model that is not loaded, the scheduler
+            must decide how to fit it. GPU discovery, in the
+            <code>discover</code> package, reports how much free VRAM each
+            device has across CUDA, ROCm, and Metal. Memory estimation, in
+            what is effectively <code>llm/memory.go</code>, reads the GGUF
+            metadata for the model, the per-layer weight sizes, the number of
+            layers, and the size of the KV cache implied by the requested
+            context length and parallelism, then computes how many layers fit
+            on the available GPUs with room for the compute graph and some
+            overhead. The answer is a number of layers to offload, and the
+            rest run on the CPU. If even with zero GPU layers there is not
+            enough system memory, or if another model must move to make room,
+            the scheduler consults its limits. <code>OLLAMA_MAX_LOADED_MODELS</code>
+            caps how many models sit resident at once, and if a new load needs
+            space it evicts the least recently used runner whose refcount is
+            zero. Only then does it spawn the runner and wait on its health
+            check.
+          </p>
+          <p>
+            Concurrency is the other half. <code>OLLAMA_NUM_PARALLEL</code>
+            controls how many requests one loaded model serves at the same
+            time by giving the runner that many KV-cache slots, and
+            <code>OLLAMA_MAX_QUEUE</code> bounds how many requests wait when
+            everything is busy. These are set to sensible automatic defaults
+            based on available memory, and turning them up trades VRAM for
+            throughput.
+          </p>
+          <p>
+            Keep-alive is the elegant part. Each runner carries a session
+            duration and an expiry timer. A request increments the runner's
+            refcount, and finishing decrements it. When the count reaches
+            zero, the timer is armed for the keep-alive duration. The
+            <code>keep_alive</code> field on any request, or the global
+            <code>OLLAMA_KEEP_ALIVE</code>, sets that duration, and the
+            semantics are worth memorizing.
+          </p>
+          <pre class="flow">keep_alive value        effect
+  "5m", "1h", 300        stay resident that long after the last request (default 5m)
+  0                      unload immediately when the request finishes
+  -1, "-1m", negative    stay resident forever, until evicted or the daemon stops</pre>
+          <p>
+            <mark>The whole feel of Ollama, instant on the second call,
+            reload after idle, one warm model at a time on a laptop, is the
+            emergent behavior of this refcount plus timer plus eviction
+            policy.</mark> The classic confusion to correct is thinking a
+            model is loaded for the lifetime of a request. It is loaded lazily
+            on first use and unloaded lazily after idle, decoupled from any
+            single call, which is exactly why <code>ollama ps</code> exists to
+            show you what is parked in memory and why it has a
+            <code>UNTIL</code> column.
+          </p>
+
+          <h3>Deep dive: the runner and the backend, llama.cpp and the new engine</h3>
+          <p>
+            The runner is where Ollama meets the actual math, and it is the
+            part of the codebase in the most active motion, so hold the roles
+            more tightly than the paths. Historically Ollama vendored
+            <a href="/oss/llama-cpp">llama.cpp</a> and GGML under the
+            <code>llama</code> directory and drove them through cgo, and the
+            runner subprocess was a Go program wrapping that C++ engine. The
+            GGML tensor library provides the operators and the GGUF loader,
+            llama.cpp provides the transformer graph, the sampler, and the
+            partial-offload machinery, and the Go runner exposes them over the
+            private <code>/completion</code>, <code>/embedding</code>, and
+            <code>/health</code> HTTP API the scheduler talks to. The GGUF
+            format and block-wise quantization, which is what lets a 4-bit
+            model fit on a laptop, are covered in depth on the
+            <a href="/oss/llama-cpp">llama.cpp page</a> and are exactly what
+            Ollama inherits.
+          </p>
+          <p>
+            More recently Ollama has been building its own inference engine in
+            Go, with a backend abstraction in the <code>ml</code> package that
+            still uses GGML for the heavy operators through the same GGUF
+            weights, and model architectures reimplemented in Go under a
+            <code>model</code> package. The practical shape is two runner
+            implementations behind one <code>ollama runner</code> command, one
+            wrapping llama.cpp and one driving the native engine, with the
+            server choosing based on whether the model's architecture is
+            supported by the new path. This is how newer capabilities, such as
+            certain vision models, arrive on the native engine while the long
+            tail of architectures keeps running through llama.cpp. Read this
+            area for the boundary rather than the file names. The server hands
+            a runner a GGUF and an offload plan and speaks HTTP to it, and
+            whether the tokens are produced by C++ or by Go on the far side of
+            that boundary is an implementation detail the scheduler does not
+            care about.
+          </p>
+          <p>
+            The reason the subprocess boundary is drawn exactly there is worth
+            stating plainly. Native inference code, whether C++ or cgo, can
+            segfault or exhaust device memory, and putting it in a child
+            process means a bad model or a bad prompt kills one runner rather
+            than the daemon that other clients depend on. It also lets the
+            same daemon hold several models as several processes, each with
+            its own GGML context, and unload any one by simply killing it,
+            which is a far cleaner memory story than trying to free a model
+            inside a long-lived server heap.
+          </p>
+
+          <h3>Deep dive: the API surface, native, OpenAI, and embeddings</h3>
+          <p>
+            The native API in <code>server/routes.go</code> is small and
+            regular. <code>/api/generate</code> is single-turn completion over
+            a raw prompt, giving you full control of the text including an
+            optional <code>raw</code> mode that skips templating.
+            <code>/api/chat</code> is the multi-turn endpoint that applies the
+            model's template to a list of role-tagged messages and supports
+            tool calls and image inputs for multimodal models. Both stream
+            newline-delimited JSON by default and accept an
+            <code>options</code> object, which is the runtime knob set,
+            <code>temperature</code>, <code>top_k</code>, <code>top_p</code>,
+            <code>num_ctx</code>, <code>num_predict</code>, <code>stop</code>,
+            <code>seed</code>, <code>repeat_penalty</code>, and
+            <code>num_gpu</code> to force a layer count, among others.
+          </p>
+          <p>
+            Embeddings have two endpoints for historical reasons. The legacy
+            <code>/api/embeddings</code> takes a single <code>prompt</code>
+            and returns one <code>embedding</code>, while the newer
+            <code>/api/embed</code> takes an <code>input</code> that may be a
+            string or an array and returns a batch of <code>embeddings</code>.
+            Prefer the batch form for indexing a corpus, and pair a dedicated
+            embedding model such as <code>nomic-embed-text</code> or
+            <code>mxbai-embed-large</code> with it rather than a chat model.
+          </p>
+          <p>
+            The OpenAI compatibility layer, in the <code>openai</code>
+            package, is a translation shim rather than a second engine. It
+            registers <code>/v1/chat/completions</code>,
+            <code>/v1/completions</code>, <code>/v1/embeddings</code>, and
+            <code>/v1/models</code>, and middleware rewrites the OpenAI request
+            body into Ollama's native <code>ChatRequest</code> or
+            <code>EmbedRequest</code>, calls the same handler, and rewrites the
+            response, including the streamed chunks, back into the OpenAI
+            server-sent-events shape.
+          </p>
+          <pre class="flow">POST /v1/chat/completions
+   openai middleware:  OpenAI body  --translate--&gt;  api.ChatRequest
+   -&gt; ChatHandler (the exact same handler as /api/chat)
+   -&gt; scheduler -&gt; runner -&gt; tokens
+   openai middleware:  ChatResponse chunks  --translate--&gt;  OpenAI SSE "data:" chunks</pre>
+          <p>
+            <mark>Because the OpenAI routes are a thin adapter over the native
+            handlers, everything the daemon can do is reachable both ways, and
+            the compatibility is real rather than a partial reimplementation.</mark>
+            The one thing to keep straight is that OpenAI-specific concepts
+            with no local meaning, such as an account's model catalog or
+            server-side tool execution, are mapped as best they can be onto
+            local semantics, so read the OpenAI-compat notes when a field
+            behaves unexpectedly.
+          </p>
+
+          <h2>Part VI: Reading the repository</h2>
+          <p>
+            The tree is a manageable Go codebase, and the two load-bearing
+            ideas from Part I tell you what each package is for. Where a path
+            is likely to have shifted with the engine migration I say so.
+          </p>
+          <p>
+            <strong>Stage 0, orientation.</strong> Read the root
+            <code>main.go</code> and then <code>cmd/cmd.go</code>. Questions.
+            What does the <code>run</code> command actually do before it prints
+            a token, where does <code>OLLAMA_HOST</code> come from, and which
+            commands are pure HTTP calls to the daemon, which is nearly all of
+            them.
+          </p>
+          <p>
+            <strong>Stage 1, the vocabulary.</strong> Read
+            <code>api/types.go</code> and <code>api/client.go</code>. This is
+            the request and response grammar the whole system shares.
+            Questions. What is on a <code>ChatRequest</code>, how does
+            <code>Options</code> carry the sampler and context knobs, and how
+            does the client turn a streamed body into a series of callbacks.
+          </p>
+          <p>
+            <strong>Stage 2, the front door.</strong> Read
+            <code>server/routes.go</code> top to bottom, following one handler
+            such as <code>ChatHandler</code> all the way through. Questions.
+            Where is the model name resolved to a manifest, how are the baked-in
+            template and parameters merged with the request, and where does the
+            handler hand off to the scheduler.
+          </p>
+          <p>
+            <strong>Stage 3, packaging and distribution.</strong>
+            <code>parser</code> for the Modelfile grammar,
+            <code>server/images.go</code> for how commands become layers and a
+            manifest, and <code>server/download.go</code> for the registry
+            pull. Questions. What media type does each Modelfile instruction
+            become, why is a blob named by its own hash, and why is the
+            manifest written last during a pull.
+          </p>
+          <p>
+            <strong>Stage 4, the runtime core.</strong>
+            <code>server/sched.go</code>, then the memory estimator around
+            <code>llm/memory.go</code> and the GGUF reader that feeds it, then
+            the <code>discover</code> package for GPU detection. Questions. How
+            does a request become a resident runner, how is the GPU-layer count
+            computed, which env vars bound concurrency and residency, and
+            exactly when does keep-alive unload a model.
+          </p>
+          <p>
+            <strong>Stage 5, the backend boundary.</strong> The
+            <code>llm</code> server launcher that spawns the subprocess, the
+            <code>llama</code> cgo bindings, and the runner packages. Read this
+            for the boundary, the private HTTP API between server and runner,
+            not for stable file names, since this is the part mid-migration
+            between the llama.cpp path and the native <code>ml</code> and
+            <code>model</code> engine. Questions. What is on the runner's
+            command line, what does <code>/health</code> gate, and where is the
+            decode loop.
+          </p>
+          <p>
+            <strong>Stage 6, the edges.</strong> The <code>openai</code>
+            compatibility package, the <code>template</code> package for
+            prompt rendering, the <code>convert</code> package that imports
+            Hugging Face safetensors into GGUF, and <code>envconfig</code> for
+            every tunable. Questions. How is an OpenAI request translated, how
+            does a Go template render chat messages into a prompt, and what
+            does <code>ollama create</code> do when <code>FROM</code> points at
+            a safetensors directory rather than an existing model.
+          </p>
+          <p>
+            Where not to start. The vendored llama.cpp and GGML C and C++
+            sources under <code>llama</code> and <code>ml/backend</code> are a
+            whole world of their own, best read through the
+            <a href="/oss/llama-cpp">llama.cpp chapter</a> rather than here.
+            The native <code>model</code> engine is genuinely interesting but
+            unstable and incomplete relative to the llama.cpp path, so meet it
+            after the packaging and scheduling stories are solid.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            All labs need only the Ollama daemon and a small model such as
+            <code>llama3.2</code> or <code>llama3.2:1b</code>, which run on a
+            laptop with or without a GPU. Log and field details shift with the
+            fast pace of the project.
+          </p>
+          <p><strong>Lab 1: watch a model load and unload.</strong> Concept: the scheduler and keep-alive from Part IV and Part V.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">ollama</span> <span class="s">ps</span>                                   <span class="c"># nothing loaded yet</span>
+<span class="m1">ollama</span> <span class="s">run</span> <span class="s">llama3.2</span> <span class="s">"hello"</span> &gt; <span class="s">/dev/null</span>      <span class="c"># loads on first use</span>
+<span class="m1">ollama</span> <span class="s">ps</span>                                   <span class="c"># now resident, note the UNTIL column</span>
+<span class="c"># wait 5 minutes, or force it:</span>
+<span class="m1">ollama</span> <span class="s">stop</span> <span class="s">llama3.2</span>                         <span class="c"># unload now</span>
+<span class="m1">ollama</span> <span class="s">ps</span>                                   <span class="c"># empty again</span></code></pre></div>
+          <p>
+            Then set <code>OLLAMA_KEEP_ALIVE=-1 ollama serve</code> in one
+            shell and repeat. The model never expires on its own. Set
+            <code>keep_alive: 0</code> on a single request and watch it unload
+            the instant that request finishes. You have just driven the
+            refcount-plus-timer machine by hand.
+          </p>
+          <p><strong>Lab 2: see the content-addressable store.</strong> Concept: models are manifests over blobs, from the packaging deep dive.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">ollama</span> <span class="s">pull</span> <span class="s">llama3.2</span>
+<span class="m1">ls</span>  <span class="s">~/.ollama/models/manifests/registry.ollama.ai/library/llama3.2/</span>
+<span class="m1">cat</span> <span class="s">~/.ollama/models/manifests/registry.ollama.ai/library/llama3.2/latest</span> | <span class="m1">python3</span> <span class="s">-m</span> <span class="s">json.tool</span>
+<span class="m1">ls</span> <span class="s">-lh</span> <span class="s">~/.ollama/models/blobs/</span>                <span class="c"># the big one is the GGUF image.model layer</span></code></pre></div>
+          <p>
+            Read the manifest and match each layer's <code>mediaType</code> to
+            the Modelfile instruction it came from. Then run
+            <code>ollama cp llama3.2 twin</code> and confirm the blob store
+            did not grow, because the copy is a new manifest pointing at the
+            same blobs.
+          </p>
+          <p><strong>Lab 3: build a custom model with a Modelfile.</strong> Concept: create compiles a Modelfile into layers.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="c"># Modelfile</span>
+<span class="m1">FROM</span> <span class="s">llama3.2</span>
+<span class="m1">PARAMETER</span> <span class="s">temperature</span> <span class="s">0</span>
+<span class="m1">SYSTEM</span> <span class="s">"You are a JSON API. Reply only with a JSON object."</span></code></pre></div>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">ollama</span> <span class="s">create</span> <span class="s">jsonbot</span> <span class="s">-f</span> <span class="s">Modelfile</span>
+<span class="m1">ollama</span> <span class="s">show</span> <span class="s">jsonbot</span> <span class="s">--modelfile</span>             <span class="c"># see the resolved recipe</span>
+<span class="m1">ollama</span> <span class="s">run</span>  <span class="s">jsonbot</span> <span class="s">"give me a person with name and age"</span></code></pre></div>
+          <p>
+            Confirm with <code>ollama show</code> that your
+            <code>SYSTEM</code> and <code>PARAMETER</code> layers are present,
+            and that the <code>FROM</code> layer is the same
+            <code>image.model</code> blob as the base, not a copy.
+          </p>
+          <p><strong>Lab 4: the OpenAI drop-in.</strong> Concept: /v1 is a shim over the native handlers.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">openai</span> <span class="k">import</span> <span class="m1">OpenAI</span>
+
+<span class="v4">client</span> = <span class="m1">OpenAI</span><span class="b0">(</span><span class="v3">base_url</span>=<span class="s">"http://localhost:11434/v1"</span>, <span class="v6">api_key</span>=<span class="s">"ollama"</span><span class="b0">)</span>
+<span class="v0">stream</span> = <span class="v4">client</span>.<span class="m2">chat</span>.<span class="m2">completions</span>.<span class="m2">create</span><span class="b0">(</span>
+    <span class="v0">model</span>=<span class="s">"llama3.2"</span>,
+    <span class="v1">messages</span>=<span class="b1">[</span><span class="b2">{</span><span class="s">"role"</span>: <span class="s">"user"</span>, <span class="s">"content"</span>: <span class="s">"count to five"</span><span class="b2">}</span><span class="b1">]</span>,
+    <span class="v0">stream</span>=<span class="k">True</span>,
+<span class="b0">)</span>
+<span class="k">for</span> <span class="v3">chunk</span> <span class="k">in</span> <span class="v0">stream</span>:
+    <span class="m1">print</span><span class="b0">(</span><span class="v3">chunk</span>.<span class="m2">choices</span><span class="b1">[</span><span class="n">0</span><span class="b1">]</span>.<span class="m2">delta</span>.<span class="m2">content</span> <span class="k">or</span> <span class="s">""</span>, <span class="v6">end</span>=<span class="s">""</span>, <span class="v3">flush</span>=<span class="k">True</span><span class="b0">)</span></code></pre></div>
+          <p>
+            Run it, then run the equivalent against
+            <code>/api/chat</code> with <code>curl</code> and compare the two
+            wire formats for the same underlying generation. The tokens are
+            produced by one handler and dressed two ways.
+          </p>
+          <p><strong>Lab 5: force the CPU cliff, then climb back.</strong> Concept: memory estimation and GPU offload from Part III and Part V.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="c"># push the context large so the KV cache crowds the weights off the GPU</span>
+<span class="v6">OLLAMA_DEBUG</span>=<span class="s">1</span> <span class="m1">ollama</span> <span class="s">run</span> <span class="s">llama3.2</span> <span class="s">--verbose</span> <span class="s">"summarize the idea of entropy"</span> <span class="s">\</span>
+  &amp;&amp; <span class="m1">echo</span> <span class="s">"watch the debug log for the offload decision and layers on GPU vs CPU"</span></code></pre></div>
+          <p>
+            With <code>OLLAMA_DEBUG=1</code> the daemon logs its memory
+            estimate and how many layers it placed on the GPU. Try a larger
+            <code>num_ctx</code> or a bigger model until layers spill to CPU
+            and tokens per second collapse, then drop to a smaller quant tag
+            or a smaller context and watch throughput recover. This is the
+            single most useful intuition for running local models well.
+          </p>
+          <p><strong>Lab 6: embeddings for a tiny search index.</strong> Concept: the embed endpoint as a retrieval backend.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">ollama</span>, <span class="m1">numpy</span> <span class="k">as</span> <span class="m1">np</span>
+
+<span class="v4">docs</span> = <span class="b0">[</span><span class="s">"cats are mammals"</span>, <span class="s">"python is a language"</span>, <span class="s">"the sun is a star"</span><span class="b0">]</span>
+<span class="v0">E</span> = <span class="m1">ollama</span>.<span class="m2">embed</span><span class="b0">(</span><span class="v0">model</span>=<span class="s">"nomic-embed-text"</span>, <span class="v2">input</span>=<span class="v4">docs</span><span class="b0">)[</span><span class="s">"embeddings"</span><span class="b0">]</span>
+<span class="v1">q</span> = <span class="m1">ollama</span>.<span class="m2">embed</span><span class="b0">(</span><span class="v0">model</span>=<span class="s">"nomic-embed-text"</span>, <span class="v2">input</span>=<span class="s">"which animal?"</span><span class="b0">)[</span><span class="s">"embeddings"</span><span class="b0">][</span><span class="n">0</span><span class="b0">]</span>
+
+<span class="v2">sims</span> = <span class="m1">np</span>.<span class="m2">array</span><span class="b0">(</span><span class="v0">E</span><span class="b0">)</span> @ <span class="m1">np</span>.<span class="m2">array</span><span class="b0">(</span><span class="v1">q</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="v4">docs</span><span class="b1">[</span><span class="m1">int</span><span class="b2">(</span><span class="m1">np</span>.<span class="m2">argmax</span><span class="b0">(</span><span class="v2">sims</span><span class="b0">)</span><span class="b2">)</span><span class="b1">]</span><span class="b0">)</span>   <span class="c"># -&gt; cats are mammals</span></code></pre></div>
+          <p>
+            Confirm the batch call returns one vector per document, then check
+            that the embedding model stays resident under its own keep-alive
+            in <code>ollama ps</code>, independent of any chat model.
+          </p>
+
+          <h2>Part VIII: Questions and model answers</h2>
+          <p>Understanding checks. Answer aloud before reading.</p>
+          <p><strong>1. What is Ollama, in one sentence?</strong></p>
+          <p>
+            A small Go server that makes running an LLM locally a single
+            command, by packaging models like container images, pulling them
+            from a content-addressable registry, and supervising a
+            llama.cpp/GGML runner subprocess through a memory-aware scheduler
+            behind a native and OpenAI-compatible REST API.
+          </p>
+          <p><strong>2. Where does inference actually run, and why there?</strong></p>
+          <p>
+            In a separate runner subprocess, not in the daemon. The server
+            spawns an <code>ollama runner</code> child that loads the GGUF and
+            serves a private HTTP completion API, and the server proxies to it.
+            The isolation means native code crashes take down a child rather
+            than the daemon, weights never live in the server heap, and
+            multiple models are just multiple processes that can be killed to
+            free memory.
+          </p>
+          <p><strong>3. What are the two layers of the model store?</strong></p>
+          <p>
+            Manifests and blobs. A manifest is a Docker v2 JSON listing layer
+            digests and media types for one model tag, and each blob is content
+            stored under its own SHA-256 digest. A Modelfile compiles into
+            those layers, and models that share a base share the base blob on
+            disk.
+          </p>
+          <p><strong>4. Trace what happens on a pull.</strong></p>
+          <p>
+            Resolve the name, GET the manifest by tag, and for each referenced
+            blob not already present GET it by digest over ranged, resumable,
+            parallel chunks, verify each blob against its digest before
+            committing it, then write the manifest last so a partial pull never
+            looks installed. It is the standard OCI registry protocol.
+          </p>
+          <p><strong>5. What is a Modelfile and what does each instruction become?</strong></p>
+          <p>
+            A Dockerfile-shaped build recipe. <code>FROM</code> becomes the
+            model weights layer, <code>TEMPLATE</code> the prompt template
+            layer, <code>SYSTEM</code> the system-prompt layer,
+            <code>PARAMETER</code> the default-options layer,
+            <code>ADAPTER</code> a LoRA layer, and <code>LICENSE</code> a
+            license layer, each a content-addressed blob under its own media
+            type.
+          </p>
+          <p><strong>6. How does the scheduler decide whether it can load a model?</strong></p>
+          <p>
+            It asks the discover package for free VRAM per device, reads the
+            GGUF metadata for per-layer sizes and layer count, sizes the KV
+            cache from the requested context length and parallelism, and
+            computes how many layers fit on the GPUs with room for the compute
+            graph and overhead. The rest run on CPU, and if there is not enough
+            room it evicts the least recently used idle runner within the
+            <code>OLLAMA_MAX_LOADED_MODELS</code> limit.
+          </p>
+          <p><strong>7. Explain keep-alive precisely.</strong></p>
+          <p>
+            Each runner has a refcount and an expiry timer. A request
+            increments the count and finishing decrements it, and when it
+            reaches zero the timer arms for the keep-alive duration, five
+            minutes by default. A duration keeps the model resident that long
+            after the last request, <code>0</code> unloads immediately when the
+            request finishes, and a negative value keeps it resident forever.
+            This is why the second call is instant and an idle model still
+            holds VRAM.
+          </p>
+          <p><strong>8. Why can a local model be slow with no error at all?</strong></p>
+          <p>
+            Because it partially offloaded. When the weights plus KV cache do
+            not fit in VRAM, some layers run on the CPU at far lower memory
+            bandwidth, so every token waits on those layers and throughput
+            collapses while the model still produces correct output. The levers
+            are a smaller quantization, a smaller <code>num_ctx</code>, or a
+            smaller model, all of which free VRAM for more GPU layers.
+          </p>
+          <p><strong>9. How does the OpenAI-compatible API relate to the native one?</strong></p>
+          <p>
+            The <code>/v1</code> routes are a translation shim in the
+            <code>openai</code> package over the same native handlers.
+            Middleware rewrites an OpenAI request into an
+            <code>api.ChatRequest</code> or <code>EmbedRequest</code>, calls the
+            identical handler the <code>/api</code> route uses, and rewrites the
+            streamed response back into OpenAI's server-sent-events shape, so
+            the compatibility is real rather than a separate engine.
+          </p>
+          <p><strong>10. What is the difference between /api/embed and /api/embeddings?</strong></p>
+          <p>
+            <code>/api/embeddings</code> is the legacy endpoint that takes a
+            single <code>prompt</code> and returns one <code>embedding</code>.
+            <code>/api/embed</code> is the newer one that takes an
+            <code>input</code> string or array and returns a batch of
+            <code>embeddings</code>. Prefer the batch form for indexing a
+            corpus, and use a dedicated embedding model rather than a chat
+            model.
+          </p>
+          <p><strong>11. When would you reach for llama.cpp, vLLM, or SGLang instead?</strong></p>
+          <p>
+            <a href="/oss/llama-cpp">llama.cpp</a> directly when you want every
+            backend knob and the newest features first and are willing to
+            manage GGUF files and flags. <a href="/oss/vllm">vLLM</a> or
+            <a href="/oss/sglang">SGLang</a> when you are serving many
+            concurrent users on a GPU and need PagedAttention and continuous
+            batching for aggregate throughput. Ollama wins on zero-ceremony
+            local single-user use, packaging, and a clean API, not on saturating
+            a datacenter GPU.
+          </p>
+          <p><strong>12. What does the number after the colon in a model tag control, and why pin it?</strong></p>
+          <p>
+            The tag selects a specific variant, usually a size and quantization
+            such as <code>8b-instruct-q4_0</code>, and <code>latest</code> is
+            whatever the registry currently points that tag at. A tag is
+            mutable while a digest is immutable, so pin an explicit tag or digest
+            when you need reproducible behavior rather than the moving default.
+          </p>
+          <p><strong>13. Why is the same binary both the CLI and the server and the runner?</strong></p>
+          <p>
+            A single static binary is the whole distribution story, with no
+            runtime, environment, or dependency to install. <code>ollama serve</code>
+            runs the daemon, the other verbs are HTTP clients to it, and a
+            hidden <code>ollama runner</code> subcommand is what the daemon
+            re-invokes as the isolated inference subprocess, so one artifact
+            plays every role.
+          </p>
+          <p><strong>14. Your app's first request after an idle period is slow, then fast. Why?</strong></p>
+          <p>
+            The model was unloaded by keep-alive during the idle period, so the
+            first request pays to reload the weights and rebuild the KV cache
+            through the scheduler and a fresh runner subprocess, and subsequent
+            requests hit the now-resident model. Raise <code>keep_alive</code>
+            or set <code>OLLAMA_KEEP_ALIVE</code> to keep it warm, at the cost of
+            holding VRAM.
+          </p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Package the artifact, not just the runtime.</strong> By
+            compiling a Modelfile into content-addressed layers under a Docker
+            manifest, Ollama got deduplication, integrity checking, resumable
+            distribution, and a push-pull workflow without inventing any of it.
+            The lesson is to borrow a proven distribution format wholesale,
+            the same instinct behind language package registries and OCI
+            images, rather than shipping a bespoke blob and a downloader.
+          </p>
+          <p>
+            <strong>Put the dangerous work in a child process.</strong> Native
+            inference can crash or exhaust device memory, so Ollama runs it in
+            a supervised subprocess behind a private HTTP API and keeps the
+            daemon clean. Wherever code is fast but fragile, whether a codec, a
+            parser, or a GPU kernel, isolating it behind a process boundary
+            buys crash containment and clean teardown, the same pattern as a
+            browser's per-tab processes.
+          </p>
+          <p>
+            <strong>Make the runtime memory-aware, not the user.</strong> The
+            hardest part of local inference is fitting a model in the memory
+            you have, and Ollama moves that decision into the scheduler by
+            reading the GGUF, measuring free VRAM, and computing the offload
+            split. Systems that own their resource math, rather than exposing a
+            dozen flags and hoping, are the ones ordinary users can run.
+          </p>
+          <p>
+            <strong>Manage residency with a refcount and a timer.</strong>
+            Keep-alive is nothing more than reference counting plus an expiry
+            timer plus an eviction policy, and from those three pieces comes the
+            entire feel of a responsive local model that also yields memory
+            when idle. Connection pools, file caches, and JIT code caches all
+            win with the same small state machine.
+          </p>
+          <p>
+            <strong>Meet the ecosystem where it already is.</strong> Shipping an
+            OpenAI-compatible surface as a thin shim over the native handlers
+            meant every tool built for that API worked against a local model on
+            day one. A compatibility adapter over your real interface, done
+            honestly, is often worth more than a superior but unfamiliar API of
+            your own.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            The one-sentence summary: <mark>Ollama compiles a Modelfile into
+            content-addressed layers, pulls them over the Docker registry
+            protocol, and on demand a memory-aware scheduler spawns a
+            llama.cpp/GGML runner subprocess, offloads as many layers as fit in
+            VRAM, streams tokens back through a native and OpenAI-compatible
+            API, and keeps the model warm until keep-alive expires.</mark>
+          </p>
+          <pre class="flow">cmd CLI -&gt; api client -&gt; server/routes (gin) -&gt; handler
+  -&gt; Scheduler (sched.go): loaded? estimate VRAM, offload, evict, keep-alive
+  -&gt; LlamaServer (llm/server.go): spawn "ollama runner" subprocess
+  -&gt; runner: GGUF via cgo llama.cpp/GGML -&gt; tokenize, decode, sample, detokenize
+  -&gt; stream tokens back up -&gt; done, arm keep-alive timer</pre>
+          <p>The chain mapped to source:</p>
+          <pre class="flow">cli            cmd/cmd.go (cobra)
+vocabulary     api/types.go, api/client.go
+front door     server/routes.go (gin), openai/ (the /v1 shim)
+packaging      parser/, server/images.go (layers + manifest)
+distribution   server/download.go (registry pull), server/upload.go (push)
+scheduling     server/sched.go, discover/ (GPU), llm/memory.go (offload)
+runner         llm/server.go (spawn), llama/ (cgo), runner + ml/ + model/ (engine)</pre>
+          <p>Memorize these blocks:</p>
+          <ul>
+            <li><strong>Two big ideas:</strong> models are packaged like Docker images, and inference runs in a supervised subprocess.</li>
+            <li><strong>Store shape:</strong> a manifest of media-typed layers plus content-addressed blobs under <code>sha256-&lt;hex&gt;</code>, deduplicated across models that share a base.</li>
+            <li><strong>Pull:</strong> OCI registry v2, GET manifest then GET each missing blob, ranged and resumable, manifest written last.</li>
+            <li><strong>Scheduler:</strong> free VRAM from discover, layer sizes from GGUF, KV from <code>num_ctx</code> and parallelism, offload the rest to CPU, evict LRU idle within <code>OLLAMA_MAX_LOADED_MODELS</code>.</li>
+            <li><strong>Keep-alive:</strong> refcount plus expiry timer, default 5m, <code>0</code> unloads now, negative stays forever.</li>
+            <li><strong>API:</strong> native <code>/api/generate</code>, <code>/api/chat</code>, <code>/api/embed</code>, and the OpenAI shim <code>/v1/*</code> over the same handlers, on port <code>11434</code>.</li>
+          </ul>
+
+          <h2>Part XI: Papers and further reading</h2>
+          <p>
+            The ideas this chapter leans on come from a handful of papers and
+            specifications, and each one rewards a direct read. Where this site
+            covers the same idea in depth, the companion link points there.
+          </p>
+          <ol class="refs">
+            <li>Vaswani et al., <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noreferrer">Attention Is All You Need</a>, 2017. The transformer architecture every model Ollama runs is built on, and the origin of the KV cache the scheduler must budget for. The <a href="/ml/attention">attention note</a> on this site derives the mechanism.</li>
+            <li>Touvron et al., <a href="https://arxiv.org/abs/2302.13971" target="_blank" rel="noreferrer">LLaMA, Open and Efficient Foundation Language Models</a>, 2023. The open-weights release that sparked llama.cpp and with it the local-inference ecosystem Ollama packages. The <a href="/classes/language-models-from-scratch">language models from scratch class</a> builds this kind of model end to end.</li>
+            <li>Grattafiori et al., <a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noreferrer">The Llama 3 Herd of Models</a>, 2024. The model family behind the <code>llama3.1</code> and <code>llama3.2</code> tags this chapter uses as its running examples.</li>
+            <li>ggml contributors, <a href="https://github.com/ggml-org/ggml/blob/master/docs/gguf.md" target="_blank" rel="noreferrer">GGUF file format specification</a>, 2023. The self-describing binary format of every <code>image.model</code> blob, metadata plus quantized tensors in one file. Covered in depth in the <a href="/oss/llama-cpp">llama.cpp walkthrough</a>.</li>
+            <li>Open Container Initiative, <a href="https://github.com/opencontainers/distribution-spec" target="_blank" rel="noreferrer">OCI Distribution Specification</a>, 2021. The registry pull and push protocol Ollama speaks, standardized from the Docker Registry HTTP API V2, and the reason model distribution behaves exactly like container images.</li>
+            <li>Ollama maintainers, <a href="https://github.com/ollama/ollama/blob/main/docs/modelfile.mdx" target="_blank" rel="noreferrer">Modelfile reference</a>. The authoritative grammar for <code>FROM</code>, <code>PARAMETER</code>, <code>SYSTEM</code>, <code>TEMPLATE</code>, <code>ADAPTER</code>, and <code>LICENSE</code> that the packaging deep dive decompiles into layers.</li>
+            <li>Dettmers and Zettlemoyer, <a href="https://arxiv.org/abs/2212.09720" target="_blank" rel="noreferrer">The case for 4-bit precision, k-bit Inference Scaling Laws</a>, 2022. The measurement showing 4-bit weights are close to optimal accuracy per byte, which is why the registry's default tags are 4-bit quantizations.</li>
+            <li>Hu et al., <a href="https://arxiv.org/abs/2106.09685" target="_blank" rel="noreferrer">LoRA, Low-Rank Adaptation of Large Language Models</a>, 2021. The adapter format behind the <code>ADAPTER</code> instruction and its <code>image.adapter</code> layer. The <a href="/oss/peft">PEFT walkthrough</a> covers the method in practice.</li>
+            <li>Holtzman et al., <a href="https://arxiv.org/abs/1904.09751" target="_blank" rel="noreferrer">The Curious Case of Neural Text Degeneration</a>, 2019. Introduces nucleus sampling, the <code>top_p</code> knob carried in every <code>options</code> object alongside temperature and <code>top_k</code>.</li>
+            <li>Nussbaum et al., <a href="https://arxiv.org/abs/2402.01613" target="_blank" rel="noreferrer">Nomic Embed, Training a Reproducible Long Context Text Embedder</a>, 2024. The open embedding model behind <code>nomic-embed-text</code> in the labs. The <a href="/oss/sentence-transformers">sentence-transformers walkthrough</a> covers embedding models more broadly.</li>
+            <li>Kwon et al., <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noreferrer">Efficient Memory Management for Large Language Model Serving with PagedAttention</a>, 2023. The high-throughput serving regime Ollama deliberately is not, covered in the <a href="/oss/vllm">vLLM walkthrough</a>.</li>
+          </ol>
+
+          <h2>Part XII: Final takeaway</h2>
+          <p>
+            If the inference engine underneath is the gap, the
+            <a href="/oss/llama-cpp">llama.cpp chapter</a> explains GGUF,
+            block-wise quantization, and partial GPU offload that Ollama
+            inherits, and the <a href="/oss/vllm">vLLM</a> and
+            <a href="/oss/sglang">SGLang</a> chapters show the high-throughput
+            serving regime Ollama deliberately is not. The broader design of a
+            serving stack is drawn out in the
+            <a href="/systems/llm-inference">LLM serving platform write-up</a>,
+            and the parallelism intuitions that scale this to a cluster live in
+            the <a href="/classes/parallel-computing">parallel computing
+            notes</a>. Then come back and read <code>server/sched.go</code>
+            once more. The whole product is in that file.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> Ollama made local LLMs trivial not
+            by writing a faster kernel but by getting the packaging and the
+            plumbing right. Distribute models like container images, run the
+            fragile inference in a subprocess a memory-aware scheduler
+            supervises, keep it warm with a refcount and a timer, and put a
+            plain OpenAI-shaped API in front, and a large language model
+            becomes something you start with a single command and forget is
+            running.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/code-copy.js"></script>
+      <script defer src="/theme.js"></script>
+  </body>
+</html>

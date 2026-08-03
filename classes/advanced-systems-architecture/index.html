@@ -1,0 +1,1447 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Advanced architecture &middot; Stanley Jacob</title>
+    <meta name="description" content="DRAM banks and row-buffer timing with real arithmetic, HBM stacking and the 3 TB/s pin budget, Little's law for memory-level parallelism, the bandwidth cascade from registers to the network, systolic dataflows and the weight/output/row-stationary taxonomy, tensor-core arithmetic intensity, the fp32-to-fp8 precision ladder, 2:4 sparsity, and the roofline applied end to end to measured H100 kernels." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%232B2621'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+      <script>(function(){try{var t=localStorage.getItem("theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes" class="active">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/classes">Classes</a></div>
+        <h1>Advanced architecture: memory systems, accelerators, and the roofline in practice</h1>
+        <p class="lead">
+          The companion page on <a href="/classes/computer-architecture/">computer
+          architecture</a> builds the processor, covering pipelines, predictors, caches,
+          Tomasulo, coherence, and the roofline basics. The page on
+          <a href="/classes/parallel-computing/">parallel computing</a> writes the
+          CUDA and Triton kernels, the reductions, scans, tiled matmul, and flash attention.
+          This page goes where both stopped. It reaches down inside the DRAM chip where
+          activate-read-precharge timing sets the latency floor, out across the DDR5
+          and HBM3 interfaces whose pin arithmetic predicts the 3 TB/s these H100s
+          actually stream, through Little's law applied to measured latency to derive
+          how much concurrency saturating memory requires, and up into the accelerator
+          datapath, with its systolic dataflows, the weight/output/row-stationary reuse
+          taxonomy, the arithmetic intensity a tensor-core array demands to stay fed,
+          the fp32-to-fp8 precision ladder, structured sparsity, and the roofline read
+          against real profiles. Every load-bearing number is either derived from first
+          principles or measured on the two H100 80GB GPUs and the 52-vCPU Sapphire
+          Rapids guest this site runs on, and the two are checked against each other.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Why this subject matters now</h2>
+          <p>
+            Processor microarchitecture has been the glamorous half of computer
+            architecture for decades, but the binding constraints of the last ten
+            years live elsewhere. Compute throughput per chip grew roughly 1000x
+            between a 2010 CPU socket and a 2022 H100 doing bf16 matrix math, while
+            DRAM latency barely moved and per-pin bandwidth improved by small integer
+            factors. Everything interesting in modern systems design is a response to
+            that widening gap, whether HBM stacks bonded onto silicon interposers, 50 MB
+            last-level caches on GPUs, prefetchers of increasing ambition, tensor
+            units that extract quadratic compute from linear data movement, or
+            precision reductions from fp32 to fp8 that exist mostly to move fewer
+            bytes. A systems practitioner today is expected to hold the whole
+            memory-side story quantitatively, to know why a random pointer chase on
+            this machine costs 134.6 ns while sequential streaming costs 4.5 ns per
+            line, why one thread of that chase can never exceed half a gigabyte per
+            second no matter how fast the core is, why an H100 needs on the order of a
+            megabyte of loads in flight to keep its memory system busy, and why a
+            matmul at 25 percent occupancy can outrun one at 100 percent.
+          </p>
+          <p>
+            The subject also has a second audience now. Training and serving large
+            models is a memory-system and interconnect problem before it is a compute
+            problem, and the people who make clusters fast spend their days with
+            exactly the tools this page works through, rooflines calibrated with
+            measured bandwidth, occupancy and register-pressure arithmetic, tensor-core
+            utilization counters, NVLink bus-bandwidth accounting, and the precision
+            ladder. The theory here is anchored on Hennessy and Patterson's
+            quantitative treatment, on Jacob, Ng, and Wang's memory-systems text, on
+            Williams, Waterman, and Patterson's roofline paper, and on the accelerator
+            dataflow literature that runs from Chen, Emer, and Sze's Eyeriss to
+            Jouppi's TPU. The numbers are anchored on this machine, an Intel Xeon
+            Platinum 8480+ guest with 52 vCPUs and 442 GiB of RAM, and two NVIDIA H100
+            80GB HBM3 GPUs joined by 18 NVLink links. Where the machine hides something
+            behind virtualization, the page says so and measures what it can.
+          </p>
+
+          <h2>Inside the DRAM chip</h2>
+          <h3>Banks, rows, and columns</h3>
+          <p>
+            A DRAM die is a two-dimensional grid of capacitors, each storing one bit
+            as charge, each read destructively. The grid is organized as banks, and
+            each bank as rows and columns. A modern DDR5 x8 device of 16 Gb has 32
+            banks arranged as 8 bank groups of 4 banks, and each bank's row is 1 KiB
+            wide on an x8 part. A 32-bit DDR5 subchannel built from four x8 devices
+            therefore exposes an effective 4 KiB row. The bank is the unit of
+            parallelism inside the chip. Different banks can be working on different
+            rows at once, which is the property every memory-controller scheduler
+            exploits.
+          </p>
+          <p>
+            Access is a three-act protocol, and the acts have names that appear on
+            every datasheet. ACTIVATE (ACT) reads an entire row out of the array into
+            the bank's row buffer, a row of sense amplifiers. Because reading the
+            capacitors drains them, the sense amplifiers also restore the charge, which
+            is why a row must stay open a minimum time (\(t_{RAS}\)) before it may be
+            closed. READ or WRITE (the CAS command) then moves a column, one burst of
+            data, between the row buffer and the pins. PRECHARGE (PRE) writes the row
+            back and returns the bitlines to their reference voltage so a different row
+            can be activated. Three timing parameters govern the acts. \(t_{RCD}\) is the
+            delay from ACT to the first CAS, \(t_{CL}\) (also written CAS latency) is the
+            delay from READ to the first data beat, and \(t_{RP}\) is the delay from PRE
+            until the next ACT may issue. They are quoted in controller clock cycles on
+            module labels, which is why a label like 40-39-39 means nothing until
+            multiplied by the clock period.
+          </p>
+          <pre class="flow">one DDR5 bank (of 32 per device)
+
+            columns ─────────────────────►
+   rows │  ┌──────────────────────────────┐
+        │  │        capacitor array       │
+        ▼  │  (one row = 1 KiB on an x8)   │
+           │  ..............................│
+           │  ███ activated row ███████████│ ─┐ ACT: row → sense amps
+           └──────────────────────────────┘  │ (destructive, so also restore)
+           ┌──────────────────────────────┐ ◄┘
+           │  row buffer (sense amps)      │ ── CAS: one column burst ─► pins
+           └──────────────────────────────┘
+                     │
+                     └─ PRE: restore + equalize bitlines, row now closed
+
+timing:  ACT ──t_RCD──► READ ──t_CL──► data (burst)
+         PRE ──t_RP───► next ACT       t_RAS: min ACT→PRE</pre>
+          <p>
+            The row buffer is a cache of exactly one row per bank, and it creates the
+            three-case latency structure that dominates DRAM behavior. A row-buffer hit
+            (the wanted row is already open) pays only \(t_{CL}\) plus the burst. A
+            closed bank (no row open) pays \(t_{RCD} + t_{CL}\). A row-buffer conflict
+            (a different row is open) pays the full \(t_{RP} + t_{RCD} + t_{CL}\).
+            Memory controllers reorder requests aggressively to convert conflicts into
+            hits, batching requests to the same row before closing it. The scheduling
+            problem was formalized by Rixner, Dally, and colleagues, whose FR-FCFS
+            (first-ready, first-come-first-served) policy, prioritize row hits then
+            oldest, is still the baseline every DRAM scheduling paper compares against.
+            Row-buffer locality is thus a fourth kind of locality, invisible to the
+            cache hierarchy. Two misses that land in the same DRAM row are far cheaper
+            than two that alternate between rows of one bank.
+          </p>
+
+          <div class="problem">
+            <span class="plabel">Problem 1</span>
+            <p>
+              A DDR5-4800 module carries the common JEDEC timing bin 40-39-39, meaning
+              \(t_{CL} = 40\), \(t_{RCD} = 39\), \(t_{RP} = 39\) in controller clocks,
+              and transfers a 64-byte line as a burst of 16 beats. Compute (a) the
+              clock period and the three timings in nanoseconds, (b) the latency of a
+              row-buffer hit, a closed-bank access, and a row-buffer conflict, counting
+              burst time, and (c) the ratio of conflict to hit latency.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> (a) DDR transfers data on both clock edges,
+                so 4800 MT/s means a 2400 MHz clock and \(t_{CK} = 1/2.4\,\text{GHz} =
+                0.4167\) ns. Then \(t_{CL} = 40 \times 0.4167 = 16.67\) ns and
+                \(t_{RCD} = t_{RP} = 39 \times 0.4167 = 16.25\) ns. A burst of 16 beats
+                at two beats per clock takes 8 clocks, \(3.33\) ns.
+              </p>
+              <p>
+                (b) A hit costs \(t_{CL} + t_{burst} = 16.67 + 3.33 = 20.0\) ns, a
+                closed bank \(t_{RCD} + t_{CL} + t_{burst} = 16.25 + 16.67 + 3.33 =
+                36.25\) ns, and a conflict \(t_{RP} + t_{RCD} + t_{CL} + t_{burst} =
+                16.25 + 16.25 + 16.67 + 3.33 = 52.5\) ns.
+              </p>
+              <p>
+                (c) The conflict costs \(52.5 / 20.0 = 2.63\times\) the hit. Two
+                remarks anchor this in reality. First, these are unloaded device
+                latencies. A real load also crosses the core's cache hierarchy, the
+                memory-controller queues, and here a hypervisor's nested page tables,
+                which is how 52.5 ns of DRAM becomes the 134.6 ns end-to-end chase
+                latency measured on this machine below. Second, the numbers explain why
+                DRAM "speed grades" mislead. DDR5-4800 CL40 and DDR4-3200 CL22 both
+                have \(t_{CL} \approx 14\)-\(17\) ns. Absolute row and column latencies
+                have been near-constant for two decades. What each generation buys is
+                bandwidth and bank count, not latency.
+              </p>
+            </div>
+          </div>
+
+          <h3>Refresh, the tax on every capacitor</h3>
+          <p>
+            The charge on a DRAM cell leaks, so every row must be rewritten
+            periodically, 32 or 64 ms retention at normal temperature depending on
+            generation and density. The device handles this through REFRESH commands
+            issued by the controller every \(t_{REFI}\) (refresh interval). Each command
+            occupies the device for \(t_{RFC}\) (refresh cycle time), during which the
+            refreshing bank set can serve nothing. For a 16 Gb DDR5 device the standard
+            values are \(t_{REFI} = 3.9\ \mu\text{s}\) and \(t_{RFC} = 295\) ns for
+            all-bank refresh.
+          </p>
+          <div class="problem">
+            <span class="plabel">Problem 2</span>
+            <p>
+              For the 16 Gb DDR5 device above, compute (a) the fraction of time the
+              device is unavailable due to refresh, (b) the same fraction above
+              85&deg;C, where the standard halves \(t_{REFI}\), and (c) the number of
+              refresh commands per 32 ms retention window, verifying consistency.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> (a) The refresh duty cycle is
+                \(t_{RFC} / t_{REFI} = 295 / 3900 = 7.56\) percent, a bit over one
+                thirteenth of the device's time, and effectively a 7.6 percent tax on
+                both peak bandwidth and average latency (requests arriving during a
+                refresh wait out the remainder, adding an expected
+                \(\tfrac{1}{2} \times 295 \times 0.0756 \approx 11\) ns to the mean).
+              </p>
+              <p>
+                (b) At high temperature \(t_{REFI}\) drops to \(1.95\ \mu\text{s}\) and
+                the tax doubles to \(295/1950 = 15.1\) percent, which is one reason
+                dense server DIMMs and HBM stacks care so much about cooling. A hot
+                DIMM is a measurably slower DIMM.
+              </p>
+              <p>
+                (c) \(32\ \text{ms} / 3.9\ \mu\text{s} = 8205\) commands per window,
+                against the 8192 refreshes the standard requires to cover all row
+                groups, so the two are consistent, with a small margin. The trend behind
+                this arithmetic is unfavorable. \(t_{RFC}\) grows with density because more
+                rows must be refreshed per command, so the refresh tax rises with every
+                generation. This is why DDR5 added same-bank refresh (refreshing one
+                bank group while others serve requests) and why a research literature
+                exists on retention-aware and partial refresh, much of it from the
+                SAFARI group whose Ramulator simulators (Kim et al. 2015, and Ramulator
+                2.0 in 2023) are the standard tools for evaluating such proposals. The same
+                physics of disturbing neighboring rows through repeated activates is the
+                RowHammer effect (Kim et al. 2014), which turned a reliability curiosity
+                into a security field.
+              </p>
+            </div>
+          </div>
+
+          <h2>DDR5 versus HBM3: two answers to the pin problem</h2>
+          <h3>Bus width, stacking, and what each interface is for</h3>
+          <p>
+            A DRAM interface is pins times per-pin rate. DDR5 keeps the pin count small
+            and civilized because its signals must survive centimeters of motherboard
+            trace and a socketed connector. A DIMM presents two independent 32-bit
+            subchannels, 64 data bits total, at 4800 to 8800 MT/s. One DDR5-4800 DIMM
+            therefore moves \(64 \times 4.8\,\text{Gb/s} / 8 = 38.4\) GB/s, and a server
+            socket gets to hundreds of GB/s only by replicating channels. The Xeon
+            8480+ under this page has 8 memory channels for a theoretical
+            \(8 \times 38.4 = 307\) GB/s per socket. The virtue of this design is
+            capacity and serviceability, terabytes per socket of replaceable,
+            individually cheap modules.
+          </p>
+          <p>
+            HBM inverts every one of those choices. Instead of few pins driven fast over
+            long traces, it uses an enormous number of pins driven moderately over
+            sub-millimeter wires. DRAM dies are thinned, stacked 8 or 12 high, connected
+            vertically by through-silicon vias (TSVs), and the stack sits on a silicon
+            interposer next to the GPU die, close enough that a 1024-bit bus per stack
+            is routable. An HBM3 stack exposes 16 independent 64-bit channels (each split
+            into two 32-bit pseudo-channels), and at HBM3 rates of up to 6.4 Gb/s per pin
+            one stack delivers up to 819 GB/s. The price is that the memory is soldered
+            forever to the package, capacity per stack is modest, and the interposer
+            packaging (TSMC's CoWoS and its competitors) is expensive and
+            supply-constrained. The reward is an order of magnitude more bandwidth per
+            package than any DIMM system. In short, DDR gives capacity and
+            replaceability at hundreds of GB/s, and HBM gives thousands of GB/s
+            at fixed, modest capacity.
+          </p>
+          <pre class="flow">DDR5 (few fast pins, far away)        HBM3 (many moderate pins, adjacent)
+
+ CPU ──── cm of PCB trace ──── DIMM     ┌────────┐  ┌─ DRAM die ─┐
+  8 channels × 64 bits                  │  GPU   │  ├────────────┤ ×8-12 dies
+  4.8-8.8 Gb/s per pin                  │  die   │  ├────────────┤ stacked on
+  38.4 GB/s per DIMM                    └───┬────┘  ├────────────┤ TSVs
+  replaceable, TB-scale capacity            │ 1024 bits └──┬─────┘
+                                        ════╪══ silicon ═══╪════ interposer
+ H100: 5 stacks × 1024 = 5120 pins          └── &lt; 1 mm ────┘
+        at 5.24 Gb/s per pin</pre>
+          <div class="problem">
+            <span class="plabel">Problem 3</span>
+            <p>
+              The H100 80GB in this machine reports a maximum memory clock of 2619 MHz
+              (nvidia-smi, double data rate) and carries five active HBM3 stacks of 1024
+              data pins each. Compute the peak pin bandwidth and compare it with the
+              whitepaper figure and with the bandwidths actually measured on this card in
+              this repository's benchmark data (h100.json), namely fp32 copy 2992.4 GB/s,
+              fp32 add 3063.5 GB/s, and fp32 reduction 2995.2 GB/s.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> The per-pin data rate is \(2 \times 2619\
+                \text{MHz} = 5.238\) Gb/s and the total pin count is
+                \(5 \times 1024 = 5120\), so the peak bandwidth is
+              </p>
+              $$ \frac{5120 \times 5.238\ \text{Gb/s}}{8} = 3352\ \text{GB/s} $$
+              <p>
+                matching NVIDIA's advertised 3.35 TB/s for the SXM5 H100. The measured
+                streaming numbers land at \(2992.4/3352 = 89.3\) percent (copy) to
+                \(3063.5/3352 = 91.4\) percent (add) of pin peak. The missing 9-11
+                percent is exactly the overheads this page has been accounting, the refresh
+                duty cycle, row activate/precharge gaps that no scheduler can fully hide,
+                read-write turnaround bubbles on the bus, and ECC. Reaching ninety
+                percent of pin arithmetic from a PyTorch tensor operation is the sign of
+                a healthy memory system. The remainder is physics and protocol, not
+                software.
+              </p>
+            </div>
+          </div>
+          <h3>Why HBM trades latency for bandwidth</h3>
+          <p>
+            A common misreading is that HBM is "faster memory." At the device level it
+            is not. The banks inside an HBM stack are ordinary DRAM with \(t_{RCD}\),
+            \(t_{CL}\), and \(t_{RP}\) in the same 14-18 ns range as a DIMM, because the
+            limiting physics, sense-amplifier settling on long bitlines, is the same. End
+            to end, a GPU's memory latency is actually several times worse than a CPU's,
+            at hundreds of nanoseconds, as microbenchmark studies of NVIDIA GPUs (Jia et
+            al.'s dissection series is the standard reference) consistently measure,
+            versus the 134.6 ns this host's CPU achieves. The latency is spent in the
+            GPU's deep queueing. Requests from 132 SMs funnel through a crossbar into
+            dozens of memory-controller queues sized to keep 5120 pins busy, and a deep
+            queue is precisely a latency amplifier. The design is coherent, not
+            contradictory. A GPU is built to hide latency with parallelism (the next
+            section quantifies how much), so it happily accepts worse latency in
+            exchange for an interface that moves ten times the bytes. A CPU makes the
+            opposite bet for the opposite reason. The two memory systems are not on a
+            better-and-worse axis. They are the two endpoints of Little's law.
+          </p>
+
+          <h2>Memory-level parallelism and Little's law</h2>
+          <h3>The law, derived, and what it says about memory</h3>
+          <p>
+            Little's law is queueing theory's one free lunch. In any system in steady
+            state, the average number of items inside equals the arrival rate times the
+            average time each item spends inside, \(N = \lambda \, W\), with no
+            assumptions about distributions, ordering, or independence (Little, 1961).
+            Apply it to a memory system. If a machine is to sustain bandwidth \(B\) bytes
+            per second against a memory latency of \(W\) seconds, and each in-flight
+            request carries \(g\) bytes (one cache line or sector), then the number of
+            requests simultaneously outstanding must average
+          </p>
+          $$ N = \frac{B \times W}{g}, \qquad\text{equivalently}\qquad \underbrace{B \times W}_{\text{bytes in flight}} = N \, g. $$
+          <p>
+            The product \(B \times W\), the bytes that must be in flight to hide the
+            latency, is the memory system's bandwidth-delay product, the exact analogue
+            of the network quantity of the same name. This single equation organizes
+            everything on this page. Prefetchers, out-of-order windows,
+            miss-status-holding registers, GPU occupancy, and unrolled loads are all
+            mechanisms for raising \(N\). The derivation is worth doing once because it is
+            a counting argument, not a stochastic one.
+          </p>
+          <div class="problem">
+            <span class="plabel">Problem 4</span>
+            <p>
+              (a) Prove Little's law for a system observed over a long interval. (b) This
+              host measures (os.json in this repository, pinned pointer-chase over a 32
+              GiB region with 2 MiB huge pages) a dependent-load latency of 134.6 ns, and
+              its best measured DRAM bandwidth is 111.3 GB/s (26-thread OpenMP sum,
+              parallel.json). How many 64-byte lines must be in flight to sustain that
+              bandwidth at that latency, and how many per core across 26 physical cores?
+              (c) What bandwidth can a single dependent chase achieve, and how does that
+              compare with the measured sequential rate of 4.5 ns per line?
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> (a) Watch the system for a long time \(T\) and
+                let \(A(T)\) count arrivals. The area under the curve \(n(t)\), the number
+                of items present at time \(t\), can be computed two ways. Horizontally it
+                is \(\int_0^T n(t)\,dt = \bar{N} T\) where \(\bar{N}\) is the time-average
+                occupancy, and vertically it is the sum over items of the time each spent
+                inside, which is \(A(T) \, \bar{W}\) plus a boundary term for items
+                straddling the ends. Dividing by \(T\) gives \(\bar{N} = \frac{A(T)}{T}\,\bar{W}
+                + o(1) = \lambda \bar{W}\) as \(T \to \infty\), provided the boundary term
+                stays bounded, which steady state guarantees. No distributional assumption
+                entered.
+              </p>
+              <p>
+                (b) \(N = 111.3 \times 10^9 \times 134.6 \times 10^{-9} / 64 = 234.1\)
+                lines in flight, machine-wide. Across 26 cores that is \(234.1/26 = 9.0\)
+                outstanding misses per core, every nanosecond of every second. A core that
+                could only handle one outstanding miss would cap the whole socket at
+                \(26 \times 64 / 134.6\,\text{ns} = 12.4\) GB/s.
+              </p>
+              <p>
+                (c) One dependent chase has \(N = 1\) by construction, since the next address is
+                unknown until the current load returns. Its bandwidth ceiling is
+                \(64 / 134.6\,\text{ns} = 0.475\) GB/s, which no compiler flag or clock
+                speed can raise. The measured sequential rate of 4.5 ns per line (14.2 GB/s
+                from one thread) is \(134.6/4.5 \approx 30\times\) better on identical
+                hardware. The entire difference is concurrency, supplied by the hardware
+                prefetchers and out-of-order window, which turn a predictable stream into
+                dozens of overlapped fetches. Latency hiding is not an optimization. On
+                this arithmetic it is the difference between using 0.4 percent and 13
+                percent of the socket's memory system from one thread.
+              </p>
+            </div>
+          </div>
+          <div class="problem">
+            <span class="plabel">Problem 5</span>
+            <p>
+              Now do the same accounting for the GPU. Take the H100's peak HBM bandwidth
+              as 3.35 TB/s and a representative HBM3 load-to-use latency of 500 ns (GPU
+              memory latencies measured by the Hopper microbenchmark dissections fall in
+              the 450-600 ns band, so treat 500 ns as a round figure). (a) How many bytes,
+              and how many 128-byte sectors, must be in flight to saturate HBM? (b) Spread
+              across 132 SMs, how many outstanding sectors is that per SM, and is that
+              reachable? (c) Redo (a) with the measured effective bandwidth of 3063.5 GB/s
+              and comment.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> (a) Bytes in flight
+                \(= B \times W = 3.35 \times 10^{12} \times 500 \times 10^{-9} = 1.675
+                \times 10^{6}\) bytes, about 1.68 MB. At the GPU's 128-byte sector that is
+                \(1.675 \times 10^{6} / 128 = 13086\) sectors outstanding at all times.
+              </p>
+              <p>
+                (b) \(13086 / 132 = 99.1\) sectors in flight per SM. An SM runs up to 2048
+                threads. If every thread has one 4-byte load outstanding, a warp of 32
+                touches one to four sectors, so a few hundred resident threads per SM
+                already supply a hundred outstanding sectors. The requirement is
+                comfortably met at moderate occupancy, which is exactly why the H100 hits
+                90 percent of pin bandwidth on a simple copy and why memory-bound GPU
+                kernels care about occupancy. Occupancy is the knob that sets \(N\). This
+                is the GPU restatement of Volkov's thesis that latency on GPUs is hidden by
+                parallelism, not by a cache.
+              </p>
+              <p>
+                (c) With the measured 3063.5 GB/s the bytes in flight fall to
+                \(3.0635 \times 10^{12} \times 500 \times 10^{-9} = 1.53\) MB, 11966
+                sectors, 90.7 per SM. The ratio to the pin-peak figure is exactly the 91.4
+                percent bandwidth efficiency of Problem 3, because Little's law is linear
+                in \(B\). The same latency, less delivered bandwidth, fewer bytes needed in
+                flight. The bandwidth-delay product is the right lens for both CPU and GPU.
+                Only the magnitudes differ, by three orders in \(N\).
+              </p>
+            </div>
+          </div>
+          <h3>Measuring the concurrency limit directly on this machine</h3>
+          <p>
+            The theory predicts that bandwidth from one thread should scale linearly with
+            the number of independent pointer chases it interleaves, until some hardware
+            resource that tracks outstanding misses saturates. A microbenchmark that runs
+            \(k\) independent Sattolo-cycle chases over a 2 GiB region from a single
+            thread, each chase contributing exactly one line in flight, shows the plateau
+            directly. Scaling is close to linear for the first several chains, then
+            collapses as requests queue behind a full fill-buffer structure. The plateau
+            bandwidth divided into \(g/W\) recovers the number of miss-tracking entries
+            the core exposes, on the order of 10-16 across recent Intel cores. This is why
+            single-thread random-access workloads, pointer-heavy graph traversals, hash
+            joins, garbage collectors, cannot come close to memory bandwidth, and why the
+            same 4 KiB-page chase costs 255.0 ns against 134.6 ns with huge pages
+            (os.json). With a 32 GiB working set, the 4 KiB TLB misses add a page walk to
+            nearly every hop, and the walk itself is more dependent memory traffic.
+          </p>
+
+          <h2>The memory hierarchy as a bandwidth cascade</h2>
+          <p>
+            The single most useful mental model for a modern accelerator is not the
+            classic latency pyramid but a bandwidth cascade. Each level down the hierarchy
+            delivers roughly an order of magnitude fewer bytes per second than the one
+            above, and the entire craft of a fast kernel is keeping the working set as
+            high in the cascade as it will fit. Assembling one table for this machine,
+            with each row labeled measured, derived, or spec, makes the drop concrete. The
+            register and shared-memory rows are derived from the SM's issue arithmetic
+            (shared memory serves 32 banks of 4 bytes per clock per SM, so
+            \(32 \times 4 \times 1.98\,\text{GHz} \times 132 \approx 33\) TB/s aggregate).
+            The L2 row is the whitepaper's modeled figure, and HBM, NVLink, and PCIe are
+            measured in this repository's JSON.
+          </p>
+          <div class="tbl-wrap"><table class="data">
+            <thead><tr><th>level</th><th>capacity</th><th>aggregate bandwidth</th><th>rough latency</th><th>source</th></tr></thead>
+            <tbody>
+              <tr><td>registers (per SM file)</td><td>256 KB &times; 132</td><td>&gt; 100 TB/s</td><td>~1 cycle</td><td>analytic</td></tr>
+              <tr><td>shared memory / L1</td><td>228 KB &times; 132</td><td>~33 TB/s</td><td>~20-30 cyc</td><td>derived</td></tr>
+              <tr><td>L2 cache</td><td>50 MB</td><td>~10 TB/s</td><td>~200 cyc</td><td>spec / modeled</td></tr>
+              <tr><td>HBM3 (device memory)</td><td>80 GB</td><td>3063.5 GB/s</td><td>~500 ns</td><td>measured (h100.json)</td></tr>
+              <tr><td>NVLink (to peer GPU)</td><td>&mdash;</td><td>330.2 GB/s</td><td>~1-2 &micro;s</td><td>measured (networks.json)</td></tr>
+              <tr><td>PCIe gen5 x16 (to host)</td><td>&mdash;</td><td>54.84 GB/s</td><td>~1-2 &micro;s</td><td>measured (os.json)</td></tr>
+              <tr><td>400 Gb/s NIC (to network)</td><td>&mdash;</td><td>~50 GB/s</td><td>~&micro;s-ms</td><td>spec (loopback only here)</td></tr>
+            </tbody>
+          </table></div>
+          <p>
+            The cascade spans nearly four orders of magnitude, from &gt;100 TB/s in the
+            register file to ~50 GB/s at the NIC. Three cliffs matter most. The first is
+            SMEM to HBM, roughly 10x, which is the entire reason for tiling. A matmul or
+            attention kernel that streams operands from HBM is bandwidth-bound, whereas one
+            that loads a tile into shared memory and reuses it is not (the
+            <a href="/classes/parallel-computing/">parallel-computing page</a> works the
+            tiled-matmul and flash-attention kernels that do this). The second is HBM to
+            NVLink, about 9x, which is why data-parallel training overlaps gradient
+            all-reduce with the backward pass rather than serializing it. The third is
+            NVLink to PCIe, about 6x, which is why an offloading scheme that spills
+            optimizer state to host memory is throttled at PCIe rates no matter how fast the
+            GPU is. Every serious performance decision in this stack is a choice about which
+            cliff a given byte has to cross and how many times.
+          </p>
+
+          <h2>Prefetching: manufacturing concurrency from patterns</h2>
+          <h3>Stream, stride, and spatial prefetchers</h3>
+          <p>
+            A prefetcher is hardware that converts predictability into memory-level
+            parallelism. The taxonomy, surveyed thoroughly by Mittal (2016), runs from
+            simple to speculative. Next-line and stream prefetchers detect monotone
+            sequences of miss addresses and run ahead by a configurable depth. They are why
+            the sequential chase achieves 4.5 ns per line. Stride prefetchers track, per
+            load instruction (indexed by PC), the difference between successive addresses,
+            and issue ahead when the delta is stable, covering column-major walks and
+            strided array code. Spatial-pattern prefetchers learn which offsets within a
+            region tend to be touched together and replay the bit pattern on first touch of
+            a new region. Beyond these sit correlation and temporal-stream prefetchers that
+            record miss-address sequences and replay them, effectively memoizing pointer
+            chases, at substantial metadata cost. Every prefetcher trades accuracy against
+            coverage and timeliness. A wrong prefetch wastes bandwidth and evicts useful
+            lines, so real designs throttle themselves when accuracy drops, and all of them
+            are defeated by a Sattolo cycle, which is constructed to have no pattern at any
+            granularity.
+          </p>
+          <h3>Why strided access decays: the measured table</h3>
+          <p>
+            The GPU makes the cost of non-unit stride unusually clean to see, because its
+            memory system is explicitly organized around 128-byte cache lines fetched as
+            four 32-byte sectors. The measured strided-read bandwidths on this repository's
+            H100 (parallel.json, idle GPU, useful bytes per second) appear in the table below.
+          </p>
+          <div class="tbl-wrap"><table class="data">
+            <thead><tr><th>stride (floats)</th><th>useful bytes per 32 B sector</th><th>measured GB/s</th><th>fraction of stride-1</th></tr></thead>
+            <tbody>
+              <tr><td>1</td><td>32 of 32</td><td>2380.5</td><td>1.00</td></tr>
+              <tr><td>2</td><td>16 of 32</td><td>1856.3</td><td>0.78</td></tr>
+              <tr><td>4</td><td>8 of 32</td><td>1218.3</td><td>0.51</td></tr>
+              <tr><td>8</td><td>4 of 32</td><td>674.3</td><td>0.28</td></tr>
+              <tr><td>16</td><td>4 of 32</td><td>352.9</td><td>0.148</td></tr>
+              <tr><td>32</td><td>4 of 32</td><td>325.2</td><td>0.137</td></tr>
+            </tbody>
+          </table></div>
+          <p>
+            The limiting arithmetic is simple. A stride of \(s\) 4-byte floats means each 32-byte
+            sector fetched from HBM contains at most \(\max(1, 8/s)\) useful elements, so
+            once \(s \geq 8\) each fetched sector carries a single useful float and the
+            useful-bandwidth waste factor saturates at 8. The measured asymptote of
+            \(2380.5 / 325.2 = 7.3\) agrees, within noise of the predicted 8. At small strides the
+            decay is gentler than the naive \(1/s\) because the L2 cache recaptures sectors
+            that a neighboring warp will use shortly, and at stride 16 versus 8 the further
+            drop comes from touching twice as many 128-byte lines (and DRAM rows) per useful
+            byte even though sector waste has already saturated. The CUDA tab in the
+            implementation section reproduces the shape of this table. The general lesson
+            transfers directly to CPUs. Hardware moves lines and sectors, so the effective
+            bandwidth of any access pattern is pin bandwidth times the fraction of each
+            fetched line the program actually uses. Array-of-structures layouts where a loop
+            touches one field are stride-\(s\) reads in disguise, which is the entire case
+            for structure-of-arrays layouts in performance code.
+          </p>
+
+          <h2>NUMA on this machine, honestly</h2>
+          <p>
+            NUMA, non-uniform memory access, is what happens when "memory" stops being one
+            place. Each socket (or, with sub-NUMA clustering, each quadrant of a socket) has
+            local DRAM channels, and touching another node's memory crosses a
+            socket-to-socket link (UPI on Intel) at higher latency and lower bandwidth. This
+            host is the right place to demonstrate epistemic honesty rather than the effect
+            itself, because it is a KVM guest, and the hypervisor flattens whatever physical
+            topology exists. The guest exposes a single fictitious socket with a single NUMA
+            node covering all 52 vCPUs and a synthetic 16 MiB L3, whereas a physical Xeon
+            Platinum 8480+ has 56 cores and about 105 MB of L3, so this guest is a carve-out
+            of something larger presented as one node. No cross-node measurement is possible
+            from in here, which is itself the most practical NUMA lesson this machine can
+            teach. Measured latency here already includes whatever remote-socket penalty the
+            hypervisor's placement imposes, invisibly and variably.
+          </p>
+          <p>
+            On bare metal the effects are large and well documented (Hennessy and Patterson
+            treat the architecture). Local versus remote DRAM latency on two-socket servers
+            typically differs by 1.5-2x (order of 100 ns local, 150-200 ns remote), remote
+            bandwidth is capped by the UPI links rather than the remote DIMMs, and Sapphire
+            Rapids adds sub-NUMA clustering (SNC), which splits even one socket into four NUMA
+            domains so that each quadrant's cores favor their nearest memory controllers. The
+            operating system's default policy, first touch, allocates a page on the node of
+            the thread that first writes it, which is why parallel programs that initialize
+            arrays from thread 0 and then process them from all threads quietly serialize
+            every access through one node's controllers. The fixes are mechanical. Initialize
+            in parallel with the same partitioning as the compute loop, pin threads, and bind
+            memory where the topology is real.
+          </p>
+
+          <h2>Interconnects: PCIe gen5, NVLink, CXL</h2>
+          <h3>PCIe lane arithmetic against a measured copy</h3>
+          <p>
+            PCIe gen5 signals at 32 GT/s per lane per direction with 128b/130b encoding, so
+            an x16 link's raw data rate is
+          </p>
+          $$ 32\ \text{GT/s} \times 16 \times \frac{128}{130} \div 8 = 63.0\ \text{GB/s per direction} $$
+          <p>
+            before packet overheads (TLP headers, flow control) shave several more percent.
+            Both H100s here report gen5 x16 links. The measured host-to-device copy on this
+            machine (os.json, 256 MiB buffers, torch) is 54.84 GB/s from pinned memory, 87
+            percent of the lane arithmetic and about as good as PCIe copies get, but only
+            21.01 GB/s from ordinary pageable memory, a measured 2.61x penalty, because a
+            pageable copy is really host-side staging into a pinned bounce buffer, and the
+            staging memcpy steals the bandwidth. Pinning itself cost a measured 95.7 ms per
+            256 MiB, roughly 25 copies' worth, which is the arithmetic behind the standard
+            advice. Pin once, reuse the buffer, overlap copies with compute, and never pin
+            inside a loop.
+          </p>
+          <h3>NVLink, measured with NCCL, and the coherence question</h3>
+          <p>
+            The two H100s are joined by NVLink, and nvidia-smi reports 18 links (the NV18
+            topology), for a raw \(18 \times 26.562 = 478.1\) GB/s per direction, marketed as
+            450 GB/s effective after protocol framing. What a training job actually
+            experiences is the collective bandwidth, and this repository measured it
+            (networks.json, torch.distributed all_reduce over NCCL 2.26.2). A raw
+            peer-to-peer device copy sustains 388.28 GB/s, and all-reduce bus bandwidth climbs
+            from 41.68 GB/s at 1 MiB messages to 300.14 GB/s at 256 MiB and 330.15 GB/s at 1
+            GiB. Small messages are latency-dominated. At 1 MiB the transfer spends its time in
+            kernel launches and synchronization, achieving 12 percent of what 1 GiB achieves.
+            For two ranks bus bandwidth equals algorithmic bandwidth (the \(2(N-1)/N\) ring
+            factor is 1 at \(N = 2\)), so 330.15 GB/s is the honest number, 73 percent of the
+            450 GB/s link rating, with the gap going to protocol, the reduction arithmetic
+            itself, and the fact that a ring all-reduce must both read and write HBM at each
+            step. All of it is an order of magnitude above the 54.84 GB/s PCIe ceiling that
+            the same data would face without NVLink, which is the entire reason the links
+            exist.
+          </p>
+          <p>
+            The coherence distinction is worth stating precisely, because it separates NVLink
+            from PCIe more than raw bandwidth does. Plain PCIe is non-coherent. A device DMA
+            into host memory does not participate in the CPU's cache-coherence protocol, so
+            software must flush and fence explicitly, and there is no notion of the GPU and
+            CPU sharing a cache line. NVLink between GPUs, and the NVLink-C2C link that binds
+            a Grace CPU to a Hopper GPU, carry coherence traffic. A load on one side can
+            observe a store on the other with hardware-maintained ordering, which is what
+            makes unified memory and fine-grained peer access practical rather than a
+            correctness hazard. CXL brings the same idea to commodity hardware. CXL.cache lets
+            a device coherently cache host memory and CXL.mem lets the host issue plain loads
+            and stores to device-attached DRAM at a latency comparable to one extra NUMA hop.
+            CXL.mem is the one reshaping memory systems, because it turns DRAM into a pooled,
+            fabric-attached resource. A CXL expander is, in the language of the NUMA section,
+            a memory node with no CPUs on it, addressable with ordinary load/store semantics.
+          </p>
+
+          <h2>Tensor cores and systolic arrays</h2>
+          <p>
+            Everything so far has been about moving bytes. The reason the byte-moving matters
+            so much is that a modern accelerator's compute unit is so voracious that only a
+            carefully amortized memory system can keep it busy. The compute unit in question
+            is a two-dimensional array of multiply-accumulate (MAC) cells. NVIDIA calls its
+            version a tensor core, Google's TPU is one large version of it, and the design
+            principle is the systolic array that H. T. Kung and Charles Leiserson described in
+            1978. This section derives why such an array amortizes bandwidth, works the reuse
+            arithmetic of the three canonical dataflows, and then derives the arithmetic
+            intensity a tensor-core array demands, connecting it to the roofline.
+          </p>
+          <h3>The systolic dataflow, derived</h3>
+          <p>
+            Consider computing \(C = AB\) with \(A\) of shape \(M \times K\) and \(B\) of
+            shape \(K \times N\). A systolic array is a \(P \times P\) grid of MAC cells, each
+            holding one accumulator. In the weight-stationary formulation, one \(P \times P\)
+            tile of \(B\) is preloaded so that cell \((i,j)\) holds \(B_{ij}\) and never moves.
+            Rows of \(A\) then march in from the left edge, one column of the array per clock,
+            while partial sums march down from the top. At each clock, cell \((i,j)\) receives
+            an input element from its left neighbor and a partial sum from above, computes
+            \(\text{psum} + a \cdot B_{ij}\), passes the input right and the new partial sum
+            down. After the operands have rippled through, the bottom edge emits one row of
+            \(C\) per clock. The name systolic is Kung's. Data pulses through the array like
+            blood through a heart, each cell touching each datum once.
+          </p>
+          <pre class="flow">weight-stationary P×P systolic array (P = 4 shown)
+
+  inputs (rows of A) stream in ►      B tile preloaded, stationary
+        a30 a20 a10 a00 ─►┌────┬────┬────┬────┐
+        a31 a21 a11 a01 ─►│B00 │B01 │B02 │B03 │  each cell: psum += a·B
+        a32 a22 a12 a02 ─►│B10 │B11 │B12 │B13 │  pass a right, psum down
+        a33 a23 a13 a03 ─►│B20 │B21 │B22 │B23 │
+                          │B30 │B31 │B32 │B33 │
+                          └─┬──┴─┬──┴─┬──┴─┬──┘
+                            ▼    ▼    ▼    ▼
+                          columns of C emerge (partial sums)
+
+  P² MACs per clock, fed by ~P new inputs per clock  ⇒ operand reuse ≈ P/2</pre>
+          <p>
+            The bandwidth argument is now immediate and is the whole point of the design. The
+            array performs \(P^2\) MACs every clock, one per cell. It is fed by roughly \(P\)
+            new input elements streaming in the left edge each clock (the weights were loaded
+            once and amortize over the whole tile pass, and the partial sums are internal). The
+            ratio of compute to fresh operands is therefore
+          </p>
+          $$ \frac{P^2\ \text{MACs/clock}}{\approx 2P\ \text{operands/clock}} = \frac{P}{2}, $$
+          <p>
+            counting both the input stream and the eventual output drain as operand traffic.
+            Each operand brought to the array edge participates in \(\Theta(P)\) MACs before it
+            leaves. This is the amortization. A naive matmul that read both operands of every
+            MAC from memory would need two operand fetches per MAC, an operand-reuse of
+            \(\tfrac12\). The array raises that by a factor of \(P\). For the TPUv1's
+            \(256 \times 256\) array that is a reuse of 128, and for a Hopper tensor core doing
+            a warp-level \(16 \times 16 \times 16\) MMA the reuse per issued instruction is on
+            the same order. The MAC array does not make arithmetic cheaper. It makes each byte
+            that crosses the memory interface do \(\Theta(P)\) times as much arithmetic, which
+            is exactly what a bandwidth-starved system needs.
+          </p>
+          <h3>The dataflow taxonomy: weight-, output-, and row-stationary</h3>
+          <p>
+            Which datum is held stationary in the array, and which stream, is the defining
+            design choice of a spatial accelerator, and Chen, Emer, and Sze's Eyeriss work
+            (ISCA 2016) gave the taxonomy its standard names by classifying designs according
+            to which data type is kept local to maximize its reuse. The three canonical
+            choices are stated below for a convolution or matmul with weights \(W\), inputs (activations)
+            \(I\), and partial sums \(P\!s\).
+          </p>
+          <ul>
+            <li><strong>Weight-stationary</strong> keeps weights pinned in each PE's register
+              and streams activations past them, maximizing weight reuse. It is what the TPU
+              and most inference accelerators use, because in inference the weights are reused
+              across every element of a large batch or feature map while activations are seen
+              once.</li>
+            <li><strong>Output-stationary</strong> keeps each partial sum pinned in its PE and
+              streams weights and activations in, maximizing partial-sum reuse by never
+              spilling an accumulator to memory until the reduction over \(K\) is complete. It
+              minimizes the most expensive traffic, the read-modify-write of partial sums,
+              which is why deep reductions favor it.</li>
+            <li><strong>Row-stationary</strong>, the dataflow Eyeriss introduced, keeps a row of
+              the convolution's computation, a one-dimensional weight row and the corresponding
+              input row, resident in each PE, and reuses all three data types at once by mapping
+              the 2D convolution's reuse structure onto the 2D PE array. Chen et al. showed it
+              minimizes total data movement energy across the whole array rather than optimizing
+              any single data type, which under a realistic energy model is what actually
+              matters.</li>
+          </ul>
+          <p>
+            The reason the taxonomy is worth memorizing is that it maps directly onto an energy
+            model. Chen and Sze report, and it is the number every architect carries, that in a
+            65 nm process a single 32-bit DRAM access costs roughly 200 times the energy of one
+            MAC, an on-chip global-buffer (SRAM) access about 6 times, a neighbor or array
+            access about 2 times, and a local register-file access about 1 time. Data movement,
+            not arithmetic, dominates the energy budget, so the winning dataflow is the one that
+            keeps each datum in the cheapest level for the longest, and that is a per-workload
+            question. The next problem quantifies exactly how much a reuse dataflow saves.
+          </p>
+          <div class="problem">
+            <span class="plabel">Problem 6</span>
+            <p>
+              Consider a \(256 \times 256 \times 256\) matmul, so \(M = K = N = 256\), giving
+              \(M K N = 2^{24} = 16{,}777{,}216\) MACs. Use the normalized Eyeriss energy costs
+              (one MAC \(= 1\), register-file access \(= 1\), DRAM access \(= 200\)). Compare
+              two schemes, (A) a no-reuse scheme where each MAC reads both operands directly
+              from DRAM, and (B) a reuse scheme where each distinct operand element is fetched
+              from DRAM exactly once into the array and all reuse is served from the register
+              file. Compute the total energy in normalized units and the ratio.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> In scheme A, each of the \(2^{24}\) MACs fetches two
+                operands from DRAM and does one multiply-accumulate, so its energy is
+                \(2^{24} \times (2 \times 200 + 1) = 2^{24} \times 401 = 6.728 \times 10^{9}\)
+                units.
+              </p>
+              <p>
+                In scheme B, the distinct operands are the \(M K = 65{,}536\) elements of \(A\) plus
+                the \(K N = 65{,}536\) elements of \(B\), so \(131{,}072\) DRAM reads at cost 200
+                each, and every MAC then reads its two operands from the register file (cost 1
+                each) and accumulates (cost 1), giving \(131{,}072 \times 200 + 2^{24} \times (2 + 1) =
+                2.621 \times 10^{7} + 5.033 \times 10^{7} = 7.655 \times 10^{7}\) units.
+              </p>
+              <p>
+                The ratio is \(6.728 \times 10^{9} / 7.655 \times 10^{7} = 87.9\times\). The
+                reuse scheme cuts DRAM traffic from \(2 \times 2^{24}\) reads to \(131{,}072\), a
+                \(256\times\) reduction (exactly the reuse factor \(K\) for each element), and
+                because DRAM dominates the energy the whole computation runs almost 88 times more
+                cheaply. This single ratio is why every accelerator, from Eyeriss to the TPU to a
+                tensor core with its operand-collector register files, is built around keeping
+                operands resident. The systolic array of the previous section is one physical way
+                to realize scheme B. The stationary weights are the operands that stay, and the
+                register-file reuse is the array's internal wiring.
+              </p>
+            </div>
+          </div>
+          <h3>How much arithmetic intensity keeps the array fed</h3>
+          <p>
+            The array amortizes bandwidth, but only if the kernel supplies enough arithmetic per
+            byte. The precise requirement is the roofline ridge point. Define arithmetic
+            intensity \(I = \text{FLOPs} / \text{bytes moved from HBM}\) (units FLOP/byte). The
+            roofline model (Williams, Waterman, Patterson, 2009) says attainable performance is
+          </p>
+          $$ \text{FLOP/s} = \min\!\big(\, \pi, \beta \cdot I \,\big), $$
+          <p>
+            where \(\pi\) is peak compute and \(\beta\) is peak memory bandwidth. The two regimes
+            meet at the ridge point \(I^\star = \pi / \beta\). Below it a kernel is memory-bound
+            and above it compute-bound. For this H100, using the measured bf16 tensor-core peak of
+            744.6 TFLOP/s (h100.json, \(n = 4096\)) and the pin bandwidth 3.35 TB/s,
+          </p>
+          $$ I^\star = \frac{744.6 \times 10^{12}}{3.35 \times 10^{12}} = 222\ \text{FLOP/byte}, $$
+          <p>
+            and using the whitepaper's dense bf16 peak of 989.5 TFLOP/s it is 295 FLOP/byte. Either
+            way the number is large. To keep the tensor cores saturated, a kernel must do on the
+            order of 220-300 floating-point operations for every byte it reads from HBM. In bf16,
+            two bytes per element, that is 440-590 FLOPs per element loaded. No elementwise or
+            reduction kernel comes close. Only matmul-shaped work, whose intensity grows with tile
+            size, can. This is the arithmetic that forces the whole tensor-core design. The array
+            is worth building only because matmul's intensity can exceed the ridge, and it is worth
+            feeding from a bandwidth cascade only because the ridge is so high.
+          </p>
+          <div class="problem">
+            <span class="plabel">Problem 7</span>
+            <p>
+              A square matmul \(C = AB\) with \(A, B, C\) all \(n \times n\) in bf16 does
+              \(2n^3\) FLOPs and, in the ideal case where each matrix is read or written from HBM
+              exactly once, moves \(3 n^2\) elements \(\times\) 2 bytes. (a) Derive the arithmetic
+              intensity as a function of \(n\). (b) At what \(n\) does the kernel cross the ridge
+              point \(I^\star = 222\) FLOP/byte? (c) Evaluate the intensity at \(n = 1024\) and
+              \(n = 4096\) and reconcile with the measured bf16 throughputs (h100.json, 108.9
+              TFLOP/s at \(n = 1024\), 744.6 at \(n = 4096\)).
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> (a) \(I(n) = \dfrac{2n^3}{3 n^2 \cdot 2} =
+                \dfrac{2n^3}{6 n^2} = \dfrac{n}{3}\) FLOP/byte. Matmul intensity grows linearly in
+                the matrix dimension, which is the mathematical fact that makes matmul the one
+                dense kernel that can saturate a tensor core.
+              </p>
+              <p>
+                (b) Set \(n/3 = 222\), so \(n = 666\). Any square bf16 matmul larger than about
+                \(666 \times 666\), read once from HBM, has enough intensity in principle to be
+                compute-bound.
+              </p>
+              <p>
+                (c) \(I(1024) = 341\) and \(I(4096) = 1365\) FLOP/byte, both above the 222 ridge, so
+                both are compute-bound by the intensity test. Yet \(n = 1024\) reaches only 108.9
+                TFLOP/s, 15 percent of the 744.6 the \(n = 4096\) case reaches. The intensity test
+                is a necessary condition, not a sufficient one. At \(n = 1024\) there is not enough
+                parallel work to fill 132 SMs with large enough tiles, launch and epilogue overheads
+                are a larger fraction of the runtime, and the tensor cores stall waiting on the
+                shared-memory pipeline. The lesson is that the roofline sets the ceiling a kernel can
+                aspire to. Hitting it also requires enough occupancy and large enough tiles to hide
+                every latency in the cascade, which is why production matmul at \(n = 4096\) and up is
+                where the hardware finally delivers, exactly as the measured curve shows the
+                throughput climbing 108.9, 453.4, 744.6 TFLOP/s from \(n = 1024\) to 2048 to 4096.
+              </p>
+            </div>
+          </div>
+
+          <h2>The precision ladder: fp32, tf32, bf16, fp8</h2>
+          <p>
+            The tensor core is not one datapath but a ladder of them, each trading numerical range
+            or precision for throughput and, just as importantly, for bytes moved. Every rung halves
+            or doubles something, and the measured throughputs on this machine (h100.json, square
+            matmul at \(n = 4096\)) make the ladder concrete.
+          </p>
+          <div class="tbl-wrap"><table class="data">
+            <thead><tr><th>format</th><th>bits (E/M)</th><th>bytes</th><th>measured TFLOP/s, n=4096</th><th>vs fp32</th></tr></thead>
+            <tbody>
+              <tr><td>fp32 (CUDA cores)</td><td>8 / 23</td><td>4</td><td>51.3</td><td>1.0x</td></tr>
+              <tr><td>tf32 (tensor core)</td><td>8 / 10</td><td>4 stored</td><td>384.0</td><td>7.5x</td></tr>
+              <tr><td>bf16</td><td>8 / 7</td><td>2</td><td>744.6</td><td>14.5x</td></tr>
+              <tr><td>fp16</td><td>5 / 10</td><td>2</td><td>723.4</td><td>14.1x</td></tr>
+              <tr><td>fp8 (E4M3/E5M2)</td><td>4 / 3 or 5 / 2</td><td>1</td><td>~2x bf16 (spec)</td><td>~29x</td></tr>
+            </tbody>
+          </table></div>
+          <p>
+            The design of each rung follows a single idea. For neural-network math the exponent range
+            matters more than the mantissa. bf16 keeps fp32's full 8-bit exponent and throws away 16
+            mantissa bits, so it never overflows or underflows where fp32 would not, which is why it
+            trains large models stably where fp16, with its 5-bit exponent, needs loss scaling to keep
+            gradients in range (Micikevicius et al., 2018). tf32 is the subtle one. It keeps the 8-bit
+            exponent and 10 mantissa bits (19 bits total), is stored in a 32-bit container so code sees
+            fp32 tensors, but the tensor core internally rounds the inputs to tf32 before multiplying,
+            which is how a matmul that looks like fp32 runs 7.5x faster on this card. fp8, standardized
+            by Micikevicius et al. (2022) in two variants, E4M3 for weights and activations and E5M2 for
+            gradients, halves bytes again and doubles the spec throughput, and it is now the default for
+            large-model inference and increasingly for training with per-tensor or per-block scaling to
+            place the tiny dynamic range where the values live. The through-line for this page is that
+            every rung down the ladder is a memory-system decision as much as a compute one. fp8 doubles
+            tensor-core throughput, but it also halves the bytes read from HBM against bf16, which for a
+            bandwidth-bound stage such as attention's value load or an embedding gather is the larger win.
+          </p>
+          <p>
+            The accuracy cost is real but bounded, and the standard reference on why it is bounded is
+            the observation that matmul accumulation should happen in higher precision than the inputs.
+            Markidis et al. (2018) measured that NVIDIA tensor cores multiply fp16 inputs but accumulate
+            in fp32, so the error of a length-\(K\) dot product grows like the fp16 rounding of the
+            inputs plus fp32 accumulation error, far better than pure fp16 would give. The same
+            split-accumulate principle carries to bf16 and fp8. The practical rule that falls out is to
+            store and multiply in the lowest precision the range tolerates, accumulate in fp32, and keep
+            a master copy of weights in fp32 or bf16 for the optimizer.
+          </p>
+
+          <h2>Structured sparsity and quantization hardware</h2>
+          <p>
+            Two further hardware features extend the ladder past dense low precision. The first is
+            structured 2:4 sparsity, introduced with the A100's Sparse Tensor Cores and carried into
+            Hopper. The constraint is deliberately rigid. In every contiguous group of four weights,
+            at most two may be nonzero. A network is trained dense, pruned to satisfy the 2:4 pattern,
+            and fine-tuned. Mishra et al. (2021) showed this recovers full accuracy across a wide range
+            of models. The hardware payoff is that the sparse tensor core stores only the two nonzeros
+            per group plus a 2-bit index selecting their positions, so it skips half the MACs and reads
+            half the weight bytes, delivering up to a nominal 2x over the dense rung. The rigidity is
+            the point. Unstructured sparsity gives no speedup on such a MAC array because the array
+            cannot skip arbitrary zeros without gather logic that would cost more than it saves,
+            whereas the fixed 2:4 pattern maps to a small multiplexer in front of each PE row. Sparsity
+            here is a memory-bandwidth technique wearing a compute costume. Half the weight bytes cross
+            the cascade, which for the weight-bound decode phase of LLM inference is exactly the bytes
+            that matter.
+          </p>
+          <p>
+            The second is native quantization support, integer tensor cores (int8, int4) for inference,
+            and the fp8 scaling machinery just described. The hardware provides fast per-tensor and,
+            increasingly, per-block scale application so that a low-precision matmul can be dequantized
+            in the epilogue at negligible cost. The systems consequence, again, is bytes. An int8 or fp8
+            weight is one byte, a quarter of an fp32 weight, so a 70B-parameter model that needs 280 GB
+            in fp32 fits in 70 GB in int8 and streams from HBM four times faster, which is why quantized
+            inference is bandwidth-bound-friendly and why the accelerator landscape below competes so
+            hard on low-precision throughput and on-package memory.
+          </p>
+
+          <h2>The roofline, applied end to end</h2>
+          <p>
+            The roofline is only useful when a real kernel is placed on it with measured coordinates. Do
+            that for three kernels on this H100, using the measured effective HBM bandwidth of 3063.5
+            GB/s as \(\beta\) and the measured bf16 tensor-core peak of 744.6 TFLOP/s as \(\pi\), so the
+            ridge sits at \(I^\star = 744.6\times10^{12} / 3.0635\times10^{12} = 243\) FLOP/byte.
+          </p>
+          <div class="tbl-wrap"><table class="data">
+            <thead><tr><th>kernel</th><th>arithmetic intensity</th><th>roofline verdict</th><th>measured</th></tr></thead>
+            <tbody>
+              <tr><td>vector add (fp32)</td><td>1/12 = 0.083 FLOP/byte</td><td>hard memory-bound, cap = 255 GFLOP/s</td><td>2988 GB/s = 97% of copy peak</td></tr>
+              <tr><td>bf16 matmul n=2048</td><td>683 FLOP/byte &gt; 243</td><td>compute-bound, cap = 744.6 TFLOP/s</td><td>453.4 TFLOP/s = 61% of peak</td></tr>
+              <tr><td>naive attention L=2048</td><td>low (materializes L&times;L scores)</td><td>memory-bound</td><td>25.9 TFLOP/s</td></tr>
+              <tr><td>flash attention L=2048</td><td>raised by tiling, no L&times;L spill</td><td>toward compute-bound</td><td>460.0 TFLOP/s (17.8x)</td></tr>
+            </tbody>
+          </table></div>
+          <p>
+            Each row tells the same story from a different corner of the plane. Vector add has intensity
+            \(1/12\), one add per three fp32 accesses of 4 bytes. Its roofline cap is
+            \(\beta I = 3063.5 \times 10^{9} \times 0.083 = 255\) GFLOP/s, a factor of 2900 below the
+            tensor-core peak, so the only question about a vector add is whether it reaches memory
+            bandwidth, and at 2988 GB/s it does, 97 percent of copy peak. The bf16 \(n = 2048\) matmul
+            sits far to the right of the ridge, so its ceiling is the compute roof, and its measured 453.4
+            TFLOP/s is 61 percent of that ceiling, with the gap being tile efficiency at that middling
+            size rather than any bandwidth problem. The two attention rows are the most instructive,
+            because they are the same math at two intensities. Naive attention writes the entire
+            \(L \times L\) score matrix to HBM and reads it back, which for \(L = 2048\) is 1.07 GB of
+            traffic (h100.json) that pins it at memory-bound 25.9 TFLOP/s, whereas flash attention keeps
+            the scores in SRAM and never spills them, raising the intensity enough to reach 460.0 TFLOP/s,
+            a measured 17.8x. Flash attention is a roofline move. It does not change the FLOPs, it changes
+            the bytes, and by changing the bytes it slides the kernel from the memory roof to the compute
+            roof. The <a href="/classes/parallel-computing/">parallel-computing page</a> derives and
+            benchmarks the kernel itself. Here the point is that the roofline predicted the win before a
+            line of it was written.
+          </p>
+
+          <h2>Reading a profile</h2>
+          <p>
+            A profiler turns the roofline into three numbers a practitioner reads in order. The first is
+            achieved memory bandwidth, reported by Nsight Compute as a percentage of peak DRAM throughput
+            (dram__throughput.avg.pct_of_peak_sustained_elapsed) and by the vendors' bandwidth counters.
+            For a memory-bound kernel this is the whole story. The vector add above at 97 percent of copy
+            peak is done, and no restructuring will help. The second is occupancy, the ratio of resident
+            warps to the hardware maximum, which sets \(N\) in Little's law and therefore whether the
+            kernel supplies enough outstanding requests to hide latency. Occupancy is bounded by whichever
+            resource runs out first, registers per thread, shared memory per block, or block slots. The
+            register-pressure arithmetic is exact and worth doing, so it is the next problem. The third is
+            tensor-core utilization (sm__pipe_tensor_op_hmma.avg.pct_of_peak_sustained_active on recent
+            tools), which for a matmul-shaped kernel says what fraction of the MMA pipeline's cycles issued
+            a tensor instruction. A compute-bound matmul stuck at 40 percent tensor utilization is starved
+            somewhere upstream, in the shared-memory load pipeline or the operand-collector, not at the
+            array. The diagnostic discipline is to read them in that order. If bandwidth is saturated, stop.
+            Otherwise, if occupancy is low, find the limiting resource, and if tensor utilization is low, look at
+            the feeding pipeline.
+          </p>
+          <div class="problem">
+            <span class="plabel">Problem 8</span>
+            <p>
+              A kernel compiles to 96 registers per thread and 24 KB of shared memory per block, with a
+              block size of 256 threads, on this H100 (65536 registers per SM, 228 KB of shared memory per
+              SM, up to 2048 resident threads and 32 resident blocks per SM). Compute the occupancy limit
+              imposed by each resource and state the achieved occupancy. Then suppose a small rewrite drops
+              the register count to 64: recompute.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> For registers, \(65536 / 96 = 682\) threads' worth of registers per
+                SM, but registers are allocated per warp. \(682 / 32 = 21.3\), floor to 21 warps, times 32
+                is 672 threads, which as whole 256-thread blocks (8 warps each) allows
+                \(\lfloor 21/8 \rfloor = 2\) blocks = 512 threads. Shared memory gives
+                \(228 / 24 = 9.5\), floor to 9 blocks, not binding. Thread and block slots allow 2048 threads or 32
+                blocks, not binding at 2 blocks. The register file binds at 2 blocks = 512 resident threads,
+                so occupancy is \(512 / 2048 = 25\) percent.
+              </p>
+              <p>
+                At 64 registers, \(65536 / 64 = 1024\) threads = 32 warps per SM, allowing
+                \(\lfloor 32/8 \rfloor = 4\) blocks = 1024 threads. Shared memory still allows 9 blocks,
+                slots allow 8 blocks at 256 threads (2048/256). The register file now allows 4 blocks and
+                the thread cap allows 8, so registers still bind, at 4 blocks = 1024 resident threads,
+                occupancy \(1024 / 2048 = 50\) percent, double the previous. This is the register-pressure
+                lever in one calculation. A 33 percent register reduction doubled the warps available to hide
+                latency. Whether that helps depends on the roofline verdict from the previous section. For a
+                latency-bound kernel it raises \(N\) and thus bandwidth, for a compute-bound matmul that is
+                already issuing tensor instructions every cycle it may do nothing, which is why occupancy is
+                read second, after bandwidth, not first. As the
+                <a href="/classes/parallel-computing/">parallel-computing page</a> shows with measured
+                ptxas register counts, the fastest kernels are often not the highest-occupancy ones.
+              </p>
+            </div>
+          </div>
+
+          <h2>The accelerator landscape</h2>
+          <p>
+            The systolic array and the memory cascade are the two axes along which every AI accelerator is
+            positioned, and reading the landscape as points in that plane makes the field legible. The
+            attribution matters, so each is named with the group that built it.
+          </p>
+          <ul>
+            <li><strong>Google TPU</strong> (Jouppi et al., ISCA 2017) is the reference systolic machine, a
+              single large weight-stationary \(256 \times 256\) MAC array in the v1, fed by a large software-managed
+              on-chip buffer, with the explicit design thesis that a big deterministic array beats a cache-heavy
+              CPU or GPU on inference energy per operation. Later TPU generations added bf16 training, HBM, and the
+              inter-chip optical interconnect that makes TPU pods a single-fabric alternative to NVLink-plus-InfiniBand
+              clusters. The TPU is the datapoint that proved the systolic bet at datacenter scale.</li>
+            <li><strong>Cerebras</strong> (Lauterbach and colleagues, IEEE Micro 2021) takes the opposite view of the
+              memory cascade, building the entire accelerator on one wafer so the SRAM and the compute never cross a
+              package boundary. The Wafer-Scale Engine puts hundreds of thousands of cores and tens of gigabytes of
+              on-wafer SRAM on a single die-sized chip, eliminating the HBM rung entirely for models that fit and
+              collapsing the cascade's most expensive cliff into on-chip bandwidth. The tradeoff is capacity. What
+              does not fit in wafer SRAM must stream from an external memory service.</li>
+            <li><strong>Groq</strong> (Abts et al., ISCA 2020) attacks latency and determinism with a tensor-streaming
+              processor that has no caches and no dynamic scheduling. The compiler places every operation on a
+              statically scheduled datapath so that latency is a compile-time constant. It is the accelerator built for
+              the low-latency inference corner, trading the GPU's flexibility for a memory system whose timing is
+              known exactly.</li>
+            <li><strong>AWS Trainium</strong> (Annapurna Labs, presented at Hot Chips) is a systolic training
+              accelerator paired with high-bandwidth memory and a custom collective interconnect, positioned as a
+              cost-per-training-token alternative to GPUs within one cloud. It is the datapoint that the
+              weight-stationary array plus HBM plus a good collective fabric is now a reproducible recipe rather than a
+              research artifact.</li>
+            <li><strong>Tenstorrent</strong> (Vasiljevic et al., IEEE Micro 2021) builds a grid of small
+              general-purpose cores each with a matrix engine, connected by an on-chip network, and leans on
+              conditional execution and a software 2.0 compiler rather than one monolithic array, betting that a
+              programmable mesh generalizes better than a fixed systolic array as model architectures churn.</li>
+          </ul>
+          <p>
+            The common thread is that none of these competes primarily on peak MAC count. They compete on where in the
+            bandwidth cascade the working set lives and on how deterministically the array can be fed. Cerebras removes
+            the HBM rung, Groq removes the cache nondeterminism, the TPU and Trainium optimize the array-plus-HBM-plus-
+            collective recipe, and Tenstorrent trades a bit of array efficiency for programmability. Every one of them is
+            a different answer to the same question this page has been asking, how to keep a voracious MAC array fed
+            across an increasingly steep memory cascade.
+          </p>
+
+          <h2>Implementation</h2>
+          <p>
+            Three self-contained microbenchmarks make the page's claims runnable. The first is a CUDA kernel that
+            reproduces the strided-read bandwidth collapse of the prefetching section, reading one float every
+            <code>stride</code> elements and reporting useful bandwidth. Because a strided load wastes the unused bytes of
+            each 32-byte sector, useful bandwidth falls toward one eighth of the stride-1 rate as the stride passes 8, the
+            shape measured in parallel.json.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="cuda" class="active">CUDA</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="cuda" class="shl lang active"><code class="language-cpp"><span class="c">// strided_read.cu  --  measure useful bandwidth vs stride on an H100</span>
+<span class="c">// nvcc -arch=sm_90 -O3 strided_read.cu -o strided_read</span>
+<span class="k">#include</span> <span class="s">&lt;cstdio&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;cstdint&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;cuda_runtime.h&gt;</span>
+
+<span class="c">// each thread reads N/stride elements, stride floats apart, and accumulates.</span>
+<span class="c">// the accumulate keeps the compiler from deleting the loads.</span>
+<span class="k">__global__</span> <span class="k">void</span> <span class="m1">strided_sum</span><span class="b0">(</span><span class="k">const</span> <span class="k">float</span>* <span class="k">__restrict__</span> <span class="v4">x</span>, <span class="k">float</span>* <span class="k">__restrict__</span> <span class="v2">out</span>,
+                            <span class="k">int64_t</span> <span class="v5">n</span>, <span class="k">int</span> <span class="v5">stride</span><span class="b0">)</span> <span class="b0">{</span>
+  <span class="k">int64_t</span> <span class="v1">tid</span> = <span class="v5">blockIdx</span>.<span class="m2">x</span> * <span class="b1">(</span><span class="k">int64_t</span><span class="b1">)</span><span class="v6">blockDim</span>.<span class="m2">x</span> + <span class="v3">threadIdx</span>.<span class="m2">x</span>;
+  <span class="k">int64_t</span> <span class="v4">nthreads</span> = <span class="v2">gridDim</span>.<span class="m2">x</span> * <span class="b1">(</span><span class="k">int64_t</span><span class="b1">)</span><span class="v6">blockDim</span>.<span class="m2">x</span>;
+  <span class="k">float</span> <span class="v6">acc</span> = <span class="n">0.0</span><span class="k">f</span>;
+  <span class="k">for</span> <span class="b1">(</span><span class="k">int64_t</span> <span class="v3">i</span> = <span class="v1">tid</span> * <span class="v5">stride</span>; <span class="v3">i</span> &lt; <span class="v5">n</span>; <span class="v3">i</span> += <span class="v4">nthreads</span> * <span class="b2">(</span><span class="k">int64_t</span><span class="b2">)</span><span class="v5">stride</span><span class="b1">)</span> <span class="b1">{</span>
+    <span class="v6">acc</span> += <span class="v4">x</span><span class="b2">[</span><span class="v3">i</span><span class="b2">]</span>;
+  <span class="b1">}</span>
+<span class="c">  // one write per thread; negligible next to the reads</span>
+  <span class="v2">out</span><span class="b1">[</span><span class="v1">tid</span> % <span class="n">1024</span><span class="b1">]</span> = <span class="v6">acc</span>;
+<span class="b0">}</span>
+
+<span class="k">int</span> <span class="m1">main</span><span class="b0">()</span> <span class="b0">{</span>
+  <span class="k">const</span> <span class="k">int64_t</span> <span class="v5">n</span> = <span class="n">1</span><span class="k">LL</span> &lt;&lt; <span class="n">28</span>;<span class="c">           // 256 M floats = 1 GiB</span>
+  <span class="k">float</span> *<span class="v4">x</span>, *<span class="v2">out</span>;
+  <span class="m1">cudaMalloc</span><span class="b1">(</span>&amp;<span class="v4">x</span>, <span class="v5">n</span> * <span class="k">sizeof</span><span class="b2">(</span><span class="k">float</span><span class="b2">)</span><span class="b1">)</span>;
+  <span class="m1">cudaMalloc</span><span class="b1">(</span>&amp;<span class="v2">out</span>, <span class="n">1024</span> * <span class="k">sizeof</span><span class="b2">(</span><span class="k">float</span><span class="b2">)</span><span class="b1">)</span>;
+  <span class="m1">cudaMemset</span><span class="b1">(</span><span class="v4">x</span>, <span class="n">1</span>, <span class="v5">n</span> * <span class="k">sizeof</span><span class="b2">(</span><span class="k">float</span><span class="b2">)</span><span class="b1">)</span>;
+
+  <span class="k">const</span> <span class="k">int</span> <span class="v0">strides</span><span class="b1">[]</span> = <span class="b1">{</span><span class="n">1</span>, <span class="n">2</span>, <span class="n">4</span>, <span class="n">8</span>, <span class="n">16</span>, <span class="n">32</span><span class="b1">}</span>;
+  <span class="m1">cudaEvent_t</span> <span class="v5">a</span>, <span class="v6">b</span>; <span class="m1">cudaEventCreate</span><span class="b1">(</span>&amp;<span class="v5">a</span><span class="b1">)</span>; <span class="m1">cudaEventCreate</span><span class="b1">(</span>&amp;<span class="v6">b</span><span class="b1">)</span>;
+
+  <span class="k">for</span> <span class="b1">(</span><span class="k">int</span> <span class="v4">s</span> : <span class="v0">strides</span><span class="b1">)</span> <span class="b1">{</span>
+    <span class="k">int64_t</span> <span class="v1">touched</span> = <span class="v5">n</span> / <span class="v4">s</span>;<span class="c">               // elements actually read</span>
+    <span class="v0">dim3</span> <span class="m1">block</span><span class="b2">(</span><span class="n">256</span><span class="b2">)</span>, <span class="m1">grid</span><span class="b2">(</span><span class="n">4096</span><span class="b2">)</span>;
+    <span class="m1">strided_sum</span>&lt;&lt;&lt;<span class="m1">grid</span>, <span class="m1">block</span>&gt;&gt;&gt;<span class="b2">(</span><span class="v4">x</span>, <span class="v2">out</span>, <span class="v5">n</span>, <span class="v4">s</span><span class="b2">)</span>;<span class="c">   // warmup</span>
+    <span class="m1">cudaDeviceSynchronize</span><span class="b2">()</span>;
+    <span class="m1">cudaEventRecord</span><span class="b2">(</span><span class="v5">a</span><span class="b2">)</span>;
+    <span class="k">for</span> <span class="b2">(</span><span class="k">int</span> <span class="v2">r</span> = <span class="n">0</span>; <span class="v2">r</span> &lt; <span class="n">30</span>; ++<span class="v2">r</span><span class="b2">)</span> <span class="m1">strided_sum</span>&lt;&lt;&lt;<span class="m1">grid</span>, <span class="m1">block</span>&gt;&gt;&gt;<span class="b2">(</span><span class="v4">x</span>, <span class="v2">out</span>, <span class="v5">n</span>, <span class="v4">s</span><span class="b2">)</span>;
+    <span class="m1">cudaEventRecord</span><span class="b2">(</span><span class="v6">b</span><span class="b2">)</span>; <span class="m1">cudaEventSynchronize</span><span class="b2">(</span><span class="v6">b</span><span class="b2">)</span>;
+    <span class="k">float</span> <span class="v0">ms</span> = <span class="n">0</span>; <span class="m1">cudaEventElapsedTime</span><span class="b2">(</span>&amp;<span class="v0">ms</span>, <span class="v5">a</span>, <span class="v6">b</span><span class="b2">)</span>; <span class="v0">ms</span> /= <span class="n">30.0</span><span class="k">f</span>;
+    <span class="k">double</span> <span class="v3">gbs</span> = <span class="b2">(</span><span class="v1">touched</span> * <span class="b0">(</span><span class="k">double</span><span class="b0">)</span><span class="k">sizeof</span><span class="b0">(</span><span class="k">float</span><span class="b0">)</span><span class="b2">)</span> / <span class="b2">(</span><span class="v0">ms</span> * <span class="n">1</span><span class="k">e</span>-<span class="n">3</span><span class="b2">)</span> / <span class="n">1</span><span class="k">e</span><span class="n">9</span>;
+    <span class="m1">printf</span><span class="b2">(</span><span class="s">"stride=%2d  useful GB/s = %8.1f\n"</span>, <span class="v4">s</span>, <span class="v3">gbs</span><span class="b2">)</span>;
+  <span class="b1">}</span>
+  <span class="m1">cudaFree</span><span class="b1">(</span><span class="v4">x</span><span class="b1">)</span>; <span class="m1">cudaFree</span><span class="b1">(</span><span class="v2">out</span><span class="b1">)</span>;
+  <span class="k">return</span> <span class="n">0</span>;
+<span class="b0">}</span>
+</code></pre>
+          </div>
+          <p>
+            The second is a Triton bf16 matmul, the kernel that actually exercises the tensor cores. It tiles the output
+            into <code>BLOCK_M &times; BLOCK_N</code> blocks, streams <code>BLOCK_K</code>-deep slabs of the operands through
+            shared memory, and accumulates in fp32, exactly the reuse scheme of Problem 6. On this H100 a Triton fp16 matmul
+            at \(n = 4096\) reaches 511.6 TFLOP/s against cuBLAS's 702.4 (parallel.json), which is the tile-efficiency gap of
+            Problem 7 made concrete.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="triton" class="active">Triton</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="triton" class="shl lang active"><code class="language-python"><span class="c"># triton bf16 matmul: C = A @ B, tensor-core MMA with fp32 accumulate</span>
+<span class="c"># A: (M, K) bf16   B: (K, N) bf16   C: (M, N) fp32</span>
+<span class="k">import</span> <span class="m1">torch</span>, <span class="m1">triton</span>, <span class="m1">triton</span>.<span class="m2">language</span> <span class="k">as</span> <span class="m1">tl</span>
+
+<span class="m1">@triton.jit</span>
+<span class="k">def</span> <span class="m1">matmul_kernel</span><span class="b0">(</span><span class="v6">A</span>, <span class="v0">B</span>, <span class="v2">C</span>, <span class="v5">M</span>, <span class="v6">N</span>, <span class="v0">K</span>,
+                  <span class="v5">sam</span>, <span class="v2">sak</span>, <span class="v5">sbk</span>, <span class="v6">sbn</span>, <span class="v3">scm</span>, <span class="v5">scn</span>,
+                  <span class="v3">BM</span>: <span class="m1">tl</span>.<span class="m2">constexpr</span>, <span class="v4">BN</span>: <span class="m1">tl</span>.<span class="m2">constexpr</span>, <span class="v5">BK</span>: <span class="m1">tl</span>.<span class="m2">constexpr</span><span class="b0">)</span>:
+    <span class="v3">pid_m</span> = <span class="m1">tl</span>.<span class="m2">program_id</span><span class="b0">(</span><span class="n">0</span><span class="b0">)</span>
+    <span class="v5">pid_n</span> = <span class="m1">tl</span>.<span class="m2">program_id</span><span class="b0">(</span><span class="n">1</span><span class="b0">)</span>
+    <span class="v3">offs_m</span> = <span class="v3">pid_m</span> * <span class="v3">BM</span> + <span class="m1">tl</span>.<span class="m2">arange</span><span class="b0">(</span><span class="n">0</span>, <span class="v3">BM</span><span class="b0">)</span>          <span class="c"># rows of this C tile</span>
+    <span class="v1">offs_n</span> = <span class="v5">pid_n</span> * <span class="v4">BN</span> + <span class="m1">tl</span>.<span class="m2">arange</span><span class="b0">(</span><span class="n">0</span>, <span class="v4">BN</span><span class="b0">)</span>          <span class="c"># cols of this C tile</span>
+    <span class="v5">offs_k</span> = <span class="m1">tl</span>.<span class="m2">arange</span><span class="b0">(</span><span class="n">0</span>, <span class="v5">BK</span><span class="b0">)</span>
+    <span class="v0">a_ptr</span> = <span class="v6">A</span> + <span class="v3">offs_m</span><span class="b0">[</span>:, <span class="k">None</span><span class="b0">]</span> * <span class="v5">sam</span> + <span class="v5">offs_k</span><span class="b0">[</span><span class="k">None</span>, :<span class="b0">]</span> * <span class="v2">sak</span>
+    <span class="v4">b_ptr</span> = <span class="v0">B</span> + <span class="v5">offs_k</span><span class="b0">[</span>:, <span class="k">None</span><span class="b0">]</span> * <span class="v5">sbk</span> + <span class="v1">offs_n</span><span class="b0">[</span><span class="k">None</span>, :<span class="b0">]</span> * <span class="v6">sbn</span>
+    <span class="v6">acc</span> = <span class="m1">tl</span>.<span class="m2">zeros</span><span class="b0">(</span><span class="b1">(</span><span class="v3">BM</span>, <span class="v4">BN</span><span class="b1">)</span>, <span class="v3">dtype</span>=<span class="m1">tl</span>.<span class="m2">float32</span><span class="b0">)</span>       <span class="c"># fp32 accumulator</span>
+    <span class="k">for</span> <span class="v6">k</span> <span class="k">in</span> <span class="m1">range</span><span class="b0">(</span><span class="n">0</span>, <span class="v0">K</span>, <span class="v5">BK</span><span class="b0">)</span>:
+        <span class="v5">a</span> = <span class="m1">tl</span>.<span class="m2">load</span><span class="b0">(</span><span class="v0">a_ptr</span>, <span class="v3">mask</span>=<span class="v3">offs_m</span><span class="b1">[</span>:, <span class="k">None</span><span class="b1">]</span> &lt; <span class="v5">M</span>, <span class="v6">other</span>=<span class="n">0.0</span><span class="b0">)</span>
+        <span class="v6">b</span> = <span class="m1">tl</span>.<span class="m2">load</span><span class="b0">(</span><span class="v4">b_ptr</span>, <span class="v3">mask</span>=<span class="v1">offs_n</span><span class="b1">[</span><span class="k">None</span>, :<span class="b1">]</span> &lt; <span class="v6">N</span>, <span class="v6">other</span>=<span class="n">0.0</span><span class="b0">)</span>
+        <span class="v6">acc</span> += <span class="m1">tl</span>.<span class="m2">dot</span><span class="b0">(</span><span class="v5">a</span>, <span class="v6">b</span><span class="b0">)</span>                          <span class="c"># issues tensor-core MMA</span>
+        <span class="v0">a_ptr</span> += <span class="v5">BK</span> * <span class="v2">sak</span>
+        <span class="v4">b_ptr</span> += <span class="v5">BK</span> * <span class="v5">sbk</span>
+    <span class="v5">c_ptr</span> = <span class="v2">C</span> + <span class="v3">offs_m</span><span class="b0">[</span>:, <span class="k">None</span><span class="b0">]</span> * <span class="v3">scm</span> + <span class="v1">offs_n</span><span class="b0">[</span><span class="k">None</span>, :<span class="b0">]</span> * <span class="v5">scn</span>
+    <span class="m1">tl</span>.<span class="m2">store</span><span class="b0">(</span><span class="v5">c_ptr</span>, <span class="v6">acc</span>, <span class="v3">mask</span>=<span class="b1">(</span><span class="v3">offs_m</span><span class="b2">[</span>:, <span class="k">None</span><span class="b2">]</span> &lt; <span class="v5">M</span><span class="b1">)</span> &amp; <span class="b1">(</span><span class="v1">offs_n</span><span class="b2">[</span><span class="k">None</span>, :<span class="b2">]</span> &lt; <span class="v6">N</span><span class="b1">)</span><span class="b0">)</span>
+
+<span class="k">def</span> <span class="m1">matmul</span><span class="b0">(</span><span class="v5">a</span>, <span class="v6">b</span><span class="b0">)</span>:
+    <span class="v5">M</span>, <span class="v0">K</span> = <span class="v5">a</span>.<span class="m2">shape</span>; <span class="v6">K2</span>, <span class="v6">N</span> = <span class="v6">b</span>.<span class="m2">shape</span>; <span class="k">assert</span> <span class="v0">K</span> == <span class="v6">K2</span>
+    <span class="v1">c</span> = <span class="m1">torch</span>.<span class="m2">empty</span><span class="b0">(</span><span class="b1">(</span><span class="v5">M</span>, <span class="v6">N</span><span class="b1">)</span>, <span class="v6">device</span>=<span class="v5">a</span>.<span class="m2">device</span>, <span class="v3">dtype</span>=<span class="m1">torch</span>.<span class="m2">float32</span><span class="b0">)</span>
+    <span class="v1">grid</span> = <span class="b0">(</span><span class="m1">triton</span>.<span class="m2">cdiv</span><span class="b1">(</span><span class="v5">M</span>, <span class="n">128</span><span class="b1">)</span>, <span class="m1">triton</span>.<span class="m2">cdiv</span><span class="b1">(</span><span class="v6">N</span>, <span class="n">128</span><span class="b1">)</span><span class="b0">)</span>
+    <span class="m1">matmul_kernel</span><span class="b0">[</span><span class="v1">grid</span><span class="b0">](</span><span class="v5">a</span>, <span class="v6">b</span>, <span class="v1">c</span>, <span class="v5">M</span>, <span class="v6">N</span>, <span class="v0">K</span>,
+                        <span class="v5">a</span>.<span class="m2">stride</span><span class="b1">(</span><span class="n">0</span><span class="b1">)</span>, <span class="v5">a</span>.<span class="m2">stride</span><span class="b1">(</span><span class="n">1</span><span class="b1">)</span>, <span class="v6">b</span>.<span class="m2">stride</span><span class="b1">(</span><span class="n">0</span><span class="b1">)</span>, <span class="v6">b</span>.<span class="m2">stride</span><span class="b1">(</span><span class="n">1</span><span class="b1">)</span>,
+                        <span class="v1">c</span>.<span class="m2">stride</span><span class="b1">(</span><span class="n">0</span><span class="b1">)</span>, <span class="v1">c</span>.<span class="m2">stride</span><span class="b1">(</span><span class="n">1</span><span class="b1">)</span>,
+                        <span class="v3">BM</span>=<span class="n">128</span>, <span class="v4">BN</span>=<span class="n">128</span>, <span class="v5">BK</span>=<span class="n">64</span>, <span class="v6">num_warps</span>=<span class="n">8</span><span class="b0">)</span>
+    <span class="k">return</span> <span class="v1">c</span>
+
+<span class="v5">a</span> = <span class="m1">torch</span>.<span class="m2">randn</span><span class="b0">(</span><span class="n">4096</span>, <span class="n">4096</span>, <span class="v6">device</span>=<span class="s">"cuda"</span>, <span class="v3">dtype</span>=<span class="m1">torch</span>.<span class="m2">bfloat16</span><span class="b0">)</span>
+<span class="v6">b</span> = <span class="m1">torch</span>.<span class="m2">randn</span><span class="b0">(</span><span class="n">4096</span>, <span class="n">4096</span>, <span class="v6">device</span>=<span class="s">"cuda"</span>, <span class="v3">dtype</span>=<span class="m1">torch</span>.<span class="m2">bfloat16</span><span class="b0">)</span>
+<span class="v1">c</span> = <span class="m1">matmul</span><span class="b0">(</span><span class="v5">a</span>, <span class="v6">b</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">"max abs err:"</span>, <span class="b1">(</span><span class="v1">c</span> - <span class="b2">(</span><span class="v5">a</span>.<span class="m2">float</span><span class="b0">()</span> @ <span class="v6">b</span>.<span class="m2">float</span><span class="b0">()</span><span class="b2">)</span><span class="b1">)</span>.<span class="m2">abs</span><span class="b1">()</span>.<span class="m2">max</span><span class="b1">()</span>.<span class="m2">item</span><span class="b1">()</span><span class="b0">)</span>
+</code></pre>
+          </div>
+          <p>
+            The third is the roofline arithmetic itself in plain Python, reading the measured constants and reporting, for a
+            kernel's FLOPs and HBM bytes, which roof binds and how far the measurement is from it. This is the calculation
+            behind every table on the page.
+          </p>
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="python" class="active">Python</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="python" class="shl lang active"><code class="language-python"><span class="c"># roofline.py -- place a kernel on this H100's roofline</span>
+<span class="c"># measured constants (h100.json / parallel.json), this repository</span>
+<span class="v2">PEAK_BF16</span> = <span class="n">744.6e12</span>     <span class="c"># FLOP/s, measured n=4096 bf16 matmul</span>
+<span class="v0">BETA_HBM</span>  = <span class="n">3063.5e9</span>     <span class="c"># B/s, measured effective HBM bandwidth (fp32 add)</span>
+<span class="v4">RIDGE</span> = <span class="v2">PEAK_BF16</span> / <span class="v0">BETA_HBM</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">f"ridge point I* = {</span><span class="v4">RIDGE</span><span class="s">:.0f} FLOP/byte"</span><span class="b0">)</span>
+
+<span class="k">def</span> <span class="m1">roofline</span><span class="b0">(</span><span class="v2">name</span>, <span class="v2">flops</span>, <span class="v1">bytes_moved</span>, <span class="v5">measured_flops</span><span class="b0">)</span>:
+    <span class="v4">I</span> = <span class="v2">flops</span> / <span class="v1">bytes_moved</span>
+    <span class="v5">cap</span> = <span class="m1">min</span><span class="b0">(</span><span class="v2">PEAK_BF16</span>, <span class="v0">BETA_HBM</span> * <span class="v4">I</span><span class="b0">)</span>
+    <span class="v0">regime</span> = <span class="s">"compute-bound"</span> <span class="k">if</span> <span class="v4">I</span> &gt;= <span class="v4">RIDGE</span> <span class="k">else</span> <span class="s">"memory-bound"</span>
+    <span class="m1">print</span><span class="b0">(</span><span class="s">f"{</span><span class="v2">name</span><span class="s">:22s} I={</span><span class="v4">I</span><span class="s">:8.2f}  {</span><span class="v0">regime</span><span class="s">:14s} "</span>
+          <span class="s">f"cap={</span><span class="v5">cap</span>/<span class="n">1e12</span><span class="s">:7.1f} TFLOP/s  meas={</span><span class="v5">measured_flops</span>/<span class="n">1e12</span><span class="s">:7.1f} "</span>
+          <span class="s">f"({</span><span class="n">100</span>*<span class="v5">measured_flops</span>/<span class="v5">cap</span><span class="s">:4.0f}% of cap)"</span><span class="b0">)</span>
+
+<span class="c"># vector add: n adds, 3n fp32 accesses of 4 bytes</span>
+<span class="v5">n</span> = <span class="n">268_435_456</span>
+<span class="m1">roofline</span><span class="b0">(</span><span class="s">"vadd fp32"</span>,        <span class="v5">n</span>,        <span class="n">3</span>*<span class="v5">n</span>*<span class="n">4</span>,           <span class="n">255e9</span><span class="b0">)</span>
+<span class="c"># bf16 matmul n=2048: 2 n^3 flops, 3 n^2 * 2 bytes</span>
+<span class="v4">m</span> = <span class="n">2048</span>
+<span class="m1">roofline</span><span class="b0">(</span><span class="s">"matmul bf16 2048"</span>, <span class="n">2</span>*<span class="v4">m</span>**<span class="n">3</span>,   <span class="n">3</span>*<span class="v4">m</span>*<span class="v4">m</span>*<span class="n">2</span>,         <span class="n">453.4e12</span><span class="b0">)</span>
+<span class="c"># naive vs flash attention already have measured tflops; show intensity via bytes</span>
+</code></pre>
+          </div>
+
+          <h2>How it is done in practice</h2>
+          <p>
+            The gap between these derivations and a deployed system is mostly bookkeeping about which byte crosses which
+            cliff. A production training run for a 70B-parameter model, sharded data-parallel across hundreds of GPUs, spends
+            its time in exactly the quantities this page derived. The forward and backward passes are matmuls the roofline
+            says are compute-bound at large tile sizes, the gradient all-reduce moves the model's worth of bytes across NVLink
+            and the network every step, and the whole thing is fast only if the all-reduce overlaps the backward pass so its
+            bandwidth cost hides under compute. This repository's networks.json models exactly that overlap. For a 70B model at
+            data-parallel width 256 with a 4M-token global batch, the compute is 16.4 s and the NVLink-class all-reduce 5.6 s
+            per step, a 0.34 communication-to-compute ratio that overlaps cleanly, whereas at a 500k-token batch the compute
+            drops to 2.05 s and the same 5.6 s of communication now dominates at a 2.72 ratio, the batch-size cliff that governs
+            how small a step can be before the interconnect becomes the bottleneck.
+          </p>
+          <p>
+            Inference is the mirror image. The prefill phase is compute-bound matmul, well above the roofline ridge, but the
+            decode phase generates one token at a time and is weight-bound. Each token reads the entire model's weights from HBM
+            to do a single small matmul, so decode throughput is set by HBM bandwidth divided by model bytes, not by tensor-core
+            peak. This is why every serving stack reaches for the memory-side levers this page derived, fp8 and int8 quantization
+            to quarter the weight bytes, 2:4 sparsity to halve them again, KV-cache paging to keep the attention state in HBM
+            rather than recomputing it, and speculative decoding to convert the memory-bound single-token step into a
+            compute-bound multi-token verification. Each is a move on the roofline, sliding decode from the memory roof toward the
+            compute roof, and each is chosen by the same arithmetic that placed the kernels on the roofline above.
+          </p>
+
+          <h2>The current research frontier</h2>
+          <p>
+            The last few years have pushed on every rung of this page at once. On precision, the frontier is sub-8-bit training
+            and inference. Microscaling (MX) formats, standardized across NVIDIA, AMD, Intel, ARM, and Microsoft in 2023, attach a
+            shared block exponent to short vectors so that fp4 and fp6 become numerically usable, and NVIDIA's Blackwell generation
+            ships fp4 tensor cores that double the fp8 rung again. On sparsity, the debate is whether the rigid 2:4 pattern is the
+            right structure or whether coarser block sparsity and mixture-of-experts routing, which is sparsity at the layer
+            granularity rather than the weight, is the more durable lever. The MoE line, pursued at scale by Google, Mistral,
+            DeepSeek, and others, is sparsity that the memory cascade rewards because only the routed experts' weights cross the
+            HBM cliff per token. On the memory system itself, CXL memory pooling and disaggregation are moving from specification to
+            deployment, and processing-in-memory, computing inside the DRAM or on the HBM base die rather than moving data to a
+            separate compute chip, is an active line at the SAFARI group, Samsung, and SK Hynix, aimed squarely at the bandwidth
+            cliff that this page argues is the binding constraint. On interconnect, the competition is between NVIDIA's NVLink plus
+            InfiniBand fabric, Google's optically-switched TPU pods, and Ethernet-based alternatives standardized through the
+            Ultra Ethernet Consortium, all trying to keep the collective bandwidth of the bandwidth cascade's lowest rungs from
+            capping the largest training runs. The unifying thesis of the frontier is the thesis of this page. Compute has run
+            ahead of memory, and the interesting work is now in the cascade.
+          </p>
+
+          <h2>Open source to read</h2>
+          <ul>
+            <li><a href="https://github.com/NVIDIA/cutlass">NVIDIA/cutlass</a> is the reference for how a real tensor-core matmul
+              is tiled across the bandwidth cascade. Open <code>media/docs/efficient_gemm.md</code> for the pipelining and
+              shared-memory staging that turn the roofline ceiling into an achieved number.</li>
+            <li><a href="https://github.com/triton-lang/triton">triton-lang/triton</a> is the compiler behind the matmul tab.
+              Read <code>python/tutorials/03-matrix-multiplication.py</code>, which is the autotuned version of the kernel above,
+              then <code>06-fused-attention.py</code> for the flash-attention roofline move.</li>
+            <li><a href="https://github.com/NVIDIA/nccl-tests">NVIDIA/nccl-tests</a> is how the NVLink and collective bandwidth
+              numbers in networks.json are measured. Start with <code>src/all_reduce.cu</code> and the bus-bandwidth definition in
+              the README.</li>
+            <li><a href="https://github.com/stas00/ml-engineering">stas00/ml-engineering</a> is the practitioner's field guide to
+              the whole cascade at cluster scale. The <code>network/</code> and <code>compute/</code> chapters connect this page's
+              arithmetic to production training.</li>
+            <li><a href="https://github.com/cyanguwa/nersc-roofline">cyanguwa/nersc-roofline</a> is the NERSC roofline toolkit.
+              It shows how to collect the FLOP and byte counters and plot a real kernel on the roofline, the empirical version of the
+              Python tab.</li>
+            <li><a href="https://github.com/CMU-SAFARI/ramulator2">CMU-SAFARI/ramulator2</a> is the standard DRAM simulator for the
+              timing and refresh model of the first sections. Its configs expose exactly the \(t_{RCD}\), \(t_{RP}\), and
+              \(t_{RFC}\) parameters worked in Problems 1 and 2.</li>
+            <li><a href="https://github.com/NVIDIA/nvbench">NVIDIA/nvbench</a> is a small, honest microbenchmark harness for the kind
+              of bandwidth and occupancy sweeps this page relies on, with correct warmup and timing built in.</li>
+          </ul>
+
+          <h2>Common misconceptions</h2>
+          <p><strong>"HBM is faster memory than DDR."</strong> Only in bandwidth. The DRAM banks inside an HBM stack have the same
+            14-18 ns row and column latencies as a DIMM, and a GPU's end-to-end memory latency is several times worse than a CPU's
+            because of its deep request queues. HBM buys bandwidth and pays with latency, and it is worth it only because a GPU hides
+            latency with the parallelism Little's law quantifies.</p>
+          <p><strong>"Higher occupancy is always faster."</strong> Occupancy sets \(N\) in Little's law, which matters only when the
+            kernel is latency-bound. A compute-bound matmul already issuing a tensor instruction every cycle gains nothing from more
+            warps, and the fastest matmul kernels often run at modest occupancy with high register counts. Read bandwidth first,
+            occupancy second, tensor utilization third.</p>
+          <p><strong>"A faster clock or a better compiler can speed up a pointer chase."</strong> A single dependent chase has one
+            request in flight by construction, so its bandwidth is fixed at one cache line per memory latency, 0.475 GB/s on this
+            host, regardless of clock or flags. The only cure is concurrency, more independent chases, prefetching, or a different
+            data structure.</p>
+          <p><strong>"Sparsity gives a speedup on any hardware."</strong> Only structured sparsity does, and only where the hardware
+            supports it. Unstructured zeros give no speedup on a MAC array because skipping arbitrary positions costs more than the
+            skipped work. The rigid 2:4 pattern exists precisely so the skip maps to a small multiplexer.</p>
+          <p><strong>"Arithmetic intensity above the ridge means the kernel hits peak."</strong> It is a necessary condition, not a
+            sufficient one. An \(n = 1024\) bf16 matmul has intensity 341, well above the 222 ridge, yet reaches only 15 percent of
+            peak because the tiles are too small to fill the machine. The roofline sets the ceiling. Occupancy and tile size decide
+            whether you reach it.</p>
+          <p><strong>"Lower precision is purely a compute optimization."</strong> It is at least as much a memory optimization. fp8
+            halves the bytes an operand costs against bf16, and for a bandwidth-bound stage such as LLM decode, where each token reads
+            the whole model from HBM, halving the bytes is the entire win, independent of any change in tensor-core throughput.</p>
+          <p><strong>"PCIe and NVLink differ only in bandwidth."</strong> They also differ in coherence. Plain PCIe is non-coherent,
+            requiring explicit flushes and fences, whereas NVLink and NVLink-C2C carry hardware coherence traffic, which is what makes
+            unified memory and fine-grained peer access correct rather than a hazard.</p>
+
+          <h2>Self-check</h2>
+          <div class="quiz" data-quiz>
+            <script type="application/json" class="quiz-data">[
+              {"id": "q1", "qtype": "mcq",
+               "stem": "A DRAM access finds a different row already open in the target bank (a row-buffer conflict). Which timing sequence does it pay?",
+               "options": ["t_CL + burst only", "t_RCD + t_CL + burst", "t_RP + t_RCD + t_CL + burst", "t_REFI + t_RFC"],
+               "correctIndex": 2,
+               "explanation": "A conflict must first precharge the open row (t_RP), then activate the wanted row (t_RCD), then read a column (t_CL), plus the burst. A hit pays only t_CL+burst; a closed bank pays t_RCD+t_CL+burst."},
+              {"id": "q2", "qtype": "mcq",
+               "stem": "The H100 sustains about 3.0 TB/s of HBM at roughly 500 ns latency. Little's law says the bytes that must be in flight to hide that latency are about:",
+               "options": ["1.5 KB", "1.5 MB", "1.5 GB", "1.5 TB"],
+               "correctIndex": 1,
+               "explanation": "Bytes in flight = bandwidth x latency = 3.0e12 x 500e-9 = 1.5e6 bytes, about 1.5 MB, roughly 12 thousand 128-byte sectors, near 90 per SM."},
+              {"id": "q3", "qtype": "truefalse",
+               "stem": "A single dependent pointer chase can be sped up close to memory bandwidth by increasing the CPU clock frequency.",
+               "options": ["True", "False"],
+               "correctIndex": 1,
+               "explanation": "False. A dependent chase has exactly one request in flight, so by Little's law its bandwidth is one line per memory latency regardless of clock. Only concurrency helps."},
+              {"id": "q4", "qtype": "mcq",
+               "stem": "For a square bf16 matmul read once from HBM (2n^3 FLOPs, 3n^2 elements of 2 bytes), the arithmetic intensity is:",
+               "options": ["constant, independent of n", "n/3 FLOP/byte", "3/n FLOP/byte", "2n FLOP/byte"],
+               "correctIndex": 1,
+               "explanation": "I = 2n^3 / (3n^2 * 2) = n/3 FLOP/byte. Intensity grows linearly with n, which is why large matmul is the one dense kernel that can exceed the roofline ridge."},
+              {"id": "q5", "qtype": "mcq",
+               "stem": "In the Eyeriss energy model, roughly how much more energy does one 32-bit DRAM access cost than one MAC operation?",
+               "options": ["about 2x", "about 6x", "about 200x", "about the same"],
+               "correctIndex": 2,
+               "explanation": "About 200x. This is why data movement, not arithmetic, dominates accelerator energy, and why every dataflow keeps operands resident in the register file (about 1x) or global buffer (about 6x)."},
+              {"id": "q6", "qtype": "mcq",
+               "stem": "Why does a P x P weight-stationary systolic array amortize bandwidth?",
+               "options": ["It uses a faster memory technology", "It performs about P^2 MACs per clock but ingests only about 2P operands per clock, so each operand serves about P/2 MACs", "It compresses the operands", "It skips zero operands"],
+               "correctIndex": 1,
+               "explanation": "The array does P^2 MACs per clock fed by roughly 2P fresh operands per clock (inputs in, outputs out), so operand reuse is about P/2. Each byte at the array edge does order-P arithmetic."},
+              {"id": "q7", "qtype": "truefalse",
+               "stem": "tf32 stores fewer bytes per element than fp32.",
+               "options": ["True", "False"],
+               "correctIndex": 1,
+               "explanation": "False. tf32 is stored in a 32-bit container so software sees fp32-sized tensors; the tensor core internally rounds to a 19-bit (8 exponent, 10 mantissa) form before multiplying. The speedup is in the datapath, not in bytes moved."},
+              {"id": "q8", "qtype": "mcq",
+               "stem": "Naive attention at L=2048 measures 25.9 TFLOP/s while flash attention measures 460.0 TFLOP/s on the same H100. The main reason is:",
+               "options": ["flash attention does far fewer FLOPs", "flash attention avoids writing the L x L score matrix to HBM, raising arithmetic intensity", "flash attention uses fp8", "flash attention runs on more SMs"],
+               "correctIndex": 1,
+               "explanation": "Both do the same FLOPs. Naive attention spills the L x L scores (1.07 GB at L=2048) to HBM and reads them back, pinning it at the memory roof; flash keeps them in SRAM, raising intensity and sliding the kernel toward the compute roof."},
+              {"id": "q9", "qtype": "mcq",
+               "stem": "A kernel compiles to 96 registers per thread on an SM with 65536 registers. Roughly how many resident threads can the register file support?",
+               "options": ["about 512", "about 682", "about 2048", "about 65536"],
+               "correctIndex": 1,
+               "explanation": "65536 / 96 = 682 threads' worth of registers per SM (block/warp rounding then reduces this to whole blocks). Registers are the occupancy-limiting resource here, capping resident threads well below the 2048 hardware max."},
+              {"id": "q10", "qtype": "truefalse",
+               "stem": "Unstructured weight sparsity yields a proportional speedup on a dense tensor-core MAC array.",
+               "options": ["True", "False"],
+               "correctIndex": 1,
+               "explanation": "False. A MAC array cannot skip arbitrary zeros without gather logic that costs more than the skipped work. Only structured patterns like 2:4, which map to a small multiplexer, give a speedup."},
+              {"id": "q11", "qtype": "ordering",
+               "stem": "Order these memory levels from highest to lowest aggregate bandwidth on this H100 machine.",
+               "options": ["shared memory (~33 TB/s)", "HBM3 (~3 TB/s)", "NVLink to peer GPU (~330 GB/s)", "PCIe gen5 to host (~55 GB/s)"],
+               "correctIndex": -1,
+               "explanation": "The bandwidth cascade drops roughly an order of magnitude per level: SMEM ~33 TB/s, HBM ~3 TB/s, NVLink ~330 GB/s, PCIe ~55 GB/s. Keeping the working set as high in the cascade as it fits is the core of fast-kernel design."},
+              {"id": "q12", "qtype": "mcq",
+               "stem": "In the diagnostic order for reading a profile, which counter is read first?",
+               "options": ["tensor-core utilization", "achieved memory bandwidth", "occupancy", "register count"],
+               "correctIndex": 1,
+               "explanation": "Read achieved memory bandwidth first: if it is saturated the kernel is memory-bound and done. Then occupancy (does it supply enough outstanding requests), then tensor utilization (is the feeding pipeline starving the array)."}
+            ]</script>
+          </div>
+
+          <h2>References</h2>
+          <ol class="refs">
+            <li>Hennessy, J. and Patterson, D. <em>Computer Architecture: A Quantitative Approach</em>, 6th edition. Morgan
+              Kaufmann, 2019. The standard treatment of memory hierarchy, DRAM, NUMA, and the roofline.</li>
+            <li>Jacob, B., Ng, S., and Wang, D. <em>Memory Systems: Cache, DRAM, Disk</em>. Morgan Kaufmann, 2007. The reference on
+              DRAM device organization, timing parameters, and controller scheduling.</li>
+            <li>Williams, S., Waterman, A., and Patterson, D. "Roofline: an insightful visual performance model for multicore
+              architectures." <em>Communications of the ACM</em>, 52(4), 2009. <a href="https://doi.org/10.1145/1498765.1498785">doi:10.1145/1498765.1498785</a>.</li>
+            <li>Little, J. D. C. "A Proof for the Queuing Formula L = &lambda;W." <em>Operations Research</em>, 9(3), 1961.
+              <a href="https://doi.org/10.1287/opre.9.3.383">doi:10.1287/opre.9.3.383</a>.</li>
+            <li>Kung, H. T. and Leiserson, C. E. "Systolic Arrays (for VLSI)." Sparse Matrix Proceedings, 1978. The origin of the
+              systolic dataflow.</li>
+            <li>Chen, Y.-H., Emer, J., and Sze, V. "Eyeriss: A Spatial Architecture for Energy-Efficient Dataflow for Convolutional
+              Neural Networks." <em>ISCA</em>, 2016. The dataflow taxonomy and the row-stationary design.</li>
+            <li>Sze, V., Chen, Y.-H., Yang, T.-J., and Emer, J. <em>Efficient Processing of Deep Neural Networks</em>. Morgan &amp;
+              Claypool, 2020. The survey with the normalized data-movement energy model.</li>
+            <li>Jouppi, N. P. et al. "In-Datacenter Performance Analysis of a Tensor Processing Unit." <em>ISCA</em>, 2017.
+              <a href="https://arxiv.org/abs/1704.04760">arXiv:1704.04760</a>.</li>
+            <li>NVIDIA. "NVIDIA H100 Tensor Core GPU Architecture." Whitepaper, 2022. Source for the SM, tensor-core, and HBM3
+              figures compared against measurement.</li>
+            <li>Markidis, S., Der Chien, S. W., Laure, E., Peng, I. B., and Vetter, J. S. "NVIDIA Tensor Core Programmability,
+              Performance &amp; Precision." <em>IPDPSW</em>, 2018. <a href="https://arxiv.org/abs/1803.04014">arXiv:1803.04014</a>.</li>
+            <li>Micikevicius, P. et al. "Mixed Precision Training." <em>ICLR</em>, 2018.
+              <a href="https://arxiv.org/abs/1710.03740">arXiv:1710.03740</a>.</li>
+            <li>Micikevicius, P. et al. "FP8 Formats for Deep Learning." 2022.
+              <a href="https://arxiv.org/abs/2209.05433">arXiv:2209.05433</a>.</li>
+            <li>Mishra, A. et al. "Accelerating Sparse Deep Neural Networks." NVIDIA, 2021.
+              <a href="https://arxiv.org/abs/2104.08378">arXiv:2104.08378</a>. The 2:4 structured-sparsity recipe.</li>
+            <li>Rixner, S., Dally, W. J., Kapasi, U. J., Mattson, P., and Owens, J. D. "Memory Access Scheduling."
+              <em>ISCA</em>, 2000. FR-FCFS and the DRAM scheduling baseline.</li>
+            <li>Mittal, S. "A Survey of Recent Prefetching Techniques for Processor Caches." <em>ACM Computing Surveys</em>, 49(2),
+              2016. <a href="https://doi.org/10.1145/2907071">doi:10.1145/2907071</a>.</li>
+            <li>Kim, Y., Yang, W., and Mutlu, O. "Ramulator: A Fast and Extensible DRAM Simulator." <em>IEEE Computer Architecture
+              Letters</em>, 2015. The standard DRAM timing/refresh simulator (SAFARI group).</li>
+            <li>Kim, Y. et al. "Flipping Bits in Memory Without Accessing Them: An Experimental Study of DRAM Disturbance Errors
+              (RowHammer)." <em>ISCA</em>, 2014.</li>
+            <li>Jia, Z., Maggioni, M., Staiger, B., and Scarpazza, D. P. "Dissecting the NVIDIA Volta GPU Architecture via
+              Microbenchmarking." 2018. <a href="https://arxiv.org/abs/1804.06826">arXiv:1804.06826</a>. GPU memory-latency
+              methodology.</li>
+            <li>Volkov, V. "Understanding Latency Hiding on GPUs." PhD thesis, University of California, Berkeley, 2016. The GPU
+              statement of Little's law for occupancy.</li>
+            <li>Abts, D. et al. "Think Fast: A Tensor Streaming Processor (TSP) for Accelerating Deep Learning Workloads (Groq)."
+              <em>ISCA</em>, 2020.</li>
+            <li>Lauterbach, G. "The Path to Successful Wafer-Scale Integration: The Cerebras Story." <em>IEEE Micro</em>, 41(6),
+              2021.</li>
+            <li>Vasiljevic, J. et al. "Compute Substrate for Software 2.0 (Tenstorrent)." <em>IEEE Micro</em>, 41(2), 2021.</li>
+            <li>JEDEC. <em>JESD238 High Bandwidth Memory (HBM3) DRAM</em> standard, 2022, and the earlier <em>JESD235</em> HBM
+              standard. Source for channel, pseudo-channel, and per-pin-rate definitions.</li>
+          </ol>
+
+          <div class="takeaway">
+            Modern architecture is a memory problem wearing a compute costume. Compute per chip has outrun DRAM by three orders of
+            magnitude, so every design that matters is a response to the bandwidth cascade, from a register file above 100 TB/s
+            down to a NIC near 50 GB/s, each level roughly a tenth of the one above. DRAM's activate-read-precharge timing sets a
+            latency floor that has barely moved in twenty years, and Little's law converts that floor into a concurrency
+            requirement. Bytes in flight equal bandwidth times latency, about 1.5 MB to saturate this H100's HBM and about 234
+            cache lines to saturate its CPU socket. The tensor core earns its keep by amortizing bandwidth, doing order-P
+            arithmetic per operand through a systolic array whose dataflow, weight-, output-, or row-stationary, is chosen to keep
+            each byte in the cheapest level of the cascade, because a DRAM access costs two hundred MACs of energy. The roofline
+            ties it together. A kernel's arithmetic intensity against the ridge point of about 220 FLOP/byte decides whether it is
+            memory- or compute-bound, and the whole craft, tiling, flash attention, fp8, 2:4 sparsity, quantized decode, is the
+            art of moving a kernel across that ridge by changing the bytes, not the FLOPs.
+          </div>
+
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>&copy; <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;&middot;&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/classes/math.js"></script>
+    <script defer src="/code-tabs.js"></script>
+    <script defer src="/quiz.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/code-copy.js"></script>
+      <script defer src="/theme.js"></script>
+  </body>
+</html>

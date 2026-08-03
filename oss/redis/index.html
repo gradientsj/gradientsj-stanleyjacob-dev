@@ -4,9 +4,10 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Redis walkthrough · Stanley Jacob</title>
-    <meta name="description" content="A full chapter on Redis: a practical tutorial, a systems-internals walkthrough following one SET and one GET from the socket through ae.c, networking.c, server.c, and dict.c, deep dives into the event loop, encodings, persistence, and eviction, plus a staged repository reading plan and hands-on labs." />
+    <meta name="description" content="A full chapter on Redis: a practical tutorial, a systems-internals walkthrough following one SET and one GET from the socket through ae.c, networking.c, server.c, and dict.c, worked systems designs for where Redis belongs and where it does not, deep dives into the event loop, encodings, persistence, and eviction, plus a staged repository reading plan and hands-on labs." />
     <link rel="stylesheet" href="/style.css" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%232B2621'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+      <script>(function(){try{var t=localStorage.getItem("theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
   </head>
   <body>
     <nav class="top">
@@ -16,6 +17,7 @@
           <a href="/ai">AI</a>
           <a href="/robotics">Robotics</a>
           <a href="/software">Software</a>
+          <a href="/classes">Classes</a>
           <a href="/algorithms">Algorithms</a>
           <a href="/systems">Systems</a>
           <a href="/ml">ML</a>
@@ -40,9 +42,10 @@
           will ever open. This is a full chapter, not a tour: a practical
           tutorial, a systems-internals walkthrough that follows one
           <code>SET</code> and one <code>GET</code> from the client socket
-          through the event loop to the reply buffer, deep dives into the
-          four load-bearing subsystems, a staged plan for reading the
-          repository, and labs you can run tonight. File names and defaults
+          through the event loop to the reply buffer, worked systems
+          designs for where Redis belongs and where it does not, deep
+          dives into the four load-bearing subsystems, a staged plan for
+          reading the repository, and labs you can run tonight. File names and defaults
           were checked against the Redis 8.0 source tree.
         </p>
       </div>
@@ -207,7 +210,7 @@ SCAN 0 MATCH user:* COUNT 100
             a read-modify-write of the whole blob, done in your application
             with a race window. A hash lets Redis update one field atomically,
             and small hashes are stored in a compact encoding you will meet in
-            Part V:
+            Part VII:
           </p>
           <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code><span class="c"># wrong: fetch, mutate, write back the whole object</span>
 <span class="v2">u</span> = <span class="m1">json</span>.<span class="m2">loads</span><span class="b0">(</span><span class="v2">r</span>.<span class="m2">get</span><span class="b1">(</span><span class="s">"user:1000"</span><span class="b1">)</span><span class="b0">)</span>
@@ -225,7 +228,7 @@ SCAN 0 MATCH user:* COUNT 100
             failing with an error instead of evicting. A cache deployment
             wants an explicit limit and an eviction policy, for example
             <code>maxmemory 2gb</code> with
-            <code>maxmemory-policy allkeys-lru</code>. Part V explains what
+            <code>maxmemory-policy allkeys-lru</code>. Part VII explains what
             those policies actually do.
           </p>
 
@@ -276,7 +279,415 @@ dangerous: app ──▶ Redis (only copy, everysec fsync, async replica)
             requirements instead of from code.
           </p>
 
-          <h2>Part IV: The full life of one command</h2>
+          <h2>Part IV: Systems designs where Redis belongs</h2>
+          <p>
+            Part III gave the rule, Redis wins when the operations you need
+            map onto its commands. This part works the rule as concrete
+            designs, each with the keys, the commands, the TTLs, and the
+            failure behavior spelled out, because the difference between a
+            checklist and a system is the wiring. Everything here runs on a
+            single instance, survives the move to Cluster, and leans on the
+            two properties the rest of the chapter establishes, every
+            command is atomic and almost every command is fast.
+          </p>
+
+          <h3>A cache-aside layer in front of Postgres</h3>
+          <p>
+            The most common deployment is also the most instructive. The
+            application reads Redis first, and on a miss it reads
+            <a href="/oss/postgresql">Postgres</a>, then writes the row
+            back with a TTL so the entry retires itself. Read-through is
+            the same design with the fetch moved into a cache library, the
+            wiring below is cache-aside, where the application owns the
+            miss path. Writes go to Postgres and then delete the cache key
+            rather than updating it, because a delete cannot plant a stale
+            value during a race while an update can, and every TTL gets
+            jitter so keys populated together do not expire together. The
+            remaining failure mode is the stampede, a hot key expires and a
+            thousand concurrent requests all miss at once and arrive at the
+            database as a synchronized herd. One defense is a rebuild lock,
+            the first missing reader claims a sentinel key with
+            <code>SET NX EX</code> and recomputes while the rest wait
+            briefly or serve slightly stale data. The other is
+            probabilistic early refresh, where each reader recomputes
+            before expiry with a probability that rises as the deadline
+            approaches, scaled by how long the recompute takes, so the
+            refresh has usually happened before any miss can occur. The
+            lock version is the easier one to reason about.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">json</span>, <span class="m1">random</span>, <span class="m1">time</span>
+
+<span class="v3">TTL</span> = <span class="n">300</span>
+
+<span class="k">def</span> <span class="m1">get_user</span><span class="b0">(</span><span class="v5">uid</span><span class="b0">)</span>:
+    <span class="v4">key</span> = <span class="s">f"user:{</span><span class="v5">uid</span><span class="s">}"</span>
+    <span class="v5">hit</span> = <span class="v2">r</span>.<span class="m2">get</span><span class="b0">(</span><span class="v4">key</span><span class="b0">)</span>
+    <span class="k">if</span> <span class="v5">hit</span> <span class="k">is</span> <span class="k">not</span> <span class="k">None</span>:
+        <span class="k">return</span> <span class="m1">json</span>.<span class="m2">loads</span><span class="b0">(</span><span class="v5">hit</span><span class="b0">)</span>
+    <span class="c"># one worker rebuilds a hot key, the rest wait briefly and retry</span>
+    <span class="k">if</span> <span class="v2">r</span>.<span class="m2">set</span><span class="b0">(</span><span class="s">f"rebuild:{</span><span class="v4">key</span><span class="s">}"</span>, <span class="s">"1"</span>, <span class="v4">nx</span>=<span class="k">True</span>, <span class="v2">ex</span>=<span class="n">10</span><span class="b0">)</span>:
+        <span class="v6">row</span> = <span class="m1">fetch_user_from_postgres</span><span class="b0">(</span><span class="v5">uid</span><span class="b0">)</span>
+        <span class="v2">r</span>.<span class="m2">set</span><span class="b0">(</span><span class="v4">key</span>, <span class="m1">json</span>.<span class="m2">dumps</span><span class="b1">(</span><span class="v6">row</span><span class="b1">)</span>, <span class="v2">ex</span>=<span class="v3">TTL</span> + <span class="m1">random</span>.<span class="m2">randint</span><span class="b1">(</span><span class="n">0</span>, <span class="n">60</span><span class="b1">)</span><span class="b0">)</span>
+        <span class="v2">r</span>.<span class="m2">delete</span><span class="b0">(</span><span class="s">f"rebuild:{</span><span class="v4">key</span><span class="s">}"</span><span class="b0">)</span>
+        <span class="k">return</span> <span class="v6">row</span>
+    <span class="m1">time</span>.<span class="m2">sleep</span><span class="b0">(</span><span class="n">0.05</span><span class="b0">)</span>
+    <span class="k">return</span> <span class="m1">get_user</span><span class="b0">(</span><span class="v5">uid</span><span class="b0">)</span></code></pre></div>
+          <p>
+            Size the cache for hit rate rather than for the whole table,
+            set <code>maxmemory</code> with <code>allkeys-lru</code>, and
+            let eviction do the working-set selection. The full derivation
+            of this design, including how it shards, is my
+            <a href="/systems/distributed-cache">distributed cache
+            write-up</a>.
+          </p>
+
+          <h3>A session store</h3>
+          <p>
+            Sessions are the cleanest case of data Redis should own
+            outright. The browser holds an opaque random id in a cookie,
+            and the server holds a hash at <code>session:{id}</code> with
+            the user id, roles, and a CSRF secret, created with a TTL and
+            refreshed with <code>EXPIRE</code> on each authenticated
+            request so the window slides. Every app server sees the same
+            store, so there is no sticky routing and any instance can
+            serve any request, which is the property that lets the web
+            tier scale horizontally and deploy without draining
+            connections. Logout is a <code>DEL</code>, and revoking
+            everything a user holds is a small per-user set of their
+            session ids, deleted in one pipeline. The loss story is what
+            makes the fit honest, if the store dies users log in again, an
+            annoyance rather than an outage, which is exactly the
+            durability contract Redis offers. A session hash with a
+            handful of short fields stays in the listpack encoding from
+            Part VII and costs a few hundred bytes, so a million live
+            sessions fit comfortably under a gigabyte.
+          </p>
+
+          <h3>A rate limiter, three ways</h3>
+          <p>
+            The fixed window is <code>INCR</code> on
+            <code>rl:{user}:{minute}</code> with <code>EXPIRE</code> set
+            on the first increment, two commands and almost no memory, and
+            one known flaw, a client can spend a full budget at the end of
+            one window and another at the start of the next, so a limit of
+            100 per minute briefly admits nearly 200 across the boundary.
+            The sliding window log fixes that with a sorted set per
+            client, each request adds a member scored by its timestamp,
+            <code>ZREMRANGEBYSCORE</code> drops entries older than the
+            window, and <code>ZCARD</code> counts exactly what happened in
+            the last minute, at the cost of one stored entry per request.
+            The token bucket allows controlled bursts, and it belongs in a
+            Lua script so the read-modify-write of the bucket state is one
+            atomic step. A script runs alone on the one execution thread,
+            which turns the classic concurrent-counter race into
+            straight-line code.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="v6">BUCKET</span> = <span class="s">"""</span>
+<span class="s">local rate   = tonumber(ARGV[1])      -- tokens added per second</span>
+<span class="s">local burst  = tonumber(ARGV[2])      -- bucket capacity</span>
+<span class="s">local now    = tonumber(ARGV[3])</span>
+<span class="s">local ttl    = tonumber(ARGV[4])</span>
+<span class="s">local b      = redis.call('HMGET', KEYS[1], 'tokens', 'ts')</span>
+<span class="s">local tokens = tonumber(b[1]) or burst</span>
+<span class="s">local ts     = tonumber(b[2]) or now</span>
+<span class="s">tokens = math.min(burst, tokens + (now - ts) * rate)</span>
+<span class="s">local allowed = 0</span>
+<span class="s">if tokens &gt;= 1 then</span>
+<span class="s">    tokens  = tokens - 1</span>
+<span class="s">    allowed = 1</span>
+<span class="s">end</span>
+<span class="s">redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', now)</span>
+<span class="s">redis.call('EXPIRE', KEYS[1], ttl)</span>
+<span class="s">return allowed</span>
+<span class="s">"""</span>
+
+<span class="m1">allow</span> = <span class="v2">r</span>.<span class="m2">register_script</span><span class="b0">(</span><span class="v6">BUCKET</span><span class="b0">)</span>
+<span class="v6">ok</span> = <span class="m1">allow</span><span class="b0">(</span><span class="v4">keys</span>=<span class="b1">[</span><span class="s">"rl:user:1000"</span><span class="b1">]</span>, <span class="v2">args</span>=<span class="b1">[</span><span class="n">5</span>, <span class="n">10</span>, <span class="m1">time</span>.<span class="m2">time</span><span class="b2">()</span>, <span class="n">60</span><span class="b1">]</span><span class="b0">)</span></code></pre></div>
+          <p>
+            Pick by what the limit protects. The fixed window suits coarse
+            abuse caps where a boundary burst is tolerable, the sliding
+            log gives exact enforcement for expensive endpoints, and the
+            token bucket is the shape traffic policing actually wants,
+            steady rate with bounded burst. The service built around these
+            decisions is my <a href="/systems/rate-limiter">rate limiter
+            design write-up</a>.
+          </p>
+
+          <h3>A leaderboard on sorted sets</h3>
+          <p>
+            The leaderboard is the design where Redis is not merely a good
+            choice but the reference answer. One sorted set per season,
+            <code>ZINCRBY</code> applies a score event,
+            <code>ZRANGE ... REV</code> reads the top ten,
+            <code>ZREVRANK</code> answers the question every player
+            actually asks, where am I, and a range around a player's rank
+            produces the neighbors view. Each of those is O(log&nbsp;n)
+            through the skiplist plus dict pairing described in Part VII,
+            so ten million members answer rank queries in microseconds,
+            which relational engines handle badly because a global rank is
+            a count of everyone with a better score, recomputed per
+            request. The wiring detail that matters is seasons as separate
+            keys, <code>lb:2026w30</code> rather than one eternal set, so
+            a reset is starting a new key and old seasons retire by TTL
+            instead of by deletion storm. My
+            <a href="/systems/gaming-leaderboard">gaming leaderboard
+            design</a> builds the surrounding service.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">redis-cli</span> <span class="s">ZINCRBY</span> <span class="s">lb:2026w30</span> <span class="s">31</span> <span class="s">player:ada</span>
+<span class="m1">redis-cli</span> <span class="s">ZRANGE</span> <span class="s">lb:2026w30</span> <span class="s">0</span> <span class="s">9</span> <span class="s">REV</span> <span class="s">WITHSCORES</span>   <span class="c"># top ten</span>
+<span class="m1">redis-cli</span> <span class="s">ZREVRANK</span> <span class="s">lb:2026w30</span> <span class="s">player:ada</span>         <span class="c"># ada's rank, 0-based</span></code></pre></div>
+
+          <h3>A work queue, Streams versus lists</h3>
+          <p>
+            The list version came first and is still everywhere. Producers
+            <code>LPUSH</code> jobs, and each worker takes one with
+            <code>BRPOPLPUSH</code>, a blocking pop from the pending list
+            and an atomic push onto that worker's processing list in a
+            single step, spelled <code>BLMOVE</code> in newer code. The
+            processing list is the safety net, a job leaves it only after
+            completion, so a crashed worker leaves evidence behind. The
+            weakness is that the evidence does not act on itself, you must
+            run a janitor that scans processing lists for entries older
+            than a deadline and pushes them back, and there is no delivery
+            counter, so a poison job can circulate forever. Streams with
+            consumer groups build all of that in. <code>XADD</code>
+            appends, <code>XREADGROUP</code> delivers each entry to
+            exactly one consumer in the group, every delivered but
+            unacknowledged entry sits in the pending entries list with an
+            idle time and a delivery count, <code>XAUTOCLAIM</code>
+            reassigns entries idle too long to a live worker, and
+            <code>XACK</code> retires them. A delivery count that climbs
+            past a threshold flags the poison job for a dead letter
+            stream. The contract is at least once, a worker that dies
+            after doing the work but before the ack causes a redelivery,
+            so handlers must be idempotent, which is what the idempotency
+            key design at the end of this part provides.
+          </p>
+          <pre class="flow">producer ──XADD──▶ jobs stream
+                     │ XREADGROUP GROUP workers ...   each entry to one consumer
+                     ▼
+        worker w1 crashes mid-job ▶ entry stays in the pending entries list
+                     │ XAUTOCLAIM after the idle threshold
+                     ▼
+        worker w2 finishes ──XACK──▶ entry retired, delivery count remembers</pre>
+          <p>
+            My <a href="/systems/distributed-message-queue">distributed
+            message queue design</a> derives the same contract from
+            requirements, and the next part covers where Streams stop
+            being the right log.
+          </p>
+
+          <h3>Pub/sub fan-out, and what it promises</h3>
+          <p>
+            <code>PUBLISH</code> and <code>SUBSCRIBE</code> are the
+            simplest primitives in the building, and the delivery
+            guarantee is the entire design decision. A message goes to the
+            subscribers connected at that instant and is stored nowhere, a
+            slow subscriber is disconnected when its output buffer fills,
+            and one that reconnects has missed everything in between. That
+            is at most once, and it is precisely right when the message is
+            a hint rather than a fact. Cache invalidation broadcasts
+            qualify because the next read repairs any loss, so do presence
+            and typing indicators, config reload pushes, and the fan-out
+            tier of a chat system where each websocket server subscribes
+            to channels for the users it holds and a reconnecting client
+            resyncs from durable history anyway, the shape my
+            <a href="/systems/chat-system">chat system design</a> uses.
+            The rule is short, publish things whose loss is repaired by
+            the next read, queue things whose loss is a bug, and reach for
+            Streams as the in-house upgrade when you need replay.
+          </p>
+
+          <h3>Idempotency keys with SET NX EX</h3>
+          <p>
+            Retries are how distributed systems cope with failure, and
+            idempotency keys are how they stay honest while doing it. The
+            client sends a unique request id, and the server claims it
+            with <code>SET key value NX EX ttl</code>, one atomic command
+            that succeeds for exactly one attempt. The winner processes
+            the request and overwrites the key with the stored result,
+            retries find the key and return that result without
+            re-executing, and a retry that arrives mid-flight sees the
+            in-progress marker and backs off. The TTL is the retry
+            horizon, a day covers clients that retry after long outages
+            without accumulating keys forever. The honest caveat comes
+            from the durability story in Part VII, a failover can forget a
+            freshly claimed key, so for money movement the ledger itself
+            must also enforce uniqueness, with the Redis key as the fast
+            path that absorbs the retry traffic. My
+            <a href="/systems/payment-system">payment system design</a>
+            spells out that layering.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="v5">claimed</span> = <span class="v2">r</span>.<span class="m2">set</span><span class="b0">(</span><span class="s">f"idem:{</span><span class="v4">req_id</span><span class="s">}"</span>, <span class="s">"in-progress"</span>, <span class="v4">nx</span>=<span class="k">True</span>, <span class="v2">ex</span>=<span class="n">86400</span><span class="b0">)</span>
+<span class="k">if</span> <span class="v5">claimed</span>:
+    <span class="v5">result</span> = <span class="m1">process</span><span class="b0">(</span><span class="v0">request</span><span class="b0">)</span>
+    <span class="v2">r</span>.<span class="m2">set</span><span class="b0">(</span><span class="s">f"idem:{</span><span class="v4">req_id</span><span class="s">}"</span>, <span class="m1">json</span>.<span class="m2">dumps</span><span class="b1">(</span><span class="v5">result</span><span class="b1">)</span>, <span class="v2">xx</span>=<span class="k">True</span>, <span class="v2">ex</span>=<span class="n">86400</span><span class="b0">)</span>
+<span class="k">else</span>:
+    <span class="v3">prior</span> = <span class="v2">r</span>.<span class="m2">get</span><span class="b0">(</span><span class="s">f"idem:{</span><span class="v4">req_id</span><span class="s">}"</span><span class="b0">)</span>
+    <span class="k">if</span> <span class="v3">prior</span> == <span class="s">"in-progress"</span>:
+        <span class="k">raise</span> <span class="m1">Conflict</span><span class="b0">(</span><span class="s">"original attempt still running"</span><span class="b0">)</span>
+    <span class="v5">result</span> = <span class="m1">json</span>.<span class="m2">loads</span><span class="b0">(</span><span class="v3">prior</span><span class="b0">)</span></code></pre></div>
+
+          <h2>Part V: Where Redis does not belong</h2>
+          <p>
+            The negative space matters as much as the designs. Most
+            production misuses of Redis trace back to one of a few
+            boundaries, and each boundary follows from architecture this
+            chapter has already built, the memory budget, the bounded
+            durability, the single execution thread, and the absence of a
+            query planner. This part walks them in order of how expensive
+            the lesson tends to be.
+          </p>
+
+          <h3>As the primary system of record</h3>
+          <p>
+            The durability numbers from Part VII decide this one. An RDB
+            snapshot preserves the past at the price of the present,
+            everything after the last save is gone on a crash, and saves
+            are minutes apart. AOF at the default everysec acknowledges
+            writes that can still die with the process, about a second of
+            them, and even <code>appendfsync always</code> cannot help
+            with failover, promoting an asynchronous replica can discard
+            acknowledged writes regardless of the fsync dial. A system of
+            record also grows for years, and Redis charges RAM prices for
+            every byte, which turns cold history into the most expensive
+            storage in the fleet. Keep the authoritative copy in a
+            disk-first engine with a real write-ahead log, which is
+            <a href="/oss/postgresql">Postgres</a> in most stacks, and let
+            Redis be the fast copy in front, the shape Part III drew. The
+            tell that a team has crossed this line is a backup strategy
+            that consists of hoping the replica stays up.
+          </p>
+
+          <h3>When the working set cannot fit in RAM</h3>
+          <p>
+            Redis has one storage tier and it is the expensive one. If the
+            data is genuinely evictable cache, oversubscription is the
+            design, set <code>maxmemory</code>, choose an eviction policy,
+            size for hit rate, and let the cold tail live in the database
+            behind you. If the data is not evictable, the arithmetic stops
+            working, because every cold byte occupies DRAM that a
+            disk-first engine would keep on SSD at a fraction of the cost.
+            LSM-tree storage in the
+            <a href="/oss/rocksdb">RocksDB</a> family exists exactly for
+            the shape where the working set is smaller than the dataset,
+            hot pages in memory and cold levels on disk. Some
+            Redis-compatible servers offer flash tiers, and the fair way
+            to assess them is as different systems with different latency
+            contracts rather than as a bigger Redis.
+          </p>
+
+          <h3>For complex queries and joins</h3>
+          <p>
+            Redis answers exactly the questions you prepared it to answer.
+            Access by key is O(1), and access by anything else is a
+            secondary index you build by hand, a set per attribute value,
+            updated by your application, on every write, forever. There is
+            no planner, no constraint enforcement, no ad hoc query, and a
+            join is a Lua script you now maintain. Two or three hand-built
+            indexes are a normal and healthy pattern, the leaderboard
+            above is one. A keyspace that has grown into a shadow
+            relational schema, sets mirroring foreign keys and scripts
+            replaying joins, is the sign to hand the workload to
+            <a href="/oss/postgresql">Postgres</a>, where declarative
+            indexes and a planner do that bookkeeping with decades of
+            correctness behind them, and to keep Redis for the hot paths
+            it still owns.
+          </p>
+
+          <h3>For large blobs</h3>
+          <p>
+            Every value travels through the single thread and the
+            per-client output buffer. A huge value technically fits, the
+            protocol allows bulk strings up to
+            <code>proto-max-bulk-len</code>, half a gigabyte by default,
+            but limits are not the problem, latency is. Serving a 100 MB
+            value occupies the loop while the bytes are copied, inflates
+            the client output buffer toward its disconnect thresholds, and
+            gets rewritten wholesale into the AOF and the replication
+            stream on every update. Blobs also convert RAM directly into
+            cost while using none of the data structure semantics that
+            justify the price. The standard wiring stores the bytes in
+            object storage and keeps the pointer plus the hot metadata in
+            Redis, the design my
+            <a href="/systems/object-storage">object storage write-up</a>
+            covers from the other side.
+          </p>
+
+          <h3>For exactly-once messaging</h3>
+          <p>
+            Pub/sub is at most once, and Streams are at least once,
+            delivery repeats until acknowledged, so duplicates are a
+            normal event and consumer idempotency is what turns the
+            contract into effectively exactly once. That is genuinely fine
+            for most work queues. It stops being fine when the log itself
+            is the product, days or weeks of retention for replay and
+            backfill, many independent consumer groups reading at their
+            own pace, ordered partitions rebalanced across a consumer
+            fleet, and throughput planned at disk prices for storage.
+            Kafka-class replicated logs are built around exactly those
+            requirements, retention on disk, offsets as plain
+            consumer-owned integers, ordering within each partition, and
+            an in-memory stream cannot follow them there without paying
+            RAM prices for history. My
+            <a href="/systems/distributed-message-queue">distributed
+            message queue design</a> works through where that line falls.
+          </p>
+
+          <h3>The distributed lock caveat</h3>
+          <p>
+            The single-instance lock from Part II, <code>SET NX EX</code>
+            with a unique token and a Lua release that checks the token
+            before deleting, is a fine efficiency lock. It deduplicates
+            work, one cron runner instead of five, and its failure mode, a
+            rare double execution when the lock expires under a stalled
+            holder, wastes computation without corrupting anything. The
+            debate begins when the lock guards correctness. Redlock, the
+            multi-instance algorithm, acquires the lock on a majority of
+            independent Redis nodes so that one node's crash cannot hand
+            the lock out twice. Kleppmann's critique makes two calm
+            points. A client can be paused after acquiring, by garbage
+            collection or by the network, and act on a lock that has
+            already expired, so safety requires a fencing token, a
+            monotonically increasing number that the protected resource
+            itself checks, and Redlock does not produce one. And the
+            algorithm's safety rests on timing assumptions, bounded pauses
+            and well-behaved clocks, that distributed systems theory
+            prefers not to rest on. Antirez's reply argues that those
+            timing assumptions are the same ones most practical systems
+            already accept, and that many uses need mutual exclusion in
+            the common case rather than proof against adversarial
+            schedules. Both essays reward a full read, and they agree on
+            more than the framing suggests. The operational line is the
+            cost of a stale lock. If it wastes work, single-instance
+            <code>SET NX EX</code> is enough and Redlock adds machinery
+            without adding a fencing token. If it can corrupt state, the
+            fix is fencing enforced by the storage being protected, or
+            leases from a linearizable coordinator, not a bigger lock
+            service.
+          </p>
+
+          <h3>The ecosystem, briefly</h3>
+          <p>
+            One boundary is organizational rather than technical. The 2024
+            license change, when Redis moved off the BSD license to
+            source-available terms, produced Valkey, the Linux Foundation
+            fork that major distros and cloud providers adopted, and 2025
+            brought a partial reversal when Redis 8 added the AGPLv3
+            option, returning the project to an OSI-approved license. For
+            everything in this chapter the two are interchangeable, Valkey
+            forked from Redis 7.2 and kept the architecture, and every
+            design above runs unchanged on either. KeyDB is an earlier
+            fork that made the server multithreaded, and Dragonfly is a
+            from-scratch multithreaded implementation of the same protocol
+            on a different internal architecture under a source-available
+            license, both worth knowing as evidence that the protocol has
+            outgrown any single steward. This chapter follows the Redis
+            source because it remains the reference implementation and the
+            most readable of the family.
+          </p>
+
+          <h2>Part VI: The full life of one command</h2>
           <p>
             This is the core of the chapter. We follow
             <code>SET user:1000:name "Ada"</code> and then
@@ -437,7 +848,7 @@ dangerous: app ──▶ Redis (only copy, everysec fsync, async replica)
             sub-millisecond Redis.
           </p>
 
-          <h2>Part V: Internals deep dives</h2>
+          <h2>Part VII: Internals deep dives</h2>
 
           <h3>Deep dive: the event loop, and where the threads actually are</h3>
           <p>
@@ -602,7 +1013,7 @@ fork children: RDB save  │ AOF rewrite               (whole-process snapshots)
             exactly like noeviction and fails writes at the limit.</mark>
           </p>
 
-          <h2>Part VI: Reading the repository</h2>
+          <h2>Part VIII: Reading the repository</h2>
           <p>
             Everything lives flat in <code>src/</code>. Read it in stages,
             each with questions you should be able to answer before moving
@@ -663,7 +1074,7 @@ fork children: RDB save  │ AOF rewrite               (whole-process snapshots)
             loop is second nature.
           </p>
 
-          <h2>Part VII: Hands-on labs</h2>
+          <h2>Part IX: Hands-on labs</h2>
           <h3>Lab 1: watch the traffic, measure the latency</h3>
           <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code><span class="m1">redis-cli</span> <span class="s">MONITOR</span>                   <span class="c"># terminal 1: every command, live</span>
 <span class="m1">redis-benchmark</span> <span class="s">-t</span> <span class="s">set,get</span> <span class="s">-n</span> <span class="s">100000</span> <span class="s">-q</span>   <span class="c"># terminal 2</span>
@@ -673,7 +1084,7 @@ fork children: RDB save  │ AOF rewrite               (whole-process snapshots)
             (never leave it on in production; it costs real throughput).
             <code>--latency</code> shows the round-trip floor, typically a
             fraction of a millisecond on localhost; numbers vary by machine.
-            Concept taught: the request path from Part IV, observed from
+            Concept taught: the request path from Part VI, observed from
             outside.
           </p>
           <h3>Lab 2: watch an encoding transition</h3>
@@ -725,7 +1136,7 @@ fork children: RDB save  │ AOF rewrite               (whole-process snapshots)
             production.
           </p>
 
-          <h2>Part VIII: Understanding checks</h2>
+          <h2>Part X: Understanding checks</h2>
           <p><strong>What is Redis in one sentence?</strong>
             An in-memory data structure server: a dictionary of typed,
             adaptively encoded values, executed one command at a time by a
@@ -811,7 +1222,7 @@ fork children: RDB save  │ AOF rewrite               (whole-process snapshots)
             output-buffer limits disconnect consumers that fall too far
             behind.</p>
 
-          <h2>Part IX: Design lessons</h2>
+          <h2>Part XI: Design lessons</h2>
           <p>
             <strong>One writer, no locks, as an architecture.</strong> Redis
             gets atomicity and simplicity by serializing all mutation
@@ -852,7 +1263,7 @@ fork children: RDB save  │ AOF rewrite               (whole-process snapshots)
             io_uring elsewhere) is a recurring senior move.
           </p>
 
-          <h2>Part X: Memorization framework</h2>
+          <h2>Part XII: Memorization framework</h2>
           <p>
             The one-sentence summary: <mark>Redis is a single-threaded event
             loop executing atomic commands against an in-memory dict of
@@ -913,5 +1324,6 @@ ae.c → networking.c → server.c → t_string.c → dict.c/object.c → networ
       document.getElementById("yr").textContent = new Date().getFullYear();
     </script>
     <script defer src="/code-copy.js"></script>
+      <script defer src="/theme.js"></script>
   </body>
 </html>

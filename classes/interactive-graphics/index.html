@@ -1,0 +1,1499 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Interactive rendering &middot; Stanley Jacob</title>
+    <meta name="description" content="Real-time rendering derived from the frame budget: the 16.6 ms and 8.3 ms constraint, the GPU pipeline stage by stage, forward vs deferred vs clustered shading with a cost crossover, the G-buffer, shadow mapping and cascaded maps, SSAO and real-time GI, MSAA vs temporal AA and DLSS/FSR, culling and GPU-driven draw submission, and hardware ray tracing with ReSTIR." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%232B2621'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+      <script>(function(){try{var t=localStorage.getItem("theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes" class="active">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/classes">Classes</a></div>
+        <h1>Interactive rendering: the real-time GPU pipeline and its budget</h1>
+        <p class="lead">
+          Every decision in real-time graphics is a consequence of one number: the time
+          available to produce a frame, roughly sixteen milliseconds at sixty frames per second
+          and half that at a hundred and twenty. This page starts from that budget and derives the
+          engineering that fits inside it. It walks the GPU pipeline stage by stage and shows where
+          the bottleneck moves; it derives the cost model that makes deferred and clustered shading
+          beat forward shading as the light count grows, and computes the crossover; it works out
+          the memory cost of a G-buffer, the texel density of a shadow map and the depth bias that
+          cures acne without causing peter-panning, the effective sample count of temporal
+          antialiasing and why it needs history rejection, and the CPU arithmetic that makes draw
+          calls, not triangles, the thing that kills a frame. It closes on hardware ray tracing: the
+          two-level BVH, why a one-sample-per-pixel image is unusable without a denoiser, and how
+          ReSTIR reuses samples across space and time. The companion pages
+          <a href="/classes/rendering-foundations">rendering-foundations</a> (the transform and
+          rasterization chain) and <a href="/classes/physically-based-rendering">physically-based-rendering</a>
+          (offline Monte Carlo transport) carry the material this page builds on and does not repeat.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+
+          <h2>Why this subject matters now</h2>
+          <p>
+            Real-time rendering is the discipline of producing a correct-enough image inside a hard
+            deadline, over and over, without ever missing. The deadline is what separates it from
+            offline rendering, where a path tracer treated on the
+            <a href="/classes/physically-based-rendering">physically-based-rendering</a> page can
+            spend minutes on a frame and converge to the true solution of the rendering equation. A
+            real-time renderer has milliseconds and must approximate. The whole field is a catalogue
+            of approximations chosen for how much error they hide per millisecond spent, and it only
+            makes sense when read against the budget.
+          </p>
+          <p>
+            Three things changed the field in the last several years. First, dedicated ray-tracing
+            hardware arrived around 2018: GPUs now contain fixed-function units that intersect a ray
+            with a bounding box or a triangle and that traverse a bounding-volume hierarchy, so a
+            frame can mix rasterized primary visibility with ray-traced shadows, reflections, and
+            global illumination. Second, temporal techniques took over. Antialiasing, ambient
+            occlusion, reflections, and increasingly upscaling all now amortize their cost across
+            frames by reusing the previous frame's result, which is why temporal antialiasing and
+            neural upscalers such as NVIDIA DLSS and AMD FidelityFX Super Resolution became the
+            default rather than the exception. Third, submission moved onto the GPU: instead of the
+            CPU issuing one draw call per object, the GPU culls and builds its own draw lists, a
+            style Epic's Nanite pushed to virtualized geometry. A practitioner today is expected to
+            reason quantitatively about all three, and to know when to spend the budget on more rays
+            versus more temporal reuse versus fewer draw calls.
+          </p>
+          <p>
+            The pipeline itself, the coordinate transforms, edge-function rasterization, the depth
+            buffer, texture filtering, and the Cook-Torrance BRDF, is derived on the
+            <a href="/classes/rendering-foundations">rendering-foundations</a> page and is assumed
+            here. This page owns the part that the frame budget forces: how the pipeline is
+            scheduled, where its bandwidth goes, and which approximations buy the most image per
+            millisecond.
+          </p>
+
+          <h2>The frame budget is the whole constraint</h2>
+          <p>
+            A display refreshes at a fixed rate, and a renderer that wants to present one new image
+            per refresh without tearing has exactly one refresh interval to produce it. At sixty
+            hertz that interval is
+          </p>
+          $$ t_{60} = \frac{1000\ \text{ms}}{60} = 16.\overline{6}\ \text{ms}, \qquad
+             t_{120} = \frac{1000}{120} = 8.\overline{3}\ \text{ms}, \qquad
+             t_{144} = 6.94\ \text{ms}, \qquad t_{240} = 4.17\ \text{ms}. $$
+          <p>
+            Missing the deadline is not graceful. If the frame is not ready when the display scans
+            out, the renderer either shows the old frame again, which under a fixed refresh means the
+            effective rate halves to thirty, or it tears. Variable-refresh displays soften this by
+            letting the refresh follow the renderer, but the budget remains: to hold a rate, every
+            frame must finish in its interval. This is a real-time constraint in the technical sense,
+            a deadline that must be met every period, not on average. A renderer that averages twelve
+            milliseconds but spikes to twenty every second stutters visibly, which is why the field
+            cares about the worst frame, the 99th-percentile frame time, more than the mean.
+          </p>
+          <p>
+            The budget is spent on two kinds of work that overlap: CPU work preparing the frame
+            (visibility, animation, submitting commands) and GPU work executing it (transforming
+            vertices, shading pixels, moving bytes). Modern engines pipeline these so the CPU is
+            preparing frame \(n+1\) while the GPU renders frame \(n\); the throughput is then set by
+            the slower of the two, but the latency the player feels is longer. The single most useful
+            habit in this field is to convert every proposed feature into milliseconds and subtract
+            it from the interval before deciding whether it fits.
+          </p>
+
+          <div class="problem">
+            <span class="plabel">Problem 1</span>
+            <p>
+              A game targets 60 fps at 1920&times;1080. Budget the frame. Suppose the fixed costs
+              (animation, culling, post-processing, UI) consume 6.0 ms, leaving the rest for the
+              deferred lighting pass. The lighting pass reads a 20-byte G-buffer per pixel, writes an
+              8-byte HDR target, and its shading loop over lights is bandwidth-bound at an effective
+              600 GB/s (a mid-range consumer GPU figure, not the datacenter part). How many bytes per
+              frame can the lighting pass move, and does the base cost fit? Then, if instead the pass
+              becomes compute-bound at 50 ALU operations per light per pixel with an effective
+              throughput of 5&times;10<sup>12</sup> op/s, how many lights fit in the remaining time?
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> The interval is \(16.\overline{6}\) ms; after 6.0 ms of
+                fixed cost the lighting pass has \(16.667 - 6.0 = 10.667\) ms. At 600 GB/s the pass
+                can move \(600\times 10^{9}\ \text{B/s}\times 10.667\times 10^{-3}\ \text{s} = 6.40\)
+                GB in that window.
+              </p>
+              <p>
+                The base bandwidth cost is one G-buffer read and one HDR write per pixel:
+                \((20+8)\ \text{B}\times 2{,}073{,}600\ \text{px} = 58.06\) MB, which at 600 GB/s
+                takes \(58.06\times 10^{6} / 600\times 10^{9} = 0.0968\) ms. The base pass fits with
+                enormous room; bandwidth is not the binding constraint here, which is exactly why the
+                lighting loop is written to read the G-buffer once and iterate lights in registers.
+              </p>
+              <p>
+                Compute-bound, the pass costs \(P\cdot L\cdot 50\) operations where
+                \(P = 2{,}073{,}600\). The remaining 10.667 ms at \(5\times 10^{12}\) op/s afford
+                \(5\times 10^{12}\times 10.667\times 10^{-3} = 5.33\times 10^{10}\) operations.
+                Dividing by \(P\cdot 50 = 1.037\times 10^{8}\) operations per light gives
+                \(L = 5.33\times 10^{10} / 1.037\times 10^{8} \approx 514\) full-screen lights. In
+                practice no light touches the whole screen, so tiled or clustered culling (below)
+                turns this global number into a per-tile one and the effective light count is much
+                higher. The lesson is the method: reduce the feature to operations, divide by the
+                budget, and read off the count.
+              </p>
+            </div>
+          </div>
+
+          <h2>The real-time pipeline, stage by stage, and where the bottleneck lives</h2>
+          <p>
+            The programmable rasterization pipeline is a fixed sequence of stages, some programmable
+            and some fixed-function, that a triangle passes through. The transforms and the
+            edge-function coverage test are derived on the
+            <a href="/classes/rendering-foundations">rendering-foundations</a> page; here the concern
+            is the schedule, the data volume between stages, and which stage stalls.
+          </p>
+          <pre class="flow">  vertices        indices
+      │              │
+      ▼              ▼
+ ┌─────────────────────────┐
+ │  input assembly (IA)    │  fetch + assemble primitives, fixed-function
+ └───────────┬─────────────┘
+             ▼
+ ┌─────────────────────────┐
+ │  vertex shader (VS)      │  per-vertex, programmable: object → clip
+ └───────────┬─────────────┘
+             ▼
+ ┌─────────────────────────┐
+ │  tessellation / geometry │  optional: subdivide / amplify primitives
+ └───────────┬─────────────┘
+             ▼
+ ┌─────────────────────────┐
+ │  rasterizer (fixed)      │  clip, /w, viewport, coverage, early-Z
+ └───────────┬─────────────┘
+             ▼
+ ┌─────────────────────────┐
+ │  fragment shader (FS)    │  per-covered-sample, programmable: shading
+ └───────────┬─────────────┘
+             ▼
+ ┌─────────────────────────┐
+ │  output merger (OM/ROP)  │  depth/stencil test, blend, write to targets
+ └─────────────────────────┘</pre>
+          <p>
+            <strong>Input assembly</strong> reads the vertex and index buffers and forms primitives.
+            Its cost is memory: pulling attribute streams through the cache. <strong>The vertex
+            shader</strong> runs once per vertex and applies the model-view-projection chain plus any
+            skinning; a scene with a million vertices runs it a million times, cheap next to the
+            fragment work unless the mesh is dense relative to its screen area. <strong>Tessellation
+            and geometry shaders</strong> amplify or generate primitives, and are the one place the
+            pipeline can create data, which makes them easy to misuse: a geometry shader that emits
+            many primitives per input serializes badly on most hardware, which is part of why modern
+            engines replaced them with compute-driven mesh shaders.
+          </p>
+          <p>
+            <strong>The rasterizer</strong> is fixed-function. It clips against the frustum, performs
+            the perspective divide, maps to the viewport, and finds covered samples with the edge
+            functions. Crucially it runs the early depth test here when it can: if a fragment's depth
+            fails the depth buffer before the fragment shader runs, the shader is skipped entirely.
+            Early-Z is why sorting geometry front-to-back, or running a cheap depth prepass, saves
+            fragment work, and why any fragment shader that writes its own depth or discards pixels
+            forfeits early-Z and pays for every covered sample.
+          </p>
+          <p>
+            <strong>The fragment shader</strong> is where real-time renderers spend most of their
+            budget, because it runs per covered sample and there are millions of them, each evaluating
+            a BRDF against several lights and sampling several textures. <strong>The output merger</strong>,
+            also called the raster operations unit, does the depth and stencil tests and alpha
+            blending and writes the results; its cost is bandwidth to the render targets, and it is
+            the stage that transparency (which cannot use early-Z and must blend in order) hammers.
+          </p>
+          <p>
+            The practical fact is that the bottleneck moves. A pipeline is only as fast as its
+            busiest stage, and different scenes stress different stages: a dense mesh far away is
+            vertex-bound, a screen full of overlapping foliage is fragment- and blend-bound, a
+            fullscreen post-process is bandwidth-bound at the output merger, a scene with thousands of
+            small objects is bound on the CPU submitting draws. Profiling a real-time renderer is
+            largely the work of finding the current bottleneck, because optimizing anything else buys
+            nothing. This is the roofline idea applied per stage: a stage is either compute-bound or
+            bandwidth-bound, and the arithmetic intensity, operations per byte, decides which.
+          </p>
+
+          <h2>Forward, deferred, and clustered shading: the light-count cost model</h2>
+          <p>
+            The central scaling question in real-time shading is how cost grows with the number of
+            lights. The three dominant architectures answer it differently, and the difference is a
+            derivation, not a matter of taste.
+          </p>
+
+          <h3>Forward shading: cost couples geometry to lights</h3>
+          <p>
+            In classic forward shading, each object is drawn and its fragment shader loops over every
+            light that affects it. Let \(P\) be the number of screen pixels, \(d\) the average depth
+            complexity (how many fragments are produced per pixel before the depth test resolves
+            them, so \(P d\) fragments are shaded), \(L\) the number of lights, and \(c\) the cost of
+            evaluating one light at one fragment. The shading cost is
+          </p>
+          $$ C_{\text{fwd}} = P\, d\, L\, c. $$
+          <p>
+            Every fragment, including those later overwritten by a nearer surface, pays for all
+            lights. The coupling of \(d\) and \(L\) in a product is the weakness: overdraw multiplies
+            the lighting cost. A depth prepass removes the overdraw for opaque geometry by
+            establishing the nearest depth first so that early-Z kills hidden fragments, turning
+            \(P d\) into \(P\), but forward still evaluates all \(L\) lights at every surviving
+            fragment unless it culls lights per object, which is coarse.
+          </p>
+
+          <h3>Deferred shading: decouple geometry from lights</h3>
+          <p>
+            Deferred shading, popularized for real-time use by the CryEngine work Mittring presented
+            in 2007, splits shading into two passes. The <em>geometry pass</em> rasterizes all opaque
+            objects and writes their surface parameters, base color, world-space normal, roughness,
+            metalness, depth, into a set of screen-sized textures called the G-buffer. No lighting
+            happens yet. The <em>lighting pass</em> then reads the G-buffer per screen pixel and
+            evaluates the lights, once, at the single nearest surface. The cost separates into a term
+            that scales with geometry and a term that scales with lights:
+          </p>
+          $$ C_{\text{def}} = \underbrace{P\, d\, g}_{\text{geometry pass}} \;+\; \underbrace{P\, L\, c}_{\text{lighting pass}}, $$
+          <p>
+            where \(g\) is the per-fragment cost of writing the G-buffer. Lighting now costs
+            \(P L c\), independent of depth complexity, because the G-buffer already resolved
+            visibility: only the nearest surface survives, so lighting is evaluated \(P\) times, not
+            \(P d\) times. The product \(dL\) that hurt forward shading is gone; deferred pays \(d\)
+            for geometry and \(L\) for lighting, added, not multiplied.
+          </p>
+
+          <h3>The crossover</h3>
+          <p>
+            Setting \(C_{\text{fwd}} = C_{\text{def}}\) and solving for the light count where they
+            tie:
+          </p>
+          $$ P d L c = P d g + P L c \;\Longrightarrow\; L c (d - 1) = d g \;\Longrightarrow\;
+             L^\star = \frac{d\, g}{c\,(d-1)}. $$
+          <p>
+            Write the G-buffer write cost as a multiple of a light evaluation, \(g = k c\). Then
+            \(L^\star = \dfrac{d\,k}{d-1}\). For depth complexity \(d = 4\) and a G-buffer that costs
+            about \(k = 3\) light-evaluations to fill,
+            \(L^\star = 4\cdot 3 /(4-1) = 4\) lights: beyond four overlapping lights, deferred wins,
+            and the margin grows linearly with \(L\) because deferred adds one \(Pc\) per light while
+            forward adds \(P d c\). This is the reason deferred shading dominated the era of
+            many-small-light scenes. Its costs are equally derivable: the G-buffer eats bandwidth and
+            memory (next section), it cannot express hardware multisample antialiasing cheaply because
+            every sample would need its own G-buffer, and it cannot handle transparency, which has no
+            single nearest surface, so transparent objects are always drawn forward in a separate
+            pass.
+          </p>
+
+          <h3>Forward-plus and clustered: the light list</h3>
+          <p>
+            Forward-plus (tiled forward) and clustered shading recover the best of both. They keep
+            forward's single pass and antialiasing- and transparency-friendliness but cull lights
+            spatially first. The screen is divided into tiles (say 16&times;16 pixels) or, in the
+            clustered variant, into a 3D grid of view-frustum cells called froxels; a compute pass
+            intersects each light's bounding volume with each cell and writes, per cell, the short
+            list of lights that touch it. The fragment shader then loops only over its cell's list,
+            of average length \(\ell \ll L\), so the cost becomes
+          </p>
+          $$ C_{\text{clus}} = \underbrace{P\, d\, s}_{\text{shading over local list}} \;+\;
+             \underbrace{L\, T\, u}_{\text{light culling}}, \qquad \ell = \frac{\text{(lights per cell)}}{1}, $$
+          <p>
+            where \(s\approx \ell c\) is the shading cost against the local list, \(T\) is the number
+            of cells, and \(u\) is the cost of testing one light against one cell. The culling term
+            \(L T u\) is small because it is per cell, not per pixel, and the shading term scales with
+            the <em>local</em> light density, which is what physically matters: a pixel only pays for
+            lights that actually reach it. Clustered forward is the default in Google's Filament,
+            in the Doom-era id Tech renderers, and in Godot's Vulkan backend, precisely because it
+            scales with local light count and stays compatible with multisampling and transparency.
+          </p>
+
+          <div class="problem">
+            <span class="plabel">Problem 2</span>
+            <p>
+              A scene at 1080p has depth complexity \(d = 4\). One light evaluation costs \(c = 50\)
+              ALU operations per fragment; the G-buffer write costs \(g = 150\) operations per
+              fragment (so \(k = 3\)). The GPU sustains \(5\times 10^{12}\) op/s on this shader.
+              Compute forward and deferred shading time for \(L \in \{2, 4, 8, 16, 32\}\) lights,
+              confirm the crossover, and state where clustered forward would land if the average
+              per-pixel light list has length \(\ell = 3\).
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> With \(P = 2{,}073{,}600\), forward costs
+                \(P d L c = 2.0736\times 10^{6}\cdot 4\cdot L\cdot 50 = 4.147\times 10^{8}\, L\)
+                operations; deferred costs \(P d g + P L c = 2.0736\times 10^6(4\cdot 150 + 50 L)
+                = 1.244\times 10^{9} + 1.037\times 10^{8} L\). Dividing by \(5\times 10^{12}\) op/s
+                gives milliseconds:
+              </p>
+              <div class="tbl-wrap"><table class="data">
+                <tr><th>L</th><th>forward (ms)</th><th>deferred (ms)</th></tr>
+                <tr><td>2</td><td>0.166</td><td>0.290</td></tr>
+                <tr><td>4</td><td>0.332</td><td>0.332</td></tr>
+                <tr><td>8</td><td>0.664</td><td>0.415</td></tr>
+                <tr><td>16</td><td>1.327</td><td>0.581</td></tr>
+                <tr><td>32</td><td>2.654</td><td>0.912</td></tr>
+              </table></div>
+              <p>
+                Forward and deferred tie at \(L^\star = 4\), matching \(L^\star = dk/(d-1) =
+                4\cdot 3/3 = 4\). Below four lights forward is cheaper because it avoids the
+                G-buffer's fixed 1.24 GFLOP geometry cost; above four, deferred wins and pulls away,
+                because forward's slope is \(P d c = 4.147\times 10^8\) op/light while deferred's is
+                only \(P c = 1.037\times 10^8\) op/light, a factor of \(d = 4\).
+              </p>
+              <p>
+                Clustered forward shades a local list of \(\ell = 3\) lights regardless of the global
+                \(L\), so its shading term is \(P d \ell c = 2.0736\times 10^6\cdot 4\cdot 3\cdot 50
+                = 1.244\times 10^9\) operations, about 0.249 ms, plus a small per-cell culling pass.
+                For a scene with 32 lights but only 3 reaching any given pixel, clustered forward
+                (0.25 ms plus culling) beats both full-screen forward (2.65 ms) and deferred
+                (0.91 ms), which is why it is the modern default. Its advantage is that it charges
+                each pixel for local, not global, light density.
+              </p>
+            </div>
+          </div>
+
+          <h2>The G-buffer and its memory cost</h2>
+          <p>
+            The G-buffer is the intermediate that makes deferred shading possible, and its size is a
+            direct budget line. A minimal physically based G-buffer stores, per pixel, base color,
+            surface normal, the roughness and metalness that parameterize the Cook-Torrance BRDF, and
+            depth; a motion vector is added for temporal antialiasing. Packing tightly matters because
+            every byte is written once in the geometry pass and read once in the lighting pass, so the
+            round trip is charged twice against bandwidth. A representative layout:
+          </p>
+          <div class="tbl-wrap"><table class="data">
+            <tr><th>target</th><th>format</th><th>contents</th><th>bytes/px</th></tr>
+            <tr><td>RT0</td><td>RGBA8</td><td>base color (rgb), occlusion (a)</td><td>4</td></tr>
+            <tr><td>RT1</td><td>RGB10A2</td><td>world normal (packed), 2 spare bits</td><td>4</td></tr>
+            <tr><td>RT2</td><td>RGBA8</td><td>roughness, metalness, spec, flags</td><td>4</td></tr>
+            <tr><td>RT3</td><td>RG16F</td><td>screen-space motion vector</td><td>4</td></tr>
+            <tr><td>depth</td><td>D32</td><td>hardware depth</td><td>4</td></tr>
+            <tr><td colspan="3"><strong>total</strong></td><td><strong>20</strong></td></tr>
+          </table></div>
+          <p>
+            At 1920&times;1080 the footprint is \(20\ \text{B}\times 2{,}073{,}600 = 41.5\) MB
+            resident, and 41.5 MB written per frame; the lighting pass reads those 20 bytes and writes
+            an 8-byte HDR result, a further 58 MB moved. At 1440p the footprint scales to
+            \(20\times 3{,}686{,}400 = 73.7\) MB and at 4K to \(20\times 8{,}294{,}400 = 166\) MB, so
+            the G-buffer alone can be a large fraction of the framebuffer memory budget at high
+            resolution, and its bandwidth grows linearly with pixel count. This linear-in-\(P\) growth
+            is the reason 4K deferred renderers work hard to shrink the G-buffer, packing normals into
+            two channels via octahedral encoding, storing depth once and reconstructing position from
+            it rather than storing world position outright (which would cost 12 more bytes), and
+            reusing channels. It is also part of the argument for clustered forward at 4K, which needs
+            no G-buffer at all.
+          </p>
+
+          <div class="problem">
+            <span class="plabel">Problem 3</span>
+            <p>
+              A studio must choose between the 20-byte G-buffer above and a fatter 32-byte variant
+              that additionally stores world-space position (12 bytes) instead of reconstructing it.
+              At 4K (3840&times;2160) and a 60 fps target, compute the per-frame bandwidth each costs
+              for the write-then-read round trip of the G-buffer channels alone (ignore the HDR
+              output), and express each as a fraction of a 600 GB/s bandwidth budget over one 16.67 ms
+              frame. Is storing position worth it?
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> At 4K, \(P = 3840\times 2160 = 8{,}294{,}400\) pixels. The
+                round trip writes the G-buffer in the geometry pass and reads it in the lighting pass,
+                so bytes moved \(= 2 \times (\text{bytes/px}) \times P\).
+              </p>
+              <p>
+                Thin (20 B): \(2\times 20\times 8{,}294{,}400 = 3.318\times 10^{8}\) B \(= 331.8\) MB.
+                Fat (32 B): \(2\times 32\times 8{,}294{,}400 = 5.308\times 10^{8}\) B \(= 530.8\) MB.
+              </p>
+              <p>
+                A 16.67 ms frame at 600 GB/s can move
+                \(600\times 10^{9}\times 0.01667 = 1.0\times 10^{10}\) B \(= 10.0\) GB. The thin
+                G-buffer round trip is \(0.332/10.0 = 3.3\%\) of the frame's bandwidth; the fat one is
+                \(0.531/10.0 = 5.3\%\). Storing position costs an extra 199 MB per frame, 2.0
+                percentage points of the total bandwidth budget, purely to avoid a handful of ALU
+                operations that reconstruct position from depth and the inverse projection. Since the
+                lighting pass is compute-light and bandwidth is the scarcer resource at 4K,
+                reconstruction wins: the thin G-buffer is the right call, and this is exactly the
+                trade every deferred renderer makes.
+              </p>
+            </div>
+          </div>
+
+          <h2>Shadow mapping: projection, acne, peter-panning, cascades, and PCF</h2>
+          <p>
+            A shadow map answers, for each shaded point, whether the light can see it. The technique,
+            due to Williams in 1978, renders the scene once from the light's point of view and stores
+            the nearest depth per light-space texel; then, when shading a surface point, the renderer
+            transforms the point into light space and compares its depth to the stored value. If the
+            point is farther than what the light saw, something nearer blocked the light and the point
+            is in shadow.
+          </p>
+          <p>
+            Formally, let \(M_{\text{light}} = P_{\text{light}} V_{\text{light}}\) be the light's
+            view-projection. A world point \(x\) maps to light clip space \(M_{\text{light}}\,
+            \tilde{x}\), and after the perspective divide and the \([-1,1]\to[0,1]\) remap gives a
+            texture coordinate \((u,v)\) and a reference depth \(z_{\text{ref}}\). The shadow test is
+          </p>
+          $$ \text{lit}(x) = \big[\, z_{\text{ref}} \le T_{\text{shadow}}(u,v) + b \,\big], $$
+          <p>
+            where \(T_{\text{shadow}}\) is the stored depth and \(b\) is a bias discussed next. A
+            directional light uses an orthographic \(P_{\text{light}}\); a spotlight uses a
+            perspective one; a point light needs six faces (a cube map) or a dual-paraboloid map.
+          </p>
+
+          <h3>Acne and peter-panning: the bias tradeoff</h3>
+          <p>
+            The stored depth is a point sample of a surface that a whole texel-sized patch of the
+            world projects onto, and the shaded point almost never lands exactly where the sample was
+            taken. On a surface tilted relative to the light, the true depth varies across the texel,
+            so comparing a shaded point's exact depth against a neighbor's stored depth produces false
+            self-shadowing: a striped or stippled pattern called <em>shadow acne</em>. The cure is a
+            depth bias \(b\) that pushes the stored surface slightly away from the light before the
+            comparison, so that a surface does not shadow itself.
+          </p>
+          <p>
+            The needed bias depends on the surface slope. For a surface whose normal makes angle
+            \(\theta\) with the light direction, the depth changes by \(\tan\theta\) per unit of
+            texel-space movement, so the bias must scale as
+          </p>
+          $$ b(\theta) = b_{\text{const}} + b_{\text{slope}}\tan\theta, $$
+          <p>
+            which is the constant-plus-slope-scaled bias every graphics API exposes. Too little bias
+            leaves acne; too much bias detaches the shadow from the object's contact point, so the
+            object appears to float and its shadow starts a few texels away. That artifact is called
+            <em>peter-panning</em>. The bias must be large enough to clear the depth variation across
+            one texel and no larger, which is why slope-scaled bias, proportional to \(\tan\theta\),
+            is the right functional form: it grows exactly as fast as the error it must hide. A common
+            refinement, normal-offset bias, moves the sample position along the surface normal in
+            world space rather than biasing depth, which reduces peter-panning at grazing angles.
+          </p>
+
+          <h3>Cascaded shadow maps</h3>
+          <p>
+            A single shadow map covering a large outdoor scene wastes resolution: the same texel
+            budget stretches over near and far geometry equally, but near geometry occupies far more
+            screen pixels and needs finer shadows. Cascaded shadow maps, described by Engel and by
+            Zhang and colleagues in the mid-2000s, split the view frustum into a few depth slices and
+            give each slice its own shadow map, so the near slice packs its full resolution into a
+            small world region. The split distances are chosen to keep shadow texel size roughly
+            proportional to screen pixel size across the whole range, which a logarithmic split
+            achieves. Zhang's practical scheme blends a logarithmic and a uniform split,
+          </p>
+          $$ c_i = \lambda\, n\left(\frac{f}{n}\right)^{i/N} + (1-\lambda)\left(n + (f-n)\frac{i}{N}\right), $$
+          <p>
+            for cascade boundary \(i\) of \(N\), near \(n\), far \(f\), and a blend \(\lambda\in[0,1]\).
+            The logarithmic term alone would over-concentrate resolution near the camera; the uniform
+            term spreads it out; \(\lambda\) trades between them.
+          </p>
+
+          <h3>Percentage-closer filtering</h3>
+          <p>
+            The shadow test returns a hard binary, so a magnified shadow edge is a staircase of lit
+            and shadowed texels. Percentage-closer filtering, introduced by Reeves, Salesin, and Cook
+            in 1987, softens the edge by taking several shadow samples in a neighborhood, performing
+            the depth comparison at each, and averaging the binary results. Note the order: one cannot
+            average the stored depths and then compare, because depth is nonlinear and averaging it is
+            meaningless; PCF compares first, then averages the comparisons, yielding a fractional
+            visibility, say 0.6, that is the estimated fraction of the neighborhood that is lit. A
+            \(3\times 3\) PCF kernel does nine comparisons per shaded pixel; hardware exposes a
+            two-by-two bilinear PCF fetch that does four comparisons in one instruction, and larger
+            soft shadows use wider kernels or precomputed variance-based approximations.
+          </p>
+
+          <div class="problem">
+            <span class="plabel">Problem 4</span>
+            <p>
+              A directional light uses a 2048&times;2048 shadow map covering a 50 m &times; 50 m
+              ground region. The camera renders at 1080p with a 60&deg; vertical field of view.
+              Compute the shadow texel size in world units, and find the camera distance at which one
+              shadow texel projects to exactly one screen pixel. For surfaces nearer than that, how
+              blocky are the shadow edges, and what does this imply for cascade placement?
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> Shadow texel size is
+                \(50\ \text{m} / 2048 = 0.02441\ \text{m} = 2.44\) cm. A screen pixel subtends an
+                angle \(\alpha = \dfrac{2\tan(\text{fov}/2)}{H} = \dfrac{2\tan 30^\circ}{1080}
+                = \dfrac{1.1547}{1080} = 1.069\times 10^{-3}\) rad, so at distance \(z\) it covers a
+                world width \(z\,\alpha\).
+              </p>
+              <p>
+                Setting the screen-pixel footprint equal to the shadow texel,
+                \(z\,\alpha = 0.02441\), gives the critical distance
+                \(z^\star = 0.02441 / 1.069\times 10^{-3} = 22.8\) m. Beyond 22.8 m each shadow texel
+                is smaller than a screen pixel (the shadow is oversampled and looks fine); nearer than
+                that the shadow texel is larger than a pixel and the edge is blocky. At 5 m, a screen
+                pixel covers \(5\times 1.069\times 10^{-3} = 0.535\) cm, while the shadow texel is
+                2.44 cm, a ratio of 4.57: a single shadow texel spans about four and a half screen
+                pixels, so a hard shadow edge shows a staircase of roughly that width, which PCF must
+                blur.
+              </p>
+              <p>
+                The implication is direct: a single 50 m map is far too coarse for near geometry. To
+                keep the shadow texel near one screen pixel everywhere, the near region needs its own
+                cascade covering a much smaller world extent. To reach the target texel size of about
+                0.5 cm at 5 m, the nearest cascade should cover roughly \(0.005\times 2048 = 10.2\) m,
+                five times finer than the single map, which is exactly the resolution redistribution
+                cascaded shadow maps provide.
+              </p>
+            </div>
+          </div>
+
+          <h2>Ambient occlusion and real-time global illumination</h2>
+          <p>
+            Direct lighting is only part of the picture; surfaces are also lit by light bouncing off
+            other surfaces, the indirect term of the rendering equation solved exactly by the path
+            tracer on the <a href="/classes/physically-based-rendering">physically-based-rendering</a>
+            page. Real-time renderers cannot afford that integral per frame, so they approximate it,
+            and the approximations form a ladder from cheap and crude to expensive and accurate.
+          </p>
+
+          <h3>Ambient occlusion in screen space</h3>
+          <p>
+            Ambient occlusion approximates one visible consequence of indirect light: creases,
+            contact points, and cavities receive less ambient light because nearby geometry blocks it.
+            The true occlusion at a point \(x\) is the fraction of the hemisphere that is unblocked,
+          </p>
+          $$ AO(x) = \frac{1}{\pi}\int_{\Omega} V(x,\omega)\,\cos\theta\;d\omega, $$
+          <p>
+            with \(V\) the visibility of direction \(\omega\). Screen-space ambient occlusion (SSAO),
+            introduced by Mittring for Crytek in 2007, estimates this from the depth buffer alone:
+            around each pixel it samples nearby points in a hemisphere, projects them back to screen
+            space, and checks whether the stored depth there is nearer than the sample, which would
+            mean the sample is occluded. Horizon-based ambient occlusion (HBAO), from Bavoil and
+            colleagues at NVIDIA in 2008, refines this by marching along a few directions in screen
+            space and finding the horizon angle above which geometry blocks the sky, integrating the
+            occlusion analytically between the horizon and the surface tangent. Both are
+            approximations with known failures: they only see what is in the depth buffer, so
+            occlusion from off-screen or behind geometry is missed, and the sampling radius is a fixed
+            screen-space size that does not correspond to a fixed world size. They are used everywhere
+            regardless because they cost a millisecond or two and add exactly the contact darkening the
+            eye expects.
+          </p>
+
+          <h3>Global illumination approximations</h3>
+          <p>
+            Full indirect lighting is harder. The real-time ladder, from oldest to newest, runs
+            roughly as follows. <em>Light probes</em> precompute the incoming radiance at a grid of
+            points, usually as spherical-harmonic coefficients, and interpolate between them at
+            shading time; they capture low-frequency bounce lighting cheaply but cannot represent sharp
+            indirect shadows and go stale when geometry moves. <em>Voxel cone tracing</em>, from
+            Crassin and colleagues at INRIA and NVIDIA in 2011, voxelizes the scene into a sparse
+            octree that stores directional radiance, then approximates the indirect integral by
+            tracing a few wide cones through the voxels, trading rays for prefiltered volume lookups;
+            it produces plausible one-bounce diffuse and glossy indirect light in real time at the
+            cost of voxelization and memory. The modern path replaces both with hardware ray tracing:
+            trace actual rays for indirect light, accept one or a few samples per pixel, and denoise
+            heavily. Reservoir-based spatiotemporal importance resampling (ReSTIR), from Bitterli and
+            colleagues in 2020, makes many-light and indirect sampling tractable by reusing samples
+            across neighboring pixels and across frames, discussed with hardware ray tracing below.
+            The trend is unmistakable: precomputed approximations are giving way to sampled-and-denoised
+            real ray tracing as the hardware matures.
+          </p>
+
+          <h2>Antialiasing: MSAA, the shift to temporal AA, and neural upscaling</h2>
+          <p>
+            Rasterization samples the image at pixel centers, so a triangle edge that crosses a pixel
+            is either fully in or fully out, producing the jagged staircase of aliasing. The signal
+            being sampled has frequencies above the pixel Nyquist rate, and the fix is either to
+            sample more densely or to reconstruct across time.
+          </p>
+
+          <h3>MSAA and why deferred shading strained it</h3>
+          <p>
+            Multisample antialiasing (MSAA) stores several coverage and depth samples per pixel but
+            runs the fragment shader only once per covered pixel per triangle, sharing that shaded
+            color across the samples the triangle covers. This is the key economy: geometry edges get
+            supersampled coverage while shading stays at pixel rate, so MSAA antialiases silhouettes
+            cheaply in compute but not in memory. The framebuffer grows linearly with the sample
+            count: at 1080p with an 8-byte HDR color and 4-byte depth per sample, one sample is
+            \((8+4)\times 2{,}073{,}600 = 24.9\) MB, and 4&times; MSAA is four times that, 99.5 MB,
+            plus a resolve pass that reads all samples and averages them.
+          </p>
+          <p>
+            MSAA fits forward and clustered-forward renderers, which shade at the sample's surface,
+            but it fits deferred shading badly: the G-buffer would need to store every sample's surface
+            parameters, quadrupling an already large buffer, and the lighting pass would have to detect
+            edge pixels and shade their samples separately. That mismatch, together with MSAA's blindness
+            to shader aliasing (specular sparkle from high-frequency normal and roughness detail, which
+            coverage sampling does nothing for), pushed the field toward temporal methods.
+          </p>
+
+          <h3>Temporal antialiasing: reprojection and its failure</h3>
+          <p>
+            Temporal antialiasing (TAA) turns time into extra samples. Each frame the camera projection
+            is jittered by a sub-pixel offset drawn from a low-discrepancy sequence, so successive
+            frames sample the scene at slightly different positions within each pixel. The current frame
+            is blended with an accumulated history using an exponential moving average,
+          </p>
+          $$ c_n = \alpha\, x_n + (1-\alpha)\, c_{n-1}^{\text{reproj}}, $$
+          <p>
+            where \(x_n\) is the current jittered sample and \(c_{n-1}^{\text{reproj}}\) is last
+            frame's result <em>reprojected</em> to the current pixel. Reprojection is necessary because
+            the camera and objects moved: the surface at this pixel today was at a different pixel
+            yesterday. The renderer writes a per-pixel motion vector \(\mathbf{m}\) (the RT3 channel of
+            the G-buffer), and last frame's color is sampled at \((u,v) - \mathbf{m}\).
+          </p>
+          <p>
+            The blend accumulates samples like a running average. Treating each frame as an independent
+            sample of variance \(\sigma^2\), the steady-state variance of the exponential moving average is
+          </p>
+          $$ \Var[c_\infty] = \alpha^2 \sigma^2 \sum_{k=0}^{\infty}(1-\alpha)^{2k}
+             = \frac{\alpha^2}{1-(1-\alpha)^2}\sigma^2 = \frac{\alpha}{2-\alpha}\sigma^2, $$
+          <p>
+            so the effective sample count is \(N_{\text{eff}} = \sigma^2/\Var = (2-\alpha)/\alpha\).
+            With the common \(\alpha = 0.1\), \(N_{\text{eff}} = 1.9/0.1 = 19\): a single sample per
+            frame, accumulated, gives the smoothness of nineteen samples once converged, at the cost of
+            one sample's shading. That amortization is why TAA is nearly free per frame and why it
+            became the default antialiaser.
+          </p>
+          <p>
+            The failure is reprojection validity. When a surface becomes newly visible (disocclusion),
+            or moves off screen, or the shading changes faster than motion vectors predict (a moving
+            specular highlight, a shadow edge, a transparent surface with no motion vector), the
+            history is <em>wrong</em>, and blending it in produces ghosting, trails behind moving
+            objects. TAA must therefore <em>reject</em> stale history. The standard mechanism, from
+            Karis's 2014 notes on the Unreal Engine 4 implementation, clamps the history color to the
+            bounding box of the current pixel's neighborhood in color space before blending: if the
+            reprojected history falls outside the range of colors currently around this pixel, it is
+            clamped back in, which suppresses ghosting at the cost of throwing away accumulated
+            samples exactly where they are most needed, at edges. History rejection is thus a
+            bias-variance trade in disguise: accept stale history and get smooth but smeared images,
+            reject aggressively and get sharp but noisier, flickering ones. Every TAA is a tuning of
+            this rejection.
+          </p>
+
+          <h3>Temporal upscaling: DLSS and FSR</h3>
+          <p>
+            Once a renderer accumulates jittered samples across frames, it can render at a lower
+            resolution and let the temporal accumulation reconstruct a higher-resolution image, which
+            is temporal upscaling. NVIDIA's Deep Learning Super Sampling (DLSS) replaces the hand-tuned
+            history-rejection heuristics with a neural network trained to reconstruct the high-resolution
+            frame from the jittered low-resolution samples, motion vectors, and depth; AMD's FidelityFX
+            Super Resolution (FSR), in its temporal 2.x form, does the same reconstruction with an
+            analytical, non-neural pipeline. Both let a renderer shade, say, 1080p worth of pixels and
+            present a 4K image, cutting the fragment-shading cost by the resolution ratio while relying
+            on temporal reuse to recover detail. Their remaining artifacts, ghosting, disocclusion
+            fizzle, thin-feature instability, are exactly the reprojection failures TAA has, because
+            they are TAA with a smarter reconstruction. Upscaling is the current answer to the fragment
+            budget: rather than shade fewer lights, shade fewer pixels and reconstruct.
+          </p>
+
+          <div class="problem">
+            <span class="plabel">Problem 5</span>
+            <p>
+              A renderer uses TAA with blend weight \(\alpha = 0.1\). (a) Derive the effective sample
+              count once converged and state how many frames it takes to reach roughly 95% of steady
+              state. (b) During a fast camera pan, disocclusion forces history rejection, resetting to
+              \(\alpha = 1\) (current sample only). If the scene is stationary again after the pan, how
+              many frames until the accumulator is back within 5% of the converged value? (c) Compare
+              the shading cost of this TAA against 4&times; MSAA for the fragment work, assuming
+              MSAA's coverage supersampling does not increase shading but a supersampled reference
+              would run the shader four times.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> (a) \(N_{\text{eff}} = (2-\alpha)/\alpha =
+                1.9/0.1 = 19\) samples. The transient of an exponential moving average decays as
+                \((1-\alpha)^n = 0.9^n\); reaching 95% convergence needs
+                \(0.9^n \le 0.05\), i.e. \(n \ge \ln 0.05 / \ln 0.9 = -2.996/-0.105 = 28.4\), about
+                29 frames, roughly half a second at 60 fps.
+              </p>
+              <p>
+                (b) After a hard reset the accumulator restarts, so it again takes about 29 frames to
+                return within 5%, which is why a fast pan followed by a stop shows a brief period of
+                shimmer that settles over half a second. This is the visible cost of history
+                rejection: the smoothing is gone precisely when motion stops and the eye can inspect
+                the image.
+              </p>
+              <p>
+                (c) TAA shades once per pixel per frame, the same as no antialiasing, and reaches
+                19-sample smoothness for free through accumulation; its extra cost is the reprojection
+                and blend, a bandwidth-bound fullscreen pass of a few tenths of a millisecond. A true
+                4&times; supersample runs the fragment shader four times per pixel, quadrupling the
+                dominant shading cost. MSAA sits between: it supersamples coverage and depth (4&times;
+                the framebuffer bandwidth and the depth test) but shades once per covered pixel per
+                triangle, so its shading cost is near 1&times; on interiors and only rises at edges.
+                The upshot: TAA gets more effective samples than 4&times; MSAA at a fraction of MSAA's
+                memory bandwidth, which, combined with MSAA's incompatibility with deferred shading, is
+                why TAA won.
+              </p>
+            </div>
+          </div>
+
+          <h2>Level of detail, culling, instancing, and the draw-call problem</h2>
+          <p>
+            Everything above assumed the geometry reaching the rasterizer was already the right
+            geometry. Getting there, deciding what to draw at all and at what detail, is its own budget
+            battle, and it is usually fought on the CPU.
+          </p>
+
+          <h3>Culling: don't shade what isn't seen</h3>
+          <p>
+            The cheapest fragment is the one never rasterized. Three culling stages remove work in
+            order of cost. <em>Frustum culling</em> tests each object's bounding volume against the six
+            planes of the view frustum and discards what lies entirely outside; it is cheap and
+            removes most of an open-world scene, which extends far beyond the camera's cone. <em>Occlusion
+            culling</em> removes objects that are inside the frustum but hidden behind nearer geometry;
+            the modern GPU-friendly form uses a hierarchical depth buffer (hi-Z), a mip pyramid of the
+            depth buffer whose coarser levels store the farthest depth in each region, so a bounding
+            box can be rejected by comparing its nearest depth against one coarse hi-Z texel that
+            already bounds everything behind it. <em>Backface culling</em>, fixed-function in the
+            rasterizer, drops triangles facing away from the camera by the sign of their screen-space
+            winding, halving triangle work on closed meshes.
+          </p>
+
+          <h3>Level of detail</h3>
+          <p>
+            An object far from the camera covers few pixels and does not need its full triangle count;
+            drawing a million-triangle mesh that lands on twenty pixels wastes vertex work and, worse,
+            aliases, because sub-pixel triangles thrash the rasterizer and never fill a quad. Level of
+            detail (LOD) swaps in simplified meshes as an object recedes, chosen by projected screen
+            size. The classic scheme keeps a few discrete LODs and pops between them, which is visible;
+            continuous and virtualized approaches, culminating in Epic's Nanite (Karis and colleagues,
+            2021), store a hierarchy of mesh clusters and select, per cluster, the detail level whose
+            triangles are about pixel-sized, so the rendered triangle count tracks screen resolution
+            rather than scene complexity. That decouples the vertex budget from how much geometry the
+            artist authored, the same decoupling deferred shading gave the lighting budget.
+          </p>
+
+          <h3>The draw-call problem and GPU-driven rendering</h3>
+          <p>
+            Each draw call carries CPU overhead: validating state, binding resources, and recording a
+            command into the buffer the GPU will execute. Historically this cost a few microseconds per
+            call, small until multiplied by object count. The arithmetic is unforgiving. At 5 &micro;s
+            per draw, one thousand objects cost 5.0 ms of CPU, already a third of a 60 fps frame; ten
+            thousand objects cost 50 ms, three full frames, and the GPU sits idle waiting for commands.
+            The draw call, not the triangle, is the scaling wall, which is why reducing call count is
+            the first optimization in a CPU-bound frame.
+          </p>
+          <p>
+            Two techniques attack it. <em>Instancing</em> draws many copies of the same mesh (trees,
+            crowd characters, debris) in a single call, with per-instance data (transforms, colors)
+            read from a buffer, turning ten thousand draws into one. <em>GPU-driven rendering</em>,
+            described in work by Sander, Riccio, Persson, and others through the GPU Pro series and
+            NVIDIA and AMD presentations, goes further: the object list, culling, and LOD selection all
+            run in a compute shader on the GPU, which then emits a single multi-draw-indirect command
+            whose parameters it wrote itself, so the CPU issues essentially one call for the whole
+            scene. This depends on <em>bindless</em> resources, letting a shader index into a global
+            table of textures and buffers rather than binding each per draw, so the GPU can draw
+            arbitrary objects without CPU state changes between them. GPU-driven, bindless submission is
+            how Nanite and modern engines render hundreds of thousands of objects; it moves the
+            draw-call arithmetic off the CPU entirely.
+          </p>
+
+          <div class="problem">
+            <span class="plabel">Problem 6</span>
+            <p>
+              A city scene has 40,000 visible objects. On a CPU-driven path each draw costs 4 &micro;s
+              of CPU time. (a) What is the CPU submission cost, and does it fit a 60 fps frame? (b)
+              Instancing groups the objects into 300 unique meshes; each unique mesh is one instanced
+              draw. Recompute the cost. (c) A GPU-driven path culls on the GPU and issues 1 indirect
+              draw, but adds a 0.4 ms compute cull pass and requires the objects to fit a bindless
+              layout. Compare all three and state the qualitative shift.
+            </p>
+            <div class="solution">
+              <p>
+                <strong>Solution.</strong> (a) \(40{,}000\times 4\ \mu\text{s} = 160{,}000\ \mu\text{s}
+                = 160\) ms of CPU, nearly ten full 60 fps frames spent only recording commands. The
+                frame is hopelessly CPU-bound; the GPU starves.
+              </p>
+              <p>
+                (b) Instancing: \(300\ \text{draws}\times 4\ \mu\text{s} = 1{,}200\ \mu\text{s} =
+                1.2\) ms of CPU, a 133&times; reduction, comfortably inside the 16.67 ms budget. The
+                triangle and pixel work is unchanged; only the per-object CPU overhead collapsed,
+                which confirms the bottleneck was submission, not the GPU.
+              </p>
+              <p>
+                (c) GPU-driven: 1 CPU draw (a few microseconds, call it negligible) plus a 0.4 ms GPU
+                compute cull. CPU cost drops to essentially zero; the 0.4 ms lands on the GPU, which
+                had spare time. Summary: 160 ms &rarr; 1.2 ms &rarr; about 0 ms CPU. The qualitative
+                shift is that submission stops being a CPU function at all: culling and LOD move to the
+                GPU, the CPU issues one indirect call, and object count is limited by GPU throughput
+                rather than driver overhead, which is the entire point of GPU-driven rendering.
+              </p>
+            </div>
+          </div>
+
+          <h2>Compute shaders and async compute</h2>
+          <p>
+            Not all GPU work is triangles. A compute shader runs a general parallel program over a grid
+            of thread groups, with no fixed-function rasterization, reading and writing buffers and
+            images directly. Real-time renderers use compute for everything that is not primary
+            visibility: light culling for clustered shading, the hi-Z pyramid build, SSAO, the TAA
+            resolve, bloom and tone-mapping, particle simulation, and the BVH-adjacent work of
+            GPU-driven culling. Compute exposes fast on-chip shared memory within a thread group, which
+            lets a pass stage data once and reuse it, the same locality argument that makes tiled
+            algorithms fast on any parallel machine.
+          </p>
+          <p>
+            Modern GPUs can execute graphics and compute work concurrently, called <em>async
+            compute</em>. The point is to fill idle units: a shadow pass that is bound on the fixed-function
+            rasterizer and depth units leaves the arithmetic units underused, and a bandwidth-bound
+            post-process leaves the same units idle, so scheduling an ALU-heavy compute pass (light
+            culling, SSAO) to overlap a rasterization-bound graphics pass raises overall utilization
+            without extending the frame. The overlap is a scheduling win, not free work: it only helps
+            when two passes stress complementary parts of the chip, and it costs synchronization care to
+            avoid one pass reading another's unfinished output. Async compute is why a naive sum of
+            individual pass timings overestimates a well-scheduled frame: passes that overlap on the
+            timeline are charged once against wall-clock, not twice.
+          </p>
+
+          <h2>Hardware ray tracing: BVH, the two-level split, denoising, and ReSTIR</h2>
+          <p>
+            Ray tracing computes visibility by shooting a ray and finding its nearest intersection,
+            the dual of rasterization's per-triangle scan. Its acceleration structure, the
+            bounding-volume hierarchy, and the ray-triangle test are derived on the
+            <a href="/classes/rendering-foundations">rendering-foundations</a> page; the offline use of
+            rays to solve the rendering equation is on the
+            <a href="/classes/physically-based-rendering">physically-based-rendering</a> page. What is
+            new in real time is that the traversal and intersection are now fixed-function hardware, and
+            that the budget allows only about one ray per pixel, which forces a reconstruction problem.
+          </p>
+
+          <h3>The two-level acceleration structure</h3>
+          <p>
+            Real-time ray tracing splits the BVH into two levels to handle animation and instancing
+            efficiently. Each unique mesh gets a <em>bottom-level acceleration structure</em> (BLAS), a
+            BVH over its triangles in the mesh's local space, built once and reused. A <em>top-level
+            acceleration structure</em> (TLAS) is a BVH over instances, where each instance references a
+            BLAS and carries a transform placing it in the world. A ray traverses the TLAS to find
+            candidate instances, transforms into each instance's local space, and traverses that
+            instance's BLAS. The split matters for the frame budget: when an object moves, only the TLAS
+            must be rebuilt (cheap, a few thousand instances) while the BLAS geometry is untouched; only
+            deforming meshes need a BLAS refit. This mirrors the instancing argument in rasterization,
+            build the expensive structure once, reuse it under many transforms, and it is why the
+            construction and traversal literature, Wald's work on fast BVH construction and Reshetov and
+            colleagues on traversal, is central to making ray tracing fit a frame.
+          </p>
+          <p>
+            The hardware intersects rays with boxes and triangles and traverses these hierarchies in
+            fixed-function units, because, as the
+            <a href="/classes/rendering-foundations">rendering-foundations</a> page argues, BVH
+            traversal is incoherent pointer-chasing that maps poorly onto the streaming execution the
+            rest of the GPU is built for. Dedicated units hide that latency and reorder rays for
+            coherence.
+          </p>
+
+          <h3>One sample per pixel forces a denoiser</h3>
+          <p>
+            The budget affords roughly one ray per pixel for a given effect, sometimes fewer. One
+            sample is a Monte Carlo estimate of an integral, so it is unbiased but extremely noisy: a
+            single shadow ray gives a binary, a single indirect-lighting ray gives one random bounce,
+            and the raw image is a snowstorm. Real-time ray tracing is therefore inseparable from
+            <em>denoising</em>, which reconstructs a smooth image from the sparse noisy samples using
+            spatial filtering (edge-aware blurs guided by the G-buffer's normals and depth so the blur
+            does not cross real edges) and, crucially, temporal accumulation, the same reprojection and
+            history mechanism as TAA. A one-sample-per-pixel ray-traced image accumulated over many
+            frames and spatially filtered approaches the converged result; without the denoiser it is
+            unusable. NVIDIA's real-time denoisers and the spatiotemporal filters in the research
+            literature exist for exactly this reason, and their failure modes, ghosting, over-blurring,
+            lag on fast motion, are once again the reprojection failures of temporal reuse.
+          </p>
+
+          <h3>ReSTIR: reuse samples across space and time</h3>
+          <p>
+            When a scene has thousands of lights or requires indirect illumination, even choosing which
+            light to sample at a pixel is expensive, and one sample is a poor estimate. Reservoir-based
+            spatiotemporal importance resampling, from Bitterli, Wyman, Pharr, and colleagues in 2020,
+            attacks this by having each pixel keep a small <em>reservoir</em> that holds one
+            probabilistically chosen sample, selected by weighted reservoir sampling so that a good
+            light or path is retained with probability proportional to its contribution. The key move is
+            reuse: a pixel combines its reservoir with those of its spatial neighbors and with its own
+            reservoir from the previous frame, so that a well-chosen sample found anywhere nearby, or a
+            moment ago, propagates to where it is needed. Because a neighbor's chosen light is likely a
+            good light here too (nearby surfaces see similar illumination), this resampling dramatically
+            lowers the variance of the one-sample-per-pixel estimate without tracing more rays, at the
+            cost of the bias that spatial reuse introduces when neighbors are not actually similar,
+            which the method bounds by reweighting. ReSTIR made many-light direct lighting and, in later
+            work, full path-traced global illumination feasible in real time, and it is the reason a
+            single-sample ray budget can produce a converged-looking image: the samples are reused, in
+            space and time, exactly as TAA reuses shaded pixels and as the denoiser reuses accumulated
+            frames. The three are the same idea, amortize a sparse budget across neighbors and across
+            time, applied at three points in the pipeline.
+          </p>
+
+          <h2>Implementation</h2>
+          <p>
+            The first block is the budget arithmetic of Problems 1, 2, and 6 in NumPy: it reproduces
+            the frame intervals, the forward-versus-deferred crossover table, the G-buffer bandwidth,
+            and the draw-call collapse under instancing. Running it prints every number used above.
+          </p>
+
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="python" class="active">NumPy</button>
+              <button data-lang="jax">JAX</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="python" class="shl lang active"><code class="language-python"><span class="k">import</span> <span class="m1">numpy</span> <span class="k">as</span> <span class="m1">np</span>
+
+<span class="c"># --- frame budgets: ms per frame at each refresh rate ---</span>
+<span class="k">for</span> <span class="v4">fps</span> <span class="k">in</span> <span class="b0">(</span><span class="n">30</span>, <span class="n">60</span>, <span class="n">90</span>, <span class="n">120</span>, <span class="n">144</span>, <span class="n">240</span><span class="b0">)</span>:
+    <span class="m1">print</span><span class="b0">(</span><span class="s">f"{</span><span class="v4">fps</span><span class="s">:3d} fps -&gt; {</span><span class="n">1000.0</span> / <span class="v4">fps</span><span class="s">:6.3f} ms"</span><span class="b0">)</span>
+
+<span class="c"># --- forward vs deferred shading cost (Problem 2) ---</span>
+<span class="v0">P</span> = <span class="n">1920</span> * <span class="n">1080</span>          <span class="c"># 2,073,600 screen pixels at 1080p</span>
+<span class="v4">d</span> = <span class="n">4</span>                    <span class="c"># average depth complexity (fragments per pixel)</span>
+<span class="v1">c</span> = <span class="n">50</span>                   <span class="c"># ALU ops per light per fragment</span>
+<span class="v2">g</span> = <span class="n">150</span>                  <span class="c"># ALU ops to write the G-buffer per fragment (k = g/c = 3)</span>
+<span class="v1">rate</span> = <span class="n">5e12</span>              <span class="c"># sustained ops/second on this shader</span>
+
+<span class="k">def</span> <span class="m1">forward_ms</span><span class="b0">(</span><span class="v3">L</span><span class="b0">)</span>:       <span class="c"># every shaded fragment loops over all L lights</span>
+    <span class="k">return</span> <span class="v0">P</span> * <span class="v4">d</span> * <span class="v3">L</span> * <span class="v1">c</span> / <span class="v1">rate</span> * <span class="n">1e3</span>
+<span class="k">def</span> <span class="m1">deferred_ms</span><span class="b0">(</span><span class="v3">L</span><span class="b0">)</span>:      <span class="c"># geometry pass writes G-buffer, lighting pass is O(P*L)</span>
+    <span class="k">return</span> <span class="b0">(</span><span class="v0">P</span> * <span class="v4">d</span> * <span class="v2">g</span> + <span class="v0">P</span> * <span class="v3">L</span> * <span class="v1">c</span><span class="b0">)</span> / <span class="v1">rate</span> * <span class="n">1e3</span>
+
+<span class="k">for</span> <span class="v3">L</span> <span class="k">in</span> <span class="b0">(</span><span class="n">2</span>, <span class="n">4</span>, <span class="n">8</span>, <span class="n">16</span>, <span class="n">32</span><span class="b0">)</span>:
+    <span class="m1">print</span><span class="b0">(</span><span class="s">f"L={</span><span class="v3">L</span><span class="s">:2d}: forward {</span><span class="m1">forward_ms</span><span class="b1">(</span><span class="v3">L</span><span class="b1">)</span><span class="s">:.3f} ms   deferred {</span><span class="m1">deferred_ms</span><span class="b1">(</span><span class="v3">L</span><span class="b1">)</span><span class="s">:.3f} ms"</span><span class="b0">)</span>
+
+<span class="v0">L_star</span> = <span class="v4">d</span> * <span class="v2">g</span> / <span class="b0">(</span><span class="v1">c</span> * <span class="b1">(</span><span class="v4">d</span> - <span class="n">1</span><span class="b1">)</span><span class="b0">)</span>                    <span class="c"># crossover light count</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">"crossover L* ="</span>, <span class="v0">L_star</span><span class="b0">)</span>                   <span class="c"># 4.0</span>
+
+<span class="c"># --- G-buffer bandwidth round trip (Problem 3) ---</span>
+<span class="k">def</span> <span class="m1">gbuffer_mb</span><span class="b0">(</span><span class="v3">bytes_per_px</span>, <span class="v5">w</span>, <span class="v1">h</span><span class="b0">)</span>:
+    <span class="k">return</span> <span class="n">2</span> * <span class="v3">bytes_per_px</span> * <span class="v5">w</span> * <span class="v1">h</span> / <span class="n">1e6</span>          <span class="c"># write + read</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">"thin 20B @4K:"</span>, <span class="m1">round</span><span class="b1">(</span><span class="m1">gbuffer_mb</span><span class="b2">(</span><span class="n">20</span>, <span class="n">3840</span>, <span class="n">2160</span><span class="b2">)</span>, <span class="n">1</span><span class="b1">)</span>, <span class="s">"MB"</span><span class="b0">)</span>   <span class="c"># 331.8</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">"fat  32B @4K:"</span>, <span class="m1">round</span><span class="b1">(</span><span class="m1">gbuffer_mb</span><span class="b2">(</span><span class="n">32</span>, <span class="n">3840</span>, <span class="n">2160</span><span class="b2">)</span>, <span class="n">1</span><span class="b1">)</span>, <span class="s">"MB"</span><span class="b0">)</span>   <span class="c"># 530.8</span>
+
+<span class="c"># --- draw-call collapse under instancing (Problem 6) ---</span>
+<span class="v2">objs</span>, <span class="v5">us</span> = <span class="n">40000</span>, <span class="n">4.0</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">"CPU-driven:"</span>, <span class="v2">objs</span> * <span class="v5">us</span> / <span class="n">1e3</span>, <span class="s">"ms"</span><span class="b0">)</span>        <span class="c"># 160.0 ms</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">"instanced :"</span>, <span class="n">300</span> * <span class="v5">us</span> / <span class="n">1e3</span>, <span class="s">"ms"</span><span class="b0">)</span>         <span class="c"># 1.2 ms</span>
+
+<span class="c"># --- TAA effective samples (Problem 5) ---</span>
+<span class="v5">alpha</span> = <span class="n">0.1</span>
+<span class="v2">N_eff</span> = <span class="b0">(</span><span class="n">2</span> - <span class="v5">alpha</span><span class="b0">)</span> / <span class="v5">alpha</span>                         <span class="c"># 19.0</span>
+<span class="v3">frames_95</span> = <span class="m1">np</span>.<span class="m2">log</span><span class="b0">(</span><span class="n">0.05</span><span class="b0">)</span> / <span class="m1">np</span>.<span class="m2">log</span><span class="b0">(</span><span class="n">1</span> - <span class="v5">alpha</span><span class="b0">)</span>        <span class="c"># 28.4</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">"TAA N_eff:"</span>, <span class="v2">N_eff</span>, <span class="s">" frames to 95%:"</span>, <span class="m1">round</span><span class="b1">(</span><span class="v3">frames_95</span>, <span class="n">1</span><span class="b1">)</span><span class="b0">)</span>
+</code></pre>
+            <pre data-lang="jax" class="shl lang"><code class="language-python"><span class="k">import</span> <span class="m1">jax</span>.<span class="m2">numpy</span> <span class="k">as</span> <span class="m1">jnp</span>
+
+<span class="c"># The budget arithmetic is pure array math; JAX vectorizes it over light counts.</span>
+<span class="v0">P</span> = <span class="n">1920</span> * <span class="n">1080</span>
+<span class="v4">d</span>, <span class="v1">c</span>, <span class="v2">g</span>, <span class="v1">rate</span> = <span class="n">4</span>, <span class="n">50.0</span>, <span class="n">150.0</span>, <span class="n">5e12</span>
+
+<span class="v3">L</span> = <span class="m1">jnp</span>.<span class="m2">array</span><span class="b0">(</span><span class="b1">[</span><span class="n">2</span>, <span class="n">4</span>, <span class="n">8</span>, <span class="n">16</span>, <span class="n">32</span><span class="b1">]</span><span class="b0">)</span>
+<span class="v5">forward_ms</span> = <span class="v0">P</span> * <span class="v4">d</span> * <span class="v3">L</span> * <span class="v1">c</span> / <span class="v1">rate</span> * <span class="n">1e3</span>
+<span class="v0">deferred_ms</span> = <span class="b0">(</span><span class="v0">P</span> * <span class="v4">d</span> * <span class="v2">g</span> + <span class="v0">P</span> * <span class="v3">L</span> * <span class="v1">c</span><span class="b0">)</span> / <span class="v1">rate</span> * <span class="n">1e3</span>
+<span class="v2">crossover</span> = <span class="v4">d</span> * <span class="v2">g</span> / <span class="b0">(</span><span class="v1">c</span> * <span class="b1">(</span><span class="v4">d</span> - <span class="n">1</span><span class="b1">)</span><span class="b0">)</span>                   <span class="c"># 4.0</span>
+
+<span class="m1">print</span><span class="b0">(</span><span class="s">"L         :"</span>, <span class="v3">L</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">"forward ms:"</span>, <span class="m1">jnp</span>.<span class="m2">round</span><span class="b1">(</span><span class="v5">forward_ms</span>, <span class="n">3</span><span class="b1">)</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">"deferred  :"</span>, <span class="m1">jnp</span>.<span class="m2">round</span><span class="b1">(</span><span class="v0">deferred_ms</span>, <span class="n">3</span><span class="b1">)</span><span class="b0">)</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">"crossover :"</span>, <span class="v2">crossover</span><span class="b0">)</span>
+
+<span class="c"># G-buffer round-trip bandwidth at 4K for a sweep of packings</span>
+<span class="v5">bytes_px</span> = <span class="m1">jnp</span>.<span class="m2">array</span><span class="b0">(</span><span class="b1">[</span><span class="n">16</span>, <span class="n">20</span>, <span class="n">24</span>, <span class="n">32</span><span class="b1">]</span><span class="b0">)</span>
+<span class="v5">mb</span> = <span class="n">2</span> * <span class="v5">bytes_px</span> * <span class="n">3840</span> * <span class="n">2160</span> / <span class="n">1e6</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">"gbuffer MB:"</span>, <span class="m1">jnp</span>.<span class="m2">round</span><span class="b1">(</span><span class="v5">mb</span>, <span class="n">1</span><span class="b1">)</span><span class="b0">)</span>
+
+<span class="c"># TAA converged effective sample count as a function of blend weight</span>
+<span class="v5">alpha</span> = <span class="m1">jnp</span>.<span class="m2">array</span><span class="b0">(</span><span class="b1">[</span><span class="n">0.05</span>, <span class="n">0.1</span>, <span class="n">0.2</span><span class="b1">]</span><span class="b0">)</span>
+<span class="v2">N_eff</span> = <span class="b0">(</span><span class="n">2</span> - <span class="v5">alpha</span><span class="b0">)</span> / <span class="v5">alpha</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">"TAA N_eff :"</span>, <span class="m1">jnp</span>.<span class="m2">round</span><span class="b1">(</span><span class="v2">N_eff</span>, <span class="n">1</span><span class="b1">)</span><span class="b0">)</span>           <span class="c"># [39. 19.  9.]</span>
+</code></pre>
+          </div>
+
+          <p>
+            The second block is a deferred lighting pass in GLSL: a fullscreen fragment shader that
+            reconstructs world position from the depth buffer, unpacks the G-buffer, and accumulates a
+            Cook-Torrance response over a small light list, the compute-bound loop whose cost Problem 1
+            and Problem 2 model. It is written in the reader's own words to illustrate structure, not
+            copied from any engine. The angle brackets in the code are the shader's own operators.
+          </p>
+
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="cpp" class="active">GLSL (deferred lighting)</button>
+              <button data-lang="c">GLSL (PCF shadow lookup)</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="cpp" class="shl lang active"><code class="language-cpp">#<span class="v2">version</span> <span class="n">450</span>
+<span class="c">// Fullscreen deferred lighting pass. One invocation per screen pixel.</span>
+<span class="c">// The G-buffer resolved visibility, so we shade the single nearest surface.</span>
+
+<span class="m1">layout</span><span class="b0">(</span><span class="v1">binding</span> = <span class="n">0</span><span class="b0">)</span> <span class="v5">uniform</span> <span class="v4">sampler2D</span> <span class="v3">gAlbedoAO</span>;<span class="c">   // rgb = base color, a = AO</span>
+<span class="m1">layout</span><span class="b0">(</span><span class="v1">binding</span> = <span class="n">1</span><span class="b0">)</span> <span class="v5">uniform</span> <span class="v4">sampler2D</span> <span class="v1">gNormal</span>;<span class="c">     // rgb = packed world normal</span>
+<span class="m1">layout</span><span class="b0">(</span><span class="v1">binding</span> = <span class="n">2</span><span class="b0">)</span> <span class="v5">uniform</span> <span class="v4">sampler2D</span> <span class="v0">gMaterial</span>;<span class="c">   // r = roughness, g = metalness</span>
+<span class="m1">layout</span><span class="b0">(</span><span class="v1">binding</span> = <span class="n">3</span><span class="b0">)</span> <span class="v5">uniform</span> <span class="v4">sampler2D</span> <span class="v1">gDepth</span>;<span class="c">      // hardware depth</span>
+
+<span class="m1">layout</span><span class="b0">(</span><span class="v4">std140</span>, <span class="v1">binding</span> = <span class="n">4</span><span class="b0">)</span> <span class="v5">uniform</span> <span class="v4">Frame</span> <span class="b0">{</span>
+    <span class="v2">mat4</span>  <span class="v4">invViewProj</span>;<span class="c">      // clip -&gt; world, to reconstruct position from depth</span>
+    <span class="m1">vec3</span>  <span class="v4">camPos</span>;
+    <span class="k">int</span>   <span class="v3">lightCount</span>;<span class="c">       // length of the local light list (clustered cull)</span>
+    <span class="m1">vec4</span>  <span class="v0">lightPosRadius</span><span class="b1">[</span><span class="n">64</span><span class="b1">]</span>;
+    <span class="m1">vec4</span>  <span class="v1">lightColor</span><span class="b1">[</span><span class="n">64</span><span class="b1">]</span>;
+<span class="b0">}</span>;
+
+<span class="v4">in</span>  <span class="m1">vec2</span> <span class="v6">uv</span>;
+<span class="v2">out</span> <span class="m1">vec4</span> <span class="v5">outColor</span>;
+
+<span class="k">const</span> <span class="k">float</span> <span class="v5">PI</span> = <span class="n">3.14159265</span>;
+
+<span class="c">// GGX normal distribution: concentrates the specular lobe by roughness.</span>
+<span class="k">float</span> <span class="m1">D_ggx</span><span class="b0">(</span><span class="k">float</span> <span class="v3">NdH</span>, <span class="k">float</span> <span class="v5">a</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">float</span> <span class="v0">a2</span> = <span class="v5">a</span> * <span class="v5">a</span>;
+    <span class="k">float</span> <span class="v4">d</span>  = <span class="v3">NdH</span> * <span class="v3">NdH</span> * <span class="b1">(</span><span class="v0">a2</span> - <span class="n">1.0</span><span class="b1">)</span> + <span class="n">1.0</span>;
+    <span class="k">return</span> <span class="v0">a2</span> / <span class="b1">(</span><span class="v5">PI</span> * <span class="v4">d</span> * <span class="v4">d</span><span class="b1">)</span>;
+<span class="b0">}</span>
+<span class="c">// Smith height-correlated visibility term (geometry masking-shadowing).</span>
+<span class="k">float</span> <span class="m1">V_smith</span><span class="b0">(</span><span class="k">float</span> <span class="v2">NdV</span>, <span class="k">float</span> <span class="v4">NdL</span>, <span class="k">float</span> <span class="v5">a</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">float</span> <span class="v0">a2</span> = <span class="v5">a</span> * <span class="v5">a</span>;
+    <span class="k">float</span> <span class="v2">gv</span> = <span class="v4">NdL</span> * <span class="m1">sqrt</span><span class="b1">(</span><span class="v2">NdV</span> * <span class="v2">NdV</span> * <span class="b2">(</span><span class="n">1.0</span> - <span class="v0">a2</span><span class="b2">)</span> + <span class="v0">a2</span><span class="b1">)</span>;
+    <span class="k">float</span> <span class="v0">gl</span> = <span class="v2">NdV</span> * <span class="m1">sqrt</span><span class="b1">(</span><span class="v4">NdL</span> * <span class="v4">NdL</span> * <span class="b2">(</span><span class="n">1.0</span> - <span class="v0">a2</span><span class="b2">)</span> + <span class="v0">a2</span><span class="b1">)</span>;
+    <span class="k">return</span> <span class="n">0.5</span> / <span class="m1">max</span><span class="b1">(</span><span class="v2">gv</span> + <span class="v0">gl</span>, <span class="n">1</span><span class="k">e</span>-<span class="n">4</span><span class="b1">)</span>;
+<span class="b0">}</span>
+<span class="c">// Schlick Fresnel: reflectance rises toward 1 at grazing angles.</span>
+<span class="m1">vec3</span> <span class="m1">F_schlick</span><span class="b0">(</span><span class="k">float</span> <span class="v5">VdH</span>, <span class="m1">vec3</span> <span class="v5">f0</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">return</span> <span class="v5">f0</span> + <span class="b1">(</span><span class="n">1.0</span> - <span class="v5">f0</span><span class="b1">)</span> * <span class="m1">pow</span><span class="b1">(</span><span class="n">1.0</span> - <span class="v5">VdH</span>, <span class="n">5.0</span><span class="b1">)</span>;
+<span class="b0">}</span>
+
+<span class="m1">vec3</span> <span class="m1">reconstructWorldPos</span><span class="b0">(</span><span class="m1">vec2</span> <span class="v6">uv</span>, <span class="k">float</span> <span class="v3">depth</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="m1">vec4</span> <span class="v4">ndc</span> = <span class="m1">vec4</span><span class="b1">(</span><span class="v6">uv</span> * <span class="n">2.0</span> - <span class="n">1.0</span>, <span class="v3">depth</span>, <span class="n">1.0</span><span class="b1">)</span>;<span class="c">   // NDC with z in [0,1] or [-1,1]</span>
+    <span class="m1">vec4</span> <span class="v5">w</span>   = <span class="v4">invViewProj</span> * <span class="v4">ndc</span>;
+    <span class="k">return</span> <span class="v5">w</span>.<span class="m2">xyz</span> / <span class="v5">w</span>.<span class="m2">w</span>;<span class="c">                            // undo the perspective divide</span>
+<span class="b0">}</span>
+
+<span class="k">void</span> <span class="m1">main</span><span class="b0">()</span> <span class="b0">{</span>
+    <span class="k">float</span> <span class="v3">depth</span> = <span class="m1">texture</span><span class="b1">(</span><span class="v1">gDepth</span>, <span class="v6">uv</span><span class="b1">)</span>.<span class="m2">r</span>;
+    <span class="k">if</span> <span class="b1">(</span><span class="v3">depth</span> &gt;= <span class="n">1.0</span><span class="b1">)</span> <span class="b1">{</span> <span class="v5">outColor</span> = <span class="m1">vec4</span><span class="b2">(</span><span class="n">0.0</span><span class="b2">)</span>; <span class="k">return</span>; <span class="b1">}</span><span class="c">  // untouched background</span>
+
+    <span class="m1">vec3</span>  <span class="v6">albedo</span>    = <span class="m1">texture</span><span class="b1">(</span><span class="v3">gAlbedoAO</span>, <span class="v6">uv</span><span class="b1">)</span>.<span class="m2">rgb</span>;
+    <span class="k">float</span> <span class="v3">ao</span>        = <span class="m1">texture</span><span class="b1">(</span><span class="v3">gAlbedoAO</span>, <span class="v6">uv</span><span class="b1">)</span>.<span class="m2">a</span>;
+    <span class="m1">vec3</span>  <span class="v6">N</span>         = <span class="m1">normalize</span><span class="b1">(</span><span class="m1">texture</span><span class="b2">(</span><span class="v1">gNormal</span>, <span class="v6">uv</span><span class="b2">)</span>.<span class="m2">rgb</span> * <span class="n">2.0</span> - <span class="n">1.0</span><span class="b1">)</span>;
+    <span class="k">float</span> <span class="v6">roughness</span> = <span class="m1">texture</span><span class="b1">(</span><span class="v0">gMaterial</span>, <span class="v6">uv</span><span class="b1">)</span>.<span class="m2">r</span>;
+    <span class="k">float</span> <span class="v1">metalness</span> = <span class="m1">texture</span><span class="b1">(</span><span class="v0">gMaterial</span>, <span class="v6">uv</span><span class="b1">)</span>.<span class="m2">g</span>;
+
+    <span class="m1">vec3</span>  <span class="v0">P</span> = <span class="m1">reconstructWorldPos</span><span class="b1">(</span><span class="v6">uv</span>, <span class="v3">depth</span><span class="b1">)</span>;
+    <span class="m1">vec3</span>  <span class="v4">V</span> = <span class="m1">normalize</span><span class="b1">(</span><span class="v4">camPos</span> - <span class="v0">P</span><span class="b1">)</span>;
+    <span class="k">float</span> <span class="v2">NdV</span> = <span class="m1">max</span><span class="b1">(</span><span class="m1">dot</span><span class="b2">(</span><span class="v6">N</span>, <span class="v4">V</span><span class="b2">)</span>, <span class="n">1</span><span class="k">e</span>-<span class="n">4</span><span class="b1">)</span>;
+
+<span class="c">    // metals take their f0 from albedo; dielectrics use the ~4% base reflectance.</span>
+    <span class="m1">vec3</span> <span class="v5">f0</span> = <span class="m1">mix</span><span class="b1">(</span><span class="m1">vec3</span><span class="b2">(</span><span class="n">0.04</span><span class="b2">)</span>, <span class="v6">albedo</span>, <span class="v1">metalness</span><span class="b1">)</span>;
+    <span class="m1">vec3</span> <span class="v4">diffuseAlbedo</span> = <span class="v6">albedo</span> * <span class="b1">(</span><span class="n">1.0</span> - <span class="v1">metalness</span><span class="b1">)</span>;
+    <span class="k">float</span> <span class="v5">a</span> = <span class="v6">roughness</span> * <span class="v6">roughness</span>;
+
+    <span class="m1">vec3</span> <span class="v2">color</span> = <span class="m1">vec3</span><span class="b1">(</span><span class="n">0.0</span><span class="b1">)</span>;
+    <span class="k">for</span> <span class="b1">(</span><span class="k">int</span> <span class="v3">i</span> = <span class="n">0</span>; <span class="v3">i</span> &lt; <span class="v3">lightCount</span>; ++<span class="v3">i</span><span class="b1">)</span> <span class="b1">{</span><span class="c">          // only the clustered local list</span>
+        <span class="m1">vec3</span>  <span class="v5">Lvec</span> = <span class="v0">lightPosRadius</span><span class="b2">[</span><span class="v3">i</span><span class="b2">]</span>.<span class="m2">xyz</span> - <span class="v0">P</span>;
+        <span class="k">float</span> <span class="v2">dist</span> = <span class="m1">length</span><span class="b2">(</span><span class="v5">Lvec</span><span class="b2">)</span>;
+        <span class="k">if</span> <span class="b2">(</span><span class="v2">dist</span> &gt; <span class="v0">lightPosRadius</span><span class="b0">[</span><span class="v3">i</span><span class="b0">]</span>.<span class="m2">w</span><span class="b2">)</span> <span class="k">continue</span>;<span class="c">    // outside light radius</span>
+        <span class="m1">vec3</span>  <span class="v3">L</span>   = <span class="v5">Lvec</span> / <span class="v2">dist</span>;
+        <span class="m1">vec3</span>  <span class="v2">H</span>   = <span class="m1">normalize</span><span class="b2">(</span><span class="v4">V</span> + <span class="v3">L</span><span class="b2">)</span>;
+        <span class="k">float</span> <span class="v4">NdL</span> = <span class="m1">max</span><span class="b2">(</span><span class="m1">dot</span><span class="b0">(</span><span class="v6">N</span>, <span class="v3">L</span><span class="b0">)</span>, <span class="n">0.0</span><span class="b2">)</span>;
+        <span class="k">if</span> <span class="b2">(</span><span class="v4">NdL</span> &lt;= <span class="n">0.0</span><span class="b2">)</span> <span class="k">continue</span>;
+
+        <span class="k">float</span> <span class="v6">atten</span> = <span class="n">1.0</span> / <span class="b2">(</span><span class="v2">dist</span> * <span class="v2">dist</span><span class="b2">)</span>;<span class="c">           // inverse-square falloff</span>
+        <span class="m1">vec3</span>  <span class="v3">radiance</span> = <span class="v1">lightColor</span><span class="b2">[</span><span class="v3">i</span><span class="b2">]</span>.<span class="m2">rgb</span> * <span class="v6">atten</span>;
+
+        <span class="k">float</span> <span class="v5">D</span> = <span class="m1">D_ggx</span><span class="b2">(</span><span class="m1">max</span><span class="b0">(</span><span class="m1">dot</span><span class="b1">(</span><span class="v6">N</span>, <span class="v2">H</span><span class="b1">)</span>, <span class="n">0.0</span><span class="b0">)</span>, <span class="v5">a</span><span class="b2">)</span>;
+        <span class="k">float</span> <span class="v2">Vt</span> = <span class="m1">V_smith</span><span class="b2">(</span><span class="v2">NdV</span>, <span class="v4">NdL</span>, <span class="v5">a</span><span class="b2">)</span>;
+        <span class="m1">vec3</span>  <span class="v1">Fr</span> = <span class="m1">F_schlick</span><span class="b2">(</span><span class="m1">max</span><span class="b0">(</span><span class="m1">dot</span><span class="b1">(</span><span class="v4">V</span>, <span class="v2">H</span><span class="b1">)</span>, <span class="n">0.0</span><span class="b0">)</span>, <span class="v5">f0</span><span class="b2">)</span>;
+
+        <span class="m1">vec3</span> <span class="v1">specular</span> = <span class="v5">D</span> * <span class="v2">Vt</span> * <span class="v1">Fr</span>;<span class="c">                  // Cook-Torrance numerator</span>
+        <span class="m1">vec3</span> <span class="v6">kd</span> = <span class="b2">(</span><span class="n">1.0</span> - <span class="v1">Fr</span><span class="b2">)</span>;<span class="c">                         // energy left for diffuse</span>
+        <span class="m1">vec3</span> <span class="v1">diffuse</span> = <span class="v6">kd</span> * <span class="v4">diffuseAlbedo</span> / <span class="v5">PI</span>;
+
+        <span class="v2">color</span> += <span class="b2">(</span><span class="v1">diffuse</span> + <span class="v1">specular</span><span class="b2">)</span> * <span class="v3">radiance</span> * <span class="v4">NdL</span>;
+    <span class="b1">}</span>
+    <span class="v2">color</span> += <span class="v4">diffuseAlbedo</span> * <span class="n">0.03</span> * <span class="v3">ao</span>;<span class="c">              // crude ambient term</span>
+    <span class="v5">outColor</span> = <span class="m1">vec4</span><span class="b1">(</span><span class="v2">color</span>, <span class="n">1.0</span><span class="b1">)</span>;
+<span class="b0">}</span>
+</code></pre>
+            <pre data-lang="c" class="shl lang"><code class="language-cpp">#<span class="v2">version</span> <span class="n">450</span>
+<span class="c">// Percentage-closer filtering with slope-scaled bias and a cascade select.</span>
+<span class="c">// Compares depth first, then averages the binary results (never the depths).</span>
+
+<span class="m1">layout</span><span class="b0">(</span><span class="v1">binding</span> = <span class="n">0</span><span class="b0">)</span> <span class="v5">uniform</span> <span class="v3">sampler2DArrayShadow</span> <span class="v5">shadowCascades</span>;<span class="c"> // hw PCF compare</span>
+<span class="m1">layout</span><span class="b0">(</span><span class="v4">std140</span>, <span class="v1">binding</span> = <span class="n">1</span><span class="b0">)</span> <span class="v5">uniform</span> <span class="v6">ShadowData</span> <span class="b0">{</span>
+    <span class="v2">mat4</span>  <span class="v4">cascadeVP</span><span class="b1">[</span><span class="n">4</span><span class="b1">]</span>;<span class="c">      // light view-projection per cascade</span>
+    <span class="k">float</span> <span class="v0">cascadeSplit</span><span class="b1">[</span><span class="n">4</span><span class="b1">]</span>;<span class="c">   // view-space far distance of each cascade</span>
+    <span class="m1">vec2</span>  <span class="v2">texelSize</span>;<span class="c">         // 1.0 / shadow map resolution</span>
+    <span class="k">int</span>   <span class="v6">cascadeCount</span>;
+<span class="b0">}</span>;
+
+<span class="k">int</span> <span class="m1">selectCascade</span><span class="b0">(</span><span class="k">float</span> <span class="v2">viewZ</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">for</span> <span class="b1">(</span><span class="k">int</span> <span class="v3">i</span> = <span class="n">0</span>; <span class="v3">i</span> &lt; <span class="v6">cascadeCount</span>; ++<span class="v3">i</span><span class="b1">)</span>
+        <span class="k">if</span> <span class="b1">(</span><span class="v2">viewZ</span> &lt; <span class="v0">cascadeSplit</span><span class="b2">[</span><span class="v3">i</span><span class="b2">]</span><span class="b1">)</span> <span class="k">return</span> <span class="v3">i</span>;<span class="c">       // nearest slice that contains it</span>
+    <span class="k">return</span> <span class="v6">cascadeCount</span> - <span class="n">1</span>;
+<span class="b0">}</span>
+
+<span class="c">// visibility in [0,1]: fraction of the 3x3 neighborhood that is lit.</span>
+<span class="k">float</span> <span class="m1">pcfShadow</span><span class="b0">(</span><span class="m1">vec3</span> <span class="v6">worldPos</span>, <span class="m1">vec3</span> <span class="v6">N</span>, <span class="m1">vec3</span> <span class="v3">L</span>, <span class="k">float</span> <span class="v2">viewZ</span><span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">int</span> <span class="v1">c</span> = <span class="m1">selectCascade</span><span class="b1">(</span><span class="v2">viewZ</span><span class="b1">)</span>;
+    <span class="m1">vec4</span> <span class="v3">lc</span> = <span class="v4">cascadeVP</span><span class="b1">[</span><span class="v1">c</span><span class="b1">]</span> * <span class="m1">vec4</span><span class="b1">(</span><span class="v6">worldPos</span>, <span class="n">1.0</span><span class="b1">)</span>;
+    <span class="m1">vec3</span> <span class="v0">proj</span> = <span class="v3">lc</span>.<span class="m2">xyz</span> / <span class="v3">lc</span>.<span class="m2">w</span>;<span class="c">                        // light NDC</span>
+    <span class="v0">proj</span>.<span class="m2">xy</span> = <span class="v0">proj</span>.<span class="m2">xy</span> * <span class="n">0.5</span> + <span class="n">0.5</span>;<span class="c">                    // -&gt; [0,1] texture coords</span>
+    <span class="k">if</span> <span class="b1">(</span><span class="v0">proj</span>.<span class="m2">z</span> &gt; <span class="n">1.0</span><span class="b1">)</span> <span class="k">return</span> <span class="n">1.0</span>;<span class="c">                     // beyond far plane: lit</span>
+
+<span class="c">    // slope-scaled bias: needed bias grows as tan(theta) = the depth slope.</span>
+    <span class="k">float</span> <span class="v5">cosT</span> = <span class="m1">clamp</span><span class="b1">(</span><span class="m1">dot</span><span class="b2">(</span><span class="v6">N</span>, <span class="v3">L</span><span class="b2">)</span>, <span class="n">0.0</span>, <span class="n">1.0</span><span class="b1">)</span>;
+    <span class="k">float</span> <span class="v6">tanT</span> = <span class="m1">sqrt</span><span class="b1">(</span><span class="m1">max</span><span class="b2">(</span><span class="n">1.0</span> - <span class="v5">cosT</span> * <span class="v5">cosT</span>, <span class="n">0.0</span><span class="b2">)</span><span class="b1">)</span> / <span class="m1">max</span><span class="b1">(</span><span class="v5">cosT</span>, <span class="n">1</span><span class="k">e</span>-<span class="n">3</span><span class="b1">)</span>;
+    <span class="k">float</span> <span class="v4">bias</span> = <span class="m1">clamp</span><span class="b1">(</span><span class="n">0.0008</span> * <span class="v6">tanT</span>, <span class="n">0.0</span>, <span class="n">0.004</span><span class="b1">)</span> + <span class="n">0.0004</span>;
+
+    <span class="k">float</span> <span class="v4">lit</span> = <span class="n">0.0</span>;
+    <span class="k">for</span> <span class="b1">(</span><span class="k">int</span> <span class="v3">dy</span> = -<span class="n">1</span>; <span class="v3">dy</span> &lt;= <span class="n">1</span>; ++<span class="v3">dy</span><span class="b1">)</span>
+    <span class="k">for</span> <span class="b1">(</span><span class="k">int</span> <span class="v1">dx</span> = -<span class="n">1</span>; <span class="v1">dx</span> &lt;= <span class="n">1</span>; ++<span class="v1">dx</span><span class="b1">)</span> <span class="b1">{</span>
+        <span class="m1">vec2</span> <span class="v2">off</span> = <span class="m1">vec2</span><span class="b2">(</span><span class="v1">dx</span>, <span class="v3">dy</span><span class="b2">)</span> * <span class="v2">texelSize</span>;
+<span class="c">        // hardware compare-sample: returns the fraction passing (proj.z - bias)</span>
+        <span class="v4">lit</span> += <span class="m1">texture</span><span class="b2">(</span><span class="v5">shadowCascades</span>, <span class="m1">vec4</span><span class="b0">(</span><span class="v0">proj</span>.<span class="m2">xy</span> + <span class="v2">off</span>, <span class="k">float</span><span class="b1">(</span><span class="v1">c</span><span class="b1">)</span>, <span class="v0">proj</span>.<span class="m2">z</span> - <span class="v4">bias</span><span class="b0">)</span><span class="b2">)</span>;
+    <span class="b1">}</span>
+    <span class="k">return</span> <span class="v4">lit</span> / <span class="n">9.0</span>;<span class="c">                                 // average the comparisons</span>
+<span class="b0">}</span>
+</code></pre>
+          </div>
+
+          <p>
+            The third block is a WebGPU compute shader (WGSL) for the clustered light-culling pass: one
+            thread group per screen tile builds the short per-tile light list that the forward-plus
+            shader loops over, the \(LTu\) culling term in the clustered cost model. It is illustrative
+            and simplified (a screen-tile 2D cull rather than a full froxel grid).
+          </p>
+
+          <div class="code-tabs">
+            <div class="lang-row">
+              <button data-lang="rust" class="active">WGSL (tile light cull)</button>
+            <button class="shl-copy" type="button" aria-label="Copy code">Copy</button></div>
+            <pre data-lang="rust" class="shl lang active"><code class="language-rust"><span class="c">// WGSL compute: cull lights against a 16x16 screen tile.</span>
+<span class="c">// Dispatch one workgroup per tile; each writes a bounded light list for that tile.</span>
+
+<span class="k">struct</span> <span class="m1">Light</span> <span class="b0">{</span> <span class="v5">posRadius</span>: <span class="v5">vec4</span>&lt;<span class="m1">f32</span>&gt;, <span class="v2">color</span>: <span class="v5">vec4</span>&lt;<span class="m1">f32</span>&gt; <span class="b0">}</span>;
+
+@<span class="m1">group</span><span class="b0">(</span><span class="n">0</span><span class="b0">)</span> @<span class="m1">binding</span><span class="b0">(</span><span class="n">0</span><span class="b0">)</span> <span class="v3">var</span>&lt;<span class="v3">storage</span>, <span class="v3">read</span>&gt;        <span class="v6">lights</span>   : <span class="v1">array</span>&lt;<span class="m1">Light</span>&gt;;
+@<span class="m1">group</span><span class="b0">(</span><span class="n">0</span><span class="b0">)</span> @<span class="m1">binding</span><span class="b0">(</span><span class="n">1</span><span class="b0">)</span> <span class="v3">var</span>&lt;<span class="v3">storage</span>, <span class="v6">read_write</span>&gt;  <span class="v2">tileList</span> : <span class="v1">array</span>&lt;<span class="m1">u32</span>&gt;; <span class="c">// flat lists</span>
+@<span class="m1">group</span><span class="b0">(</span><span class="n">0</span><span class="b0">)</span> @<span class="m1">binding</span><span class="b0">(</span><span class="n">2</span><span class="b0">)</span> <span class="v3">var</span>&lt;<span class="v5">uniform</span>&gt;              <span class="v2">cfg</span>      : <span class="m1">Config</span>;
+
+<span class="k">struct</span> <span class="m1">Config</span> <span class="b0">{</span>
+    <span class="v4">invViewProj</span> : <span class="v6">mat4x4</span>&lt;<span class="m1">f32</span>&gt;,
+    <span class="v2">screen</span>      : <span class="v0">vec2</span>&lt;<span class="m1">u32</span>&gt;,   <span class="c">// pixels</span>
+    <span class="v3">tiles</span>       : <span class="v0">vec2</span>&lt;<span class="m1">u32</span>&gt;,   <span class="c">// tile grid dims</span>
+    <span class="v3">lightCount</span>  : <span class="m1">u32</span>,
+    <span class="v0">maxPerTile</span>  : <span class="m1">u32</span>,
+<span class="b0">}</span>;
+
+<span class="c">// AABB of a tile's frustum in world space, from its screen-space corners at</span>
+<span class="c">// near and far, reconstructed through the inverse view-projection.</span>
+<span class="k">fn</span> <span class="m1">tileBounds</span><span class="b0">(</span><span class="v2">tile</span>: <span class="v0">vec2</span>&lt;<span class="m1">u32</span>&gt;<span class="b0">)</span> -&gt; <span class="m2">array</span>&lt;<span class="v2">vec3</span>&lt;<span class="m1">f32</span>&gt;, <span class="n">2</span>&gt; <span class="b0">{</span>
+    <span class="k">let</span> <span class="v4">px0</span> = <span class="v0">vec2</span>&lt;<span class="m1">f32</span>&gt;<span class="b1">(</span><span class="v2">tile</span><span class="b1">)</span> * <span class="n">16.0</span>;
+    <span class="k">let</span> <span class="v6">px1</span> = <span class="v4">px0</span> + <span class="v0">vec2</span>&lt;<span class="m1">f32</span>&gt;<span class="b1">(</span><span class="n">16.0</span>, <span class="n">16.0</span><span class="b1">)</span>;
+    <span class="k">let</span> <span class="v4">s</span>   = <span class="v0">vec2</span>&lt;<span class="m1">f32</span>&gt;<span class="b1">(</span><span class="v2">cfg</span>.<span class="m2">screen</span><span class="b1">)</span>;
+    <span class="v3">var</span> <span class="v4">lo</span>  = <span class="v2">vec3</span>&lt;<span class="m1">f32</span>&gt;<span class="b1">(</span> <span class="n">1e30</span>,  <span class="n">1e30</span>,  <span class="n">1e30</span><span class="b1">)</span>;
+    <span class="v3">var</span> <span class="v0">hi</span>  = <span class="v2">vec3</span>&lt;<span class="m1">f32</span>&gt;<span class="b1">(</span>-<span class="n">1e30</span>, -<span class="n">1e30</span>, -<span class="n">1e30</span><span class="b1">)</span>;
+    <span class="k">for</span> <span class="b1">(</span><span class="v3">var</span> <span class="v3">zi</span> = 0<span class="v2">u</span>; <span class="v3">zi</span> &lt; 2<span class="v2">u</span>; <span class="v3">zi</span> = <span class="v3">zi</span> + 1<span class="v2">u</span><span class="b1">)</span> <span class="b1">{</span>
+        <span class="k">let</span> <span class="v0">z</span> = <span class="m1">f32</span><span class="b2">(</span><span class="v3">zi</span><span class="b2">)</span>;                          <span class="c">// near (0) and far (1) in NDC z</span>
+        <span class="k">for</span> <span class="b2">(</span><span class="v3">var</span> <span class="v1">c</span> = 0<span class="v2">u</span>; <span class="v1">c</span> &lt; 4<span class="v2">u</span>; <span class="v1">c</span> = <span class="v1">c</span> + 1<span class="v2">u</span><span class="b2">)</span> <span class="b2">{</span>
+            <span class="k">let</span> <span class="v6">cx</span> = <span class="m1">select</span><span class="b0">(</span><span class="v4">px0</span>.<span class="m2">x</span>, <span class="v6">px1</span>.<span class="m2">x</span>, <span class="b1">(</span><span class="v1">c</span> &amp; 1<span class="v2">u</span><span class="b1">)</span> == 1<span class="v2">u</span><span class="b0">)</span>;
+            <span class="k">let</span> <span class="v4">cy</span> = <span class="m1">select</span><span class="b0">(</span><span class="v4">px0</span>.<span class="m2">y</span>, <span class="v6">px1</span>.<span class="m2">y</span>, <span class="b1">(</span><span class="v1">c</span> &amp; 2<span class="v2">u</span><span class="b1">)</span> == 2<span class="v2">u</span><span class="b0">)</span>;
+            <span class="k">let</span> <span class="v4">ndc</span> = <span class="v5">vec4</span>&lt;<span class="m1">f32</span>&gt;<span class="b0">(</span><span class="b1">(</span><span class="v0">vec2</span>&lt;<span class="m1">f32</span>&gt;<span class="b2">(</span><span class="v6">cx</span>, <span class="v4">cy</span><span class="b2">)</span> / <span class="v4">s</span><span class="b1">)</span> * <span class="n">2.0</span> - <span class="n">1.0</span>, <span class="v0">z</span>, <span class="n">1.0</span><span class="b0">)</span>;
+            <span class="k">let</span> <span class="v5">w</span> = <span class="v2">cfg</span>.<span class="m2">invViewProj</span> * <span class="v4">ndc</span>;
+            <span class="k">let</span> <span class="v6">p</span> = <span class="v5">w</span>.<span class="m2">xyz</span> / <span class="v5">w</span>.<span class="m2">w</span>;
+            <span class="v4">lo</span> = <span class="m1">min</span><span class="b0">(</span><span class="v4">lo</span>, <span class="v6">p</span><span class="b0">)</span>;
+            <span class="v0">hi</span> = <span class="m1">max</span><span class="b0">(</span><span class="v0">hi</span>, <span class="v6">p</span><span class="b0">)</span>;
+        <span class="b2">}</span>
+    <span class="b1">}</span>
+    <span class="k">return</span> <span class="v1">array</span>&lt;<span class="v2">vec3</span>&lt;<span class="m1">f32</span>&gt;, <span class="n">2</span>&gt;<span class="b1">(</span><span class="v4">lo</span>, <span class="v0">hi</span><span class="b1">)</span>;
+<span class="b0">}</span>
+
+<span class="c">// squared distance from a point to an AABB; zero if the point is inside.</span>
+<span class="k">fn</span> <span class="m1">sqDistToAabb</span><span class="b0">(</span><span class="v6">p</span>: <span class="v2">vec3</span>&lt;<span class="m1">f32</span>&gt;, <span class="v4">lo</span>: <span class="v2">vec3</span>&lt;<span class="m1">f32</span>&gt;, <span class="v0">hi</span>: <span class="v2">vec3</span>&lt;<span class="m1">f32</span>&gt;<span class="b0">)</span> -&gt; <span class="m1">f32</span> <span class="b0">{</span>
+    <span class="k">let</span> <span class="v4">d</span> = <span class="m1">max</span><span class="b1">(</span><span class="m1">max</span><span class="b2">(</span><span class="v4">lo</span> - <span class="v6">p</span>, <span class="v6">p</span> - <span class="v0">hi</span><span class="b2">)</span>, <span class="v2">vec3</span>&lt;<span class="m1">f32</span>&gt;<span class="b2">(</span><span class="n">0.0</span><span class="b2">)</span><span class="b1">)</span>;
+    <span class="k">return</span> <span class="m1">dot</span><span class="b1">(</span><span class="v4">d</span>, <span class="v4">d</span><span class="b1">)</span>;
+<span class="b0">}</span>
+
+@<span class="v0">compute</span> @<span class="m1">workgroup_size</span><span class="b0">(</span><span class="n">1</span><span class="b0">)</span>
+<span class="k">fn</span> <span class="m1">main</span><span class="b0">(</span>@<span class="m1">builtin</span><span class="b1">(</span><span class="v4">workgroup_id</span><span class="b1">)</span> <span class="v1">wg</span>: <span class="v2">vec3</span>&lt;<span class="m1">u32</span>&gt;<span class="b0">)</span> <span class="b0">{</span>
+    <span class="k">let</span> <span class="v2">tile</span> = <span class="v1">wg</span>.<span class="m2">xy</span>;
+    <span class="k">let</span> <span class="v6">b</span> = <span class="m1">tileBounds</span><span class="b1">(</span><span class="v2">tile</span><span class="b1">)</span>;
+    <span class="k">let</span> <span class="v0">base</span> = <span class="b1">(</span><span class="v2">tile</span>.<span class="m2">y</span> * <span class="v2">cfg</span>.<span class="m2">tiles</span>.<span class="m2">x</span> + <span class="v2">tile</span>.<span class="m2">x</span><span class="b1">)</span> * <span class="v2">cfg</span>.<span class="m2">maxPerTile</span>;
+    <span class="v3">var</span> <span class="v6">count</span> = 0<span class="v2">u</span>;
+    <span class="k">for</span> <span class="b1">(</span><span class="v3">var</span> <span class="v3">i</span> = 0<span class="v2">u</span>; <span class="v3">i</span> &lt; <span class="v2">cfg</span>.<span class="m2">lightCount</span> &amp;&amp; <span class="v6">count</span> &lt; <span class="v2">cfg</span>.<span class="m2">maxPerTile</span>; <span class="v3">i</span> = <span class="v3">i</span> + 1<span class="v2">u</span><span class="b1">)</span> <span class="b1">{</span>
+        <span class="k">let</span> <span class="m1">L</span> = <span class="v6">lights</span><span class="b2">[</span><span class="v3">i</span><span class="b2">]</span>;
+        <span class="k">let</span> <span class="v2">r</span> = <span class="m1">L</span>.<span class="m2">posRadius</span>.<span class="m2">w</span>;
+        <span class="k">if</span> <span class="b2">(</span><span class="m1">sqDistToAabb</span><span class="b0">(</span><span class="m1">L</span>.<span class="m2">posRadius</span>.<span class="m2">xyz</span>, <span class="v6">b</span><span class="b1">[</span><span class="n">0</span><span class="b1">]</span>, <span class="v6">b</span><span class="b1">[</span><span class="n">1</span><span class="b1">]</span><span class="b0">)</span> &lt;= <span class="v2">r</span> * <span class="v2">r</span><span class="b2">)</span> <span class="b2">{</span>
+            <span class="v2">tileList</span><span class="b0">[</span><span class="v0">base</span> + <span class="v6">count</span><span class="b0">]</span> = <span class="v3">i</span>;           <span class="c">// light i touches this tile</span>
+            <span class="v6">count</span> = <span class="v6">count</span> + 1<span class="v2">u</span>;
+        <span class="b2">}</span>
+    <span class="b1">}</span>
+    <span class="c">// sentinel terminates the per-tile list for the shading pass.</span>
+    <span class="k">if</span> <span class="b1">(</span><span class="v6">count</span> &lt; <span class="v2">cfg</span>.<span class="m2">maxPerTile</span><span class="b1">)</span> <span class="b1">{</span> <span class="v2">tileList</span><span class="b2">[</span><span class="v0">base</span> + <span class="v6">count</span><span class="b2">]</span> = 0<span class="v1">xffffffffu</span>; <span class="b1">}</span>
+<span class="b0">}</span>
+</code></pre>
+          </div>
+
+          <h2>How it is done in practice</h2>
+          <p>
+            A shipping renderer is a schedule of passes packed into the interval, each with a measured
+            cost, and the engineering is in the packing. A representative modern frame runs, roughly in
+            order: a compute pass to cull and build draw lists (GPU-driven), a depth prepass to
+            establish visibility for early-Z, the G-buffer or the forward geometry pass, a shadow pass
+            per cascade, ray-traced or screen-space passes for shadows, ambient occlusion, reflections,
+            and indirect light (each denoised), the lighting resolve, transparency drawn forward, then a
+            chain of post-processing: temporal antialiasing or upscaling, bloom, exposure and
+            tone-mapping, and UI. Passes that stress different units are overlapped with async compute.
+            The whole thing is instrumented with GPU timestamps so that the team knows the millisecond
+            cost of every pass and can defend the budget.
+          </p>
+          <p>
+            The numbers this page uses for consumer targets, 600 GB/s of bandwidth, a few teraflops of
+            effective shader throughput, are deliberately mid-range and are the kind measured on a
+            desktop gaming GPU, not a datacenter accelerator. It is worth stating the gap concretely.
+            The NVIDIA H100 80GB HBM3 in this repository sustains about 2,992 GB/s of memory bandwidth
+            on a streaming copy and hundreds of teraflops of tensor throughput (measured: 744.6 bf16
+            TFLOP/s on a 4096-cube matmul), which is five times the bandwidth and far more compute than
+            a consumer part. That does not make it a game GPU: it lacks the display pipeline and the
+            fixed-function raster and ray units tuned for real-time frames are provisioned differently,
+            and above all a frame budget is about <em>ratios</em>, how many pixels and lights fit in an
+            interval, not absolute throughput. The H100 numbers are useful here only to anchor the
+            bandwidth-to-compute ratio that decides whether a pass is bandwidth- or compute-bound; the
+            frame arithmetic holds on any GPU once its own bandwidth and throughput are substituted.
+          </p>
+          <p>
+            The recurring practical lesson is that the bottleneck is rarely where intuition puts it.
+            Teams profile obsessively because the binding constraint moves between the CPU (draw
+            submission), the fixed-function units (rasterization, depth, ray traversal), the arithmetic
+            units (shading), and memory bandwidth (G-buffer, post-processing, MSAA), and optimizing a
+            non-bottleneck pass buys nothing. The habit of converting every feature to milliseconds,
+            worked throughout this page, is the core professional skill.
+          </p>
+
+          <h2>The current research frontier</h2>
+          <p>
+            The last several years have been dominated by the maturation of real-time ray tracing and
+            temporal reuse. ReSTIR, from Bitterli and colleagues (NVIDIA and Dartmouth) in 2020,
+            reframed real-time many-light and path-traced lighting as a resampling problem and has been
+            extended to full global illumination and to volumetrics in follow-on work; it is the most
+            influential idea in the area since deferred shading. Neural denoising and neural upscaling,
+            NVIDIA's DLSS line and the analytical AMD FidelityFX Super Resolution, moved reconstruction
+            from hand-tuned heuristics toward learned or carefully engineered filters, and the frontier
+            now includes neural components inside the shading itself, learned radiance caches and neural
+            materials that evaluate a small network per pixel. Epic's Nanite (Karis and colleagues,
+            2021) virtualized geometry so that triangle count tracks screen resolution, and its
+            companion Lumen combined screen-space, voxel, and ray-traced signals into a unified
+            real-time global illumination system, a pragmatic layering of every approximation on this
+            page. Work on GPU-driven and bindless rendering, across the GPU Pro and GPU Zen volumes and
+            vendor presentations, continues to move submission and culling onto the GPU. The competing
+            lines are visible in the open engines: id Tech and Filament favor clustered forward and
+            careful hand-tuned passes, Unreal pushes virtualized geometry and layered GI, and the
+            research renderers such as NVIDIA's Falcor exist to prototype the sampling and denoising
+            ideas before they ship. The through-line is amortization: spend a sparse budget of rays and
+            shaded pixels, and reuse each sample across neighbors and across frames as aggressively as
+            the artifacts allow.
+          </p>
+
+          <h2>Open source to read</h2>
+          <ul>
+            <li><a href="https://github.com/google/filament">google/filament</a>: a compact,
+              well-documented physically based renderer with a clustered-forward path; read
+              <code>filament/src/details/View.cpp</code> and the material-system docs to see clustered
+              light culling and the PBR shading model in production form.</li>
+            <li><a href="https://github.com/KhronosGroup/Vulkan-Samples">KhronosGroup/Vulkan-Samples</a>:
+              focused samples for deferred shading, hi-Z occlusion culling, and subpasses; open the
+              <code>samples/performance</code> directory to see each technique isolated with timings.</li>
+            <li><a href="https://github.com/ConfettiFX/The-Forge">ConfettiFX/The-Forge</a>: a
+              cross-platform rendering framework with GPU-driven and visibility-buffer examples; a good
+              read for bindless resource layouts and multi-draw-indirect submission.</li>
+            <li><a href="https://github.com/godotengine/godot">godotengine/godot</a>: the Vulkan
+              clustered renderer in <code>servers/rendering/renderer_rd/</code> is a complete,
+              approachable clustered-forward implementation with shadows, SSAO, and SDFGI.</li>
+            <li><a href="https://github.com/o3de/o3de">o3de/o3de</a>: an open engine (Atom renderer)
+              with a fully data-driven, pass-based frame graph; useful for seeing how passes are wired
+              and scheduled.</li>
+            <li><a href="https://github.com/bevyengine/bevy">bevyengine/bevy</a>: a Rust engine whose
+              renderer (<code>crates/bevy_pbr</code>) implements clustered forward, cascaded shadow
+              maps, and TAA in readable, modern code.</li>
+            <li><a href="https://github.com/NVIDIAGameWorks/Falcor">NVIDIAGameWorks/Falcor</a>: the
+              research renderer behind many ray-tracing and ReSTIR papers; the sample render passes are
+              the reference for real-time path tracing and denoising.</li>
+            <li><a href="https://github.com/gpuweb/webgpu-samples">gpuweb/webgpu-samples</a>: minimal
+              WebGPU samples including a deferred renderer and a compute-based particle system, the
+              quickest way to run the pipeline stages in a browser.</li>
+          </ul>
+
+          <h2>Common misconceptions</h2>
+          <p>
+            <strong>"Higher frame rate just means more of the same work."</strong> It means a smaller
+            interval: 120 fps halves the budget to 8.3 ms, so every pass must finish in half the time,
+            which usually forces lower resolution, fewer lights, or more upscaling, not merely running
+            faster.
+          </p>
+          <p>
+            <strong>"Deferred shading is always faster than forward."</strong> Only past the crossover.
+            Below a handful of overlapping lights, forward avoids the G-buffer's fixed geometry and
+            bandwidth cost and wins; deferred also forfeits cheap MSAA and cannot shade transparency,
+            which is why clustered forward, not deferred, is the modern default.
+          </p>
+          <p>
+            <strong>"MSAA supersamples shading."</strong> It supersamples coverage and depth but runs
+            the fragment shader once per covered pixel per triangle, so it antialiases silhouettes but
+            does nothing for specular sparkle or shader aliasing, which is one reason temporal methods
+            replaced it.
+          </p>
+          <p>
+            <strong>"TAA is free smoothing."</strong> Its amortization is real, nineteen effective
+            samples at \(\alpha=0.1\), but only where reprojection is valid. At disocclusions and on
+            fast specular motion the history is wrong and must be rejected, trading ghosting for noise;
+            TAA is a bias-variance knob, not a free lunch.
+          </p>
+          <p>
+            <strong>"Fewer triangles is the main way to speed up a scene."</strong> Usually the wall is
+            draw calls, not triangles: ten thousand objects at a few microseconds each blow the frame on
+            the CPU before the GPU touches a triangle, which is why instancing and GPU-driven submission
+            matter more than polygon reduction.
+          </p>
+          <p>
+            <strong>"Shadow acne is fixed by cranking up the depth bias."</strong> Too much bias causes
+            peter-panning, the shadow detaching from the object's contact point. The correct bias is
+            slope-scaled, proportional to \(\tan\theta\), just large enough to clear the depth variation
+            across one texel and no larger.
+          </p>
+          <p>
+            <strong>"Hardware ray tracing gives you a clean image."</strong> At the one-sample-per-pixel
+            the budget allows, the raw result is a snowstorm; real-time ray tracing is inseparable from
+            spatiotemporal denoising and sample reuse (ReSTIR), and its artifacts are the reprojection
+            failures of temporal accumulation.
+          </p>
+
+          <h2>Self-check</h2>
+          <div class="quiz" data-quiz>
+            <script type="application/json" class="quiz-data">[
+              {"id": "q1", "qtype": "mcq",
+               "stem": "A game moves from a 60 Hz to a 120 Hz target. What fundamentally changes for the renderer?",
+               "options": ["Nothing, the GPU just runs faster", "The per-frame budget halves from 16.7 ms to 8.3 ms, so every pass must fit in half the time", "The resolution must double", "Bandwidth requirements drop"],
+               "correctIndex": 1,
+               "explanation": "The interval is 1000/fps ms. At 120 fps it is 8.3 ms, half the 60 fps budget, so the same passes must each complete in half the time or be cut."},
+              {"id": "q2", "qtype": "mcq",
+               "stem": "Why does deferred shading's lighting cost scale as P*L rather than forward's P*d*L?",
+               "options": ["Deferred uses fewer lights", "The G-buffer resolves visibility first, so lighting is evaluated once per pixel (the nearest surface), removing the depth-complexity factor d", "Deferred skips the fragment shader", "L is smaller in deferred"],
+               "correctIndex": 1,
+               "explanation": "The geometry pass writes only the nearest surface into the G-buffer, so the lighting pass shades each pixel once regardless of overdraw; the d and L that multiply in forward become d (geometry) plus L (lighting), added."},
+              {"id": "q3", "qtype": "mcq",
+               "stem": "With overdraw d=4 and a G-buffer that costs k=3 light-evaluations to fill, at how many lights do forward and deferred tie?",
+               "options": ["2", "4", "8", "16"],
+               "correctIndex": 1,
+               "explanation": "L* = d*k/(d-1) = 4*3/3 = 4. Below 4 overlapping lights forward wins (no G-buffer cost); above 4, deferred pulls away because its per-light slope is d times smaller."},
+              {"id": "q4", "qtype": "truefalse",
+               "stem": "Clustered (forward-plus) shading charges each pixel for the number of lights that actually reach it, not the global light count.",
+               "options": ["True", "False"],
+               "correctIndex": 0,
+               "explanation": "A per-cell cull builds a short local light list, so the shading loop runs over local density; the culling term is per cell, not per pixel, which is why clustered forward scales well and stays MSAA- and transparency-compatible."},
+              {"id": "q5", "qtype": "mcq",
+               "stem": "Shadow acne is caused by, and correctly fixed by, respectively:",
+               "options": ["Too few lights; adding lights", "Point-sampled depth on a sloped surface causing false self-shadow; a slope-scaled bias proportional to tan(theta)", "Low resolution; higher resolution only", "Blending; disabling blending"],
+               "correctIndex": 1,
+               "explanation": "The stored depth is a point sample of a texel-sized patch; on a tilted surface the true depth varies across the texel, causing self-shadowing. The bias must grow as tan(theta), just enough to clear that variation without detaching the shadow (peter-panning)."},
+              {"id": "q6", "qtype": "mcq",
+               "stem": "In percentage-closer filtering, why must you compare depths first and then average, not average depths then compare?",
+               "options": ["It is faster", "Stored depth is nonlinear, so averaging depths is meaningless; averaging the binary comparison results gives a valid fractional visibility", "Hardware cannot average", "The bias would be wrong otherwise"],
+               "correctIndex": 1,
+               "explanation": "PCF estimates the fraction of the neighborhood that is lit; each sample yields a 0/1 comparison, and the average of those is the fractional visibility. Averaging the depths first has no meaningful interpretation."},
+              {"id": "q7", "qtype": "mcq",
+               "stem": "A TAA blend uses alpha = 0.1. Its converged effective sample count is:",
+               "options": ["10", "19", "100", "2"],
+               "correctIndex": 1,
+               "explanation": "Steady-state variance of the EMA is alpha/(2-alpha) times single-sample variance, so N_eff = (2-alpha)/alpha = 1.9/0.1 = 19."},
+              {"id": "q8", "qtype": "truefalse",
+               "stem": "TAA can blend in reprojected history unconditionally, since motion vectors always predict where the surface was.",
+               "options": ["True", "False"],
+               "correctIndex": 1,
+               "explanation": "At disocclusions, off-screen history, and fast shading changes (specular, shadows, transparency without motion vectors), the reprojected history is wrong and must be rejected (e.g. neighborhood color clamping) to avoid ghosting."},
+              {"id": "q9", "qtype": "mcq",
+               "stem": "Ten thousand objects at 5 microseconds of CPU per draw call cost how much CPU, and what is the fix?",
+               "options": ["0.05 ms; nothing needed", "50 ms (three 60 fps frames); reduce call count via instancing or GPU-driven submission", "5 ms; add more lights", "500 ms; raise resolution"],
+               "correctIndex": 1,
+               "explanation": "10000 * 5 us = 50 ms of CPU, far over a 16.7 ms frame. The bottleneck is submission overhead, not triangles; instancing and GPU-driven, bindless rendering collapse the call count."},
+              {"id": "q10", "qtype": "mcq",
+               "stem": "What is the purpose of the two-level (TLAS over BLAS) ray-tracing acceleration structure?",
+               "options": ["To store colors", "To let each mesh's BVH (BLAS) be built once and reused under many instance transforms, so only the top-level structure (TLAS) is rebuilt when objects move", "To reduce triangle count", "To replace the depth buffer"],
+               "correctIndex": 1,
+               "explanation": "BLAS holds per-mesh triangle BVHs in local space; TLAS is a BVH over instances that reference BLASes with transforms. Moving an object rebuilds only the cheap TLAS, mirroring instancing's build-once-reuse-many economy."},
+              {"id": "q11", "qtype": "truefalse",
+               "stem": "A one-sample-per-pixel ray-traced image is usable as-is without denoising.",
+               "options": ["True", "False"],
+               "correctIndex": 1,
+               "explanation": "One Monte Carlo sample is unbiased but extremely noisy; real-time RT is inseparable from spatiotemporal denoising and sample reuse (ReSTIR), which reconstruct a smooth image from sparse noisy samples."},
+              {"id": "q12", "qtype": "ordering",
+               "stem": "Order these stages of the rasterization pipeline as a primitive passes through them.",
+               "options": ["input assembly", "vertex shader", "rasterizer (coverage, early-Z)", "fragment shader", "output merger (depth test, blend)"],
+               "correctIndex": -1,
+               "explanation": "Input assembly forms primitives, the vertex shader transforms to clip space, the rasterizer finds covered samples and runs early-Z, the fragment shader shades, and the output merger tests depth and blends into the targets."}
+            ]</script>
+          </div>
+
+          <h2>References</h2>
+          <ol class="refs">
+            <li>Akenine-Moller, T., Haines, E., Hoffman, N., Pesce, A., Iwanicki, M., and Hillaire, S. <em>Real-Time Rendering</em>, 4th ed. CRC Press, 2018. The central reference for this page: the pipeline, deferred and clustered shading, shadows, antialiasing, and acceleration structures. <a href="https://www.realtimerendering.com/">realtimerendering.com</a></li>
+            <li>Pharr, M., Jakob, W., and Humphreys, G. <em>Physically Based Rendering: From Theory to Implementation</em>, 4th ed. MIT Press, 2023. The reference for the ray-tracing, sampling, and reconstruction material. <a href="https://www.pbr-book.org/">pbr-book.org</a></li>
+            <li>Marschner, S. and Shirley, P. <em>Fundamentals of Computer Graphics</em>, 4th ed. CRC Press, 2015. Background for the transforms and rasterization the companion foundations page derives.</li>
+            <li>Williams, L. "Casting Curved Shadows on Curved Surfaces." <em>SIGGRAPH</em>, 1978. The original shadow-mapping paper. <a href="https://doi.org/10.1145/800248.807402">doi:10.1145/800248.807402</a></li>
+            <li>Reeves, W., Salesin, D., and Cook, R. "Rendering Antialiased Shadows with Depth Maps." <em>SIGGRAPH</em>, 1987. Percentage-closer filtering. <a href="https://doi.org/10.1145/37401.37435">doi:10.1145/37401.37435</a></li>
+            <li>Zhang, F., Sun, H., Xu, L., and Lun, L. K. "Parallel-Split Shadow Maps for Large-Scale Virtual Environments." <em>VRCIA</em>, 2006. The logarithmic/uniform cascade split. <a href="https://doi.org/10.1145/1128923.1128975">doi:10.1145/1128923.1128975</a></li>
+            <li>Engel, W. "Cascaded Shadow Maps." In <em>ShaderX5</em>, Charles River Media, 2006. The practical cascaded-shadow-map formulation.</li>
+            <li>Mittring, M. "Finding Next Gen: CryEngine 2." <em>SIGGRAPH Courses (Advanced Real-Time Rendering in 3D Graphics and Games)</em>, 2007. Deferred shading and the original screen-space ambient occlusion. <a href="https://doi.org/10.1145/1281500.1281671">doi:10.1145/1281500.1281671</a></li>
+            <li>Bavoil, L., Sainz, M., and Dimitrov, R. "Image-Space Horizon-Based Ambient Occlusion." <em>ACM SIGGRAPH Talks</em>, 2008. HBAO. <a href="https://doi.org/10.1145/1401032.1401061">doi:10.1145/1401032.1401061</a></li>
+            <li>Crassin, C., Neyret, F., Sainz, M., Green, S., and Eisemann, E. "Interactive Indirect Illumination Using Voxel Cone Tracing." <em>Computer Graphics Forum (Pacific Graphics)</em>, 2011. Voxel cone tracing, from INRIA and NVIDIA. <a href="https://doi.org/10.1111/j.1467-8659.2011.02063.x">doi:10.1111/j.1467-8659.2011.02063.x</a></li>
+            <li>Karis, B. "High-Quality Temporal Supersampling." <em>SIGGRAPH Courses (Advances in Real-Time Rendering in Games)</em>, 2014. The Unreal Engine 4 TAA with neighborhood clamping, and PBR shading notes. <a href="https://advances.realtimerendering.com/">advances.realtimerendering.com</a></li>
+            <li>Lottes, T. "FXAA." NVIDIA white paper, 2009. The morphological, single-frame antialiasing baseline temporal methods improved on. <a href="https://developer.nvidia.com/fxaa">developer.nvidia.com/fxaa</a></li>
+            <li>Bitterli, B., Wyman, C., Pharr, M., Shirley, P., Lefohn, A., and Jarosz, W. "Spatiotemporal Reservoir Resampling for Real-Time Ray Tracing with Dynamic Direct Lighting." <em>ACM Transactions on Graphics (SIGGRAPH)</em>, 2020. ReSTIR, from NVIDIA and Dartmouth. <a href="https://doi.org/10.1145/3386569.3392481">doi:10.1145/3386569.3392481</a></li>
+            <li>Wald, I. "On Fast Construction of SAH-Based Bounding Volume Hierarchies." <em>IEEE Symposium on Interactive Ray Tracing</em>, 2007. Fast BVH build. <a href="https://doi.org/10.1109/RT.2007.4342588">doi:10.1109/RT.2007.4342588</a></li>
+            <li>Reshetov, A., Soupikov, A., and Hurley, J. "Multi-Level Ray Tracing Algorithm." <em>ACM Transactions on Graphics (SIGGRAPH)</em>, 2005. Coherent BVH traversal. <a href="https://doi.org/10.1145/1073204.1073329">doi:10.1145/1073204.1073329</a></li>
+            <li>Karis, B., Stubbe, R., and Wihlidal, G. "A Deep Dive into Nanite Virtualized Geometry." <em>SIGGRAPH Courses (Advances in Real-Time Rendering)</em>, Epic Games, 2021. Virtualized geometry and GPU-driven, cluster-based LOD. <a href="https://advances.realtimerendering.com/">advances.realtimerendering.com</a></li>
+            <li>Nvidia. "NVIDIA DLSS: Deep Learning Super Sampling, Technical Overview." NVIDIA developer documentation, accessed 2026. Temporal neural upscaling. <a href="https://developer.nvidia.com/rtx/dlss">developer.nvidia.com/rtx/dlss</a></li>
+            <li>AMD. "FidelityFX Super Resolution (FSR): Technical Documentation." AMD GPUOpen, accessed 2026. Analytical temporal upscaling. <a href="https://gpuopen.com/fidelityfx-superresolution/">gpuopen.com/fidelityfx-superresolution</a></li>
+            <li>Pharr, M. and Fernando, R. (eds.). <em>GPU Gems 2</em> and Nguyen, H. (ed.), <em>GPU Gems 3</em>. Addison-Wesley, 2005 and 2007. Deferred shading, shadow, and GPU-technique chapters. <a href="https://developer.nvidia.com/gpugems/gpugems3">developer.nvidia.com/gpugems</a></li>
+            <li>Engel, W. (ed.). <em>GPU Pro</em> and <em>GPU Zen</em> series. CRC Press / Black Cat, 2010-2019. Clustered shading, GPU-driven rendering, and tiled-light techniques by many authors including Persson and Riccio.</li>
+            <li>Olsson, O., Billeter, M., and Assarsson, U. "Clustered Deferred and Forward Shading." <em>High-Performance Graphics</em>, 2012. The clustered (froxel) light-culling formulation, from Chalmers. <a href="https://doi.org/10.2312/EGGH/HPG12/087-096">doi:10.2312/EGGH/HPG12/087-096</a></li>
+            <li>Harada, T., McKee, J., and Yang, J. "Forward+: Bringing Deferred Lighting to the Next Level." <em>Eurographics Short Papers</em>, 2012. Tiled forward light culling. <a href="https://doi.org/10.2312/conf/EG2012/short/005-008">doi:10.2312/conf/EG2012/short/005-008</a></li>
+            <li>Karis, B. "Real Shading in Unreal Engine 4." <em>SIGGRAPH Courses (Physically Based Shading in Theory and Practice)</em>, Epic Games, 2013. The real-time Cook-Torrance parameterization used in the shader above. <a href="https://blog.selfshadow.com/publications/s2013-shading-course/">blog.selfshadow.com</a></li>
+          </ol>
+
+          <div class="takeaway">
+            Real-time rendering is the art of fitting a good-enough image into a fixed interval, about
+            16.7 ms at 60 fps and 8.3 ms at 120, and every technique on this page is a way to buy more
+            image per millisecond. Forward shading couples cost to objects times lights; deferred
+            decouples lighting to per-pixel at the price of a G-buffer's memory and bandwidth, and
+            clustered forward charges each pixel only for the lights that reach it, which is why it is
+            the modern default. Shadows, ambient occlusion, antialiasing, and ray tracing all converge
+            on one idea, amortize a sparse budget by reusing samples across space and across time:
+            cascaded shadow maps redistribute texel density, temporal antialiasing accumulates
+            nineteen effective samples from one per frame until reprojection fails and history must be
+            rejected, and hardware ray tracing survives on one sample per pixel only because ReSTIR and
+            denoisers reuse that sample among neighbors and frames. The scaling walls are rarely where
+            intuition puts them: draw calls, not triangles, and bandwidth, not arithmetic, most often
+            bind, so the core skill is to convert every proposed feature into milliseconds and subtract
+            it from the interval before deciding whether it fits.
+          </div>
+
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>&copy; <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;&middot;&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script defer src="/classes/math.js"></script>
+    <script defer src="/code-tabs.js"></script>
+    <script defer src="/quiz.js"></script>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/code-copy.js"></script>
+      <script defer src="/theme.js"></script>
+  </body>
+</html>

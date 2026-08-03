@@ -1,0 +1,1161 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OpenRLHF walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A full chapter on OpenRLHF: the Ray + vLLM + DeepSpeed ZeRO-3 RLHF stack. A practical quickstart for PPO and GRPO, the complete life of one PPO iteration from train_ppo_ray through vLLM rollout, the experience maker, advantage estimation, and the weight sync back into the engines, deep dives on distributed actor placement, remote reward models, and the algorithms, a staged reading plan, labs, and understanding checks." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%232B2621'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+      <script>(function(){try{var t=localStorage.getItem("theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>OpenRLHF</h1>
+        <p class="lead">
+          <a href="https://github.com/OpenRLHF/OpenRLHF" target="_blank" rel="noreferrer">OpenRLHF</a>
+          is a clean, high-performance RLHF stack that treats reinforcement
+          learning from human feedback as two cooperating distributed
+          systems rather than one. It runs generation on dedicated
+          <a href="/oss/vllm">vLLM</a> engines and gradient updates on
+          DeepSpeed ZeRO-3 actors, uses Ray to place the actor, critic,
+          reference, and reward models across a cluster, and supports PPO,
+          GRPO, REINFORCE++, RLOO, and remote or programmatic reward models
+          from the same launcher. This chapter is three things at once. It
+          is a practical tutorial for launching real PPO and GRPO runs, a
+          systems walkthrough that follows one PPO iteration from
+          <code>train_ppo_ray</code> through the vLLM rollout, the
+          experience maker, advantage estimation, the loss, and the weight
+          sync back into the engines, and a staged guide to reading the
+          repository. It ends with runnable labs, understanding checks with
+          model answers, and a compact framework for keeping the whole
+          system in your head.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">ray job submit ... -- python -m openrlhf.cli.train_ppo_ray
+      |
+      v
+train(args)                build Ray placement groups, one RayActorGroup per role
+      |
+      +-- PolicyModelActor      actor policy,  DeepSpeed ZeRO-3      xN gpus
+      +-- CriticModelActor      value model,   DeepSpeed ZeRO-3      xN gpus
+      +-- ReferenceModelActor   frozen policy for the KL term        xN gpus
+      +-- RewardModelActor      score head, or --reward.remote_url   xN gpus
+      +-- RolloutRayActor       vLLM inference engines               xM engines
+      |
+      v
+one PPO iteration (repeated)
+   1. SamplesGenerator     -&gt; vLLM engines generate responses (the rollout)
+   2. RemoteExperienceMaker-&gt; ref logprobs, actor logprobs, critic values, reward
+   3. per-token KL, reward - kl*KL, advantages (gae / group_norm / reinforce)
+   4. ppo_train            -&gt; PolicyLoss (clipped) on actor, ValueLoss on critic
+   5. broadcast_to_vllm    -&gt; push the freshly trained actor weights into vLLM</pre>
+          <p>
+            The one-sentence identity. <mark>OpenRLHF is a Ray-orchestrated
+            RLHF framework that splits the training loop into a generation
+            system built on vLLM and a learning system built on DeepSpeed
+            ZeRO-3, then reconnects them by broadcasting the updated policy
+            weights into the inference engines after every step.</mark> A
+            naive RLHF trainer generates responses with the same Hugging
+            Face model it trains, calling <code>model.generate</code> under
+            the training framework. That is correct and simple and slow,
+            because autoregressive decoding under a training runtime has
+            none of the batching tricks that make inference fast. OpenRLHF
+            refuses that coupling. Generation is a separate service with its
+            own memory, its own paged attention, and its own continuous
+            batching, and the trainer's only job across the boundary is to
+            keep that service loaded with current weights.
+          </p>
+          <p>
+            The load-bearing idea, said plainly. <mark>In RLHF the rollout
+            dominates wall-clock time, so the highest-leverage move is to
+            run rollouts on an engine that is good at inference instead of
+            on the engine that is good at training.</mark> Every PPO or GRPO
+            step spends most of its seconds generating long completions one
+            token at a time. vLLM turns that phase into a throughput problem
+            it already solves, with paged key-value caches and dynamic
+            batching across many in-flight sequences, while DeepSpeed keeps
+            doing what it is good at, which is sharding a large model's
+            parameters, gradients, and optimizer state so the backward pass
+            fits. Ray is the glue that lets these two systems live on the
+            same GPUs or on different GPUs, whichever the cluster affords.
+          </p>
+          <p>
+            Two consequences follow. First, placement becomes a first-class
+            configuration axis. The actor, critic, reference, and reward
+            models are each a group of Ray actors, and you decide by flags
+            whether they share GPUs or spread across the cluster, which is a
+            very different design from a monolithic trainer that owns every
+            device. Second, the reward signal is pluggable in a way that
+            matters for reasoning work. A reward can come from a trained
+            reward model, from an HTTP service, or from an ordinary Python
+            function you write, which is how verifiable-reward training on
+            math and code fits the same harness as classic preference-based
+            RLHF. Everything here is verified against <code>main</code> in
+            July 2026. OpenRLHF moves quickly and recently reorganized its
+            command-line flags into grouped namespaces, so where a detail is
+            likely to shift I say so and stay at concept level.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <p>
+            OpenRLHF is a Linux-and-NVIDIA-GPUs project. It leans on vLLM,
+            DeepSpeed, Ray, and Hugging Face Transformers, and the intended
+            way in is from PyPI or from source into a recent CUDA
+            environment.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">pip</span> <span class="s">install</span> <span class="s">openrlhf</span>
+<span class="c"># generation acceleration and the Ray path pull in vLLM:</span>
+<span class="m1">pip</span> <span class="s">install</span> <span class="s">openrlhf[vllm]</span>
+<span class="c"># or from source, which is the honest choice while main moves fast:</span>
+<span class="m1">git</span> <span class="s">clone</span> <span class="s">https://github.com/OpenRLHF/OpenRLHF</span>
+<span class="m1">cd</span> <span class="s">OpenRLHF</span>
+<span class="m1">pip</span> <span class="s">install</span> <span class="s">-e</span> <span class="s">.[vllm]</span></code></pre></div>
+          <p>
+            The non-RL trainers run under <code>deepspeed</code> directly.
+            Supervised fine-tuning, reward-model training, and DPO each have
+            a CLI module, and these are the right first runs because they
+            exercise the model and data plumbing without Ray or vLLM in the
+            way.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="c"># supervised fine-tuning of a base model</span>
+<span class="m1">deepspeed</span> <span class="s">--module</span> <span class="s">openrlhf.cli.train_sft</span> <span class="s">\</span>
+  <span class="s">--actor.model_name_or_path</span> <span class="s">meta-llama/Llama-3.1-8B</span> <span class="s">\</span>
+  <span class="s">--data.prompt_dataset</span> <span class="s">Open-Orca/OpenOrca</span> <span class="s">\</span>
+  <span class="s">--ds.zero_stage</span> <span class="s">2</span> <span class="s">--ds.param_dtype</span> <span class="s">bf16</span>
+
+<span class="c"># train a reward model from preference pairs</span>
+<span class="m1">deepspeed</span> <span class="s">--module</span> <span class="s">openrlhf.cli.train_rm</span> <span class="s">\</span>
+  <span class="s">--reward.model_name_or_path</span> <span class="s">meta-llama/Llama-3.1-8B</span> <span class="s">\</span>
+  <span class="s">--data.prompt_dataset</span> <span class="s">OpenRLHF/preference_dataset_mixture2_and_safe_pku</span></code></pre></div>
+          <p>
+            The main event is Ray-based PPO with vLLM rollouts. You start a
+            Ray cluster (a single node is fine to learn on), then submit the
+            job. The command below places all four learned models and the
+            vLLM engines onto the same set of eight GPUs by colocating them,
+            which is the memory-efficient layout for a single node.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="c"># one terminal: start Ray</span>
+<span class="m1">ray</span> <span class="s">start</span> <span class="s">--head</span> <span class="s">--node-ip-address</span> <span class="s">0.0.0.0</span>
+
+<span class="c"># another terminal: submit the PPO job</span>
+<span class="m1">ray</span> <span class="s">job</span> <span class="s">submit</span> <span class="s">--address="http://127.0.0.1:8265"</span> <span class="s">\</span>
+  <span class="s">--</span> <span class="s">python3</span> <span class="s">-m</span> <span class="s">openrlhf.cli.train_ppo_ray</span> <span class="s">\</span>
+  <span class="s">--actor.num_nodes</span> <span class="s">1</span> <span class="s">--actor.num_gpus_per_node</span> <span class="s">8</span> <span class="s">\</span>
+  <span class="s">--critic.num_nodes</span> <span class="s">1</span> <span class="s">--critic.num_gpus_per_node</span> <span class="s">8</span> <span class="s">\</span>
+  <span class="s">--ref.num_nodes</span> <span class="s">1</span> <span class="s">--ref.num_gpus_per_node</span> <span class="s">8</span> <span class="s">\</span>
+  <span class="s">--reward.num_nodes</span> <span class="s">1</span> <span class="s">--reward.num_gpus_per_node</span> <span class="s">8</span> <span class="s">\</span>
+  <span class="s">--vllm.num_engines</span> <span class="s">4</span> <span class="s">--vllm.tensor_parallel_size</span> <span class="s">2</span> <span class="s">\</span>
+  <span class="s">--train.colocate_all</span> <span class="s">\</span>
+  <span class="s">--actor.model_name_or_path</span> <span class="s">OpenRLHF/Llama-3-8b-sft-mixture</span> <span class="s">\</span>
+  <span class="s">--reward.model_name_or_path</span> <span class="s">OpenRLHF/Llama-3-8b-rm-700k</span> <span class="s">\</span>
+  <span class="s">--ds.zero_stage</span> <span class="s">3</span> <span class="s">--ds.param_dtype</span> <span class="s">bf16</span> <span class="s">\</span>
+  <span class="s">--actor.adam.lr</span> <span class="s">5e-7</span> <span class="s">--critic.adam.lr</span> <span class="s">9e-6</span> <span class="s">\</span>
+  <span class="s">--algo.kl.init_coef</span> <span class="s">0.01</span> <span class="s">\</span>
+  <span class="s">--rollout.batch_size</span> <span class="s">1024</span> <span class="s">--train.batch_size</span> <span class="s">128</span> <span class="s">\</span>
+  <span class="s">--data.prompt_dataset</span> <span class="s">OpenRLHF/prompt-collection-v0.1</span> <span class="s">\</span>
+  <span class="s">--data.input_key</span> <span class="s">context_messages</span> <span class="s">--data.apply_chat_template</span> <span class="s">\</span>
+  <span class="s">--vllm.sync_backend</span> <span class="s">nccl</span> <span class="s">--ds.packing_samples</span></code></pre></div>
+          <p>
+            <a href="https://arxiv.org/abs/2402.03300" target="_blank" rel="noreferrer">GRPO</a> is the same launcher with the critic removed and the
+            advantage estimator switched. GRPO does not learn a value
+            function. It samples several completions per prompt and uses
+            their reward statistics as the baseline, so you drop the
+            <code>--critic.*</code> group, raise
+            <code>--rollout.n_samples_per_prompt</code>, and select
+            <code>group_norm</code>.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">ray</span> <span class="s">job</span> <span class="s">submit</span> <span class="s">--address="http://127.0.0.1:8265"</span> <span class="s">\</span>
+  <span class="s">--</span> <span class="s">python3</span> <span class="s">-m</span> <span class="s">openrlhf.cli.train_ppo_ray</span> <span class="s">\</span>
+  <span class="s">--actor.num_nodes</span> <span class="s">1</span> <span class="s">--actor.num_gpus_per_node</span> <span class="s">8</span> <span class="s">\</span>
+  <span class="s">--ref.num_nodes</span> <span class="s">1</span> <span class="s">--ref.num_gpus_per_node</span> <span class="s">8</span> <span class="s">\</span>
+  <span class="s">--vllm.num_engines</span> <span class="s">4</span> <span class="s">--vllm.tensor_parallel_size</span> <span class="s">2</span> <span class="s">\</span>
+  <span class="s">--train.colocate_all</span> <span class="s">--ds.enable_sleep</span> <span class="s">--vllm.enable_sleep</span> <span class="s">\</span>
+  <span class="s">--actor.model_name_or_path</span> <span class="s">Qwen/Qwen2.5-7B</span> <span class="s">\</span>
+  <span class="s">--reward.remote_url</span> <span class="s">/path/to/reward_func.py</span> <span class="s">\</span>
+  <span class="s">--algo.advantage.estimator</span> <span class="s">group_norm</span> <span class="s">\</span>
+  <span class="s">--rollout.n_samples_per_prompt</span> <span class="s">8</span> <span class="s">\</span>
+  <span class="s">--algo.kl.init_coef</span> <span class="s">1e-3</span> <span class="s">--algo.kl.use_loss</span> <span class="s">\</span>
+  <span class="s">--rollout.batch_size</span> <span class="s">128</span> <span class="s">--train.batch_size</span> <span class="s">128</span> <span class="s">\</span>
+  <span class="s">--data.prompt_dataset</span> <span class="s">zhuzilin/dapo-math-17k</span> <span class="s">\</span>
+  <span class="s">--data.input_key</span> <span class="s">prompt</span> <span class="s">--data.label_key</span> <span class="s">label</span> <span class="s">\</span>
+  <span class="s">--ds.zero_stage</span> <span class="s">3</span> <span class="s">--ds.param_dtype</span> <span class="s">bf16</span></code></pre></div>
+          <p>
+            The programmatic reward is worth seeing because it is why
+            OpenRLHF is comfortable on verifiable tasks. Point
+            <code>--reward.remote_url</code> at a Python file that defines a
+            single function. It receives the full decoded queries, the
+            original prompts, and the dataset labels, and it returns one
+            scalar reward per query as a tensor. This is where you put a math
+            checker, a code sandbox, or a unit-test harness.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="c"># reward_func.py, passed as --reward.remote_url /path/to/reward_func.py</span>
+<span class="k">import</span> <span class="m1">torch</span>
+
+<span class="k">def</span> <span class="m1">reward_func</span><span class="b0">(</span><span class="v2">queries</span>, <span class="v3">prompts</span>, <span class="v3">labels</span><span class="b0">)</span>:
+    <span class="c"># queries is prompts + generated responses (decoded strings)</span>
+    <span class="c"># labels is the gold answer for each prompt</span>
+    <span class="v3">rewards</span> = <span class="b0">[]</span>
+    <span class="k">for</span> <span class="v1">q</span>, <span class="v5">gold</span> <span class="k">in</span> <span class="m1">zip</span><span class="b0">(</span><span class="v2">queries</span>, <span class="v3">labels</span><span class="b0">)</span>:
+        <span class="v4">answer</span> = <span class="m1">extract_boxed_answer</span><span class="b0">(</span><span class="v1">q</span><span class="b0">)</span>     <span class="c"># your own parsing</span>
+        <span class="v3">rewards</span>.<span class="m2">append</span><span class="b0">(</span><span class="n">1.0</span> <span class="k">if</span> <span class="v4">answer</span> == <span class="v5">gold</span> <span class="k">else</span> <span class="n">0.0</span><span class="b0">)</span>
+    <span class="k">return</span> <span class="m1">torch</span>.<span class="m2">tensor</span><span class="b0">(</span><span class="v3">rewards</span><span class="b0">)</span></code></pre></div>
+          <p>
+            One caution on old documentation. OpenRLHF used to expose flat
+            flags such as <code>--actor_num_nodes</code>,
+            <code>--advantage_estimator</code>,
+            <code>--colocate_all_models</code>, and
+            <code>--remote_rm_url</code>, and most blog posts and older
+            example scripts still use them. Current <code>main</code> groups
+            them into namespaces, so <code>--actor.num_nodes</code>,
+            <code>--algo.advantage.estimator</code>,
+            <code>--train.colocate_all</code>, and
+            <code>--reward.remote_url</code> are the shapes you will meet
+            now. When an old tutorial fails on an unrecognized flag, this
+            rename is almost always why, and the translation is mechanical.
+          </p>
+          <p>
+            Now the mistakes beginners make. First, forgetting that the
+            reward path is required. PPO needs either a reward model through
+            <code>--reward.model_name_or_path</code> or a remote reward
+            through <code>--reward.remote_url</code>, and a run with neither
+            has nothing to optimize toward. Second, colocation without sleep.
+            When you pass <code>--train.colocate_all</code> to share GPUs
+            between training and vLLM, you almost always also want
+            <code>--ds.enable_sleep</code> and <code>--vllm.enable_sleep</code>
+            so DeepSpeed can offload its states while vLLM generates and vLLM
+            can release its cache while DeepSpeed trains, since otherwise
+            both try to own the memory at once and you run out. Third,
+            batch-size confusion. <code>--rollout.batch_size</code> counts
+            prompts drawn per iteration and
+            <code>--train.batch_size</code> counts samples per optimizer
+            update, and with
+            <code>--rollout.n_samples_per_prompt</code> greater than one the
+            number of experiences is the rollout batch times the sample
+            count, which is easy to under-provision. Fourth, and most
+            fundamental. <mark>The vLLM engines hold their own copy of the
+            policy weights, and they are only as current as the last weight
+            sync, so if you disable or break the sync the model generates
+            from stale parameters and training silently goes off-policy.</mark>
+          </p>
+
+          <h2>Part III: When it is the right tool</h2>
+          <p>
+            OpenRLHF is the right tool when you are doing online RL on
+            language models at a scale where generation throughput and
+            multi-GPU placement actually matter, and you want a codebase
+            small enough to read and fork. That covers RLHF on 7B to 70B
+            policies, reasoning-model training with GRPO or REINFORCE++
+            against verifiable rewards, and agentic rollouts where a custom
+            environment produces the reward. Its sweet spot is a team that
+            wants vLLM-fast generation and DeepSpeed-scale training without
+            writing the Ray orchestration between them by hand.
+          </p>
+          <p>
+            The honest cases for alternatives. <a href="/rl/trl">TRL</a> from
+            Hugging Face is the gentler on-ramp, tightly integrated with
+            Transformers and PEFT, excellent for single-node experiments and
+            for DPO-style offline methods, and it now has its own vLLM
+            integration. Reach for it first when your job is small or when
+            you want the shortest path from a Transformers checkpoint to a
+            trained policy. <a href="/rl/verl">verl</a> from ByteDance is the
+            most direct competitor at the high end. Its
+            <a href="https://arxiv.org/abs/2409.19256" target="_blank" rel="noreferrer">HybridFlow</a>
+            controller-worker model and aggressive resharding push peak
+            throughput on very large clusters, at the cost of a heavier
+            programming model. Reach for it when you are squeezing a
+            thousand-GPU run and can pay for the complexity. DeepSpeed-Chat
+            is the ancestor of this whole design and still instructive. It
+            colocates generation and training on the same GPUs with a hybrid
+            engine that reshards between the two phases, which
+            <a href="https://arxiv.org/abs/2405.11143" target="_blank" rel="noreferrer">OpenRLHF's paper</a>
+            contrasts against by decoupling generation onto vLLM
+            instead. NeMo-Aligner is the choice when you are already on
+            Megatron and want maximum performance on NVIDIA hardware with a
+            framework that owns your model code. OpenRLHF sits deliberately
+            in the middle, faster and more scalable than the simplest
+            options and far more legible than the heaviest ones.
+          </p>
+          <p>
+            The architecture-shaped warning is about mapping placement onto
+            physical GPUs and interconnect. You have two orthogonal choices,
+            how many GPUs each role gets and whether roles share GPUs, and
+            they interact with the vLLM tensor-parallel size and the
+            interconnect. Colocation saves GPUs but serializes phases, since
+            a colocated actor cannot train while its own GPUs are busy
+            generating.
+          </p>
+          <pre class="flow">disaggregated:   every role owns its own GPUs, phases can overlap
+   gpus 0-7  actor+ref (train)      gpus 8-11  critic+reward
+   gpus 12-15 vLLM engines (generate)
+   -&gt; generation of the next batch can overlap training of this one
+      (this is what --train.async_enable turns on)
+
+colocated:       all roles share the same GPUs to save hardware
+   gpus 0-7  actor, critic, ref, reward, AND vLLM engines
+   -&gt; must time-share: vLLM sleeps while DeepSpeed trains and vice versa
+      (needs --ds.enable_sleep and --vllm.enable_sleep to fit in memory)</pre>
+          <p>
+            Neither layout is wrong. Disaggregation buys overlap and costs
+            GPUs, colocation buys GPUs and costs overlap, and the async
+            training mode exists precisely to reclaim the overlap that
+            colocation gives up. The failure mode to avoid is choosing
+            colocation for its GPU savings and then being surprised that
+            step time does not improve when you add hardware, because the
+            phases are still serialized on the shared devices.
+          </p>
+
+          <h2>Part IV: The full life of one PPO iteration</h2>
+          <p>
+            The specimen is one iteration of PPO on an 8B policy, launched
+            with <code>python3 -m openrlhf.cli.train_ppo_ray</code> under a
+            Ray job. Most of the machinery below is identical for GRPO and
+            REINFORCE++. Where the path forks I follow both briefly.
+          </p>
+
+          <h3>Stage 1: train_ppo_ray and Ray placement</h3>
+          <p>
+            The entry point is <code>train(args)</code> in
+            <code>openrlhf/cli/train_ppo_ray.py</code>. It parses the grouped
+            config, then builds Ray <em>placement groups</em>, which are
+            reservations of GPU bundles across the cluster. For each learned
+            role it constructs a <code>RayActorGroup</code>
+            (<code>openrlhf/trainer/ray/launcher.py</code>), a thin manager
+            over a set of Ray actors of one type spread across the requested
+            nodes and GPUs. The roles are the policy
+            (<code>PolicyModelActor</code>), the value model
+            (<code>CriticModelActor</code>), the frozen reference
+            (<code>ReferenceModelActor</code>), and the reward model
+            (<code>RewardModelActor</code>), each a subclass of
+            <code>BaseModelActor</code>. Separately it calls
+            <code>create_vllm_engines</code>
+            (<code>openrlhf/trainer/ray/vllm_engine.py</code>) to stand up
+            the inference engines as <code>RolloutRayActor</code> instances.
+            The colocation flags decide whether these groups get overlapping
+            bundles. With <code>--train.colocate_all</code> every group binds
+            to the same GPUs, and with the default disaggregated layout each
+            group gets its own. The vLLM engine handles are then passed into
+            the policy actor's model init, because the policy is the one role
+            that must talk to the engines to sync weights.
+          </p>
+
+          <h3>Stage 2: model init and the vLLM sync group</h3>
+          <p>
+            Each role's <code>init_model_from_pretrained</code> loads its
+            model under a <code>DeepspeedStrategy</code>. The policy and
+            critic are trainable and wrapped by DeepSpeed ZeRO-3, so their
+            parameters, gradients, and optimizer state are sharded across
+            that role's GPUs. The reference and reward models are inference
+            only. The critic and reward models are not plain language models.
+            They are built by <code>get_llm_for_sequence_regression</code>
+            (<code>openrlhf/models/model.py</code>), which replaces the
+            language-model head with a scalar value head (named
+            <code>score</code> by default) so the network emits a number per
+            position instead of a vocabulary distribution. The most
+            important piece of setup happens in the policy actor. Its trainer
+            <code>ActorPPOTrainer</code>
+            (<code>openrlhf/trainer/ray/ppo_actor.py</code>) calls
+            <code>_init_vllm_sync_group</code>, which creates a torch process
+            group joining DeepSpeed rank 0 with every vLLM engine worker.
+            This dedicated group is the private channel over which trained
+            weights will later flow into the engines.
+          </p>
+
+          <h3>Stage 3: the rollout on vLLM</h3>
+          <p>
+            The iteration begins with generation, and generation does not
+            happen on the training model. <code>SamplesGenerator</code>
+            (<code>openrlhf/trainer/ppo_utils/samples_generator.py</code>)
+            pulls a batch of prompts, expands each into
+            <code>n_samples_per_prompt</code> copies, and dispatches them to
+            the vLLM engines, which decode completions with paged attention
+            and continuous batching across all the in-flight sequences at
+            once. This is the phase that would have dominated a naive trainer
+            and the whole reason vLLM is here. The engines return token
+            sequences and their positions, and for agentic or multi-turn
+            setups a pluggable executor (loaded from
+            <code>--train.agent_func_path</code>) can drive several
+            generate-and-act rounds before the sample is considered
+            complete. What comes back is raw text-as-tokens with no
+            log-probabilities and no rewards yet. Turning it into a training
+            signal is the next stage.
+          </p>
+
+          <h3>Stage 4: making the experience</h3>
+          <p>
+            <code>RemoteExperienceMaker</code>
+            (<code>openrlhf/trainer/ppo_utils/experience_maker.py</code>)
+            takes the generated samples and fills in everything PPO needs.
+            For each sample it requests, in parallel across the Ray actor
+            groups, the actor's log-probabilities of the generated tokens
+            under the current policy, the reference model's log-probabilities
+            for the KL term, the critic's per-token values, and the reward
+            model's score (or the remote reward if
+            <code>--reward.remote_url</code> is set). Because these live on
+            different actors, the maker dispatches the forward passes as
+            remote calls and gathers the futures, so the reference, critic,
+            and reward forwards can proceed concurrently rather than one
+            after another. The results are packed into an
+            <code>Experience</code> dataclass
+            (<code>openrlhf/trainer/ppo_utils/experience.py</code>) whose
+            fields carry a role tag so that sequences, log-probs, values,
+            rewards, and masks stay aligned when batches are split and
+            recombined.
+          </p>
+
+          <h3>Stage 5: KL, rewards, and advantages</h3>
+          <p>
+            With log-probs in hand the maker computes the per-token KL
+            divergence between the current policy and the frozen reference,
+            using one of the estimators selected by
+            <code>--algo.kl.estimator</code> (the k1, k2, and k3 forms, where
+            k3 is the low-variance unbiased estimator). The KL is folded into
+            the reward, so the effective per-token reward is the task reward
+            minus <code>init_coef</code> times the KL, which is what keeps
+            the policy from drifting arbitrarily far from the reference to
+            chase reward. Then <code>compute_advantages_and_returns</code>
+            turns rewards and values into advantages and returns, and this is
+            the single place the algorithm choice bites. For PPO it runs
+            generalized advantage estimation over the critic's values. For
+            GRPO (<code>group_norm</code>) it ignores the critic entirely and
+            normalizes each sample's reward against the mean and standard
+            deviation of its group of <code>n_samples_per_prompt</code>
+            siblings. For REINFORCE++ (<code>reinforce</code>) it normalizes
+            returns across the whole batch. The completed experiences go into
+            a replay buffer
+            (<code>openrlhf/trainer/ppo_utils/replay_buffer.py</code>).
+          </p>
+
+          <h3>Stage 6: ppo_train, the losses, and the optimizer</h3>
+          <p>
+            Now the learning system takes over.
+            <code>ActorPPOTrainer.ppo_train</code> iterates over the buffer
+            for <code>--train.max_epochs</code> passes, and each
+            <code>training_step</code> computes the clipped policy objective
+            with <code>PolicyLoss</code>
+            (<code>openrlhf/models/loss.py</code>), the ratio of new to old
+            log-probs clipped against the advantage, optionally with an
+            explicit KL loss term when <code>--algo.kl.use_loss</code> is set
+            and an entropy bonus. In parallel the critic actor runs its own
+            <code>CriticPPOTrainer</code>
+            (<code>openrlhf/trainer/ray/ppo_critic.py</code>) with
+            <code>ValueLoss</code>, the clipped regression of predicted
+            values toward the returns. Both updates are ordinary DeepSpeed
+            backward-and-step calls, so ZeRO-3 all-gathers each shard's
+            parameters for the backward, reduce-scatters the gradients, and
+            the optimizer touches only its slice of the state. For GRPO and
+            REINFORCE++ the critic branch is simply absent, which is much of
+            why those methods are cheaper. They trade a learned baseline for
+            a statistical one and delete an entire trainable model.
+          </p>
+
+          <h3>Stage 7: broadcasting the new weights into vLLM</h3>
+          <p>
+            The iteration is not finished when the optimizer steps, because
+            the vLLM engines still hold the previous policy. The last act is
+            <code>broadcast_to_vllm</code>. It walks the policy's named
+            parameters and, for each one, publishes it to the engines over
+            the sync group created in Stage 2. Under ZeRO-3 the parameter is
+            sharded across the actor GPUs, so the code first gathers the full
+            tensor to rank 0 with
+            <code>deepspeed.zero.GatheredParameters</code>, then broadcasts
+            it, while each vLLM worker's <code>WorkerWrap.update_weight</code>
+            (<code>openrlhf/trainer/ray/vllm_worker_wrap.py</code>) receives
+            the tensor by name, dtype, and shape and loads it into the
+            running engine in place. When training and vLLM are colocated on
+            the same physical GPUs, a faster CUDA-IPC path shares the tensors
+            through device memory handles instead of a network broadcast.
+            <mark>This sync is the seam of the whole design. It is the one
+            moment the two systems touch, and it is what keeps the fast
+            generation engine faithful to the slowly learned policy.</mark>
+            Once it returns, the engines are current and the next iteration's
+            rollout is on-policy again. That closes the loop of one step,
+            prompts in, gradients across the actors, weights back out to the
+            engines.
+          </p>
+
+          <h2>Part V: Internals deep dives</h2>
+
+          <h3>Deep dive: Ray placement and the actor groups</h3>
+          <p>
+            Ray is doing two jobs here, and it helps to keep them separate.
+            The first is scheduling. A placement group reserves bundles of
+            GPUs, and each <code>RayActorGroup</code> launches one Ray actor
+            per GPU it was given, so a role with
+            <code>--actor.num_nodes 2 --actor.num_gpus_per_node 8</code>
+            becomes sixteen <code>PolicyModelActor</code> processes that
+            together form one DeepSpeed world. The second job is remote
+            invocation. The group exposes helpers like
+            <code>async_run_method</code> that call a method on every actor
+            and return futures, which is how the driver kicks off training or
+            how the experience maker fans forward passes out to the reference
+            and reward groups at once. The colocation flags reduce to a
+            placement decision. Colocated roles are assigned overlapping
+            bundles so their actors land on the same GPUs, and disaggregated
+            roles get disjoint bundles. Nothing about the model code changes
+            between the two, which is exactly the property that makes
+            placement a configuration axis rather than a rewrite. If you have
+            met device meshes in <a href="/oss/torchtitan">torchtitan</a>,
+            this is the looser, coarser cousin. There the unit of placement
+            is a tensor's shard, here it is a whole model replica, and the
+            <a href="/classes/parallel-computing">parallel computing</a>
+            intuition about matching communication frequency to interconnect
+            carries straight over.
+          </p>
+
+          <h3>Deep dive: why decoupling generation is the whole game</h3>
+          <p>
+            It is worth being precise about why vLLM matters so much, because
+            it is the claim the framework is built on. Consider where the
+            time goes in one PPO step. Generation produces, say, a thousand
+            tokens per sample autoregressively, one forward per token, with a
+            key-value cache that grows every step. Training does a fixed
+            handful of forward-and-backward passes over the already-generated
+            sequence. The generation cost scales with sequence length and
+            sample count and has terrible arithmetic intensity, since each
+            decode step is a tall-skinny matmul that barely uses the GPU.
+            This is exactly the regime vLLM was built for.
+            <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noreferrer">Paged attention</a>
+            stores the cache in non-contiguous blocks so many sequences of
+            different lengths share memory efficiently, and continuous
+            batching keeps the GPU full by admitting and retiring sequences
+            mid-flight instead of waiting for a whole batch to finish. The
+            same reasoning drives the sister project
+            <a href="/oss/sglang">SGLang</a>, and the memory story behind
+            the attention kernels is the tiling argument in the
+            <a href="/oss/flash-attention">FlashAttention</a> chapter.
+          </p>
+          <p>
+            The cost of decoupling is the weight sync, and it is a real cost
+            worth respecting. Every step you must move a full copy of the
+            policy's parameters from the training actors into the inference
+            engines. For an 8B model in bfloat16 that is roughly sixteen
+            gigabytes crossing the sync group each iteration.
+            <mark>The design bet is that this one bulk transfer per step is
+            far cheaper than the throughput you lose by generating on a
+            training-shaped runtime, and for long completions that bet wins
+            decisively.</mark> The ZeRO-3 wrinkle is that no single actor
+            holds a whole parameter, so the gather-then-broadcast in
+            <code>broadcast_to_vllm</code> is not incidental, it is the price
+            of sharding the trainer. The colocated CUDA-IPC path exists to
+            shrink that price to near zero when the engines sit on the same
+            silicon as the trainer, since then the weights never leave the
+            GPU, only handles to them do.
+          </p>
+
+          <h3>Deep dive: the algorithms and the advantage estimator</h3>
+          <p>
+            OpenRLHF keeps one training loop and swaps algorithms almost
+            entirely through how advantages are computed. The policy loss is
+            shared. What differs is the baseline that turns a reward into an
+            advantage, and whether a critic exists at all.
+          </p>
+          <table>
+            <tr><th>Algorithm</th><th>estimator flag</th><th>Critic</th><th>Baseline / normalization</th></tr>
+            <tr><td>PPO</td><td>gae (default)</td><td>yes</td><td>learned value function, GAE over token values</td></tr>
+            <tr><td>GRPO</td><td>group_norm</td><td>no</td><td>subtract group mean, divide by group std over the samples of a prompt</td></tr>
+            <tr><td>Dr. GRPO</td><td>dr_grpo</td><td>no</td><td>subtract group mean, no std normalization</td></tr>
+            <tr><td>REINFORCE++</td><td>reinforce</td><td>no</td><td>global batch normalization of returns, token-level KL</td></tr>
+            <tr><td>REINFORCE++-baseline</td><td>reinforce_baseline</td><td>no</td><td>group-mean baseline, then global normalization</td></tr>
+            <tr><td>RLOO</td><td>rloo</td><td>no</td><td>leave-one-out mean of the other samples in the group</td></tr>
+          </table>
+          <p>
+            PPO is the classic actor-critic method described in the
+            <a href="/rl/ppo">PPO chapter</a>. It pays for a second trainable
+            model, the critic, and in exchange gets a per-token learned
+            baseline that reduces variance. GRPO, covered on the
+            <a href="/rl/grpo">GRPO page</a>, is the reasoning-era favorite.
+            It deletes the critic and replaces the learned baseline with the
+            mean reward of a group of completions to the same prompt, so the
+            advantage of a sample is just how much better than its siblings
+            it did, normalized by the group spread. That is dramatically
+            cheaper and works beautifully when you can afford several samples
+            per prompt and have a clean reward, which is the verifiable-math
+            and code setting. Dr. GRPO removes the standard-deviation
+            normalization to avoid a length and difficulty bias that the
+            division can introduce.
+            <a href="https://arxiv.org/abs/2501.03262" target="_blank" rel="noreferrer">REINFORCE++</a>
+            is the OpenRLHF authors' own
+            variant, a plain policy gradient hardened with PPO's engineering
+            tricks and a global reward normalization for stability, and its
+            baseline form borrows the group mean from GRPO for reasoning
+            tasks. The lesson underneath the table is the one from
+            <a href="/rl/policy-gradients">policy gradients</a>. All of these
+            are the same gradient with different baselines, and the baseline
+            only reduces variance without changing the expected update, which
+            is why swapping estimators is a one-flag change rather than a new
+            trainer. OpenRLHF also carries an importance-sampling correction
+            (<code>--algo.advantage.is_correction_enable</code>) for the
+            gap between the vLLM policy that generated a sample and the
+            actor policy that trains on it, which matters most under async
+            or partial rollouts where that gap can widen.
+          </p>
+
+          <h3>Deep dive: reward models, remote rewards, and the KL leash</h3>
+          <p>
+            The reward is the most swappable part of the system, and the
+            three ways to supply it map onto three research styles. A trained
+            reward model (<code>--reward.model_name_or_path</code>) is
+            classic RLHF, a network with a scalar head fit on human
+            preference pairs by <code>train_rm</code>, and it runs as its own
+            <code>RewardModelActor</code>. A remote reward
+            (<code>--reward.remote_url</code> pointing at an HTTP endpoint)
+            lets the reward live in a separate service, which you launch with
+            <code>openrlhf.cli.serve_rm</code>. That decoupling is useful when
+            the reward model is large or shared across jobs, since the
+            training run holds no reward GPUs at all and simply posts queries
+            to the server. A programmatic reward
+            (<code>--reward.remote_url</code> pointing at a Python file) is
+            the verifiable-reward path from Part II, an ordinary
+            <code>reward_func(queries, prompts, labels)</code> that returns a
+            tensor, which is how a math grader or a code sandbox becomes the
+            reward without training anything. All three feed the same
+            experience maker, so the rest of the pipeline cannot tell them
+            apart.
+          </p>
+          <p>
+            The reference model and the KL term deserve a note because
+            beginners often misread them. The reference is a frozen snapshot
+            of the starting policy, and the KL divergence between the live
+            policy and that snapshot is a leash. Without it the policy would
+            happily collapse onto whatever degenerate text maximizes the
+            reward model, a phenomenon called reward hacking, so the
+            effective reward subtracts <code>init_coef</code> times the KL to
+            penalize drift. You can apply that penalty two ways in OpenRLHF,
+            baked into the reward before advantage estimation, or added as an
+            explicit loss term with <code>--algo.kl.use_loss</code>, and the
+            controller can hold the coefficient fixed or adapt it toward a
+            target KL. <mark>The reference model is not there to be accurate,
+            it is there to be a fixed point the policy is not allowed to run
+            too far from, which is why it never trains and never syncs.</mark>
+            The relationship to the offline alternative is worth keeping in
+            view. <a href="/rl/dpo">DPO</a> folds this same reference-anchored
+            objective into a single supervised loss with no rollouts at all,
+            and OpenRLHF ships a DPO trainer for exactly the jobs that do not
+            need online generation.
+          </p>
+
+          <h3>Deep dive: DeepSpeed ZeRO-3, colocation, and sleep</h3>
+          <p>
+            The training side is DeepSpeed, and ZeRO-3 is the setting that
+            makes large policies fit. It shards parameters, gradients, and
+            optimizer state across the actors of a role, gathering each
+            layer's parameters just in time for its forward and backward and
+            releasing them after, so no actor ever holds the whole model.
+            This is the same family of idea as FSDP in
+            <a href="/oss/torchtitan">torchtitan</a>, applied here to the
+            actor and critic. On top of it OpenRLHF adds the memory tricks
+            that make colocation viable. <code>--ds.adam_offload</code> pushes
+            optimizer state to CPU, <code>--ds.packing_samples</code> packs
+            variable-length sequences to avoid padding waste, and
+            gradient checkpointing trades compute for activation memory. The
+            piece that makes all-on-one-node colocation actually fit is
+            sleep. With <code>--ds.enable_sleep</code> and
+            <code>--vllm.enable_sleep</code> the trainer offloads its states
+            while vLLM generates, then vLLM releases its KV cache while the
+            trainer runs, so the two systems take turns owning the GPU memory
+            rather than fighting over it. Under the hood this is the same
+            time-sharing that DeepSpeed-Chat's hybrid engine did, rebuilt on
+            top of vLLM's sleep support, and it is why the single-node
+            colocated recipe in Part II can put four models and several
+            inference engines on eight GPUs without an out-of-memory crash.
+          </p>
+
+          <h3>Deep dive: async and partial rollouts</h3>
+          <p>
+            The default loop is synchronous, so in a disaggregated layout the
+            training GPUs sit idle while generation runs.
+            <code>--train.async_enable</code> breaks that lockstep and lets
+            the vLLM engines run the next batch's rollout while the trainer
+            still learns from the current one, with
+            <code>--train.async_queue_size</code> bounding the staleness you
+            tolerate, and partial rollout pauses and resumes long generations
+            so one very long sample does not stall a whole batch.
+            <mark>Async training is the framework admitting that on-policy
+            purity is a spectrum, not a binary, and that a little staleness
+            bought back as throughput is usually a good trade.</mark> The cost
+            is a wider gap between the sampling and training policies, which is
+            what the importance-sampling correction absorbs, so these knobs
+            belong with REINFORCE++ or GRPO rather than a strict textbook PPO.
+          </p>
+
+          <h2>Part VI: Reading the repository</h2>
+          <p>
+            The tree is small enough to read in an afternoon, which is much
+            of its value. All paths are as of <code>main</code> in July 2026,
+            and the recent flag rename means some module internals may still
+            be settling.
+          </p>
+          <p>
+            <strong>Stage 0, orientation.</strong> Read the
+            <code>README.md</code>, then an example script such as
+            <code>examples/scripts/train_ppo_ray_hybrid_engine.sh</code> and
+            <code>train_reinforce_baseline_hybrid_engine.sh</code>. Questions.
+            Which flags choose placement versus algorithm versus data, what
+            does <code>ray job submit</code> add over a bare
+            <code>python -m</code>, and which roles appear in a GRPO command
+            that are absent versus a PPO command?
+          </p>
+          <p>
+            <strong>Stage 1, the driver.</strong> Read
+            <code>openrlhf/cli/train_ppo_ray.py</code> and its
+            <code>train(args)</code> function, then
+            <code>openrlhf/trainer/ray/launcher.py</code> for
+            <code>RayActorGroup</code> and the <code>BaseModelActor</code>
+            hierarchy. Questions. How does a placement group become GPU
+            bundles, how does a role become one Ray actor per GPU, and where
+            do the vLLM engine handles get handed to the policy actor?
+          </p>
+          <p>
+            <strong>Stage 2, the policy actor and the sync.</strong>
+            <code>openrlhf/trainer/ray/ppo_actor.py</code> is the heart of
+            the RL path. Read <code>_init_vllm_sync_group</code>,
+            <code>ppo_train</code>, <code>training_step</code>, and
+            <code>broadcast_to_vllm</code> together, then the vLLM side in
+            <code>vllm_engine.py</code> and <code>vllm_worker_wrap.py</code>.
+            Questions. What exactly is in the sync process group, why does
+            ZeRO-3 force a gather before the broadcast, and when does the
+            CUDA-IPC path replace the network broadcast?
+          </p>
+          <p>
+            <strong>Stage 3, experience and advantages.</strong>
+            <code>openrlhf/trainer/ppo_utils/samples_generator.py</code>,
+            then <code>experience_maker.py</code> with
+            <code>make_experience</code> and
+            <code>compute_advantages_and_returns</code> as the destination,
+            then <code>experience.py</code>, <code>replay_buffer.py</code>,
+            and <code>kl_controller.py</code>. Questions. Which forward passes
+            run on which actors, how is the KL folded into the reward, and
+            which lines change between <code>gae</code>,
+            <code>group_norm</code>, and <code>reinforce</code>?
+          </p>
+          <p>
+            <strong>Stage 4, models and losses.</strong>
+            <code>openrlhf/models/actor.py</code> for the <code>Actor</code>
+            wrapper, <code>model.py</code> for
+            <code>get_llm_for_sequence_regression</code> and the value head,
+            and <code>loss.py</code> for <code>PolicyLoss</code>,
+            <code>ValueLoss</code>, and the DPO and reward-model losses.
+            Questions. What makes the critic and reward models different from
+            the policy, and how does <code>PolicyLoss</code> implement the
+            clipped objective?
+          </p>
+          <p>
+            <strong>Stage 5, the non-RL trainers and the frontier.</strong>
+            The <code>train_sft</code>, <code>train_rm</code>, and
+            <code>train_dpo</code> CLIs and their trainers under
+            <code>openrlhf/trainer/</code>, then the async path in
+            <code>ppo_trainer_async.py</code> and the agent hooks in
+            <code>openrlhf/utils/agent.py</code>. This is where multi-turn and
+            environment-driven rewards live.
+          </p>
+          <p>
+            Where not to start. The ring-attention and sequence-balancing
+            utilities (<code>openrlhf/models/ring_attn_utils.py</code>,
+            <code>openrlhf/utils/seqlen_balancing.py</code>) are a
+            performance layer that matters only for very long contexts, and
+            the vision-language and agent executors add moving parts you
+            should meet after the dense text PPO path is solid.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            Labs 1 and 2 need no GPU and build intuition. Labs 3 through 6
+            want a single multi-GPU node. Log formats vary with the fast pace
+            of <code>main</code>.
+          </p>
+          <p><strong>Lab 1: write a reward function and predict the shape.</strong> Concept: the programmatic reward contract of Part V.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="c"># quiz yourself before running anything</span>
+<span class="k">import</span> <span class="m1">torch</span>
+<span class="k">def</span> <span class="m1">reward_func</span><span class="b0">(</span><span class="v2">queries</span>, <span class="v3">prompts</span>, <span class="v3">labels</span><span class="b0">)</span>:
+    <span class="c"># queries: list of decoded prompt+response strings</span>
+    <span class="c"># prompts: list of the original prompts</span>
+    <span class="c"># labels:  list of gold answers</span>
+    <span class="k">return</span> <span class="m1">torch</span>.<span class="m2">tensor</span><span class="b0">(</span><span class="b1">[</span><span class="m1">float</span><span class="b2">(</span><span class="m1">str</span><span class="b0">(</span><span class="v2">g</span><span class="b0">)</span> <span class="k">in</span> <span class="v1">q</span><span class="b2">)</span> <span class="k">for</span> <span class="v1">q</span>, <span class="v2">g</span> <span class="k">in</span> <span class="m1">zip</span><span class="b2">(</span><span class="v2">queries</span>, <span class="v3">labels</span><span class="b2">)</span><span class="b1">]</span><span class="b0">)</span>
+<span class="c"># Q: if the rollout batch is 128 prompts and n_samples_per_prompt is 8,</span>
+<span class="c">#    what is len(queries) on one call? (answer: it depends on batching,</span>
+<span class="c">#    but the tensor length must equal len(queries) every time)</span></code></pre></div>
+          <p>
+            The exercise is to internalize that the reward is per-query and
+            returns exactly one scalar per query as a tensor. Get that
+            contract wrong and the experience maker cannot align rewards to
+            samples.
+          </p>
+          <p><strong>Lab 2: draw the placement for a command.</strong> Concept: roles, GPUs, and colocation from Part IV.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="c"># given only this fragment, sketch which GPUs run what</span>
+<span class="m1">--actor.num_gpus_per_node</span> <span class="s">8</span> <span class="s">--critic.num_gpus_per_node</span> <span class="s">8</span> <span class="s">\</span>
+--<span class="v6">ref</span>.<span class="m2">num_gpus_per_node</span> <span class="s">8</span> <span class="s">--reward.num_gpus_per_node</span> <span class="s">8</span> <span class="s">\</span>
+--<span class="v3">vllm</span>.<span class="m2">num_engines</span> <span class="s">4</span> <span class="s">--vllm.tensor_parallel_size</span> <span class="s">2</span> <span class="s">\</span>
+--<span class="v1">train</span>.<span class="m2">colocate_all</span>
+<span class="c"># then remove --train.colocate_all and redraw. how many GPUs</span>
+<span class="c"># does each layout need at minimum?</span></code></pre></div>
+          <p>
+            Colocated, all five things time-share one set of eight GPUs.
+            Disaggregated, each role wants its own, and four vLLM engines at
+            tensor-parallel two want eight more. The point is to feel how
+            colocation trades GPUs for serialized phases.
+          </p>
+          <p><strong>Lab 3: a real GRPO run on a small model.</strong> Concept: the critic-free path.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">ray</span> <span class="s">start</span> <span class="s">--head</span>
+<span class="m1">ray</span> <span class="s">job</span> <span class="s">submit</span> <span class="s">--address="http://127.0.0.1:8265"</span> <span class="s">\</span>
+  <span class="s">--</span> <span class="s">python3</span> <span class="s">-m</span> <span class="s">openrlhf.cli.train_ppo_ray</span> <span class="s">\</span>
+  <span class="s">--actor.num_nodes</span> <span class="s">1</span> <span class="s">--actor.num_gpus_per_node</span> <span class="s">4</span> <span class="s">\</span>
+  <span class="s">--ref.num_nodes</span> <span class="s">1</span> <span class="s">--ref.num_gpus_per_node</span> <span class="s">4</span> <span class="s">\</span>
+  <span class="s">--vllm.num_engines</span> <span class="s">2</span> <span class="s">--vllm.tensor_parallel_size</span> <span class="s">2</span> <span class="s">\</span>
+  <span class="s">--train.colocate_all</span> <span class="s">--ds.enable_sleep</span> <span class="s">--vllm.enable_sleep</span> <span class="s">\</span>
+  <span class="s">--actor.model_name_or_path</span> <span class="s">Qwen/Qwen2.5-1.5B-Instruct</span> <span class="s">\</span>
+  <span class="s">--reward.remote_url</span> <span class="s">/path/to/reward_func.py</span> <span class="s">\</span>
+  <span class="s">--algo.advantage.estimator</span> <span class="s">group_norm</span> <span class="s">\</span>
+  <span class="s">--rollout.n_samples_per_prompt</span> <span class="s">8</span> <span class="s">--algo.kl.init_coef</span> <span class="s">1e-3</span> <span class="s">\</span>
+  <span class="s">--data.prompt_dataset</span> <span class="s">zhuzilin/dapo-math-17k</span> <span class="s">\</span>
+  <span class="s">--data.input_key</span> <span class="s">prompt</span> <span class="s">--data.label_key</span> <span class="s">label</span> <span class="s">\</span>
+  <span class="s">--ds.zero_stage</span> <span class="s">3</span> <span class="s">--ds.param_dtype</span> <span class="s">bf16</span></code></pre></div>
+          <p>
+            Watch the logs for the absence of any critic actor, the group
+            reward statistics, and the reward climbing as the policy learns
+            to satisfy your <code>reward_func</code>. Then flip
+            <code>--algo.advantage.estimator</code> to
+            <code>reinforce_baseline</code> and compare stability.
+          </p>
+          <p><strong>Lab 4: prove the weight sync is happening.</strong> Concept: the seam of Part IV, Stage 7.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="c"># run any ppo command with a tiny model, then reason about the logs:</span>
+<span class="c">#  - the vLLM engines are created once at startup</span>
+<span class="c">#  - every iteration ends with a weight broadcast into them</span>
+<span class="c"># disable or slow the sync in your head: what would the reward curve do</span>
+<span class="c"># if the engines kept generating from the initial weights forever?</span></code></pre></div>
+          <p>
+            The intended realization is that without the sync the rollouts
+            stay on the initial policy while the training model moves away, so
+            the ratio in <code>PolicyLoss</code> grows without bound and the
+            run destabilizes. The sync is not an optimization, it is
+            correctness.
+          </p>
+          <p><strong>Lab 5: PPO versus GRPO cost.</strong> Concept: the price of the critic.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="c"># PPO: keep the critic</span>
+<span class="m1">--critic.num_gpus_per_node</span> <span class="s">4</span> <span class="s">--algo.advantage.estimator</span> <span class="s">gae</span>
+<span class="c"># GRPO: delete the critic, add samples</span>
+<span class="c"># (drop the --critic.* group) --algo.advantage.estimator group_norm \</span>
+<span class="m1">--rollout.n_samples_per_prompt</span> <span class="s">8</span></code></pre></div>
+          <p>
+            Compare peak memory and step time. PPO carries a second
+            trainable model and its optimizer state. GRPO carries none of
+            that but generates several samples per prompt, so it moves the
+            cost from training memory into generation throughput, which is
+            precisely the resource vLLM is cheapest at.
+          </p>
+          <p><strong>Lab 6: colocation with and without sleep.</strong> Concept: the memory time-share of Part V.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="c"># first without sleep, on a node that is tight on memory:</span>
+<span class="m1">--train.colocate_all</span>
+<span class="c"># then add sleep and rerun:</span>
+<span class="m1">--train.colocate_all</span> <span class="s">--ds.enable_sleep</span> <span class="s">--vllm.enable_sleep</span></code></pre></div>
+          <p>
+            Without sleep, DeepSpeed and vLLM both try to hold their memory at
+            once and the run is likely to hit an out-of-memory error on a
+            tight node. With sleep they take turns and it fits. This is the
+            single most common colocation gotcha made visible.
+          </p>
+
+          <h2>Part VIII: Questions and model answers</h2>
+          <p>Understanding checks. Answer aloud before reading.</p>
+          <p><strong>1. What is OpenRLHF, in one sentence?</strong></p>
+          <p>
+            A Ray-orchestrated RLHF framework that runs generation on
+            dedicated vLLM engines and training on DeepSpeed ZeRO-3 actors,
+            placing the policy, critic, reference, and reward models across a
+            cluster and syncing fresh policy weights into the engines after
+            every step.
+          </p>
+          <p><strong>2. Why decouple generation from training at all?</strong></p>
+          <p>
+            Because rollouts dominate the wall-clock time of an RLHF step and
+            autoregressive decoding is an inference workload, not a training
+            one. vLLM gives paged attention and continuous batching that a
+            training runtime lacks, so running rollouts there and only paying
+            a weight sync per step is far faster than generating on the
+            training model.
+          </p>
+          <p><strong>3. What crosses the boundary between the two systems, and how?</strong></p>
+          <p>
+            The policy weights. After each update <code>broadcast_to_vllm</code>
+            gathers each ZeRO-3-sharded parameter to rank 0 and broadcasts it
+            over a dedicated process group to the vLLM workers, which load it
+            in place with <code>update_weight</code>. Colocated engines can use
+            a CUDA-IPC path instead of a network broadcast.
+          </p>
+          <p><strong>4. How does GRPO differ from PPO in this codebase?</strong></p>
+          <p>
+            GRPO sets <code>--algo.advantage.estimator group_norm</code>,
+            deletes the critic, and samples several completions per prompt.
+            The advantage of a sample is its reward normalized against the
+            mean and standard deviation of its group, so a statistical
+            baseline replaces the learned value function and an entire
+            trainable model disappears.
+          </p>
+          <p><strong>5. What is REINFORCE++ and when would you use it?</strong></p>
+          <p>
+            The OpenRLHF authors' policy-gradient variant, a critic-free
+            method with global reward normalization and PPO-style engineering
+            tricks. Its baseline form borrows the group mean from GRPO. It is
+            a good default for reasoning tasks with verifiable rewards where
+            you want GRPO's cheapness without committing to its exact
+            normalization.
+          </p>
+          <p><strong>6. What are the three ways to supply a reward?</strong></p>
+          <p>
+            A trained reward model through
+            <code>--reward.model_name_or_path</code>, an HTTP service through
+            <code>--reward.remote_url</code> pointing at a URL served by
+            <code>openrlhf.cli.serve_rm</code>, or a Python
+            <code>reward_func(queries, prompts, labels)</code> through
+            <code>--reward.remote_url</code> pointing at a file. All three
+            feed the same experience maker.
+          </p>
+          <p><strong>7. What is the reference model for, and why does it never sync?</strong></p>
+          <p>
+            It is a frozen snapshot of the starting policy, used to compute
+            the KL divergence that leashes the live policy so it cannot drift
+            off to hack the reward. It never trains and never receives synced
+            weights precisely because its value is being a fixed anchor, not
+            being current.
+          </p>
+          <p><strong>8. Why does colocation usually need sleep mode?</strong></p>
+          <p>
+            Colocated training and generation share the same GPU memory, and
+            DeepSpeed's states plus vLLM's KV cache do not both fit at full
+            size. Sleep lets each release its memory while the other runs, so
+            <code>--ds.enable_sleep</code> and <code>--vllm.enable_sleep</code>
+            make the time-share fit instead of hitting out-of-memory.
+          </p>
+          <p><strong>9. What does async training buy and cost?</strong></p>
+          <p>
+            It overlaps the next rollout with the current update so
+            disaggregated GPUs stop idling, bounded by
+            <code>--train.async_queue_size</code>. The cost is off-policy
+            staleness between the sampling and training policies, which is why
+            it pairs with an importance-sampling correction and with methods
+            that tolerate a little staleness.
+          </p>
+          <p><strong>10. Where does the algorithm choice actually take effect in the code?</strong></p>
+          <p>
+            Almost entirely in
+            <code>compute_advantages_and_returns</code> in the experience
+            maker. The rollout, the forward passes, and the clipped policy
+            loss are shared. Only the baseline that converts rewards and
+            values into advantages, and whether a critic exists, change with
+            the estimator flag.
+          </p>
+          <p><strong>11. When would you pick TRL or verl over OpenRLHF?</strong></p>
+          <p>
+            TRL for small or single-node jobs and for offline methods like
+            DPO, where its tight Transformers and PEFT integration is the
+            fastest path. verl when you are pushing peak throughput on very
+            large clusters and can absorb its heavier controller-worker
+            model. OpenRLHF sits between them, scalable and fast but still
+            legible.
+          </p>
+          <p><strong>12. A colocated run does not get faster when you add GPUs. Why might that be?</strong></p>
+          <p>
+            Because colocation serializes generation and training on the
+            shared devices, so adding GPUs to a colocated layout can widen
+            each phase without letting the phases overlap. The fix is either a
+            disaggregated layout so the phases run on different GPUs, or async
+            training so the next rollout overlaps the current update.
+          </p>
+          <p><strong>13. Why must the critic and reward models be built differently from the policy?</strong></p>
+          <p>
+            They emit a scalar per position, not a distribution over the
+            vocabulary, so <code>get_llm_for_sequence_regression</code>
+            replaces the language-model head with a value head. The policy
+            keeps its full vocabulary head because it must produce
+            token log-probabilities for the loss and for generation.
+          </p>
+          <p><strong>14. Why can OpenRLHF put a verifiable-reward reasoning run and a classic preference-RLHF run in the same harness?</strong></p>
+          <p>
+            Because the reward is abstracted behind a single interface that
+            returns a scalar per query. A reward model, an HTTP service, and a
+            Python grader are interchangeable behind it, so the only thing
+            that changes between the two styles is what supplies the number,
+            not the training loop that consumes it.
+          </p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Split a workload along its performance seams.</strong>
+            RLHF has a generation half that wants an inference engine and a
+            training half that wants a sharding engine, and OpenRLHF runs each
+            on the system built for it rather than compromising with one
+            runtime for both. The same instinct separates read replicas from
+            write primaries, or an OLAP store from an OLTP one. When two
+            phases have opposite resource profiles, give them different
+            engines and pay only for the seam between them.
+          </p>
+          <p>
+            <strong>Make the seam explicit and cheap.</strong> The one place
+            the two systems touch is a per-step weight broadcast, and the
+            framework invests in making it fast, with a dedicated process
+            group, a ZeRO-aware gather, and a CUDA-IPC shortcut for colocated
+            engines. Wherever a design decouples components, the interface
+            between them becomes the thing to engineer, not an afterthought.
+          </p>
+          <p>
+            <strong>Make placement a configuration, not a rewrite.</strong>
+            Because each role is a group of Ray actors, colocated or
+            disaggregated is a flag, and the same code runs on one node or on
+            a hundred. Representing deployment topology as data rather than as
+            branching code is what lets one framework serve a laptop-scale
+            experiment and a cluster-scale run without forking.
+          </p>
+          <p>
+            <strong>Keep one loop, vary the baseline.</strong> PPO, GRPO,
+            REINFORCE++, and RLOO share almost all their code and differ
+            mainly in how advantages are computed. Recognizing that these are
+            one algorithm with different variance-reduction baselines keeps
+            the trainer small and makes a new method a small, testable change
+            rather than a new system.
+          </p>
+          <p>
+            <strong>Abstract the reward behind one interface.</strong> A
+            trained model, a web service, and a Python function are
+            interchangeable reward sources because they all return a scalar
+            per query. Putting the pluggable, research-specific part behind a
+            narrow contract is what lets the stable core stay stable while the
+            reward, which is where the science is, changes freely.
+          </p>
+          <p>
+            <strong>Admit that on-policy is a spectrum.</strong> Async and
+            partial rollouts trade a bounded amount of staleness for
+            throughput, and a correction term pays for the gap. Systems that
+            let you dial a strict invariant down to a tunable one, with a
+            knob and a compensating mechanism, tend to beat systems that treat
+            the invariant as sacred and leave the throughput on the table.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            The one-sentence summary. <mark>OpenRLHF places the policy,
+            critic, reference, and reward models as Ray actor groups, runs the
+            rollout on separate vLLM engines, builds experiences with
+            per-token KL and an advantage estimator that selects the
+            algorithm, updates the actor and critic under DeepSpeed ZeRO-3,
+            and broadcasts the new policy weights back into the engines every
+            step.</mark>
+          </p>
+          <pre class="flow">train_ppo_ray.train(args) -&gt; Ray placement groups -&gt; RayActorGroup per role
+  -&gt; PolicyModelActor + CriticModelActor + ReferenceModelActor + RewardModelActor
+  -&gt; create_vllm_engines (RolloutRayActor) + _init_vllm_sync_group
+  -&gt; loop:
+       SamplesGenerator (vLLM rollout)
+       RemoteExperienceMaker (ref/actor logprobs, critic values, reward)
+       KL + reward - kl*KL + compute_advantages_and_returns
+       ppo_train: PolicyLoss (actor) + ValueLoss (critic)
+       broadcast_to_vllm (gather under ZeRO-3, then push to engines)</pre>
+          <p>The chain mapped to source:</p>
+          <pre class="flow">launch        openrlhf/cli/train_ppo_ray.py (train)
+placement     openrlhf/trainer/ray/launcher.py (RayActorGroup, BaseModelActor)
+policy actor  openrlhf/trainer/ray/ppo_actor.py (ActorPPOTrainer, broadcast_to_vllm)
+vllm side     openrlhf/trainer/ray/vllm_engine.py, vllm_worker_wrap.py (WorkerWrap)
+rollout       openrlhf/trainer/ppo_utils/samples_generator.py
+experience    openrlhf/trainer/ppo_utils/experience_maker.py, experience.py
+models        openrlhf/models/actor.py, model.py (get_llm_for_sequence_regression)
+losses        openrlhf/models/loss.py (PolicyLoss, ValueLoss)</pre>
+          <p>Memorize these blocks:</p>
+          <ul>
+            <li><strong>The five roles:</strong> policy (trains), critic (trains, PPO only), reference (frozen, KL anchor), reward (score or remote), vLLM engines (generate).</li>
+            <li><strong>The seam:</strong> every step ends with a weight broadcast into the engines, ZeRO-3 gathers each param first, colocation can use CUDA IPC.</li>
+            <li><strong>The estimators:</strong> gae (PPO, has critic), group_norm (GRPO), dr_grpo, reinforce and reinforce_baseline (REINFORCE++), rloo, all critic-free except gae.</li>
+            <li><strong>Placement:</strong> per-role num_nodes and num_gpus_per_node, colocate_all or colocate_actor_ref or colocate_critic_reward, colocation needs ds and vllm sleep to fit.</li>
+            <li><strong>Reward paths:</strong> reward.model_name_or_path, or reward.remote_url as an HTTP endpoint, or reward.remote_url as a Python reward_func(queries, prompts, labels).</li>
+          </ul>
+
+          <h2>Part XI: Papers and further reading</h2>
+          <p>
+            The ideas in this walkthrough come from a small set of papers, and
+            each one rewards a direct read. Where this site derives the same
+            idea in depth, the companion link points there.
+          </p>
+          <ol class="refs">
+            <li>Hu et al., <a href="https://arxiv.org/abs/2405.11143" target="_blank" rel="noreferrer">OpenRLHF, An Easy-to-use, Scalable and High-performance RLHF Framework</a>, 2024. The paper behind this repository, the Ray plus vLLM plus DeepSpeed design and its scheduling argument against squeezing all four models into one runtime.</li>
+            <li>Schulman et al., <a href="https://arxiv.org/abs/1707.06347" target="_blank" rel="noreferrer">Proximal Policy Optimization Algorithms</a>, 2017. The clipped objective that <code>PolicyLoss</code> implements. Derived step by step in the <a href="/rl/ppo">PPO note</a> and the <a href="/classes/deep-reinforcement-learning">deep reinforcement learning class</a> on this site.</li>
+            <li>Shao et al., <a href="https://arxiv.org/abs/2402.03300" target="_blank" rel="noreferrer">DeepSeekMath, Pushing the Limits of Mathematical Reasoning in Open Language Models</a>, 2024. Introduces GRPO, the <code>group_norm</code> estimator here. The <a href="/rl/grpo">GRPO note</a> on this site works the math.</li>
+            <li>Hu, <a href="https://arxiv.org/abs/2501.03262" target="_blank" rel="noreferrer">REINFORCE++, A Simple and Efficient Approach for Aligning Large Language Models</a>, 2025. The OpenRLHF authors' own critic-free method, the <code>reinforce</code> and <code>reinforce_baseline</code> estimators.</li>
+            <li>Ahmadian et al., <a href="https://arxiv.org/abs/2402.14740" target="_blank" rel="noreferrer">Back to Basics, Revisiting REINFORCE Style Optimization for Learning from Human Feedback in LLMs</a>, 2024. The case for simple policy gradients that the <code>rloo</code> estimator implements. The <a href="/rl/policy-gradients">policy gradients note</a> builds the underlying math.</li>
+            <li>Ouyang et al., <a href="https://arxiv.org/abs/2203.02155" target="_blank" rel="noreferrer">Training language models to follow instructions with human feedback</a>, 2022. The InstructGPT pipeline, SFT then reward model then PPO, that this launcher automates end to end.</li>
+            <li>Rafailov et al., <a href="https://arxiv.org/abs/2305.18290" target="_blank" rel="noreferrer">Direct Preference Optimization, Your Language Model is Secretly a Reward Model</a>, 2023. The offline alternative OpenRLHF ships as <code>train_dpo</code>, covered in the <a href="/rl/dpo">DPO note</a>.</li>
+            <li>Kwon et al., <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noreferrer">Efficient Memory Management for Large Language Model Serving with PagedAttention</a>, 2023. The rollout engine's core idea, covered in the <a href="/oss/vllm">vLLM walkthrough</a>.</li>
+            <li>Rajbhandari et al., <a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noreferrer">ZeRO, Memory Optimizations Toward Training Trillion Parameter Models</a>, 2019. The sharding that makes the training side fit, covered in the <a href="/oss/deepspeed">DeepSpeed walkthrough</a>.</li>
+            <li>Moritz et al., <a href="https://arxiv.org/abs/1712.05889" target="_blank" rel="noreferrer">Ray, A Distributed Framework for Emerging AI Applications</a>, 2017. The actor and placement substrate, covered in the <a href="/oss/ray">Ray walkthrough</a>.</li>
+            <li>Yao et al., <a href="https://arxiv.org/abs/2308.01320" target="_blank" rel="noreferrer">DeepSpeed-Chat, Easy, Fast and Affordable RLHF Training of ChatGPT-like Models at All Scales</a>, 2023. The ancestor design whose hybrid engine OpenRLHF contrasts with by decoupling generation onto vLLM.</li>
+            <li>Sheng et al., <a href="https://arxiv.org/abs/2409.19256" target="_blank" rel="noreferrer">HybridFlow, A Flexible and Efficient RLHF Framework</a>, EuroSys 2025. The competing single-controller design behind verl, covered in the <a href="/oss/verl">verl walkthrough</a>.</li>
+          </ol>
+
+          <h2>Part XII: Final takeaway</h2>
+          <p>
+            If the reinforcement-learning pieces underneath this repository
+            are the gap, the <a href="/rl">RL section</a> builds them from the
+            ground up, with dedicated chapters on
+            <a href="/rl/policy-gradients">policy gradients</a>,
+            <a href="/rl/ppo">PPO</a>, and <a href="/rl/grpo">GRPO</a>, and
+            the generation engine that makes the whole design pay off is the
+            subject of the <a href="/oss/vllm">vLLM chapter</a>. Then come
+            back and read <code>ppo_actor.py</code> once more, watching the
+            rollout, the loss, and the broadcast go by in order. It will read
+            like two ordinary systems with one careful handshake between them,
+            which is the entire point.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> OpenRLHF shows that the fastest
+            way to do RLHF is to stop pretending it is one system. Run
+            generation on an engine built for inference, run training on an
+            engine built for sharding, let Ray decide where each lives, and
+            connect them with a single weight sync per step. The reward stays
+            pluggable, the algorithm is a one-flag choice over how advantages
+            are baselined, and the same small codebase carries you from a
+            preference-tuned chat model on one node to a reasoning model
+            trained against a verifier across a cluster.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/code-copy.js"></script>
+      <script defer src="/theme.js"></script>
+  </body>
+</html>

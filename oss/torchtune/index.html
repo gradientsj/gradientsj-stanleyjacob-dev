@@ -1,0 +1,1150 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>torchtune walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A full chapter on pytorch/torchtune: PyTorch-native fine-tuning as readable recipes rather than a framework, a real LoRA and QLoRA quickstart with the tune CLI, the complete life of one lora_finetune_single_device run from tune run through the recipe loop to a resharded checkpoint, deep dives on the recipe and config design, the LoRA and QLoRA modules, FSDP2 distributed recipes, and the dataset, message, and prompt-template plumbing, plus a reading plan, labs, and an honest contrast with axolotl and unsloth." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%232B2621'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+      <script>(function(){try{var t=localStorage.getItem("theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>torchtune</h1>
+        <p class="lead">
+          <a href="https://github.com/pytorch/torchtune" target="_blank" rel="noreferrer">torchtune</a>
+          is the PyTorch team's answer to how fine-tuning should look in
+          native PyTorch, without a Trainer that owns your loop or a Hugging
+          Face stack buried three layers down. Its central bet is that a
+          fine-tune should be a <em>recipe</em>, a single readable Python
+          script you can open, understand, and fork, wired together by a
+          small YAML config rather than a framework. This chapter is three
+          things at once. It is a practical tutorial for running real
+          <a href="https://arxiv.org/abs/2106.09685" target="_blank" rel="noreferrer">LoRA</a>,
+          <a href="https://arxiv.org/abs/2305.14314" target="_blank" rel="noreferrer">QLoRA</a>,
+          and full fine-tunes with the <code>tune</code> CLI. It is a
+          systems walkthrough that follows one
+          <code>lora_finetune_single_device</code> run from
+          <code>tune run</code> down to the frozen base weights, the adapter
+          gradients, and the checkpoint written back in the same format it was
+          loaded from. And it is a staged guide to reading the repository. It
+          ends with runnable labs, understanding checks with model answers, an
+          honest contrast with axolotl and unsloth, and a compact framework
+          for keeping the whole design in your head.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">tune run [--nproc_per_node N] RECIPE --config CONFIG  key=value ...
+      |
+      v
+torchtune/_cli/run.py     resolve recipe + config names, torchrun if distributed
+      |
+      v
+recipe_main(cfg)          @config.parse turns YAML + CLI overrides into a DictConfig
+      |
+      v
+Recipe.setup(cfg)         a plain class in recipes/, no hidden Trainer base
+      |
+      |  config.instantiate(cfg.model)   -&gt;  lora_llama3_1_8b(...)
+      |  checkpointer.load_checkpoint()  -&gt;  base weights (HF safetensors)
+      |  set_trainable_params(adapter)   -&gt;  freeze base, train LoRA only
+      v
+Recipe.train()            for each batch: forward -&gt; chunked CE -&gt; backward -&gt; step
+      |
+      v
+save_checkpoint()         merge (or keep) adapters, write back in the SAME format</pre>
+          <p>
+            The one-sentence identity. <mark>torchtune is a library of
+            fine-tuning recipes, not a fine-tuning framework, so the training
+            loop is a flat script you read top to bottom and the config is a
+            component graph that says which building blocks to plug in.</mark>
+            A framework hides the loop behind a <code>Trainer.fit()</code> and
+            asks you to configure its behavior through hundreds of flags and
+            callbacks. torchtune inverts that. Each recipe, for example
+            <code>recipes/lora_finetune_single_device.py</code>, is a
+            self-contained Python file with an ordinary <code>for</code> loop
+            over batches. There is no base <code>Trainer</code> class doing
+            work you cannot see. When you want to change how training works you
+            copy the recipe with <code>tune cp</code> and edit the loop, which
+            is the whole point.
+          </p>
+          <p>
+            Two consequences follow. First, the config is deliberately
+            small and declarative. A YAML file names <em>components</em> by
+            their dotted Python path under a <code>_component_</code> key, and
+            <code>torchtune.config.instantiate</code> turns each block into
+            the object it describes. The config does not encode control flow,
+            it only chooses parts. The recipe holds the control flow in plain
+            sight. Second, torchtune brings its own model, dataset, and module
+            implementations in native PyTorch instead of wrapping
+            <a href="/oss/transformers">Transformers</a>, so what you read is
+            the real computation rather than a thin adapter over someone
+            else's abstractions. That is the difference this whole design
+            exists to buy, hackability, and it is worth stating plainly before
+            anything else.
+          </p>
+          <p>
+            One honest note before we go deep. torchtune tracks recent PyTorch
+            closely and moves fast, and the PyTorch post-training effort has at
+            times signaled that pieces of this work are being consolidated with
+            other projects. Treat version-specific spellings of an API as true
+            for a given commit rather than forever. Everything in this chapter
+            is written at the level of the durable design, and where a name is
+            likely to have shifted I say so and stay at the concept. torchtune
+            is the fine-tuning counterpart to the pretraining platform in the
+            <a href="/oss/torchtitan">torchtitan chapter</a>, and the two share
+            a philosophy, keep the model plain and apply everything else as
+            composable PyTorch.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <p>
+            torchtune installs from PyPI and needs a recent PyTorch. The
+            single-device LoRA and QLoRA recipes run on one consumer or
+            data-center GPU. The distributed recipes want two or more:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">pip</span> <span class="s">install</span> <span class="s">torch</span> <span class="s">torchvision</span> <span class="s">torchao</span>
+<span class="m1">pip</span> <span class="s">install</span> <span class="s">torchtune</span>
+
+<span class="c"># or from source, to read and hack the recipes directly:</span>
+<span class="m1">git</span> <span class="s">clone</span> <span class="s">https://github.com/pytorch/torchtune</span>
+<span class="m1">cd</span> <span class="s">torchtune</span>
+<span class="m1">pip</span> <span class="s">install</span> <span class="s">-e</span> <span class="s">.</span></code></pre></div>
+          <p>
+            <code>torchao</code> is not optional decoration. It provides the
+            NF4 4-bit tensor type that QLoRA quantizes the base model into, and
+            the quantization-aware training and post-training quantization that
+            some recipes use, so install it alongside torch. Once installed you
+            have a <code>tune</code> command, which is the single door into the
+            whole library. Four subcommands cover almost everything:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">tune</span> <span class="s">ls</span>                 <span class="c"># list every built-in recipe and its configs</span>
+<span class="m1">tune</span> <span class="s">download</span> <span class="s">...</span>       <span class="c"># pull model weights + tokenizer from the HF Hub</span>
+<span class="m1">tune</span> <span class="s">cp</span> <span class="s">RECIPE</span>|<span class="m1">CONFIG</span>   <span class="c"># copy a recipe or config into your tree to edit</span>
+<span class="m1">tune</span> <span class="s">run</span> <span class="s">RECIPE</span> <span class="s">...</span>     <span class="c"># launch a run (single-device or, with torchrun, multi)</span>
+<span class="m1">tune</span> <span class="s">validate</span> <span class="s">CONFIG</span>    <span class="c"># type-check a config without training</span></code></pre></div>
+          <p>
+            Start with <code>tune ls</code>. It prints a table of recipes,
+            for example <code>lora_finetune_single_device</code>,
+            <code>lora_finetune_distributed</code>,
+            <code>full_finetune_single_device</code>,
+            <code>full_finetune_distributed</code>,
+            <code>lora_dpo_single_device</code>, and
+            <code>qat_distributed</code>, and under each the named configs it
+            ships with, one per model and setting. The names are the currency
+            of the CLI, so this is where you learn what exists. Now download a
+            base model. You need a Hugging Face token and to have accepted the
+            model license:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">tune</span> <span class="s">download</span> <span class="s">meta-llama/Meta-Llama-3.1-8B-Instruct</span> <span class="s">\</span>
+  <span class="s">--output-dir</span> <span class="s">/tmp/Meta-Llama-3.1-8B-Instruct</span> <span class="s">\</span>
+  <span class="s">--ignore-patterns</span> <span class="s">"original/consolidated.00.pth"</span> <span class="s">\</span>
+  <span class="s">--hf-token</span> &lt;<span class="s">YOUR_TOKE</span><span class="v6">N</span>&gt;</code></pre></div>
+          <p>
+            The <code>--ignore-patterns</code> flag skips the large duplicate
+            original-format checkpoint when the safetensors are all you need,
+            though for Llama tokenizers you often do want the
+            <code>original/tokenizer.model</code> file that ships alongside the
+            weights. Now the real thing, a LoRA fine-tune of Llama 3.1 8B on a
+            single GPU:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">tune</span> <span class="s">run</span> <span class="s">lora_finetune_single_device</span> <span class="s">\</span>
+  <span class="s">--config</span> <span class="s">llama3_1/8B_lora_single_device</span></code></pre></div>
+          <p>
+            That resolves the config name <code>llama3_1/8B_lora_single_device</code>
+            to a YAML file shipped in <code>recipes/configs/</code>, hands it
+            to the recipe, and starts training. Expect a config dump, a model
+            build, the base checkpoint loading, then step lines with loss,
+            tokens per second, learning rate, and peak memory, with the loss
+            falling. QLoRA is the same recipe with a different config, because
+            quantizing the base model is a property of the model builder rather
+            than of the loop:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">tune</span> <span class="s">run</span> <span class="s">lora_finetune_single_device</span> <span class="s">\</span>
+  <span class="s">--config</span> <span class="s">llama3_1/8B_qlora_single_device</span></code></pre></div>
+          <p>
+            Every value in a config is overridable on the command line using
+            OmegaConf dotlist syntax, which is <code>key=value</code> appended
+            after the config, not <code>--key value</code>. This is the second
+            thing to internalize after the recipe/config split:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">tune</span> <span class="s">run</span> <span class="s">lora_finetune_single_device</span> <span class="s">\</span>
+  <span class="s">--config</span> <span class="s">llama3_1/8B_qlora_single_device</span> <span class="s">\</span>
+  <span class="s">batch_size=4</span> <span class="s">\</span>
+  <span class="s">gradient_accumulation_steps=4</span> <span class="s">\</span>
+  <span class="s">model.lora_rank=16</span> <span class="s">\</span>
+  <span class="s">model.lora_alpha=32</span> <span class="s">\</span>
+  <span class="s">dataset.packed=True</span> <span class="s">\</span>
+  <span class="s">max_steps_per_epoch=200</span></code></pre></div>
+          <p>
+            Distributed is not a different mental model, it is the same recipe
+            family launched under <code>torchrun</code>, which
+            <code>tune run</code> does for you when you pass
+            <code>--nproc_per_node</code>:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="c"># full fine-tune of 8B across 4 GPUs with FSDP2</span>
+<span class="m1">tune</span> <span class="s">run</span> <span class="s">--nproc_per_node</span> <span class="s">4</span> <span class="s">full_finetune_distributed</span> <span class="s">\</span>
+  <span class="s">--config</span> <span class="s">llama3_1/8B_full</span>
+
+<span class="c"># LoRA across 4 GPUs</span>
+<span class="m1">tune</span> <span class="s">run</span> <span class="s">--nproc_per_node</span> <span class="s">4</span> <span class="s">lora_finetune_distributed</span> <span class="s">\</span>
+  <span class="s">--config</span> <span class="s">llama3_1/8B_lora</span></code></pre></div>
+          <p>
+            Now the mistakes beginners make. First, forgetting that overrides
+            are <code>key=value</code>, not flags. Writing
+            <code>--batch_size 4</code> is a CLI error, the recipe wants
+            <code>batch_size=4</code>. Second, pointing the checkpointer at the
+            wrong directory. The config's <code>checkpointer.checkpoint_dir</code>
+            and <code>checkpoint_files</code> must match exactly where
+            <code>tune download</code> put the weights, and the
+            <code>model_type</code> must match the model, because the
+            checkpointer uses it to pick the right weight-conversion mapping.
+            Third, confusing single-device and distributed recipes. A
+            <code>*_single_device</code> recipe launched under
+            <code>torchrun</code> is wrong, and a distributed recipe run
+            without <code>--nproc_per_node</code> will not shard. Fourth, and
+            most in the spirit of the tool, <mark>do not fight the config to
+            make the loop do something new. Run <code>tune cp
+            lora_finetune_single_device my_recipe.py</code>, edit the Python,
+            and run your copy. The library is designed to be forked, and
+            reaching for the fork early is using it correctly, not abusing
+            it.</mark>
+          </p>
+          <p>
+            A word on fitting big models on small GPUs, because that is the
+            whole reason single-device recipes exist. The configs expose a
+            stack of memory levers you turn on as you scale down the hardware.
+            QLoRA quantizes the frozen base to 4-bit NF4.
+            <code>enable_activation_checkpointing</code> recomputes activations
+            in backward instead of storing them.
+            <code>enable_activation_offloading</code> moves saved activations
+            to CPU. The <code>optimizer_in_bwd</code> path in the full
+            single-device recipe fuses the optimizer step into the backward
+            pass so full gradients never coexist with optimizer state. An
+            8-bit optimizer such as <code>bitsandbytes.optim.PagedAdamW8bit</code>
+            shrinks optimizer state further. <code>compile=True</code> lowers
+            the model through <a href="/oss/pytorch">torch.compile</a>. And
+            <code>dataset.packed=True</code> packs samples to a fixed sequence
+            length to remove padding waste. Each is one line in the config.
+          </p>
+
+          <h2>Part III: When it is the right tool</h2>
+          <p>
+            torchtune is the right tool when you want to fine-tune a supported
+            open model and you value owning and understanding your loop.
+            Researchers who need to change the training math, teams who want a
+            PyTorch-native stack with no Hugging Face <code>Trainer</code> in
+            the call graph, people learning how fine-tuning actually works, and
+            anyone who needs first-class multi-GPU LoRA or full fine-tuning
+            with FSDP2 in the open source. It is also the natural early home for
+            PyTorch-native techniques, torchao quantization, QAT,
+            <code>torch.compile</code>, activation offloading, and export paths
+            toward ExecuTorch, because it is written by the same team.
+          </p>
+          <p>
+            The honest cases for alternatives, named plainly.
+            <strong>axolotl</strong> is a YAML-configured fine-tuning framework
+            built on top of the Hugging Face stack, Transformers, PEFT, TRL,
+            and accelerate, with DeepSpeed and FSDP underneath. Its strength is
+            breadth and convenience. It supports an enormous range of models
+            and techniques out of the box and you rarely write code, you write
+            a config. Its cost is that the actual training happens deep inside
+            the HF <code>Trainer</code>, so when you need to change the loop you
+            are patching someone else's framework rather than editing a script.
+            <strong>unsloth</strong> takes the opposite tack. It hand-writes
+            fused Triton kernels and manual backward passes for specific model
+            architectures and monkey-patches them into Hugging Face models,
+            winning large speedups and memory reductions on a single GPU. Its
+            cost is coverage and openness, the deep optimizations apply to the
+            architectures they have hand-tuned, and multi-GPU has historically
+            been outside the open tier.
+          </p>
+          <p>
+            So the triangle is roughly this. Reach for <strong>unsloth</strong>
+            when single-GPU speed and VRAM on a popular architecture dominate
+            everything else and you are happy to run inside their patched
+            models. Reach for <strong>axolotl</strong> when you want maximum
+            breadth of models and knobs with minimal code and you are content
+            for the HF stack to own the loop. Reach for <strong>torchtune</strong>
+            when you want a readable PyTorch-native loop you can fork, correct
+            reference implementations, and honest multi-GPU FSDP2 in the open,
+            and you accept that it may be slower than unsloth on one GPU and
+            cover fewer exotic models than axolotl. These are genuinely
+            different bets, and torchtune's is hackability over both raw
+            single-GPU speed and sheer breadth.
+          </p>
+          <p>
+            Two more boundaries. torchtune fine-tunes, it does not pretrain
+            from scratch at the thousand-GPU scale, that is
+            <a href="/oss/torchtitan">torchtitan</a>'s job, and the two are
+            deliberately separate projects with different defaults. And
+            torchtune trains, it does not serve. When the fine-tune is done you
+            hand the resulting checkpoint, written back in standard Hugging Face
+            format, to an inference engine like <a href="/oss/vllm">vLLM</a> for
+            production serving. The clean handoff at the checkpoint boundary is
+            a feature, and the format compatibility that makes it work is a
+            design point we return to in Part V.
+          </p>
+
+          <h2>Part IV: The full life of one fine-tune</h2>
+          <p>
+            The specimen. One run of
+            <code>tune run lora_finetune_single_device --config
+            llama3_1/8B_lora_single_device</code> on one GPU. Almost every
+            stage below is the same in the distributed recipe, and where it
+            forks for FSDP2 I follow both briefly. The value of tracing it is
+            that the recipe is a real script, so the trace is just reading it in
+            order.
+          </p>
+
+          <h3>Stage 1: the tune CLI resolves names</h3>
+          <p>
+            <code>tune</code> is a small argument parser in
+            <code>torchtune/_cli/</code>. The <code>run</code> subcommand
+            (<code>_cli/run.py</code>) takes a recipe name and a
+            <code>--config</code> name and looks them up in the recipe registry
+            (<code>torchtune/_recipe_registry.py</code>), which maps the short
+            name <code>lora_finetune_single_device</code> to the file
+            <code>recipes/lora_finetune_single_device.py</code> and the config
+            name <code>llama3_1/8B_lora_single_device</code> to the YAML shipped
+            under <code>recipes/configs/</code>. If the name is not a builtin it
+            is treated as a path, which is exactly how your
+            <code>tune cp</code> copies get run. If you passed
+            <code>--nproc_per_node</code> the runner execs
+            <code>torchrun</code> with that many processes, otherwise it runs
+            the recipe module in-process. Either way it forwards the config path
+            and every <code>key=value</code> override to the recipe.
+          </p>
+
+          <h3>Stage 2: config.parse builds a DictConfig</h3>
+          <p>
+            Every recipe ends with a <code>recipe_main</code> function
+            decorated with <code>@config.parse</code>
+            (<code>torchtune/config/_parse.py</code>). That decorator reads the
+            <code>--config</code> YAML with OmegaConf, applies the
+            <code>key=value</code> overrides on top as a dotlist, and hands the
+            resulting <code>DictConfig</code> to the function. No component has
+            been constructed yet. The config at this point is pure data, a tree
+            of dotted paths and scalar values, with each intended object still
+            described only by a <code>_component_</code> string and its
+            keyword arguments. This is the last moment the whole run is just a
+            document, and it is a good moment to run <code>tune validate</code>
+            against.
+          </p>
+          <pre class="flow">config as data (a DictConfig):
+
+model:
+  _component_: torchtune.models.llama3_1.lora_llama3_1_8b
+  lora_attn_modules: ['q_proj', 'v_proj', 'output_proj']
+  apply_lora_to_mlp: true
+  lora_rank: 8
+  lora_alpha: 16
+
+      |  config.instantiate(cfg.model)
+      v
+a live nn.Module: lora_llama3_1_8b(lora_attn_modules=[...], lora_rank=8, ...)</pre>
+
+          <h3>Stage 3: the recipe object and setup</h3>
+          <p>
+            <code>recipe_main</code> constructs the recipe class, for example
+            <code>LoRAFinetuneRecipeSingleDevice(cfg)</code>, then calls
+            <code>recipe.setup(cfg)</code> and <code>recipe.train()</code>. The
+            recipe implements <code>FTRecipeInterface</code> from
+            <code>recipes/interfaces.py</code>, which is documentation of the
+            lifecycle rather than a base class doing work,
+            <code>setup</code>, <code>train</code>,
+            <code>save_checkpoint</code>, <code>cleanup</code>. Inside
+            <code>setup</code> the recipe does a fixed sequence you can read in
+            one screen. It builds the checkpointer from
+            <code>cfg.checkpointer</code> and calls
+            <code>load_checkpoint()</code> to get the base model's state dict
+            already converted into torchtune's internal parameter names. It
+            builds the model with
+            <code>config.instantiate(cfg.model)</code>, which calls
+            <code>lora_llama3_1_8b(...)</code> and returns a
+            <code>TransformerDecoder</code> whose attention and MLP linears have
+            been swapped for <code>LoRALinear</code> layers. It loads the base
+            weights into that model. Then it calls
+            <code>set_trainable_params</code> after
+            <code>get_adapter_params</code> to freeze every base weight and
+            leave only the LoRA A and B matrices requiring gradients.
+          </p>
+          <p>
+            The rest of <code>setup</code> builds the optimizer from
+            <code>cfg.optimizer</code> over just the trainable params, the loss
+            (typically <code>CEWithChunkedOutputLoss</code>), the tokenizer, and
+            the dataset and dataloader. In the distributed recipe this stage
+            has one extra, load-bearing step. Between building the model and
+            loading weights it shards the model with FSDP2's
+            <code>fully_shard</code>, wrapping each transformer layer and then
+            the whole model, and materializes it from the meta device, which is
+            the same discipline the <a href="/oss/torchtitan">torchtitan</a>
+            chapter traces in detail. Single-device skips all of that and just
+            moves the model to <code>cuda</code>.
+          </p>
+
+          <h3>Stage 4: the data path and the label mask</h3>
+          <p>
+            The dataloader yields already-tokenized batches, because the
+            tokenization happened inside the dataset. The chain is worth
+            holding in mind. A dataset such as
+            <code>alpaca_cleaned_dataset</code> is an <code>SFTDataset</code>
+            configured with a <em>message transform</em> that turns each raw row
+            into a list of <code>Message</code> objects, an optional
+            <em>prompt template</em> that adds role-specific wrapping text, and
+            the model's <code>ModelTokenizer</code>. When the dataloader asks
+            for item <code>i</code> the dataset builds the messages, applies the
+            template, and calls <code>tokenizer.tokenize_messages</code>, which
+            returns token ids and a boolean mask. <mark>Messages marked as the
+            prompt are masked out, so their label positions become
+            <code>CROSS_ENTROPY_IGNORE_IDX</code> (-100) and contribute no loss.
+            The model is trained only on the tokens of the response.</mark> A
+            collate function, <code>padded_collate_sft</code>, then pads the
+            variable-length sequences in a batch and stacks them into tensors of
+            input ids and labels.
+          </p>
+
+          <h3>Stage 5: forward, chunked loss, backward</h3>
+          <p>
+            <code>train()</code> is an ordinary loop over epochs and batches.
+            Read it directly, it is the heart of the recipe and it is short.
+            For each batch it moves tensors to the GPU, runs
+            <code>logits = model(tokens, mask=..., input_pos=...)</code>, and
+            computes the loss. The loss deserves a note. Full-vocabulary logits
+            for a long sequence are enormous, so torchtune's default
+            <code>CEWithChunkedOutputLoss</code> computes cross-entropy over
+            slices of the sequence and sums, which keeps a large logits tensor
+            from ever being materialized whole. This pairs with the model
+            returning unreduced per-token outputs. Then
+            <code>loss.backward()</code> flows gradients, and because only the
+            LoRA adapters require grad, gradients exist only for the small A and
+            B matrices while the frozen base contributes none. This is exactly
+            why LoRA fits where full fine-tuning does not.
+          </p>
+          <p>
+            Gradient accumulation lives here as a plain modulo. The recipe
+            scales the loss by <code>1 / gradient_accumulation_steps</code>,
+            calls <code>backward</code> every microbatch, and only steps the
+            optimizer once the accumulation count is reached, which is how a
+            single-GPU config reaches a large effective batch size. When
+            <code>optimizer_in_bwd</code> is enabled in the full single-device
+            recipe this stage changes shape, the optimizer step for each
+            parameter fires from a gradient hook the moment that parameter's
+            gradient is ready, so full gradients never all exist at once. In the
+            FSDP2 distributed recipe the backward additionally reduce-scatters
+            each layer's gradients across ranks, but the recipe code you read is
+            unchanged, that communication is a property of the sharded
+            parameters, not of the loop.
+          </p>
+
+          <h3>Stage 6: optimizer step, clip, and metrics</h3>
+          <p>
+            On an accumulation boundary the recipe optionally clips the
+            gradient norm, calls <code>optimizer.step()</code> and
+            <code>optimizer.zero_grad()</code>, and advances the learning-rate
+            scheduler, commonly a cosine schedule with warmup from
+            <code>torchtune.training</code>. It then logs to whichever metric
+            logger the config selected, <code>DiskLogger</code>,
+            <code>StdoutLogger</code>, <code>WandBLogger</code>, or
+            <code>TensorBoardLogger</code>, reporting step, loss, learning rate,
+            tokens per second, and peak memory from
+            <code>training.get_memory_stats</code>. In the distributed recipe
+            the logged loss is reduced across ranks so the number is a true
+            global average rather than one rank's view. None of this is hidden
+            behind callbacks, it is straight-line code in <code>train()</code>.
+          </p>
+
+          <h3>Stage 7: the checkpoint written back in its own format</h3>
+          <p>
+            At the end of each epoch, or at a configured interval,
+            <code>save_checkpoint()</code> runs. For LoRA this is where the two
+            audiences are served. The adapter weights are collected via
+            <code>get_adapter_params</code> and saved on their own as a small
+            file you can keep and stack. If configured to save a merged model,
+            <code>get_merged_lora_ckpt</code> folds the low-rank updates back
+            into the base weights, and then, critically, the checkpointer
+            converts torchtune's internal parameter names back into the
+            <em>original external format</em> and writes safetensors that look
+            exactly like the model you downloaded. <mark>A torchtune fine-tune
+            comes out in the same format it went in, so the output loads
+            straight into <a href="/oss/transformers">Transformers</a> or
+            <a href="/oss/vllm">vLLM</a> with no bespoke conversion.</mark> For
+            resumable training the recipe also writes a recipe-state file with
+            the optimizer state, epoch, and seed, and the distributed recipes
+            can use <code>torch.distributed.checkpoint</code> for the
+            intermediate sharded state. That closes the loop of one run, base
+            weights in, adapter gradients trained, a standard checkpoint out.
+          </p>
+
+          <h2>Part V: Internals deep dives</h2>
+
+          <h3>Deep dive: recipes and the component config</h3>
+          <p>
+            The recipe/config split is the whole architecture, so it is worth
+            being precise about the seam between them. A <em>recipe</em> is a
+            training program. A <em>config</em> is a document that selects and
+            parameterizes the objects the program will use. The bridge is
+            <code>torchtune.config</code>. Two functions carry it.
+            <code>instantiate(node)</code> reads the <code>_component_</code>
+            key, imports that dotted path, and calls it with the remaining keys
+            as keyword arguments, recursing into nested components, so a config
+            node becomes a live object. <code>parse</code> is the decorator that
+            loads the YAML, layers CLI overrides on with OmegaConf, and feeds
+            the recipe. There is no plugin system and no registry of behaviors,
+            only Python import paths and function calls. That is a deliberate
+            constraint. Anything you can import you can name in a config, and
+            anything you name in a config you can find by reading the code it
+            points at.
+          </p>
+          <pre class="flow">config.instantiate resolution:
+
+_component_: torch.optim.AdamW      import torch.optim.AdamW
+lr: 3e-4                            call AdamW(params, lr=3e-4, weight_decay=0.01, ...)
+weight_decay: 0.01
+fused: true
+
+nested components resolve first, bottom-up, then the parent is called</pre>
+          <p>
+            What this buys, and what it costs. It buys transparency, a config
+            is a manifest of parts with no hidden control flow, and forkability,
+            since changing behavior means editing a visible loop rather than
+            configuring an invisible one. It costs the convenience of a
+            framework that has a flag for everything, because if the recipe does
+            not do something you must add it to the recipe. torchtune accepts
+            that trade on purpose. The recipes are kept short and parallel to
+            each other precisely so that copying one and changing ten lines is
+            the expected way to do something new. A misconception to correct
+            here, the config is not a weak scripting language. It cannot branch
+            or loop, and trying to make it do so is a sign you should copy the
+            recipe instead.
+          </p>
+
+          <h3>Deep dive: LoRA and QLoRA modules</h3>
+          <p>
+            LoRA lives in <code>torchtune/modules/peft/</code>. The core is
+            <code>LoRALinear</code>, a drop-in replacement for
+            <code>nn.Linear</code> that keeps the original weight frozen and
+            adds a trainable low-rank update. Conceptually the forward is the
+            base projection plus a bottleneck through two small matrices, and
+            the base path never receives gradients:
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="c"># the essential shape of LoRALinear.forward, in words not verbatim source</span>
+<span class="v2">out</span> = <span class="m1">frozen_base</span><span class="b0">(</span><span class="v4">x</span><span class="b0">)</span>                 <span class="c"># W0 @ x, W0.requires_grad_(False)</span>
+<span class="v3">lora</span> = <span class="m1">dropout</span><span class="b0">(</span><span class="v4">x</span><span class="b0">)</span> @ <span class="v6">A</span>.<span class="m2">T</span> @ <span class="v0">B</span>.<span class="m2">T</span>        <span class="c"># rank-r bottleneck, A: (r, in), B: (out, r)</span>
+<span class="k">return</span> <span class="v2">out</span> + <span class="b0">(</span><span class="v5">alpha</span> / <span class="v5">rank</span><span class="b0">)</span> * <span class="v3">lora</span>   <span class="c"># scaled low-rank update added on</span></code></pre></div>
+          <p>
+            Only <code>A</code> and <code>B</code> require gradients, so the
+            trainable parameter count is a few million against the base model's
+            billions. Which linears become LoRA is a config choice, that is
+            what <code>lora_attn_modules: ['q_proj', 'v_proj', 'output_proj']</code>
+            and <code>apply_lora_to_mlp</code> control in the model builder.
+            <code>DoRALinear</code> implements
+            <a href="https://arxiv.org/abs/2402.09353" target="_blank" rel="noreferrer">DoRA</a>,
+            a variant that additionally learns a magnitude, and it lives
+            beside <code>LoRALinear</code> under the same package. A handful of helper functions make the recipe code
+            clean. <code>get_adapter_params(model)</code> returns just the
+            adapter tensors, <code>set_trainable_params</code> freezes
+            everything else, <code>validate_missing_and_unexpected_for_lora</code>
+            confirms a base checkpoint loaded into a LoRA model has exactly the
+            expected missing keys, the adapters, and <code>get_merged_lora_ckpt</code>
+            folds adapters back into the base for export.
+          </p>
+          <p>
+            QLoRA adds one idea on top, quantize the frozen base. When the model
+            builder is called with <code>quantize_base=True</code>, for example
+            through the <code>qlora_llama3_1_8b</code> convenience builder, each
+            base linear's weight is stored as a 4-bit <code>NF4Tensor</code> from
+            torchao rather than as bf16 or fp16. The forward dequantizes on the
+            fly for the matmul, and because the base is frozen the 4-bit storage
+            is only ever read, never updated, so its error never accumulates.
+            The LoRA adapters stay in full precision and carry all the learning.
+            <mark>QLoRA's whole trick is that the enormous frozen part can be
+            lossy because it is never trained, while the tiny trainable part
+            stays exact, which is why a 4-bit base plus full-precision adapters
+            fine-tunes a large model on a single consumer GPU.</mark> The
+            precision and dtype mechanics here connect to the broader story in
+            the <a href="/ml/mixed-precision">mixed precision write-up</a>. A
+            trap worth naming, NF4 is a storage-and-compute-in-4-bit format for
+            the frozen weights, it is not the same as quantizing the fine-tune
+            output for inference, which is a separate post-training step done by
+            <code>quantize.py</code> or torchao's PTQ.
+          </p>
+
+          <h3>Deep dive: distributed recipes and FSDP2</h3>
+          <p>
+            The distributed recipes,
+            <code>full_finetune_distributed</code> and
+            <code>lora_finetune_distributed</code>, differ from their
+            single-device siblings in exactly one region of
+            <code>setup</code>, the sharding. torchtune uses FSDP2, the
+            <code>fully_shard</code> API, which keeps every parameter an
+            individual <code>DTensor</code> sharded across the data-parallel
+            mesh rather than flattening a module's parameters into one opaque
+            buffer the way the
+            <a href="https://arxiv.org/abs/2304.11277" target="_blank" rel="noreferrer">original FSDP</a>
+            did. The recipe builds the model on
+            the meta device so no full copy is ever allocated, applies
+            <code>fully_shard</code> per transformer layer and once over the
+            whole model, then materializes and loads each rank's shard. The
+            mechanics, sharding conditions, mixed-precision policy, and
+            meta-device init, are provided by helpers in
+            <code>torchtune.training</code>, and the deeper theory of device
+            meshes and per-parameter sharding is the subject of the
+            <a href="/oss/torchtitan">torchtitan chapter</a> and the
+            <a href="/classes/parallel-computing">parallel computing class</a>.
+          </p>
+          <p>
+            Two things to hold onto. First, torchtune's distributed story is
+            deliberately data-parallel with sharding, FSDP2, and it does not try
+            to be a full N-dimensional parallelism platform. Tensor, pipeline,
+            and context parallelism are torchtitan's territory. That is the
+            right division of labor, fine-tuning an 8B or 70B model fits
+            comfortably in FSDP2 across a node or two, and adding pipeline
+            parallelism would trade the readable single-program loop for
+            complexity a fine-tune rarely needs. Second, the recipe you read is
+            nearly identical to the single-device one, the collectives are a
+            property of the sharded <code>DTensor</code> parameters, so
+            <code>forward</code>, <code>backward</code>, and
+            <code>step</code> look the same in the source while all-gathers and
+            reduce-scatters happen underneath. That parallel structure between
+            the single-device and distributed recipes is not an accident, it is
+            what lets you learn one and read the other.
+          </p>
+
+          <h3>Deep dive: datasets, messages, and prompt templates</h3>
+          <p>
+            The data plumbing is where torchtune does the most quiet work to
+            keep model-specific formatting out of the loop. The central
+            abstraction is the <code>Message</code>
+            (<code>torchtune/data/</code>), a small object with a
+            <code>role</code> (<code>system</code>, <code>user</code>,
+            <code>assistant</code>, or <code>ipython</code> for tool output),
+            <code>content</code>, and a <code>masked</code> flag that decides
+            whether its tokens count toward the loss. Every dataset, whatever
+            its raw shape, is normalized into a list of messages by a <em>message
+            transform</em>. <code>InputOutputToMessages</code> handles simple
+            instruction/response columns, <code>ShareGPTToMessages</code> and
+            <code>OpenAIToMessages</code> handle multi-turn conversation
+            formats, and <code>ChosenRejectedToMessages</code> handles
+            preference pairs for
+            <a href="https://arxiv.org/abs/2305.18290" target="_blank" rel="noreferrer">DPO</a>. The dataset classes on top,
+            <code>SFTDataset</code> for supervised fine-tuning,
+            <code>PreferenceDataset</code> for DPO,
+            <code>TextCompletionDataset</code> for raw text, and
+            <code>ConcatDataset</code> for mixing, are thin wrappers that apply
+            a transform, an optional template, and the tokenizer.
+          </p>
+          <pre class="flow">raw row  --message_transform-->  [Message(system), Message(user, masked=True),
+                                  Message(assistant, masked=False)]
+         --prompt_template-->    wrap each message's content with role text
+         --tokenizer.tokenize_messages-->  (token_ids, mask)
+         --padded_collate_sft-->  batched input_ids, labels (masked -> -100)</pre>
+          <p>
+            The <em>prompt template</em> is the second half, and it is separate
+            from the message transform on purpose. A message transform decides
+            <em>what</em> the conversation is, a template decides <em>how</em> a
+            role's text is decorated, for example a summarization template that
+            wraps the input in instruction text, or the
+            <code>ChatMLTemplate</code>. The model's <code>ModelTokenizer</code>
+            then adds the model-specific special tokens and turns messages into
+            ids with <code>tokenize_messages</code>, applying the mask so that
+            prompt tokens are ignored and only the response is learned. This
+            layering is why swapping datasets is a config change. Point
+            <code>dataset._component_</code> at a different builder, or set the
+            <code>source</code> and <code>column_map</code> of the generic
+            <code>instruct_dataset</code>, and nothing in the recipe moves. The
+            misconception to correct, the mask is not cosmetic. Getting it wrong
+            trains the model to generate the prompt, and the whole reason the
+            plumbing is this careful is to make the mask correct by
+            construction.
+          </p>
+
+          <h3>Deep dive: checkpointing and format fidelity</h3>
+          <p>
+            Checkpointers live in
+            <code>torchtune/training/checkpointing/</code> and their defining
+            job is round-tripping the external format. The three main ones are
+            <code>FullModelHFCheckpointer</code> for Hugging Face safetensors,
+            <code>FullModelMetaCheckpointer</code> for Meta's original
+            consolidated <code>.pth</code> format, and
+            <code>FullModelTorchTuneCheckpointer</code> for torchtune's own
+            layout, and a <code>DistributedCheckpointer</code> wraps DCP for
+            sharded intermediate state. On load, the checkpointer reads the
+            external files and converts their parameter names and tensor layouts
+            into torchtune's internal module names using a per-model-family
+            weight mapping. On save it runs the inverse conversion. <mark>This
+            conversion is the feature. Because torchtune restores the exact
+            external naming and layout on the way out, a fine-tuned model is
+            indistinguishable in format from the base you downloaded, which is
+            what makes the clean handoff to serving possible.</mark> The trap is
+            the same one every checkpoint system has, the mapping is keyed on
+            module names, so a model implementation whose names drift from what
+            the converter expects will fail to load or, worse, load the wrong
+            tensor into the wrong place. The <code>model_type</code> field in the
+            config is what selects the right converter, which is why it must
+            match the model exactly.
+          </p>
+
+          <h2>Part VI: Reading the repository</h2>
+          <p>
+            The tree is small and unusually flat, which is half of what makes it
+            teachable. Read it in this order. Paths are described by role where
+            an exact spelling is likely to drift.
+          </p>
+          <p>
+            <strong>Stage 0, orientation.</strong> Read the top-level
+            <code>README.md</code>, then run <code>tune ls</code> and skim one
+            config end to end, for example
+            <code>recipes/configs/llama3_1/8B_lora_single_device.yaml</code>.
+            Questions to hold. What is a recipe versus a config, what does a
+            <code>_component_</code> key mean, and what does
+            <code>tune run</code> actually do differently for single-device
+            versus distributed?
+          </p>
+          <p>
+            <strong>Stage 1, one recipe top to bottom.</strong> Read
+            <code>recipes/lora_finetune_single_device.py</code> as a whole. It
+            is a single class implementing
+            <code>recipes/interfaces.py</code>'s <code>FTRecipeInterface</code>,
+            with <code>setup</code>, <code>train</code>,
+            <code>save_checkpoint</code>. Questions. Where are the adapters
+            frozen, where does the label mask come from, how does gradient
+            accumulation appear in the loop, and what exactly does
+            <code>save_checkpoint</code> write?
+          </p>
+          <p>
+            <strong>Stage 2, the config machinery.</strong> Read
+            <code>torchtune/config/</code>, specifically the
+            <code>instantiate</code> and <code>parse</code> implementations.
+            Questions. How does a dotted string become an object, how are nested
+            components resolved, and how do <code>key=value</code> overrides
+            merge onto the YAML?
+          </p>
+          <p>
+            <strong>Stage 3, the modeling building blocks.</strong> Read
+            <code>torchtune/modules/</code>, the <code>TransformerDecoder</code>
+            and its <code>TransformerSelfAttentionLayer</code>,
+            <code>MultiHeadAttention</code>,
+            <code>RotaryPositionalEmbeddings</code>, <code>RMSNorm</code>,
+            <code>FeedForward</code>, and <code>KVCache</code>, then
+            <code>modules/peft/</code> for <code>LoRALinear</code> and its
+            helpers. Then read one model family in <code>torchtune/models/</code>,
+            for example <code>llama3_1</code>, where the
+            <code>_component_builders.py</code> assembles the decoder and the
+            <code>_model_builders.py</code> exposes
+            <code>llama3_1_8b</code>, <code>lora_llama3_1_8b</code>, and
+            <code>qlora_llama3_1_8b</code>. Questions. What makes the model
+            definition plain PyTorch, and how does a builder decide which linears
+            become LoRA?
+          </p>
+          <p>
+            <strong>Stage 4, the data path.</strong> Read
+            <code>torchtune/data/</code> for <code>Message</code>, the message
+            transforms, and the prompt templates, then
+            <code>torchtune/datasets/</code> for <code>SFTDataset</code> and a
+            concrete builder like <code>alpaca_dataset</code>, and finally the
+            tokenizer for one model. Questions. Where does the loss mask get
+            set, and what is the boundary between a message transform and a
+            prompt template?
+          </p>
+          <p>
+            <strong>Stage 5, training utilities and the distributed recipe.</strong>
+            Read <code>torchtune/training/</code>, the checkpointing package,
+            the FSDP helpers, and the memory and profiling utilities, then read
+            <code>recipes/lora_finetune_distributed.py</code> beside the
+            single-device recipe you already know and diff them in your head.
+            Questions. Exactly which lines differ, and why is that difference so
+            small?
+          </p>
+          <p>
+            <strong>Stage 6, the frontier.</strong> The DPO, PPO, QAT, and
+            knowledge-distillation recipes, and the evaluation
+            (<code>eleuther_eval.py</code>), generation
+            (<code>generate.py</code>), and quantization
+            (<code>quantize.py</code>) recipes. These reuse everything above and
+            show how the same building blocks compose into other post-training
+            objectives.
+          </p>
+          <p>
+            Where not to start. The multimodal and vision model families add a
+            cross-attention path and image transforms that are best met after
+            the text story is solid, and the RL-style recipes (PPO) introduce a
+            reward model and a rollout loop that are a lot to hold before the
+            supervised recipe is second nature.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            Labs 1 through 4 need at most one GPU. Labs 5 and 6 want two or
+            more. Log formats and exact config names vary with the pace of the
+            repo, so match on role, not on a literal string.
+          </p>
+          <p><strong>Lab 1: list, copy, read.</strong> Concept, the recipe/config split.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">tune</span> <span class="s">ls</span>
+<span class="m1">tune</span> <span class="s">cp</span> <span class="s">lora_finetune_single_device</span> <span class="s">./my_recipe.py</span>
+<span class="m1">tune</span> <span class="s">cp</span> <span class="s">llama3_1/8B_lora_single_device</span> <span class="s">./my_config.yaml</span></code></pre></div>
+          <p>
+            Open <code>my_recipe.py</code> and find the <code>train</code>
+            method's <code>for</code> loop, then open
+            <code>my_config.yaml</code> and match each top-level key
+            (<code>model</code>, <code>optimizer</code>, <code>dataset</code>,
+            <code>checkpointer</code>) to where it is instantiated in the recipe.
+            You now hold the entire architecture in two files.
+          </p>
+          <p><strong>Lab 2: a real QLoRA fine-tune.</strong> Concept, the life of one run from Part IV.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">tune</span> <span class="s">download</span> <span class="s">meta-llama/Meta-Llama-3.1-8B-Instruct</span> <span class="s">\</span>
+  <span class="s">--output-dir</span> <span class="s">/tmp/Meta-Llama-3.1-8B-Instruct</span> <span class="s">--hf-token</span> &lt;<span class="s">TOKE</span><span class="v6">N</span>&gt;
+
+<span class="m1">tune</span> <span class="s">run</span> <span class="s">lora_finetune_single_device</span> <span class="s">\</span>
+  <span class="s">--config</span> <span class="s">llama3_1/8B_qlora_single_device</span> <span class="s">\</span>
+  <span class="s">max_steps_per_epoch=100</span> <span class="s">\</span>
+  <span class="s">metric_logger._component_=torchtune.training.metric_logging.StdoutLogger</span></code></pre></div>
+          <p>
+            Watch the setup logs in order, config dump, model build, base
+            checkpoint load, then step lines with falling loss. Match each phase
+            to a stage of Part IV. Note the peak-memory line, that is QLoRA's
+            4-bit base earning its keep.
+          </p>
+          <p><strong>Lab 3: override without editing.</strong> Concept, OmegaConf dotlist overrides.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">tune</span> <span class="s">run</span> <span class="s">lora_finetune_single_device</span> <span class="s">\</span>
+  <span class="s">--config</span> <span class="s">llama3_1/8B_lora_single_device</span> <span class="s">\</span>
+  <span class="s">batch_size=4</span> <span class="s">gradient_accumulation_steps=2</span> <span class="s">\</span>
+  <span class="s">model.lora_rank=16</span> <span class="s">model.lora_alpha=32</span> <span class="s">\</span>
+  <span class="s">model.apply_lora_to_mlp=True</span></code></pre></div>
+          <p>
+            Compare trainable-parameter count and step time against the default
+            rank-8 attention-only run. Then set a nonsense override like
+            <code>model.lora_rank=hello</code> and read how the config layer
+            rejects it. Run <code>tune validate my_config.yaml</code> to
+            type-check a config with no GPU at all.
+          </p>
+          <p><strong>Lab 4: swap the dataset.</strong> Concept, message transforms and templates.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-yaml"><span class="c"># in a copied config, point dataset at your own instruction data</span>
+<span class="s">dataset</span>:
+  <span class="s">_component_</span>: <span class="s">torchtune.datasets.instruct_dataset</span>
+  <span class="s">source</span>: <span class="s">json</span>
+  <span class="s">data_files</span>: <span class="s">/path/to/my_data.json</span>
+  <span class="s">column_map</span>:
+    <span class="s">input</span>: <span class="s">prompt</span>
+    <span class="s">output</span>: <span class="s">response</span>
+  <span class="s">packed</span>: <span class="k">False</span></code></pre></div>
+          <p>
+            Run the LoRA recipe against this config. The recipe does not change
+            at all. Confirm by inspecting a single tokenized batch that the
+            prompt positions carry label <code>-100</code> and only the response
+            tokens carry real labels, which is Stage 4 of Part IV made concrete.
+          </p>
+          <p><strong>Lab 5: LoRA across GPUs with FSDP2.</strong> Concept, the distributed recipe.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">tune</span> <span class="s">run</span> <span class="s">--nproc_per_node</span> <span class="s">2</span> <span class="s">lora_finetune_distributed</span> <span class="s">\</span>
+  <span class="s">--config</span> <span class="s">llama3_1/8B_lora</span> <span class="s">\</span>
+  <span class="s">batch_size=2</span></code></pre></div>
+          <p>
+            Open both <code>lora_finetune_single_device.py</code> and
+            <code>lora_finetune_distributed.py</code> and diff the
+            <code>setup</code> methods. The only substantive difference is the
+            <code>fully_shard</code> region. Watch per-GPU peak memory fall
+            relative to the single-device run at the same effective batch size,
+            because parameters, gradients, and optimizer state are now sharded.
+          </p>
+          <p><strong>Lab 6: fine-tune, then serve.</strong> Concept, format fidelity at the checkpoint boundary.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="c"># after a LoRA run with a merged save, the output dir holds standard safetensors</span>
+<span class="m1">ls</span> <span class="s">/tmp/Meta-Llama-3.1-8B-Instruct/</span>  <span class="c"># + your output dir with epoch_N/</span>
+
+<span class="c"># hand the merged checkpoint straight to an inference engine</span>
+<span class="m1">vllm</span> <span class="s">serve</span> <span class="s">/path/to/your/merged_output_dir</span></code></pre></div>
+          <p>
+            Confirm the merged output loads with no conversion step. That the
+            fine-tune comes out in exactly the format the base came in is the
+            payoff of the checkpointer deep dive, and the clean seam between
+            training in torchtune and serving in <a href="/oss/vllm">vLLM</a>.
+          </p>
+
+          <h2>Part VIII: Questions and model answers</h2>
+          <p>Understanding checks. Answer aloud before reading.</p>
+          <p><strong>1. What is torchtune, in one sentence?</strong></p>
+          <p>
+            The PyTorch team's native fine-tuning library, where each fine-tune
+            is a readable, forkable recipe script wired together by a small YAML
+            config that names components by import path, favoring hackability
+            over both a framework's convenience and a specialized kernel
+            stack's raw speed.
+          </p>
+          <p><strong>2. What is the difference between a recipe and a config?</strong></p>
+          <p>
+            A recipe is a training program, a self-contained Python script with
+            a visible loop. A config is a document that selects and
+            parameterizes the objects that program uses, with no control flow of
+            its own. <code>torchtune.config.instantiate</code> turns a
+            <code>_component_</code> node into a live object, and
+            <code>config.parse</code> loads the YAML and applies CLI overrides.
+          </p>
+          <p><strong>3. How does LoRA reduce the trainable parameter count?</strong></p>
+          <p>
+            <code>LoRALinear</code> freezes the original weight and adds a
+            trainable low-rank update through two small matrices A and B of rank
+            r. Only A and B require gradients, so a few million parameters train
+            against billions of frozen ones, and the update is scaled by
+            alpha over rank before being added to the base projection.
+          </p>
+          <p><strong>4. What does QLoRA add on top of LoRA, and why is it safe?</strong></p>
+          <p>
+            It quantizes the frozen base weights to 4-bit NF4 from torchao while
+            keeping the LoRA adapters in full precision. It is safe because the
+            base is never trained, so its quantization error never accumulates
+            through optimization, while all learning happens in the exact,
+            full-precision adapters.
+          </p>
+          <p><strong>5. Where does the loss mask come from and why does it matter?</strong></p>
+          <p>
+            From the <code>masked</code> flag on each <code>Message</code>.
+            Prompt messages are masked, so their label positions become
+            <code>CROSS_ENTROPY_IGNORE_IDX</code> (-100) and contribute no loss,
+            and the model is trained only on the response tokens. Getting the
+            mask wrong trains the model to generate the prompt.
+          </p>
+          <p><strong>6. Trace the data path from a raw dataset row to a batched tensor.</strong></p>
+          <p>
+            A message transform turns the row into a list of
+            <code>Message</code> objects, an optional prompt template decorates
+            each role's content, the model tokenizer's
+            <code>tokenize_messages</code> produces token ids and a mask, and
+            <code>padded_collate_sft</code> pads and stacks a batch, setting
+            masked label positions to -100.
+          </p>
+          <p><strong>7. How does the distributed recipe differ from the single-device one?</strong></p>
+          <p>
+            In one region of <code>setup</code>. It builds the model on the meta
+            device and applies FSDP2's <code>fully_shard</code> per transformer
+            layer and once over the whole model, so parameters, gradients, and
+            optimizer state are sharded across ranks. The loop is unchanged,
+            because the collectives are a property of the sharded
+            <code>DTensor</code> parameters rather than of the code.
+          </p>
+          <p><strong>8. Why can a torchtune fine-tune load straight into vLLM or Transformers?</strong></p>
+          <p>
+            Because the checkpointer converts torchtune's internal parameter
+            names and layouts back into the exact external format on save, so
+            the output safetensors are indistinguishable in format from the base
+            model that was downloaded. The <code>model_type</code> field selects
+            the right conversion.
+          </p>
+          <p><strong>9. Name three ways a single-device config fits a large model on one GPU.</strong></p>
+          <p>
+            QLoRA's 4-bit NF4 base, activation checkpointing and activation
+            offloading to trade compute or CPU bandwidth for activation memory,
+            and either <code>optimizer_in_bwd</code> in the full recipe or an
+            8-bit optimizer to shrink optimizer state. Chunked cross-entropy and
+            sample packing help further.
+          </p>
+          <p><strong>10. When would you choose unsloth or axolotl over torchtune?</strong></p>
+          <p>
+            unsloth when single-GPU speed and VRAM on a popular architecture
+            dominate and you are content inside its patched Hugging Face models.
+            axolotl when you want maximum breadth of models and knobs with
+            minimal code and are content for the HF <code>Trainer</code> to own
+            the loop. torchtune when you want a readable PyTorch-native loop you
+            can fork and honest multi-GPU FSDP2 in the open.
+          </p>
+          <p><strong>11. Why does torchtune not do tensor or pipeline parallelism?</strong></p>
+          <p>
+            Because fine-tuning models in the 8B to 70B range fits comfortably
+            in FSDP2 across a node or two, and adding tensor or pipeline
+            parallelism would trade the readable single-program loop for
+            complexity a fine-tune rarely needs. That N-dimensional territory is
+            deliberately left to torchtitan.
+          </p>
+          <p><strong>12. What does <code>tune cp</code> exist for?</strong></p>
+          <p>
+            To copy a builtin recipe or config into your own tree so you can
+            edit it and run it by path. It is the sanctioned way to change
+            behavior the config cannot express, and reaching for it early is
+            using the library as intended rather than fighting it.
+          </p>
+          <p><strong>13. What exactly is in a config's <code>_component_</code> value?</strong></p>
+          <p>
+            A dotted Python import path to a callable, a model builder, an
+            optimizer class, a dataset builder, a loss. The remaining keys in
+            that node are the callable's keyword arguments.
+            <code>instantiate</code> imports the path and calls it, recursing
+            into nested components first.
+          </p>
+          <p><strong>14. Why are LoRA adapters saved separately as well as merged?</strong></p>
+          <p>
+            The separate adapter file is small, stackable, and swappable at
+            inference, so you can keep many task adapters over one base. The
+            merged file is a standard full checkpoint for direct serving. The
+            recipe can do either or both, controlled by config.
+          </p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Ship a loop, not a Trainer.</strong> By making each recipe a
+            flat, self-contained script instead of a subclass of a framework
+            base, torchtune keeps the thing you most need to understand, the
+            training loop, in plain sight. The cost is some duplication across
+            recipes, and it pays that willingly because a duplicated line you can
+            read beats a shared abstraction you cannot. This is the same instinct
+            as the one-model-one-file philosophy in
+            <a href="/oss/transformers">Transformers</a> and the deliberate
+            minimalism of <a href="/oss/nanogpt">nanoGPT</a>.
+          </p>
+          <p>
+            <strong>Configuration selects parts, code holds behavior.</strong>
+            A config that can only name and parameterize components, with no
+            branching, forces every behavior to live in readable code. That is a
+            constraint that pays, because the config stays a manifest you can
+            audit and the loop stays the single source of truth. The same
+            pattern, name the pieces declaratively and keep the wiring in real
+            code, runs through dependency injection and build systems that
+            eventually admit they are just Python.
+          </p>
+          <p>
+            <strong>Make the output indistinguishable from the input.</strong>
+            Round-tripping the exact external checkpoint format means a fine-tune
+            drops into any tool that accepts the base model, with no bespoke
+            converter and no lock-in. Preserving the interface at the boundary,
+            rather than inventing a proprietary artifact, is what lets torchtune
+            hand off cleanly to serving stacks and evaluators it knows nothing
+            about.
+          </p>
+          <p>
+            <strong>Correctness lives in the boring plumbing.</strong> The label
+            mask, the global token count, the weight-name conversion. The parts
+            most tempting to hand-wave are exactly where a fine-tune silently
+            goes wrong, so torchtune spends its abstraction budget making the
+            message and mask machinery correct by construction rather than on
+            surface features. Reference implementations exist to get the boring
+            parts right.
+          </p>
+          <p>
+            <strong>Let one design own each problem.</strong> torchtune does
+            fine-tuning and hands pretraining to torchtitan and serving to vLLM,
+            and it does data-parallel FSDP2 rather than reinventing every
+            parallelism. Drawing the boundary honestly keeps each project small
+            enough to read, which is the property the whole ecosystem is
+            optimizing for.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            The one-sentence summary. <mark>torchtune expresses a fine-tune as a
+            readable recipe script plus a component config, freezes the base
+            model and trains small LoRA adapters (optionally over a 4-bit NF4
+            base for QLoRA), shards across GPUs with FSDP2 when distributed,
+            builds its batches from masked messages, and writes the result back
+            in the same checkpoint format it read.</mark>
+          </p>
+          <pre class="flow">tune run RECIPE --config CONFIG key=value
+  -&gt; config.parse (YAML + overrides -&gt; DictConfig)
+  -&gt; Recipe.setup: instantiate model, load base ckpt, freeze base + LoRA on
+  -&gt; Recipe.train: data (masked messages) -&gt; fwd -&gt; chunked CE -&gt; bwd -&gt; step
+  -&gt; save_checkpoint: merge adapters, write back in the original format</pre>
+          <p>The chain mapped to source:</p>
+          <pre class="flow">cli            torchtune/_cli/ (tune ls/download/cp/run), _recipe_registry.py
+config         torchtune/config/ (instantiate, parse), recipes/configs/*.yaml
+recipe         recipes/lora_finetune_single_device.py (+ interfaces.py)
+model          torchtune/models/&lt;family&gt;/ + torchtune/modules/ (TransformerDecoder)
+peft           torchtune/modules/peft/ (LoRALinear, get_adapter_params, merge)
+data           torchtune/data/ (Message, transforms, templates) + datasets/
+distributed    torchtune/training/ (fully_shard helpers, FSDP2)
+checkpoint     torchtune/training/checkpointing/ (FullModelHFCheckpointer)</pre>
+          <p>Memorize these blocks:</p>
+          <ul>
+            <li><strong>The split:</strong> recipe is code with the loop, config names components by import path under <code>_component_</code>, overrides are <code>key=value</code>.</li>
+            <li><strong>LoRA:</strong> freeze base weight, train low-rank A and B, scale by alpha/rank, add to the base projection. QLoRA is the same with a 4-bit NF4 frozen base.</li>
+            <li><strong>Distributed:</strong> the single-device and distributed recipes differ only in the <code>fully_shard</code> FSDP2 region of <code>setup</code>.</li>
+            <li><strong>Data:</strong> row -&gt; messages -&gt; template -&gt; tokenize_messages -&gt; mask, prompt tokens become label -100 and only responses train.</li>
+            <li><strong>Checkpoints:</strong> loaded and saved through a per-model converter, so the fine-tune output is standard HF format and serves directly.</li>
+            <li><strong>Positioning:</strong> hackable readable loops, vs unsloth's single-GPU kernel speed and axolotl's config-driven breadth over the HF stack.</li>
+          </ul>
+
+          <h2>Part XI: Papers and further reading</h2>
+          <p>
+            The ideas in this walkthrough come from a small set of papers, and
+            each one rewards a direct read. Where this site derives the same
+            idea in depth, the companion link points there.
+          </p>
+          <ol class="refs">
+            <li>Hu et al., <a href="https://arxiv.org/abs/2106.09685" target="_blank" rel="noreferrer">LoRA, Low-Rank Adaptation of Large Language Models</a>, 2021. The low-rank adapter that <code>LoRALinear</code> implements, freeze the base weight and train two small matrices scaled by alpha over rank. The <a href="/oss/peft">PEFT walkthrough</a> on this site covers the Hugging Face implementation of the same idea.</li>
+            <li>Dettmers et al., <a href="https://arxiv.org/abs/2305.14314" target="_blank" rel="noreferrer">QLoRA, Efficient Finetuning of Quantized LLMs</a>, 2023. The 4-bit NF4 frozen base with full-precision adapters that the qlora builders reproduce, and the source of the paged-optimizer idea. The precision mechanics connect to the <a href="/ml/mixed-precision">mixed precision write-up</a>.</li>
+            <li>Liu et al., <a href="https://arxiv.org/abs/2402.09353" target="_blank" rel="noreferrer">DoRA, Weight-Decomposed Low-Rank Adaptation</a>, 2024. The magnitude-and-direction decomposition behind <code>DoRALinear</code>.</li>
+            <li>Grattafiori et al., <a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noreferrer">The Llama 3 Herd of Models</a>, 2024. The model family this chapter fine-tunes, and the reference for the architecture torchtune reimplements in plain PyTorch.</li>
+            <li>Zhao et al., <a href="https://arxiv.org/abs/2304.11277" target="_blank" rel="noreferrer">PyTorch FSDP, Experiences on Scaling Fully Sharded Data Parallel</a>, 2023. The sharded data parallelism underneath the distributed recipes, which FSDP2 reworks with per-parameter DTensors. The deeper treatment is in the <a href="/oss/torchtitan">torchtitan walkthrough</a> and the <a href="/classes/parallel-computing">parallel computing class</a>.</li>
+            <li>Rafailov et al., <a href="https://arxiv.org/abs/2305.18290" target="_blank" rel="noreferrer">Direct Preference Optimization, Your Language Model is Secretly a Reward Model</a>, 2023. The preference objective behind the DPO recipes and the <code>ChosenRejectedToMessages</code> plumbing. Derived in the <a href="/rl/dpo">DPO note</a> and run at scale in the <a href="/oss/trl">TRL walkthrough</a>.</li>
+            <li>Chen et al., <a href="https://arxiv.org/abs/1604.06174" target="_blank" rel="noreferrer">Training Deep Nets with Sublinear Memory Cost</a>, 2016. The recompute-in-backward idea behind <code>enable_activation_checkpointing</code>.</li>
+            <li>Su et al., <a href="https://arxiv.org/abs/2104.09864" target="_blank" rel="noreferrer">RoFormer, Enhanced Transformer with Rotary Position Embedding</a>, 2021. The rotary position encoding that <code>RotaryPositionalEmbeddings</code> implements. The <a href="/ml/attention-variants">attention variants write-up</a> works through the geometry.</li>
+            <li>Dettmers et al., <a href="https://arxiv.org/abs/2110.02861" target="_blank" rel="noreferrer">8-bit Optimizers via Block-wise Quantization</a>, 2021. The quantized optimizer state behind the <code>PagedAdamW8bit</code> option in memory-tight configs. The state being shrunk is the moment pair from the <a href="/ml/adam">Adam note</a>.</li>
+            <li>Ouyang et al., <a href="https://arxiv.org/abs/2203.02155" target="_blank" rel="noreferrer">Training language models to follow instructions with human feedback</a>, 2022. The instruction-tuning pipeline whose supervised stage is what the SFT recipes implement. The <a href="/classes/applied-generative-ai">applied generative AI class</a> places fine-tuning in that larger pipeline.</li>
+          </ol>
+
+          <h2>Part XII: Final takeaway</h2>
+          <p>
+            If the single-device pieces this repository assumes are the gap, the
+            <a href="/ml">ML implementations section</a> builds attention,
+            optimizers, and precision from scratch, the sharding underneath the
+            distributed recipes is traced in the
+            <a href="/oss/torchtitan">torchtitan chapter</a> and the
+            <a href="/classes/parallel-computing">parallel computing class</a>,
+            and the engine that serves the result is the
+            <a href="/oss/vllm">vLLM chapter</a>. Then come back and read
+            <code>lora_finetune_single_device.py</code> once more. It will read
+            like plain PyTorch with a config bolted on the front, which is
+            exactly the point.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> torchtune argues that fine-tuning
+            does not need a framework that owns your loop. Express the run as a
+            readable recipe plus a component config, freeze the base and train
+            small adapters, shard with FSDP2 when you scale out, keep the
+            model-specific formatting in careful message-and-mask plumbing, and
+            write the result back in the format you read it from. What you give
+            up in one-GPU peak speed against unsloth and in sheer breadth
+            against axolotl, you get back as a loop you can open, understand, and
+            change, which for most people is the thing that actually matters.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/code-copy.js"></script>
+      <script defer src="/theme.js"></script>
+  </body>
+</html>

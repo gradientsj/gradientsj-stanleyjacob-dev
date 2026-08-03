@@ -1,0 +1,1087 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PEFT walkthrough · Stanley Jacob</title>
+    <meta name="description" content="A full chapter on huggingface/peft: parameter-efficient fine-tuning as a library, get_peft_model and the config system, how a LoRA adapter injects into a linear layer, QLoRA on 4-bit base weights, prefix, prompt, and P-tuning, IA3, the merge-and-unload path for inference, a derivation of the LoRA parameter savings, a guided reading path, labs, and understanding checks." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%232B2621'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+      <script>(function(){try{var t=localStorage.getItem("theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss" class="active">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/oss">Open source</a></div>
+        <h1>PEFT</h1>
+        <p class="lead">
+          <a href="https://github.com/huggingface/peft" target="_blank" rel="noreferrer">PEFT</a>
+          is Hugging Face's library for parameter-efficient fine-tuning, the
+          layer that lets you adapt a frozen billion-parameter checkpoint by
+          training a few million new parameters instead of all of them. Its
+          load-bearing idea is small. Freeze the base model, attach a tiny
+          trainable adapter to the modules that matter, and let a config
+          object plus one function call, <code>get_peft_model</code>, rewrite
+          the network in place. This chapter is three things at once, a
+          practical tutorial for fine-tuning a real model with
+          <a href="https://arxiv.org/abs/2106.09685" target="_blank" rel="noreferrer">LoRA</a> and
+          <a href="https://arxiv.org/abs/2305.14314" target="_blank" rel="noreferrer">QLoRA</a>, a systems-internals walkthrough that follows one adapter
+          from <code>get_peft_model</code> into a linear layer and back out
+          through <code>merge_and_unload</code>, and a staged guide to
+          reading the repository. It derives the LoRA parameter savings from
+          first principles, covers prefix, prompt, and P-tuning and
+          <a href="https://arxiv.org/abs/2205.05638" target="_blank" rel="noreferrer">IA3</a>
+          alongside LoRA, and ends with runnable labs, understanding checks
+          with model answers, and a compact framework for keeping the whole
+          library in your head.
+        </p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+          <h2>Part I: The mental model</h2>
+          <pre class="flow">base = AutoModelForCausalLM.from_pretrained(...)   plain frozen model (transformers)
+      |
+      v
+cfg  = LoraConfig(r=8, target_modules=["q_proj","v_proj"], ...)   the recipe
+      |
+      v
+get_peft_model(base, cfg)          src/peft/mapping_func.py
+      |
+      |  PeftModel wraps base, freezes every weight
+      |  BaseTuner.inject_adapter walks named_modules()
+      |  matches target_modules, swaps nn.Linear -&gt; lora.Linear (keeps base_layer)
+      v
+PeftModel                          only lora_A / lora_B require grad (~0.1% of params)
+      |
+      v
+train loop                         Trainer / accelerate, gradients touch adapters only
+      |
+      v
+model.save_pretrained("out/")      adapter_config.json + adapter_model.safetensors (MBs)
+      |
+      v
+merge_and_unload()                 fold (B A) * scaling into W, return a plain model</pre>
+          <p>
+            The one-sentence identity. <mark>PEFT is a thin transformation
+            layer over a frozen <a href="/oss/transformers">Transformers</a>
+            model, which reads a config object describing an adapter method
+            and injects small trainable modules into named submodules so that
+            fine-tuning updates a fraction of a percent of the weights and
+            saves as megabytes rather than gigabytes.</mark> Full fine-tuning
+            copies and updates every parameter, which for a 7B model means
+            optimizer state and gradients that dwarf the model itself and a
+            separate multi-gigabyte checkpoint per task. PEFT inverts the
+            economics. The base weights stay frozen and shared, each task
+            owns a tiny adapter, and the same base can carry dozens of
+            adapters swapped at will.
+          </p>
+          <p>
+            Two design commitments make this work. First, the base model is
+            never rewritten by hand. PEFT walks the module tree, matches
+            layers by name against a pattern in the config, and replaces each
+            matched module with a wrapper that holds the original as a
+            <code>base_layer</code> and adds the adapter beside it. The model
+            code you fine-tune is the ordinary Transformers model, untouched.
+            Second, the method is data, not code. Whether you use LoRA,
+            QLoRA, IA3, or a soft-prompt method is a choice of config class,
+            and the dispatch from config to the machinery that edits the
+            network is a lookup table. Everything in this chapter is written
+            against a recent PEFT on the main line in 2026. The library moves
+            steadily and adds methods often, so where a file path or a field
+            name is likely to have shifted I describe the component by its
+            role and stay at the level of the idea.
+          </p>
+
+          <h2>Part II: Using it</h2>
+          <p>
+            PEFT installs from PyPI and rides on top of Transformers, Accelerate,
+            and PyTorch. For the 4-bit QLoRA path you also want bitsandbytes.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">pip</span> <span class="s">install</span> <span class="s">peft</span> <span class="s">transformers</span> <span class="s">accelerate</span>
+<span class="c"># for QLoRA (4-bit base weights) on an NVIDIA GPU:</span>
+<span class="m1">pip</span> <span class="s">install</span> <span class="s">bitsandbytes</span></code></pre></div>
+          <p>
+            A first real session is a LoRA fine-tune of a small causal model.
+            The shape of the code is the same at every scale. Load a plain
+            model, describe an adapter with a config, wrap the model with
+            <code>get_peft_model</code>, then train it like any other
+            <code>nn.Module</code>. The only PEFT-specific lines are the
+            config and the wrap.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">transformers</span> <span class="k">import</span> <span class="m1">AutoModelForCausalLM</span>, <span class="m1">AutoTokenizer</span>
+<span class="k">from</span> <span class="m1">peft</span> <span class="k">import</span> <span class="m1">LoraConfig</span>, <span class="m1">get_peft_model</span>, <span class="m1">TaskType</span>
+
+<span class="v0">base</span> = <span class="m1">AutoModelForCausalLM</span>.<span class="m2">from_pretrained</span><span class="b0">(</span><span class="s">"meta-llama/Llama-3.2-1B"</span><span class="b0">)</span>
+<span class="v1">tok</span>  = <span class="m1">AutoTokenizer</span>.<span class="m2">from_pretrained</span><span class="b0">(</span><span class="s">"meta-llama/Llama-3.2-1B"</span><span class="b0">)</span>
+
+<span class="v1">peft_config</span> = <span class="m1">LoraConfig</span><span class="b0">(</span>
+    <span class="v0">task_type</span>=<span class="m1">TaskType</span>.<span class="m2">CAUSAL_LM</span>,
+    <span class="v2">r</span>=<span class="n">8</span>,                       <span class="c"># rank of the low-rank update</span>
+    <span class="v5">lora_alpha</span>=<span class="n">16</span>,            <span class="c"># scaling, applied as alpha / r</span>
+    <span class="v2">lora_dropout</span>=<span class="n">0.05</span>,
+    <span class="v4">target_modules</span>=<span class="b1">[</span><span class="s">"q_proj"</span>, <span class="s">"v_proj"</span><span class="b1">]</span>,   <span class="c"># which linears get an adapter</span>
+    <span class="v4">bias</span>=<span class="s">"none"</span>,
+<span class="b0">)</span>
+
+<span class="v0">model</span> = <span class="m1">get_peft_model</span><span class="b0">(</span><span class="v0">base</span>, <span class="v1">peft_config</span><span class="b0">)</span>
+<span class="v0">model</span>.<span class="m2">print_trainable_parameters</span><span class="b0">()</span>
+<span class="c"># trainable params: 851,968 || all params: 1,236,666,368 || trainable%: 0.0689</span></code></pre></div>
+          <p>
+            The <code>print_trainable_parameters</code> line is the whole
+            pitch in one number. Under a tenth of a percent of the weights
+            carry gradients. From here the model trains with the ordinary
+            Transformers <code>Trainer</code> or a hand-written loop, and only
+            the adapter tensors move. Saving writes just those tensors.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">transformers</span> <span class="k">import</span> <span class="m1">Trainer</span>, <span class="m1">TrainingArguments</span>
+
+<span class="v1">trainer</span> = <span class="m1">Trainer</span><span class="b0">(</span><span class="v0">model</span>=<span class="v0">model</span>, <span class="v2">args</span>=<span class="m1">TrainingArguments</span><span class="b1">(</span><span class="s">"out"</span>, <span class="v3">num_train_epochs</span>=<span class="n">1</span><span class="b1">)</span>,
+                  <span class="v4">train_dataset</span>=<span class="v2">train_ds</span>, <span class="v4">data_collator</span>=<span class="v0">collator</span><span class="b0">)</span>
+<span class="v1">trainer</span>.<span class="m2">train</span><span class="b0">()</span>
+
+<span class="v0">model</span>.<span class="m2">save_pretrained</span><span class="b0">(</span><span class="s">"my-lora"</span><span class="b0">)</span>   <span class="c"># writes adapter_config.json + adapter_model.safetensors</span></code></pre></div>
+          <p>
+            The output directory is tiny, a few megabytes for a rank-8 adapter,
+            because it holds only <code>lora_A</code> and <code>lora_B</code>,
+            not the base. Reloading needs the base plus the adapter.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">peft</span> <span class="k">import</span> <span class="m1">PeftModel</span>
+<span class="v0">base</span> = <span class="v1">AutoModelForCausalLM</span>.<span class="m2">from_pretrained</span><span class="b0">(</span><span class="s">"meta-llama/Llama-3.2-1B"</span><span class="b0">)</span>
+<span class="v0">model</span> = <span class="m1">PeftModel</span>.<span class="m2">from_pretrained</span><span class="b0">(</span><span class="v0">base</span>, <span class="s">"my-lora"</span><span class="b0">)</span>   <span class="c"># base + adapter, ready to run</span></code></pre></div>
+          <p>
+            Now the mistakes beginners make. First, <code>target_modules</code>
+            has to name modules that exist. The names are suffixes of the
+            module paths in the base model, so <code>q_proj</code> matches
+            <code>model.layers.0.self_attn.q_proj</code> and every sibling. Name
+            a module that is not there and PEFT raises rather than silently
+            attaching nothing. When unsure, pass the special value
+            <code>target_modules="all-linear"</code> to adapt every linear
+            layer except the output head, or print the module names first.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">for</span> <span class="v2">name</span>, <span class="v6">module</span> <span class="k">in</span> <span class="v0">base</span>.<span class="m2">named_modules</span><span class="b0">()</span>:
+    <span class="k">if</span> <span class="m1">isinstance</span><span class="b0">(</span><span class="v6">module</span>, <span class="m1">torch</span>.<span class="m2">nn</span>.<span class="m2">Linear</span><span class="b0">)</span>:
+        <span class="m1">print</span><span class="b0">(</span><span class="v2">name</span><span class="b0">)</span>      <span class="c"># q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj, ...</span></code></pre></div>
+          <p>
+            Second, forgetting to save the head. For sequence classification
+            you attach a fresh classifier that is not part of any adapter, so
+            it must be listed in <code>modules_to_save</code> or it will not
+            be trained or saved. Third, precision surprises. A LoRA adapter is
+            created in a working dtype and, if the base is in fp16 or bf16,
+            the adapter math runs in a compatible dtype, so mixing a
+            half-precision base with an fp32 optimizer without care can waste
+            memory or silently downcast. Fourth, and most common, expecting
+            the base to change. It does not. Until you call
+            <code>merge_and_unload</code>, the base weights are frozen and the
+            adapter is a separate additive term, which is exactly what lets
+            you disable it, swap it, or keep several around.
+          </p>
+
+          <h2>Part III: When it is the right tool</h2>
+          <p>
+            PEFT is the right tool when you are adapting an existing pretrained
+            checkpoint to a task or a style and you want the result to be cheap
+            to train, cheap to store, and easy to serve alongside other
+            adaptations of the same base. That covers most of applied
+            fine-tuning, instruction tuning a base model, giving a chat model
+            a domain voice, task-specific classifiers over a shared encoder,
+            and any setting where you will produce many adaptations of one
+            base and cannot afford a full checkpoint for each. It integrates
+            directly with the Transformers <code>Trainer</code>, with TRL for
+            preference and RL fine-tuning, with Accelerate and DeepSpeed and
+            FSDP for multi-GPU, and with Diffusers for image models, so the
+            adapter you train is a first-class citizen across the ecosystem.
+          </p>
+          <p>
+            The honest cases for alternatives. Full fine-tuning when the base
+            is small, the target task is far from the pretraining distribution,
+            and you have the memory, because updating all weights is still the
+            highest-ceiling option when you can pay for it. <a href="/oss/torchtitan">torchtitan</a>
+            and similar pretraining platforms when the job is training a model
+            from scratch or heavy continued pretraining rather than adapting a
+            finished one, which is a different problem with different defaults.
+            Unsloth when you want a tuned, kernel-optimized LoRA and QLoRA path
+            that squeezes more speed and memory out of a single GPU, it wraps
+            the same ideas with custom Triton kernels. Axolotl or LLaMA-Factory
+            when you want an opinionated YAML-driven training harness rather
+            than a library you call from Python, both of which use PEFT
+            underneath. torchtune for a PyTorch-native fine-tuning stack with
+            its own recipes. The original AdapterHub line of work, now adapters,
+            for a research-oriented take on bottleneck adapters and adapter
+            composition. PEFT itself is deliberately a library of methods and a
+            clean injection mechanism, not a training framework with a
+            thousand options.
+          </p>
+          <p>
+            The method-shaped warning is that not every parameter-efficient
+            method suits every task. LoRA and its relatives change what the
+            weights compute and reach the widest range of tasks, including ones
+            that need the model to learn genuinely new behavior. Soft-prompt
+            methods, <a href="https://arxiv.org/abs/2104.08691" target="_blank" rel="noreferrer">prompt
+            tuning</a> and <a href="https://arxiv.org/abs/2101.00190" target="_blank" rel="noreferrer">prefix
+            tuning</a> and P-tuning, steer a
+            frozen model by learning inputs rather than weights, which is
+            cheaper still and elegant for steering a large model toward a task
+            it already almost knows, but weaker when the task demands new
+            capability and sensitive to how many virtual tokens you give it.
+            IA3 is extremely light and strong in the few-shot regime it was
+            designed for. Reaching for a soft prompt where the task really
+            needs LoRA is the classic mismatch, and the symptom is a training
+            curve that plateaus early well short of what a small LoRA would
+            reach.
+          </p>
+
+          <h2>Part IV: The full life of one adapter</h2>
+          <p>
+            The specimen is a rank-8 LoRA on the query and value projections of
+            a causal language model. We follow it from the config through
+            <code>get_peft_model</code>, into a single linear layer, through one
+            forward pass, out to disk, and finally through
+            <code>merge_and_unload</code> for inference. The same path holds for
+            QLoRA, where the only difference is that the frozen base linear is a
+            4-bit quantized layer rather than an ordinary one.
+          </p>
+
+          <h3>Stage 1: the config as a recipe</h3>
+          <p>
+            A <code>LoraConfig</code> is a dataclass that subclasses
+            <code>PeftConfig</code> (in <code>src/peft/config.py</code>). It
+            records <code>peft_type=PeftType.LORA</code>, the rank <code>r</code>,
+            the scaling <code>lora_alpha</code>, the dropout, the
+            <code>target_modules</code> pattern, the <code>bias</code> policy,
+            <code>modules_to_save</code>, and a set of newer switches like
+            <code>use_rslora</code> and <code>use_dora</code>. It is pure data.
+            It knows the recipe but does nothing to a model. Its
+            <code>peft_type</code> is the key that later selects which tuner
+            edits the network.
+          </p>
+
+          <h3>Stage 2: get_peft_model and the dispatch</h3>
+          <p>
+            <code>get_peft_model(base, peft_config)</code> lives in the mapping
+            module (<code>src/peft/mapping_func.py</code> on recent versions,
+            historically <code>mapping.py</code>). It reads
+            <code>peft_config.task_type</code> to choose a task-specific
+            <code>PeftModel</code> subclass, for a causal model that is
+            <code>PeftModelForCausalLM</code>, and constructs it around the base.
+            <code>PeftModel.__init__</code> (in <code>src/peft/peft_model.py</code>)
+            then reads <code>peft_config.peft_type</code>, looks up the matching
+            tuner class in the peft-type-to-model mapping, and builds it. For
+            LoRA that class is <code>LoraModel</code> (in
+            <code>src/peft/tuners/lora/model.py</code>), a subclass of the shared
+            <code>BaseTuner</code> in <code>src/peft/tuners/tuners_utils.py</code>.
+            Constructing the tuner is what triggers the actual surgery.
+          </p>
+
+          <h3>Stage 3: inject_adapter walks the tree</h3>
+          <p>
+            <code>BaseTuner.inject_adapter</code> collects every module name from
+            <code>base.named_modules()</code> and, for each one, asks
+            <code>_check_target_module_exists(peft_config, key)</code> whether it
+            matches. The match is a suffix comparison against the strings in
+            <code>target_modules</code>, or a full regex if you passed one, so
+            <code>"q_proj"</code> matches every
+            <code>...self_attn.q_proj</code>. For each match the tuner calls
+            <code>_create_and_replace</code>, which builds a new module with
+            <code>_create_new_module</code> and swaps it into the parent with
+            <code>_replace_module</code>. The dispatch inside
+            <code>_create_new_module</code> is by the type of the target. An
+            <code>nn.Linear</code> becomes a <code>lora.Linear</code>, an
+            <code>nn.Embedding</code> becomes a <code>lora.Embedding</code>, a
+            <code>Conv2d</code> becomes a <code>lora.Conv2d</code>, and a
+            bitsandbytes <code>Linear4bit</code> becomes the 4-bit LoRA layer
+            from <code>src/peft/tuners/lora/bnb.py</code>. This type dispatch is
+            the single seam that makes QLoRA fall out of the same code path.
+          </p>
+          <pre class="flow">for name in base.named_modules():
+    if _check_target_module_exists(cfg, name):        # suffix / regex match
+        parent, target, target_name = _get_submodules(base, name)
+        new = _create_new_module(cfg, adapter_name, target)   # type dispatch
+        _replace_module(parent, target_name, new, target)     # keep target as base_layer</pre>
+          <p>
+            The replacement wrapper is the crux. A <code>lora.Linear</code>
+            (in <code>src/peft/tuners/lora/layer.py</code>) stores the original
+            linear as <code>self.base_layer</code> and adds, keyed by adapter
+            name, an <code>nn.ModuleDict</code> of low-rank factors. For an
+            adapter named <code>"default"</code> on a linear with
+            <code>in_features</code> by <code>out_features</code>, it creates
+            <code>lora_A["default"] = nn.Linear(in_features, r, bias=False)</code>
+            whose weight is shaped <code>(r, in_features)</code>, and
+            <code>lora_B["default"] = nn.Linear(r, out_features, bias=False)</code>
+            whose weight is shaped <code>(out_features, r)</code>. It records the
+            scaling <code>lora_alpha / r</code>, sets up the dropout, initializes
+            <code>lora_A</code> with a Kaiming-style random init and
+            <code>lora_B</code> to all zeros, so at step zero the adapter
+            contributes nothing and training starts from the frozen base
+            exactly. Finally <code>_mark_only_adapters_as_trainable</code> sets
+            <code>requires_grad=False</code> on every base parameter and leaves
+            only the adapter tensors trainable, honoring the <code>bias</code>
+            policy.
+          </p>
+
+          <h3>Stage 4: one forward pass</h3>
+          <p>
+            When input <code>x</code> reaches a wrapped linear, the layer runs
+            the frozen base and adds the low-rank correction on top. In its
+            simplest form the forward is this.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="c"># peft/tuners/lora/layer.py, Linear.forward, simplified</span>
+<span class="v5">result</span> = <span class="k">self</span>.<span class="m2">base_layer</span><span class="b0">(</span><span class="v4">x</span><span class="b0">)</span>                       <span class="c"># frozen W x  (+ bias)</span>
+<span class="k">for</span> <span class="v6">adapter</span> <span class="k">in</span> <span class="k">self</span>.<span class="m2">active_adapters</span>:
+    <span class="m1">A</span> = <span class="k">self</span>.<span class="m2">lora_A</span><span class="b0">[</span><span class="v6">adapter</span><span class="b0">]</span>
+    <span class="m1">B</span> = <span class="k">self</span>.<span class="m2">lora_B</span><span class="b0">[</span><span class="v6">adapter</span><span class="b0">]</span>
+    <span class="m1">drop</span> = <span class="k">self</span>.<span class="m2">lora_dropout</span><span class="b0">[</span><span class="v6">adapter</span><span class="b0">]</span>
+    <span class="v4">s</span> = <span class="k">self</span>.<span class="m2">scaling</span><span class="b0">[</span><span class="v6">adapter</span><span class="b0">]</span>                     <span class="c"># = lora_alpha / r</span>
+    <span class="v5">result</span> = <span class="v5">result</span> + <span class="m1">B</span><span class="b0">(</span><span class="m1">A</span><span class="b1">(</span><span class="m1">drop</span><span class="b2">(</span><span class="v4">x</span><span class="b2">)</span><span class="b1">)</span><span class="b0">)</span> * <span class="v4">s</span>           <span class="c"># (out_features) low-rank add</span>
+<span class="k">return</span> <span class="v5">result</span></code></pre></div>
+          <p>
+            The base path is untouched, so the model still computes exactly
+            what it did before, and the adapter adds a small residual. The cost
+            of that residual is two skinny matmuls, <code>x</code> down to
+            <code>r</code> dimensions through <code>A</code> and back up to
+            <code>out_features</code> through <code>B</code>, which is why rank
+            <code>r</code> is the whole knob. During backward only
+            <code>A</code> and <code>B</code> accumulate gradients because
+            everything else was frozen in stage 3, so the optimizer state is
+            proportional to the adapter size, not the model size. That is the
+            memory win that lets a 7B LoRA fine-tune fit where a full one never
+            could.
+          </p>
+
+          <h3>Stage 5: saving only what changed</h3>
+          <p>
+            <code>model.save_pretrained("out")</code> calls
+            <code>get_peft_model_state_dict</code> (in
+            <code>src/peft/utils/save_and_load.py</code>), which filters the full
+            state dict down to the keys the adapter owns, the
+            <code>lora_A</code> and <code>lora_B</code> weights plus any
+            <code>modules_to_save</code>, and writes them as
+            <code>adapter_model.safetensors</code>. Alongside it writes
+            <code>adapter_config.json</code>, the serialized
+            <code>LoraConfig</code> including the base model name so a reload
+            knows what to attach to. Nothing of the base is copied. This is why
+            the same 7B base can host a folder of adapters where each is a few
+            megabytes, and why you can share a task adapter as an artifact that
+            assumes the reader already has the base.
+          </p>
+
+          <h3>Stage 6: merge and unload for inference</h3>
+          <p>
+            At inference the extra matmul per adapted layer is pure overhead you
+            no longer need, because training is over and the adapter can be
+            folded into the weight it corrects. <code>merge_and_unload</code>
+            (on <code>LoraModel</code>) does exactly that. For every wrapped
+            layer it computes the delta weight and adds it to the base weight in
+            place, then replaces the wrapper with the now-updated base layer, so
+            the returned object is a plain Transformers model with no PEFT code
+            in the forward path and no latency penalty.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="c"># the folded update, from get_delta_weight, conceptually</span>
+<span class="v1">delta_W</span> = <span class="b0">(</span><span class="v0">B</span>.<span class="m2">weight</span> @ <span class="v6">A</span>.<span class="m2">weight</span><span class="b0">)</span> * <span class="v3">scaling</span>          <span class="c"># shape (out_features, in_features)</span>
+<span class="v0">base_layer</span>.<span class="m2">weight</span>.<span class="m2">data</span> += <span class="v1">delta_W</span>                   <span class="c"># now W' = W + (alpha/r) B A</span>
+
+<span class="v4">merged</span> = <span class="v0">model</span>.<span class="m2">merge_and_unload</span><span class="b0">()</span>                   <span class="c"># returns a plain nn.Module</span>
+<span class="v4">merged</span>.<span class="m2">save_pretrained</span><span class="b0">(</span><span class="s">"merged-model"</span><span class="b0">)</span>              <span class="c"># full model, no adapter needed</span></code></pre></div>
+          <p>
+            That closes the loop. A recipe became a wrapper, the wrapper learned
+            a low-rank correction while the base sat frozen, the correction
+            saved as megabytes, and at the end the correction dissolved back
+            into the weights it was always a delta of. If you would rather keep
+            the adapter separate at serving time, do not merge. Serving stacks
+            like <a href="/oss/vllm">vLLM</a> and <a href="/oss/sglang">SGLang</a>
+            can load LoRA adapters dynamically and even multiplex many adapters
+            over one shared base in a single process, which is the deployment
+            payoff of keeping the adapter as a detachable term.
+          </p>
+
+          <h2>Part V: Internals deep dives</h2>
+
+          <h3>Deep dive: deriving the LoRA parameter savings</h3>
+          <p>
+            LoRA rests on a hypothesis and a small piece of arithmetic. The
+            hypothesis is that the change a task makes to a big weight matrix
+            has low intrinsic rank, so instead of learning a dense update you
+            can learn a product of two thin matrices. The arithmetic is what
+            makes it cheap. Take a linear layer with weight <code>W</code> of
+            shape <code>(d_out, d_in)</code>. Full fine-tuning trains every
+            entry, so it updates <code>d_out * d_in</code> parameters.
+          </p>
+          <p>
+            LoRA freezes <code>W</code> and learns
+            <code>&Delta;W = B A</code>, where <code>A</code> has shape
+            <code>(r, d_in)</code> and <code>B</code> has shape
+            <code>(d_out, r)</code>, with the rank <code>r</code> much smaller
+            than either dimension. The effective weight becomes
+            <code>W + (&alpha;/r) B A</code>. The trainable count is the size of
+            the two factors.
+          </p>
+          <pre class="flow">full fine-tune of W (d_out x d_in):   d_out * d_in trainable
+
+LoRA:   W frozen,  dW = B A,  applied as (alpha / r) * B A
+        A: (r, d_in)     ->  r * d_in params
+        B: (d_out, r)    ->  d_out * r params
+        trainable = r * d_in + r * d_out = r * (d_in + d_out)
+
+square case d_in = d_out = d:
+        full = d^2        LoRA = 2 r d        ratio = 2 r / d
+
+d = 4096, r = 8:   ratio = 16 / 4096 = 1 / 256 ~ 0.39% per matrix</pre>
+          <p>
+            <mark>The saving is the ratio 2r/d, so at rank 8 on a
+            4096-wide projection you train about one parameter for every 256
+            the full update would, and the win grows linearly as the model
+            gets wider because d grows while r stays fixed.</mark> The scaling
+            factor <code>&alpha;/r</code> multiplies the update but adds no
+            parameters, it only rescales how strongly the learned correction is
+            applied, which decouples the learning-rate-like magnitude from the
+            rank. A rank-stabilized variant divides by
+            <code>sqrt(r)</code> instead to keep the scale steady as rank
+            changes, selectable with <code>use_rslora</code>.
+          </p>
+          <p>
+            Now a whole model, to see the number PEFT prints. Take a Llama-style
+            7B with hidden size 4096 and 32 layers, and put a rank-8 LoRA on
+            just <code>q_proj</code> and <code>v_proj</code>, each a
+            <code>4096 x 4096</code> matrix.
+          </p>
+          <pre class="flow">per matrix (4096 x 4096), r = 8:   2 * 4096 * 8 = 65,536
+q_proj + v_proj per layer:         2 * 65,536 = 131,072
+x 32 layers:                       4,194,304  ~ 4.19M trainable
+as fraction of ~6.7B base:         ~0.062%</pre>
+          <p>
+            Four million trainable parameters against a nearly seven billion
+            parameter base. That is the concrete meaning of "under a tenth of a
+            percent", and it is why the optimizer state, the gradients, and the
+            saved checkpoint all shrink by three orders of magnitude while the
+            forward pass stays essentially the base model plus a rounding error
+            of extra compute. Push the rank up to reach more expressive
+            corrections, widen <code>target_modules</code> to include the MLP
+            projections to reach more of the network, and the count scales
+            predictably by the same formula.
+          </p>
+
+          <h3>Deep dive: the config system and the tuner registry</h3>
+          <p>
+            The config layer is small and worth copying. Every method ships a
+            config dataclass that subclasses <code>PeftConfig</code>, and each
+            config carries a <code>peft_type</code> from the <code>PeftType</code>
+            enum (in <code>src/peft/utils/peft_types.py</code>). The
+            <code>get_peft_model</code> entry point uses two lookups. The
+            <code>task_type</code> selects a <code>PeftModel</code> subclass
+            that knows how a causal, seq2seq, sequence-classification, or
+            token-classification model wires inputs and outputs, and the
+            <code>peft_type</code> selects the tuner that edits the modules. Both
+            are plain dictionaries from enum value to class. Adding a new method
+            to PEFT is, at the plumbing level, writing a config, a tuner model, a
+            layer, and registering the pair, which is why the library can carry a
+            long list of methods without the core growing.
+          </p>
+          <p>
+            That list is genuinely long. Alongside LoRA the tree under
+            <code>src/peft/tuners/</code> holds IA3, prefix tuning, prompt tuning,
+            P-tuning, AdaLoRA (rank that adapts during training), LoHa and LoKr
+            (Hadamard and Kronecker low-rank forms), OFT and BOFT (orthogonal
+            fine-tuning), VeRA (shared random bases with tiny per-layer vectors),
+            the adaption-prompt Llama-Adapter method, and more. They all reach
+            the network through the same <code>BaseTuner</code> and
+            <code>BaseTunerLayer</code> contract, so once you understand how LoRA
+            injects, you understand the mechanism for all of them, and only the
+            per-layer math differs. The exact set of methods grows release to
+            release, so treat any list as a snapshot.
+          </p>
+
+          <h3>Deep dive: QLoRA and the 4-bit base</h3>
+          <p>
+            QLoRA is not a separate PEFT method. It is LoRA whose frozen base is
+            quantized to 4 bits, and the reason it works cleanly is the type
+            dispatch from stage 3. You load the base through Transformers with a
+            bitsandbytes quantization config, so the linear layers arrive as
+            <code>Linear4bit</code> modules holding 4-bit weights, and when the
+            tuner walks the tree it dispatches those to the 4-bit LoRA layer in
+            <code>src/peft/tuners/lora/bnb.py</code> instead of the ordinary one.
+            The adapter factors <code>A</code> and <code>B</code> stay in a
+            normal compute dtype, bf16 by convention, and the frozen base is
+            dequantized on the fly inside the matmul.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">transformers</span> <span class="k">import</span> <span class="m1">AutoModelForCausalLM</span>, <span class="m1">BitsAndBytesConfig</span>
+<span class="k">from</span> <span class="m1">peft</span> <span class="k">import</span> <span class="m1">LoraConfig</span>, <span class="m1">get_peft_model</span>, <span class="m1">prepare_model_for_kbit_training</span>
+<span class="k">import</span> <span class="m1">torch</span>
+
+<span class="v2">bnb</span> = <span class="m1">BitsAndBytesConfig</span><span class="b0">(</span>
+    <span class="v0">load_in_4bit</span>=<span class="k">True</span>,
+    <span class="v0">bnb_4bit_quant_type</span>=<span class="s">"nf4"</span>,              <span class="c"># NormalFloat4, from the QLoRA paper</span>
+    <span class="v2">bnb_4bit_use_double_quant</span>=<span class="k">True</span>,         <span class="c"># quantize the quantization constants too</span>
+    <span class="v1">bnb_4bit_compute_dtype</span>=<span class="m1">torch</span>.<span class="m2">bfloat16</span>,  <span class="c"># dtype the dequantized matmul runs in</span>
+<span class="b0">)</span>
+
+<span class="v0">base</span> = <span class="m1">AutoModelForCausalLM</span>.<span class="m2">from_pretrained</span><span class="b0">(</span><span class="s">"meta-llama/Llama-3.1-8B"</span>,
+                                            <span class="v3">quantization_config</span>=<span class="v2">bnb</span><span class="b0">)</span>
+<span class="v0">base</span> = <span class="m1">prepare_model_for_kbit_training</span><span class="b0">(</span><span class="v0">base</span><span class="b0">)</span>     <span class="c"># cast norms to fp32, enable grad ckpt, ...</span>
+
+<span class="v2">cfg</span> = <span class="m1">LoraConfig</span><span class="b0">(</span><span class="v0">task_type</span>=<span class="s">"CAUSAL_LM"</span>, <span class="v2">r</span>=<span class="n">16</span>, <span class="v5">lora_alpha</span>=<span class="n">32</span>,
+                 <span class="v4">target_modules</span>=<span class="s">"all-linear"</span>, <span class="v2">lora_dropout</span>=<span class="n">0.05</span><span class="b0">)</span>
+<span class="v0">model</span> = <span class="m1">get_peft_model</span><span class="b0">(</span><span class="v0">base</span>, <span class="v2">cfg</span><span class="b0">)</span></code></pre></div>
+          <p>
+            The three ideas from the QLoRA paper are all visible here. NF4 is a
+            4-bit data type shaped for the roughly normal distribution of neural
+            network weights, so it packs more accuracy into four bits than a
+            plain integer grid. Double quantization quantizes the per-block
+            scaling constants themselves, shaving a further fraction of a bit per
+            parameter. And paged optimizers, requested through the bitsandbytes
+            optimizer rather than PEFT, absorb the transient memory spikes that
+            would otherwise cause out-of-memory during long-sequence steps. The
+            <code>prepare_model_for_kbit_training</code> helper (in
+            <code>src/peft/utils/other.py</code>) does the housekeeping that
+            keeps 4-bit training stable, casting layer norms and the language
+            head to fp32, enabling gradient checkpointing, and making the input
+            embeddings produce gradients so activation checkpointing has
+            something to attach to. The result is the headline from the paper,
+            that a 65B model can be fine-tuned on a single 48GB GPU, because the
+            frozen base costs about four bits per parameter and only the tiny
+            adapter carries optimizer state.
+          </p>
+          <p>
+            One caution specific to the 4-bit path. Merging is lossy. Folding a
+            bf16 delta into a 4-bit weight means dequantizing, adding, and
+            requantizing, which does not round-trip exactly, so for QLoRA the
+            common practice is to keep the adapter separate at serving time, or
+            to merge into a dequantized higher-precision copy of the base rather
+            than back into 4 bits. The mechanism supports both, and the choice
+            is about how much accuracy you are willing to trade for a single
+            merged artifact. For quantized deployment more broadly the story
+            continues in <a href="/oss/llama-cpp">llama.cpp</a> and
+            <a href="/oss/tensorrt-llm">TensorRT-LLM</a>.
+          </p>
+
+          <h3>Deep dive: LoRA versus the soft-prompt methods and IA3</h3>
+          <p>
+            LoRA edits weights. The soft-prompt family edits inputs, and IA3
+            edits activations by a learned scale. They divide cleanly by where
+            the new parameters live, and that division is mirrored in the code
+            by whether they go through the tuner-injection path or the
+            prompt-encoder path.
+          </p>
+          <table>
+            <tr><th>Method</th><th>What is learned</th><th>Where it acts</th><th>Roughly how many params</th></tr>
+            <tr><td>LoRA</td><td>low-rank B A per target linear</td><td>added to the weight</td><td>r (d_in + d_out) per layer</td></tr>
+            <tr><td>IA3</td><td>elementwise scale vectors</td><td>rescale keys, values, FFN activations</td><td>d_k + d_v + d_ff per layer</td></tr>
+            <tr><td>Prompt tuning</td><td>soft token embeddings</td><td>prepended at the input layer only</td><td>num_virtual_tokens x hidden</td></tr>
+            <tr><td>P-tuning</td><td>soft tokens via a small encoder</td><td>prepended at the input layer</td><td>encoder + virtual tokens</td></tr>
+            <tr><td>Prefix tuning</td><td>key/value prefixes per layer</td><td>prepended to attention in every layer</td><td>2 x layers x tokens x hidden</td></tr>
+          </table>
+          <p>
+            IA3, which stands for infused adapter by inhibiting and amplifying
+            inner activations, is the lightest weight-space method here. Instead
+            of adding a low-rank matrix it learns a vector per target module and
+            multiplies the module elementwise, scaling the keys and values in
+            attention and the intermediate activations in the feed-forward block.
+            An <code>IA3Config</code> names both the <code>target_modules</code>
+            it rescales and, separately, the <code>feedforward_modules</code>
+            among them, because for a feed-forward module the learned vector
+            scales the input to the down projection rather than the output. In
+            <code>src/peft/tuners/ia3/layer.py</code> the forward is a
+            multiply, not an add, and because a diagonal rescale commutes into
+            the weight it merges by scaling rows or columns of the base matrix.
+            IA3 trains even fewer parameters than a small LoRA and was designed
+            for the few-shot regime where that frugality is a strength.
+          </p>
+          <p>
+            The soft-prompt methods live in a different branch of
+            <code>PeftModel</code>. Their configs subclass the prompt-learning
+            config rather than being tuner configs, and PEFT does not inject
+            anything into the base modules. Instead <code>PeftModel.forward</code>
+            calls a prompt encoder to produce virtual token representations and
+            prepends them to the sequence. Prompt tuning (in
+            <code>src/peft/tuners/prompt_tuning/</code>) learns a small table of
+            input embeddings prepended once at the bottom of the network, the
+            lightest possible intervention. P-tuning (in
+            <code>src/peft/tuners/p_tuning/</code>) generates those virtual
+            embeddings through a small LSTM or MLP encoder rather than storing
+            them directly, which stabilizes optimization. Prefix tuning (in
+            <code>src/peft/tuners/prefix_tuning/</code>) is the heaviest of the
+            three because it injects trainable key and value vectors into the
+            attention of every layer, delivered as the model's
+            <code>past_key_values</code>, so it steers the whole depth of the
+            network rather than only the input. During training the prefix is
+            produced through a reparameterizing MLP for stability, which can be
+            dropped afterward. Because these methods never touch the base
+            weights there is nothing to merge, the learned prompt is simply
+            supplied at inference.
+          </p>
+
+          <h3>Deep dive: the BaseTuner and BaseTunerLayer contract</h3>
+          <p>
+            The reason all the weight-space methods feel the same is a small
+            contract in <code>src/peft/tuners/tuners_utils.py</code>.
+            <code>BaseTuner</code> owns the tree walk, the match test, and the
+            replacement, and asks each method to supply the pieces that differ,
+            how to test a target, how to build the new module, and how to mark
+            trainables. <code>BaseTunerLayer</code> is the mixin every adapted
+            layer implements. It holds the <code>base_layer</code>, tracks which
+            adapters are active, and provides <code>merge</code>,
+            <code>unmerge</code>, and the accessor that returns the wrapped
+            original. This is what makes several capabilities uniform across
+            methods. You can hold multiple adapters on one model and switch with
+            <code>set_adapter</code>, add another with <code>add_adapter</code>,
+            temporarily turn all of them off with the
+            <code>disable_adapter</code> context manager to recover the base
+            model's behavior, and merge or unmerge without unloading when you
+            want to toggle folded weights in place. None of that logic lives in
+            LoRA specifically, it lives in the shared contract, so a new method
+            inherits it for free.
+          </p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="m1">model</span>.<span class="m2">add_adapter</span><span class="b0">(</span><span class="s">"french"</span>, <span class="m1">LoraConfig</span><span class="b1">(</span>...<span class="b1">)</span><span class="b0">)</span>    <span class="c"># a second adapter on the same base</span>
+<span class="m1">model</span>.<span class="m2">set_adapter</span><span class="b0">(</span><span class="s">"french"</span><span class="b0">)</span>                      <span class="c"># route forward through it</span>
+<span class="k">with</span> <span class="m1">model</span>.<span class="m2">disable_adapter</span><span class="b0">()</span>:
+    <span class="v3">base_output</span> = <span class="m1">model</span><span class="b0">(</span>**<span class="v6">batch</span><span class="b0">)</span>                 <span class="c"># frozen base, no adapter</span>
+<span class="m1">model</span>.<span class="m2">set_adapter</span><span class="b0">(</span><span class="s">"default"</span><span class="b0">)</span></code></pre></div>
+
+          <h2>Part VI: Reading the repository</h2>
+          <p>
+            The source lives under <code>src/peft/</code> and is small enough to
+            read in a sitting. Paths below are described by role, since the tree
+            is reorganized from time to time.
+          </p>
+          <p>
+            <strong>Stage 0, orientation.</strong> Read the top-level
+            <code>README</code>, then the conceptual pages in the docs on LoRA
+            and on the adapter injection idea, then skim
+            <code>src/peft/__init__.py</code> to see the public surface, the
+            config classes, <code>get_peft_model</code>, <code>PeftModel</code>,
+            and the method configs, all re-exported from one place. Question,
+            which names are the front door and which are internal.
+          </p>
+          <p>
+            <strong>Stage 1, the dispatch.</strong> Read the mapping module that
+            defines <code>get_peft_model</code> and the two lookup tables, from
+            task type to <code>PeftModel</code> subclass and from
+            <code>peft_type</code> to tuner. Then read <code>config.py</code> to
+            see what a <code>PeftConfig</code> is. Questions, where does the
+            branch between weight-space tuners and prompt-learning methods
+            happen, and what exactly does <code>get_peft_model</code> return.
+          </p>
+          <p>
+            <strong>Stage 2, PeftModel.</strong> Read
+            <code>src/peft/peft_model.py</code>, first the base
+            <code>PeftModel</code>, then <code>PeftModelForCausalLM</code>. Watch
+            how it builds the tuner, how <code>save_pretrained</code> and
+            <code>from_pretrained</code> route through the state-dict helpers, and
+            how the prompt-learning path prepends virtual tokens in
+            <code>forward</code>. Question, what state does a PEFT model add
+            beyond the base.
+          </p>
+          <p>
+            <strong>Stage 3, the tuner core.</strong> Read
+            <code>src/peft/tuners/tuners_utils.py</code>, the
+            <code>BaseTuner</code> and <code>BaseTunerLayer</code> contract, as
+            the spine of the whole library. Follow <code>inject_adapter</code>,
+            <code>_check_target_module_exists</code>, and the merge and unmerge
+            methods. Questions, what is the minimal interface a new method must
+            implement, and where is the frozen-versus-trainable decision made.
+          </p>
+          <p>
+            <strong>Stage 4, LoRA end to end.</strong> Read the LoRA package,
+            <code>tuners/lora/config.py</code>, then
+            <code>tuners/lora/layer.py</code> for the linear forward and
+            <code>get_delta_weight</code>, then <code>tuners/lora/model.py</code>
+            for <code>_create_new_module</code> and
+            <code>merge_and_unload</code>, then <code>tuners/lora/bnb.py</code>
+            for the 4-bit variant. Questions, how does the type dispatch pick a
+            layer class, and how does merging fold <code>B A</code> into
+            <code>W</code>.
+          </p>
+          <p>
+            <strong>Stage 5, the other methods and the utils.</strong> Skim
+            <code>tuners/ia3/</code> to see a multiply instead of an add, then
+            one soft-prompt method under <code>tuners/prompt_tuning/</code> or
+            <code>tuners/prefix_tuning/</code> to see the prompt-encoder path.
+            Finish with <code>utils/save_and_load.py</code>, which decides what
+            a checkpoint contains, and <code>utils/other.py</code>, home of
+            <code>prepare_model_for_kbit_training</code> and the
+            <code>ModulesToSaveWrapper</code> that carries a fully-trained head.
+          </p>
+          <p>
+            Where not to start. The long tail of research methods, AdaLoRA, OFT
+            and BOFT, VeRA, LoHa and LoKr, is best met after LoRA is solid, since
+            each is a variation on the same injection mechanism. The integration
+            code for DeepSpeed, FSDP, and the various quantization backends
+            beyond bitsandbytes is important in production but a distraction on a
+            first read. And the mixed-adapter and adapter-composition paths are
+            elegant but presume you already have the single-adapter model in your
+            head.
+          </p>
+
+          <h2>Part VII: Hands-on labs</h2>
+          <p>
+            Labs 1 through 4 run on a single modest GPU, and several will run on
+            CPU for a tiny model if you are patient. Lab 5 wants a GPU with
+            bitsandbytes.
+          </p>
+          <p><strong>Lab 1: see the savings.</strong> Concept, the parameter arithmetic of Part V.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">transformers</span> <span class="k">import</span> <span class="m1">AutoModelForCausalLM</span>
+<span class="k">from</span> <span class="m1">peft</span> <span class="k">import</span> <span class="m1">LoraConfig</span>, <span class="m1">get_peft_model</span>
+
+<span class="v0">base</span> = <span class="m1">AutoModelForCausalLM</span>.<span class="m2">from_pretrained</span><span class="b0">(</span><span class="s">"gpt2"</span><span class="b0">)</span>
+<span class="k">for</span> <span class="v2">r</span> <span class="k">in</span> <span class="b0">(</span><span class="n">4</span>, <span class="n">8</span>, <span class="n">16</span>, <span class="n">32</span><span class="b0">)</span>:
+    <span class="v4">m</span> = <span class="m1">get_peft_model</span><span class="b0">(</span><span class="v0">base</span>, <span class="m1">LoraConfig</span><span class="b1">(</span><span class="v2">r</span>=<span class="v2">r</span>, <span class="v4">target_modules</span>=<span class="b2">[</span><span class="s">"c_attn"</span><span class="b2">]</span><span class="b1">)</span><span class="b0">)</span>
+    <span class="v4">m</span>.<span class="m2">print_trainable_parameters</span><span class="b0">()</span>
+    <span class="v0">base</span> = <span class="v4">m</span>.<span class="m2">unload</span><span class="b0">()</span>          <span class="c"># detach the adapter, restore the plain base</span></code></pre></div>
+          <p>
+            Watch the trainable count grow linearly with <code>r</code>, and
+            check it against <code>2 * r * (d_in + d_out)</code> summed over the
+            matched modules. Then widen <code>target_modules</code> and watch the
+            count grow with the number of adapted layers, which is the formula
+            made real.
+          </p>
+          <p><strong>Lab 2: prove the base is frozen.</strong> Concept, the additive adapter of Part IV.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">torch</span>
+<span class="m1">model</span> = <span class="m1">get_peft_model</span><span class="b0">(</span><span class="v0">base</span>, <span class="m1">LoraConfig</span><span class="b1">(</span><span class="v2">r</span>=<span class="n">8</span>, <span class="v4">target_modules</span>=<span class="b2">[</span><span class="s">"c_attn"</span><span class="b2">]</span><span class="b1">)</span><span class="b0">)</span>
+<span class="v4">x</span> = <span class="m1">tokenizer</span><span class="b0">(</span><span class="s">"the cat sat on the"</span>, <span class="v1">return_tensors</span>=<span class="s">"pt"</span><span class="b0">)</span>
+<span class="k">with</span> <span class="m1">model</span>.<span class="m2">disable_adapter</span><span class="b0">()</span>:
+    <span class="v5">a</span> = <span class="m1">model</span><span class="b0">(</span>**<span class="v4">x</span><span class="b0">)</span>.<span class="m2">logits</span>
+<span class="v6">b</span> = <span class="m1">model</span><span class="b0">(</span>**<span class="v4">x</span><span class="b0">)</span>.<span class="m2">logits</span>          <span class="c"># adapter active, but B is zero-initialized at step 0</span>
+<span class="m1">print</span><span class="b0">(</span><span class="m1">torch</span>.<span class="m2">allclose</span><span class="b1">(</span><span class="v5">a</span>, <span class="v6">b</span><span class="b1">)</span><span class="b0">)</span>    <span class="c"># True before any training step</span></code></pre></div>
+          <p>
+            Because <code>lora_B</code> starts at zero, the freshly wrapped model
+            is numerically identical to the base. Take one optimizer step on any
+            batch, rerun, and watch the two diverge, which is the adapter coming
+            to life.
+          </p>
+          <p><strong>Lab 3: train, save, measure the folder.</strong> Concept, saving only the delta from Part IV.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-bash"><span class="m1">python</span> <span class="s">train_lora.py</span>           <span class="c"># a short LoRA fine-tune on any small dataset</span>
+<span class="m1">ls</span> <span class="s">-lh</span> <span class="s">out/</span>                    <span class="c"># adapter_model.safetensors is megabytes</span>
+<span class="m1">du</span> <span class="s">-sh</span> <span class="s">out/</span>                    <span class="c"># a few MB, versus GBs for a full base checkpoint</span></code></pre></div>
+          <p>
+            The point is visceral. The saved adapter is a rounding error next to
+            a full checkpoint of the base. Load it back with
+            <code>PeftModel.from_pretrained(base, "out")</code> and confirm the
+            fine-tuned behavior returns.
+          </p>
+          <p><strong>Lab 4: merge and time it.</strong> Concept, merge_and_unload from Part IV.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">import</span> <span class="m1">time</span>
+<span class="v1">peft_model</span> = <span class="v4">PeftModel</span>.<span class="m2">from_pretrained</span><span class="b0">(</span><span class="v0">base</span>, <span class="s">"out"</span><span class="b0">)</span>
+<span class="k">def</span> <span class="m1">bench</span><span class="b0">(</span><span class="m1">m</span><span class="b0">)</span>:
+    <span class="v0">t</span> = <span class="m1">time</span>.<span class="m2">time</span><span class="b0">()</span>
+    <span class="k">for</span> <span class="v4">_</span> <span class="k">in</span> <span class="m1">range</span><span class="b0">(</span><span class="n">50</span><span class="b0">)</span>: <span class="m1">m</span><span class="b0">(</span>**<span class="v4">x</span><span class="b0">)</span>
+    <span class="k">return</span> <span class="m1">time</span>.<span class="m2">time</span><span class="b0">()</span> - <span class="v0">t</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">"with adapter :"</span>, <span class="m1">bench</span><span class="b1">(</span><span class="v1">peft_model</span><span class="b1">)</span><span class="b0">)</span>
+<span class="v4">merged</span> = <span class="v1">peft_model</span>.<span class="m2">merge_and_unload</span><span class="b0">()</span>
+<span class="m1">print</span><span class="b0">(</span><span class="s">"merged       :"</span>, <span class="m1">bench</span><span class="b1">(</span><span class="v4">merged</span><span class="b1">)</span><span class="b0">)</span>       <span class="c"># no extra matmul per layer</span></code></pre></div>
+          <p>
+            The merged model should match the base model's latency, while the
+            unmerged one pays the small low-rank overhead per adapted layer.
+            Confirm the two produce the same logits to floating-point tolerance,
+            since merging is exact for a non-quantized base.
+          </p>
+          <p><strong>Lab 5: QLoRA on a real base.</strong> Concept, the 4-bit path from Part V.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="k">from</span> <span class="m1">transformers</span> <span class="k">import</span> <span class="m1">BitsAndBytesConfig</span>
+<span class="k">import</span> <span class="m1">torch</span>
+<span class="v2">bnb</span> = <span class="m1">BitsAndBytesConfig</span><span class="b0">(</span><span class="v0">load_in_4bit</span>=<span class="k">True</span>, <span class="v0">bnb_4bit_quant_type</span>=<span class="s">"nf4"</span>,
+                         <span class="v1">bnb_4bit_compute_dtype</span>=<span class="m1">torch</span>.<span class="m2">bfloat16</span>,
+                         <span class="v2">bnb_4bit_use_double_quant</span>=<span class="k">True</span><span class="b0">)</span>
+<span class="v0">base</span> = <span class="v1">AutoModelForCausalLM</span>.<span class="m2">from_pretrained</span><span class="b0">(</span><span class="s">"meta-llama/Llama-3.2-1B"</span>,
+                                            <span class="v3">quantization_config</span>=<span class="v2">bnb</span><span class="b0">)</span>
+<span class="v0">base</span> = <span class="m1">prepare_model_for_kbit_training</span><span class="b0">(</span><span class="v0">base</span><span class="b0">)</span>
+<span class="v0">model</span> = <span class="m1">get_peft_model</span><span class="b0">(</span><span class="v0">base</span>, <span class="m1">LoraConfig</span><span class="b1">(</span><span class="v2">r</span>=<span class="n">16</span>, <span class="v5">lora_alpha</span>=<span class="n">32</span>,
+                                        <span class="v4">target_modules</span>=<span class="s">"all-linear"</span><span class="b1">)</span><span class="b0">)</span>
+<span class="v0">model</span>.<span class="m2">print_trainable_parameters</span><span class="b0">()</span></code></pre></div>
+          <p>
+            Watch the memory footprint of the loaded base drop to roughly a
+            quarter of its fp16 size, and confirm the adapter still trains. Then
+            try to <code>merge_and_unload</code> and read the warning about
+            merging into a quantized base, which is the lossy-merge caveat made
+            concrete.
+          </p>
+          <p><strong>Lab 6: swap two adapters.</strong> Concept, the multi-adapter contract of Part V.</p>
+          <div class="shl-box"><button class="shl-copy" type="button" aria-label="Copy code">Copy</button><pre class="shl"><code class="language-python"><span class="v0">model</span> = <span class="m1">get_peft_model</span><span class="b0">(</span><span class="v0">base</span>, <span class="m1">LoraConfig</span><span class="b1">(</span><span class="v2">r</span>=<span class="n">8</span>, <span class="v4">target_modules</span>=<span class="b2">[</span><span class="s">"c_attn"</span><span class="b2">]</span><span class="b1">)</span>,
+                       <span class="v5">adapter_name</span>=<span class="s">"taskA"</span><span class="b0">)</span>
+<span class="v0">model</span>.<span class="m2">add_adapter</span><span class="b0">(</span><span class="s">"taskB"</span>, <span class="m1">LoraConfig</span><span class="b1">(</span><span class="v2">r</span>=<span class="n">8</span>, <span class="v4">target_modules</span>=<span class="b2">[</span><span class="s">"c_attn"</span><span class="b2">]</span><span class="b1">)</span><span class="b0">)</span>
+<span class="k">for</span> <span class="v2">name</span> <span class="k">in</span> <span class="b0">(</span><span class="s">"taskA"</span>, <span class="s">"taskB"</span><span class="b0">)</span>:
+    <span class="v0">model</span>.<span class="m2">set_adapter</span><span class="b0">(</span><span class="v2">name</span><span class="b0">)</span>
+    <span class="m1">print</span><span class="b0">(</span><span class="v2">name</span>, <span class="s">"active adapters:"</span>, <span class="v0">model</span>.<span class="m2">active_adapters</span><span class="b0">)</span></code></pre></div>
+          <p>
+            One frozen base, two adapters, routed by name, none of it duplicating
+            the base weights. This is the shape of multi-tenant serving, one
+            model in memory answering for many fine-tunes.
+          </p>
+
+          <h2>Part VIII: Questions and model answers</h2>
+          <p>Understanding checks. Answer aloud before reading.</p>
+          <p><strong>1. What is PEFT, in one sentence?</strong></p>
+          <p>
+            A library that fine-tunes a frozen pretrained model by injecting
+            small trainable adapters into named submodules, driven by a config
+            object and one call to <code>get_peft_model</code>, so that training
+            touches a fraction of a percent of the parameters and saves as
+            megabytes.
+          </p>
+          <p><strong>2. What does get_peft_model actually do?</strong></p>
+          <p>
+            It reads the config, uses <code>task_type</code> to pick a
+            <code>PeftModel</code> subclass and <code>peft_type</code> to pick a
+            tuner, builds the tuner, and the tuner walks the base model's
+            modules, matches them against <code>target_modules</code>, and
+            replaces each match with a wrapper that keeps the original as a
+            frozen <code>base_layer</code> and adds the adapter beside it.
+          </p>
+          <p><strong>3. How does a LoRA adapter change a linear layer's forward?</strong></p>
+          <p>
+            The frozen base still computes <code>W x</code>, and the adapter adds
+            a low-rank term, <code>B(A(dropout(x))) * (alpha/r)</code>, where
+            <code>A</code> projects the input down to rank <code>r</code> and
+            <code>B</code> projects back up to the output width. Since
+            <code>B</code> starts at zero the freshly wrapped model equals the
+            base until training moves the factors.
+          </p>
+          <p><strong>4. Derive the LoRA parameter count for one square projection.</strong></p>
+          <p>
+            For a <code>d x d</code> weight, LoRA trains <code>A</code> of shape
+            <code>(r, d)</code> and <code>B</code> of shape <code>(d, r)</code>,
+            totaling <code>2 r d</code> against <code>d^2</code> for full
+            fine-tuning, a ratio of <code>2r/d</code>. At <code>r = 8</code> and
+            <code>d = 4096</code> that is <code>1/256</code>, about
+            <code>0.39%</code> per matrix, and it shrinks further as the model
+            widens.
+          </p>
+          <p><strong>5. What is the difference between QLoRA and LoRA?</strong></p>
+          <p>
+            Only the base. QLoRA loads the frozen base as 4-bit NF4 weights
+            through bitsandbytes, dequantizing on the fly in the matmul, while
+            the LoRA factors stay in bf16. The tuner's type dispatch routes the
+            4-bit linears to a 4-bit LoRA layer, so it is the same method over a
+            cheaper frozen base, which is what lets very large models fit on one
+            GPU.
+          </p>
+          <p><strong>6. Why does merge_and_unload eliminate the inference overhead?</strong></p>
+          <p>
+            It computes the delta weight <code>(B A) * (alpha/r)</code>, adds it
+            to the base weight in place, and swaps the wrapper back for the
+            updated base layer, leaving a plain model whose forward has no extra
+            matmul. The correction was always a delta of the weight, so folding
+            it in is exact for a full-precision base.
+          </p>
+          <p><strong>7. When is merging a bad idea?</strong></p>
+          <p>
+            When the base is quantized, since folding a bf16 delta into 4-bit
+            weights requires a lossy requantize, and when you want to serve many
+            adapters over one base, since merging bakes one adapter in and
+            defeats the point of keeping them detachable. In both cases you keep
+            the adapter separate at inference.
+          </p>
+          <p><strong>8. How do soft-prompt methods differ from LoRA in the code?</strong></p>
+          <p>
+            They do not inject anything into the base modules. Their configs are
+            prompt-learning configs, and <code>PeftModel.forward</code> runs a
+            prompt encoder to produce virtual token representations and prepends
+            them to the sequence. Prompt tuning acts only at the input,
+            P-tuning generates the tokens with a small encoder, and prefix tuning
+            injects key and value prefixes into every layer's attention.
+          </p>
+          <p><strong>9. What is IA3 and how is it lighter than LoRA?</strong></p>
+          <p>
+            IA3 learns a single scaling vector per target module and multiplies
+            the module's activations elementwise, rescaling attention keys and
+            values and the feed-forward intermediate. A vector costs on the order
+            of a dimension rather than <code>2 r d</code>, so it trains even
+            fewer parameters, and because a diagonal scale commutes into the
+            weight it also merges cleanly.
+          </p>
+          <p><strong>10. What exactly ends up in a saved adapter folder?</strong></p>
+          <p>
+            The filtered adapter tensors, the LoRA factors and any
+            <code>modules_to_save</code> such as a classifier head, written as
+            <code>adapter_model.safetensors</code>, plus
+            <code>adapter_config.json</code> recording the method, its
+            hyperparameters, and the base model name. None of the base weights,
+            which is why the folder is megabytes and a reload needs the base.
+          </p>
+          <p><strong>11. Why must a new classification head go in modules_to_save?</strong></p>
+          <p>
+            A fresh head is not matched by any adapter, so by default it would be
+            frozen with the rest of the base and would neither train nor save.
+            Listing it in <code>modules_to_save</code> wraps it so it is trained
+            in full precision and its weights are written into the adapter
+            checkpoint.
+          </p>
+          <p><strong>12. When would you not use PEFT at all?</strong></p>
+          <p>
+            When you are pretraining or heavily continued-pretraining a model
+            rather than adapting a finished one, where a platform like
+            <a href="/oss/torchtitan">torchtitan</a> fits, or when the base is
+            small, the task is far from pretraining, and you can afford a full
+            fine-tune whose higher ceiling is worth the cost.
+          </p>
+          <p><strong>13. How can several fine-tunes share one model in memory?</strong></p>
+          <p>
+            Because adapters are additive and detachable, one frozen base can
+            hold many adapters through <code>add_adapter</code>, routed by
+            <code>set_adapter</code>, and serving stacks that support dynamic
+            LoRA load and switch adapters per request over a single shared base,
+            which is impossible with fully merged per-task checkpoints.
+          </p>
+          <p><strong>14. What does prepare_model_for_kbit_training do and why?</strong></p>
+          <p>
+            It casts sensitive layers like the norms and the language head back
+            to fp32, enables gradient checkpointing, and makes the input
+            embeddings produce gradients, all of which keep 4-bit training
+            numerically stable and compatible with activation checkpointing
+            before the LoRA adapter is attached.
+          </p>
+
+          <h2>Part IX: Design lessons</h2>
+          <p>
+            <strong>Represent the method as data, dispatch by type.</strong> The
+            choice of LoRA, IA3, or a soft prompt is a config with a
+            <code>peft_type</code>, and the machinery that edits the model is a
+            table lookup. New methods slot in without touching the core. This is
+            the strategy pattern with a registry, the same instinct as codecs
+            keyed by format or serializers keyed by content type.
+          </p>
+          <p>
+            <strong>Wrap, do not rewrite.</strong> The base module is preserved
+            as <code>base_layer</code> and the adapter sits beside it, so the
+            original computation is always available, the adapter can be disabled
+            or removed, and nothing in the base model had to change. Keeping the
+            wrapped original reachable is what buys disable, unmerge, and clean
+            unload, and it is why decorators that hide the thing they wrap age
+            worse than ones that expose it.
+          </p>
+          <p>
+            <strong>Make the invariant hold at step zero.</strong> Initializing
+            <code>B</code> to zero means the wrapped model starts exactly equal
+            to the base, so fine-tuning is a smooth departure from a known good
+            point rather than a jolt. Starting a modification as the identity is
+            a recurring safety property, present in residual connections,
+            feature-flag rollouts, and any migration that begins as a no-op.
+          </p>
+          <p>
+            <strong>Persist the delta, not the whole.</strong> A saved adapter is
+            the change plus the identity of what it changed, not a copy of the
+            base, which turns a per-task gigabyte checkpoint into a shared base
+            and a folder of megabyte diffs. Storing diffs against a stable
+            reference is the same economy as version control, container layers,
+            and copy-on-write snapshots.
+          </p>
+          <p>
+            <strong>Give one seam many uses.</strong> The type dispatch that
+            picks a layer class for an <code>nn.Linear</code> is the exact seam
+            that makes QLoRA free, because a 4-bit linear is just another type to
+            dispatch on. A single well-placed extension point that several
+            features flow through beats a special case per feature, which is why
+            the 4-bit path reads as a variant rather than a fork.
+          </p>
+
+          <h2>Part X: Memorization framework</h2>
+          <p>
+            The one-sentence summary. <mark>PEFT freezes the base, reads a config
+            whose <code>peft_type</code> selects a tuner, walks the module tree to
+            replace matched layers with wrappers that keep the original frozen
+            and add a tiny trainable adapter, trains only that adapter, saves it
+            as a megabyte diff, and optionally folds it back into the weights for
+            zero-overhead inference.</mark>
+          </p>
+          <pre class="flow">LoraConfig -&gt; get_peft_model -&gt; PeftModel(task_type) + tuner(peft_type)
+  -&gt; BaseTuner.inject_adapter: match target_modules, swap nn.Linear -&gt; lora.Linear
+  -&gt; forward: W x + (alpha/r) B A x     (B zero-init, base frozen)
+  -&gt; save_pretrained: adapter_config.json + adapter_model.safetensors
+  -&gt; merge_and_unload: W += (alpha/r) B A, return plain model</pre>
+          <p>The chain mapped to source.</p>
+          <pre class="flow">entry        src/peft/mapping_func.py  (get_peft_model)
+model        src/peft/peft_model.py    (PeftModel, PeftModelForCausalLM)
+config       src/peft/config.py, utils/peft_types.py (PeftType, TaskType)
+tuner core   src/peft/tuners/tuners_utils.py (BaseTuner, BaseTunerLayer)
+lora         src/peft/tuners/lora/{config,layer,model,bnb}.py
+ia3 / prompt src/peft/tuners/{ia3,prompt_tuning,p_tuning,prefix_tuning}/
+save/load    src/peft/utils/save_and_load.py, utils/other.py</pre>
+          <p>Memorize these blocks.</p>
+          <ul>
+            <li><strong>The wrap:</strong> a LoRA layer keeps the frozen linear as <code>base_layer</code> and adds <code>lora_A</code> (r, d_in) and <code>lora_B</code> (d_out, r), with <code>B</code> zero-initialized so the model starts equal to the base.</li>
+            <li><strong>The forward:</strong> <code>W x + (alpha/r) B A x</code>, two skinny matmuls, scaling <code>alpha/r</code> adds no parameters.</li>
+            <li><strong>The savings:</strong> full is <code>d^2</code>, LoRA is <code>2 r d</code>, ratio <code>2r/d</code>, about <code>0.39%</code> at r=8 on d=4096, roughly 4M trainable for a 7B with q and v adapted.</li>
+            <li><strong>QLoRA:</strong> same method, base loaded as 4-bit NF4 with double quant, dequantized in the matmul, adapters in bf16, merging is lossy.</li>
+            <li><strong>The family:</strong> LoRA adds to weights, IA3 scales activations, soft-prompt methods prepend learned inputs and never touch the base, so only LoRA-style methods and IA3 merge.</li>
+          </ul>
+
+          <h2>Part XI: Papers and further reading</h2>
+          <p>
+            Every method in this walkthrough traces back to a specific paper,
+            and each one rewards a direct read. Where this site covers the
+            surrounding ideas in depth, the companion link points there.
+          </p>
+          <ol class="refs">
+            <li>Houlsby et al., <a href="https://arxiv.org/abs/1902.00751" target="_blank" rel="noreferrer">Parameter-Efficient Transfer Learning for NLP</a>, 2019. The bottleneck-adapter paper that opened the field PEFT packages, and the ancestor of the adapters library mentioned in Part III.</li>
+            <li>Aghajanyan et al., <a href="https://arxiv.org/abs/2012.13255" target="_blank" rel="noreferrer">Intrinsic Dimensionality Explains the Effectiveness of Language Model Fine-Tuning</a>, 2020. The evidence that task adaptation lives in a low-dimensional subspace, which is the hypothesis LoRA turns into a method.</li>
+            <li>Hu et al., <a href="https://arxiv.org/abs/2106.09685" target="_blank" rel="noreferrer">LoRA, Low-Rank Adaptation of Large Language Models</a>, 2021. The low-rank update this chapter follows through the code. The <a href="/classes/applied-generative-ai">applied generative AI class</a> puts it to work, and the <a href="/oss/torchtune">torchtune</a> and <a href="/oss/trl">TRL</a> walkthroughs train the same adapters in other stacks.</li>
+            <li>Li and Liang, <a href="https://arxiv.org/abs/2101.00190" target="_blank" rel="noreferrer">Prefix-Tuning, Optimizing Continuous Prompts for Generation</a>, 2021. The per-layer key and value prefixes behind prefix tuning. The <a href="/ml/attention">attention note</a> derives the tensors it prepends to.</li>
+            <li>Lester et al., <a href="https://arxiv.org/abs/2104.08691" target="_blank" rel="noreferrer">The Power of Scale for Parameter-Efficient Prompt Tuning</a>, 2021. The input-layer soft prompts that become PEFT's prompt tuning, with the finding that they close the gap on full fine-tuning as models grow.</li>
+            <li>Liu et al., <a href="https://arxiv.org/abs/2103.10385" target="_blank" rel="noreferrer">GPT Understands, Too</a>, 2021. The P-tuning paper, which generates the virtual tokens through a small encoder to stabilize optimization.</li>
+            <li>Liu et al., <a href="https://arxiv.org/abs/2205.05638" target="_blank" rel="noreferrer">Few-Shot Parameter-Efficient Fine-Tuning is Better and Cheaper than In-Context Learning</a>, 2022. Introduces IA3, the learned activation scales of Part V, and makes the case for adapters over prompting in the few-shot regime.</li>
+            <li>Dettmers et al., <a href="https://arxiv.org/abs/2305.14314" target="_blank" rel="noreferrer">QLoRA, Efficient Finetuning of Quantized LLMs</a>, 2023. NF4, double quantization, and paged optimizers, the 4-bit frozen base this chapter's QLoRA path rests on. The <a href="/oss/unsloth">Unsloth walkthrough</a> covers a kernel-tuned version of the same recipe.</li>
+            <li>Zhang et al., <a href="https://arxiv.org/abs/2303.10512" target="_blank" rel="noreferrer">AdaLoRA, Adaptive Budget Allocation for Parameter-Efficient Fine-Tuning</a>, 2023. Lets the rank vary across weight matrices during training, the AdaLoRA tuner in the method list.</li>
+            <li>Kalajdzievski, <a href="https://arxiv.org/abs/2312.03732" target="_blank" rel="noreferrer">A Rank Stabilization Scaling Factor for Fine-Tuning with LoRA</a>, 2023. The sqrt(r) scaling behind the <code>use_rslora</code> switch in Part V's derivation.</li>
+            <li>Liu et al., <a href="https://arxiv.org/abs/2402.09353" target="_blank" rel="noreferrer">DoRA, Weight-Decomposed Low-Rank Adaptation</a>, 2024. Splits the update into a magnitude and a direction, the <code>use_dora</code> switch in the config.</li>
+          </ol>
+
+          <h2>Part XII: Final takeaway</h2>
+          <p>
+            If the single-model pieces PEFT assumes are the gap, the base models
+            it adapts come from <a href="/oss/transformers">Transformers</a> and
+            the attention math behind prefix tuning's key and value prefixes is
+            derived in the <a href="/oss/flash-attention">FlashAttention
+            chapter</a>. The pretraining side of the story, training a base worth
+            adapting, lives in <a href="/oss/nanogpt">nanoGPT</a> and
+            <a href="/oss/torchtitan">torchtitan</a>, and the mesh-and-sharding
+            vocabulary that scales any of this across GPUs is worked out in
+            <a href="/classes/parallel-computing">parallel computing</a>. Then
+            read one LoRA forward once more, and it will look like a frozen
+            matmul with a small correction added, which is the entire idea.
+          </p>
+          <div class="takeaway">
+            <strong>Key takeaway:</strong> PEFT shows that adapting a huge model
+            need not touch most of it. Freeze the base, describe an adapter with
+            a config, let one function inject a low-rank correction into the
+            layers that matter, and you fine-tune a fraction of a percent of the
+            weights, save the result as megabytes, run many adaptations over one
+            shared base, and fold the correction back into the weights for free
+            when the training is done.
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+    <script defer src="/code-copy.js"></script>
+      <script defer src="/theme.js"></script>
+  </body>
+</html>

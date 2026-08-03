@@ -19,12 +19,14 @@ import { fileURLToPath } from 'node:url'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 
-const SHIKI_LANGS = ['python', 'cpp', 'rust', 'go', 'typescript', 'swift', 'sql', 'http', 'bash', 'javascript', 'json', 'yaml', 'nginx', 'java', 'xml']
+const SHIKI_LANGS = ['python', 'cpp', 'rust', 'go', 'typescript', 'swift', 'sql', 'http', 'bash', 'javascript', 'json', 'yaml', 'nginx', 'java', 'xml', 'system-verilog', 'verilog', 'tcl']
 const CODE_CLASS_MAP = {
   python: 'python', cpp: 'cpp', c: 'cpp', rust: 'rust', go: 'go', typescript: 'typescript',
   ts: 'typescript', swift: 'swift', sql: 'sql', http: 'http', bash: 'bash', shell: 'bash',
   sh: 'bash', javascript: 'javascript', js: 'javascript', json: 'json', yaml: 'yaml',
   nginx: 'nginx', java: 'java', xml: 'xml',
+  systemverilog: 'system-verilog', 'system-verilog': 'system-verilog', sv: 'system-verilog',
+  verilog: 'verilog', v: 'verilog', tcl: 'tcl', xdc: 'tcl', sdc: 'tcl',
 }
 const DATA_LANG_MAP = {
   python: 'python', cpp: 'cpp', rust: 'rust', go: 'go', typescript: 'typescript', swift: 'swift',
@@ -365,9 +367,23 @@ function* htmlFiles(dir) {
   }
 }
 
+// With no arguments, walk the whole repo. With arguments, process only those
+// paths (files or directories), so a batch of finished pages can be highlighted
+// while other pages are still being edited.
+function* targets() {
+  const args = process.argv.slice(2)
+  if (!args.length) return yield* htmlFiles(ROOT)
+  for (const a of args) {
+    const p = path.resolve(a)
+    if (!fs.existsSync(p)) { console.warn(`skipping missing path: ${a}`); continue }
+    if (fs.statSync(p).isDirectory()) yield* htmlFiles(p)
+    else if (p.endsWith('.html')) yield p
+  }
+}
+
 hl = await createHighlighter({ themes: ['github-dark'], langs: SHIKI_LANGS })
 let files = 0, blocks = 0
-for (const f of htmlFiles(ROOT)) {
+for (const f of targets()) {
   const n = transformFile(f)
   if (n) files++
   blocks += n
