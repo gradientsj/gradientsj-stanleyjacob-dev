@@ -5,7 +5,8 @@
   var LANGS = ["python", "c", "cpp", "rust", "typescript", "go", "swift", "pytorch", "triton", "cuda", "jax"];
 
   function setLang(lang) {
-    document.querySelectorAll(".code-tabs").forEach(function (block) {
+    /* .code-steps blocks (approach ladder pages) manage their own visibility */
+    document.querySelectorAll(".code-tabs:not(.code-steps)").forEach(function (block) {
       var target = lang;
       if (!block.querySelector('pre[data-lang="' + lang + '"]')) {
         var first = block.querySelector("pre[data-lang]");
@@ -27,7 +28,7 @@
   }
 
   document.addEventListener("click", function (e) {
-    var btn = e.target.closest ? e.target.closest(".code-tabs button[data-lang]") : null;
+    var btn = e.target.closest ? e.target.closest(".code-tabs:not(.code-steps) button[data-lang]") : null;
     if (btn) setLang(btn.getAttribute("data-lang"));
   });
 
