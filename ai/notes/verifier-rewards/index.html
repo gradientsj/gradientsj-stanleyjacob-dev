@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Deterministic verifiers as reward functions · Stanley Jacob</title>
+    <meta name="description" content="Notes on post-training against evaluation verifiers: why a deterministic verifier doubles as an un-flatterable RL reward, rejection-sampling SFT with repair transcripts, GRPO over verifier scores, and a reward-hacking defense built from adversary-mined hidden tests — including why a different random seed is not a disjointness guarantee." />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%232B2621'/%3E%3Ctext x='50' y='70' font-size='52' font-weight='600' text-anchor='middle' font-family='-apple-system,Helvetica,Arial,sans-serif' fill='%23ffffff'%3Esj%3C/text%3E%3C/svg%3E" />
+      <script>(function(){try{var t=localStorage.getItem("theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+  </head>
+  <body>
+    <nav class="top">
+      <div class="inner">
+        <div class="brand"><a href="/">Stanley Jacob</a></div>
+        <div class="links">
+          <a href="/ai" class="active">AI</a>
+          <a href="/robotics">Robotics</a>
+          <a href="/software">Software</a>
+          <a href="/classes">Classes</a>
+          <a href="/algorithms">Algorithms</a>
+          <a href="/systems">Systems</a>
+          <a href="/ml">ML</a>
+          <a href="/rl">RL</a>
+          <a href="/oss">Open source</a>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow"><a href="/ai">← AI</a></div>
+        <h1>Deterministic verifiers as reward functions</h1>
+        <p class="meta">Notes · post-training against evaluation infrastructure · August 2026</p>
+      </div>
+    </header>
+
+    <section class="soft">
+      <div class="wrap">
+        <article class="prose article">
+
+          <p>
+            These are working notes for the post-training milestone of my
+            <a href="/ai/projects/agent-eval-lab">agent evaluation platform</a>:
+            taking Qwen3.6-27B through rejection-sampling SFT and then GRPO,
+            where the reward at every step is the <em>same deterministic
+            verifier the evaluation harness reports with</em>. The training
+            pipeline pieces described here are implemented and tested offline;
+            the GPU loop itself is queued behind the serving infrastructure,
+            and I say below exactly which is which.
+          </p>
+
+          <h2>The core move: the metric you train against is the metric you report</h2>
+          <p>
+            Most RLHF-adjacent pipelines optimize a proxy — a learned reward
+            model, an LLM judge — and then evaluate on something else, which is
+            how you get models that improved on the reward and regressed on the
+            task. The evaluation platform bans LLM judges from the scoring path
+            entirely: extraction is scored by field-level F1 against generated
+            gold labels, reasoning by exact programmatic checks, code by unit
+            tests in a restricted subprocess. Every one of those is a pure
+            function from (task, completion) to a score in [0, 1]. That has an
+            immediate consequence for post-training: <strong>the verifier IS
+            the reward function.</strong> No reward model to train, no judge to
+            flatter, no proxy gap between what the optimizer sees and what the
+            benchmark reports. The adapter is ~40 lines: bind a benchmark's
+            verifier, feed it (case, completion), return the score as reward.
+          </p>
+          <p>
+            The verifier scores are also usefully <em>dense</em> where it
+            matters: extraction F1 gives partial credit per field, so GRPO
+            groups aren't all-zero on hard cases the way strict pass/fail
+            rewards tend to be, while code stays honestly binary (pass@1)
+            because pretending test outcomes are continuous would be dishonest.
+          </p>
+
+          <h2>Rejection-sampling SFT, mined from evaluation artifacts</h2>
+          <p>
+            Rejection sampling here is literal: only completions that pass the
+            deterministic verifier become training targets. Because the
+            platform persists every rollout — prompt, output, verifier result,
+            every repair turn — the first SFT dataset comes free from runs that
+            already happened, rather than from a separate generation job. The
+            miner regenerates cases deterministically from the run manifest,
+            re-verifies every candidate completion <em>at mining time</em> (a
+            benchmark-version drift fails loudly instead of silently
+            mislabeling data), and emits three kinds of examples:
+          </p>
+          <ul>
+            <li><strong>solve</strong> — first-attempt passes: (task, verified answer);</li>
+            <li><strong>repair_final</strong> — the corrected answer after failed
+              attempts, presented as a direct answer to the original task;</li>
+            <li><strong>repair_transcript</strong> — the full conversation:
+              wrong answer → verifier feedback → verified fix. This is the
+              training signal for "steer solvers toward verified fixes," and
+              two details matter. The feedback is <em>answer-free by
+              contract</em> (it names which fields are unsupported, never the
+              correct value — a property with its own regression test, because
+              an early version leaked "must be null" and a review pass caught
+              it). And the repair turn's wording comes from the same function
+              the inference loop uses, so training transcripts match deployment
+              byte-for-byte.</li>
+          </ul>
+          <p>
+            Pipeline validation on an existing offline run (mock models, so
+            free and deterministic): 61 verified examples — 37 solve, 12
+            repair_final, 12 repair_transcript — with zero re-verification
+            failures. At real scale the same command runs against the full
+            benchmark run's artifacts, and best-of-n sampling at temperature
+            slots in as a second source for cases no model solved.
+          </p>
+
+          <h2>GRPO over verifier scores</h2>
+          <p>
+            GRPO fits this setting well: sample a group of completions per
+            task, score each with the verifier, and use group-relative
+            advantages — no value network, no learned critic, and the reward
+            is exactly the benchmark metric. The plan (queued behind the GPU
+            serving milestone) is standard: SFT checkpoint as the starting
+            policy, groups of 8–16 completions per case, verifier score as raw
+            reward, KL penalty to the SFT policy. Everything that feeds it —
+            prompt construction, the reward lookup keyed by prompt for
+            TRL/verl-style trainer loops, case splits — is implemented and
+            tested. I'm deliberately not publishing training hyperparameters I
+            haven't run.
+          </p>
+
+          <h2>Reward hacking, and why "a different seed" is not a defense</h2>
+          <p>
+            Optimizing against a fixed verifier invites the model to learn the
+            verifier rather than the task: format tricks, distribution quirks
+            of the generator, anything that raises score without raising
+            competence. The defense uses the platform's adversarial machinery
+            against its own training loop:
+          </p>
+          <ul>
+            <li>training rewards come from <em>visible</em> cases only;</li>
+            <li>a <em>hidden</em> split — adversarial derivatives of the same
+              clean tasks, generated with a held-back seed and validated by
+              the same deterministic validator — is never exposed to training
+              and gets evaluated post-hoc;</li>
+            <li>the alarm is the gap: if visible pass rates climb while hidden
+              pass rates stall or fall, the model is learning the verifier,
+              not the task.</li>
+          </ul>
+          <p>
+            Writing the disjointness test surfaced the kind of bug these notes
+            exist to remember: <strong>a different random seed does not
+            guarantee different data.</strong> Some adversarial operators are
+            low-entropy — a delimiter swap has three choices; a paragraph
+            shuffle on a short document has a small permutation space — so two
+            seeds can produce byte-identical mutations, silently leaking
+            "hidden" tests into training data. The fix is to enforce rather
+            than assume: hidden candidates are collision-filtered against the
+            actual training documents, and a test asserts the filter fires on
+            real collisions. Disjointness is a property you check, not a
+            property you get from seeding discipline.
+          </p>
+
+          <h2>The measurement protocol for [X] → [Y]</h2>
+          <p>
+            The claim worth making at the end is "post-training lifted held-out
+            pass@1 from X to Y," and both numbers need to survive scrutiny.
+            X is the <em>best steered-prompt baseline</em>: the strongest
+            configuration achievable without touching weights (repair loop on,
+            best-of-n), measured by the harness on held-out cases. Y is the
+            post-trained checkpoint served through the identical
+            OpenAI-compatible adapter and measured by the identical verifiers
+            on the identical splits — plus the hidden adversarial set, which
+            the baseline also runs so the reward-hacking comparison is
+            apples-to-apples. Until that experiment runs, these notes contain
+            no X and no Y; when it runs, both come out of persisted rollout
+            artifacts with run IDs attached, like every other number the
+            platform publishes.
+          </p>
+
+          <h2>Status</h2>
+          <ul>
+            <li><strong>Implemented and tested (offline):</strong> verifier-reward
+              adapter, prompt-keyed reward table, rejection-sampling miner with
+              repair transcripts, hidden-split generation with enforced
+              collision filtering, dataset export.</li>
+            <li><strong>Queued:</strong> Qwen3.6-27B serving (vLLM on rented
+              GPUs), the full multi-model benchmark, SFT + GRPO runs, and the
+              [X] → [Y] measurement.</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="inner">
+        <span>© <span id="yr">2026</span> Stanley Jacob</span>
+        <span>
+          <a href="https://github.com/gradientsj" target="_blank" rel="noreferrer">GitHub</a>
+          &nbsp;·&nbsp; <a href="mailto:stanleyjacobai@gmail.com">stanleyjacobai@gmail.com</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("yr").textContent = new Date().getFullYear();
+    </script>
+      <script defer src="/theme.js"></script>
+  </body>
+</html>
